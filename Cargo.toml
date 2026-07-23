@@ -10,8 +10,8 @@ repository = "https://github.com/bayanasar/dashmag"
 rust-version = "1.75"
 
 [workspace.dependencies]
-dash-core = { path = "crates/dash-core" }
-dash-tract = { path = "crates/dash-tract" }
-dash-iree = { path = "crates/dash-iree" }
-dash-tensorrt = { path = "crates/dash-tensorrt" }
-dash-edgetpu = { path = "crates/dash-edgetpu" }
+dash-core = { path = "crates/dash-core", version = "0.0.0" }
+dash-tract = { path = "crates/dash-tract", version = "0.0.0" }
+dash-iree = { path = "crates/dash-iree", version = "0.0.0" }
+dash-tensorrt = { path = "crates/dash-tensorrt", version = "0.0.0" }
+dash-edgetpu = { path = "crates/dash-edgetpu", version = "0.0.0" }
