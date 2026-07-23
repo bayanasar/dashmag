@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/dash-core", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/bayanasar/dashmag"
+rust-version = "1.75"
+
+[workspace.dependencies]
+dash-core = { path = "crates/dash-core" }
+dash-tract = { path = "crates/dash-tract" }
+dash-iree = { path = "crates/dash-iree" }
+dash-tensorrt = { path = "crates/dash-tensorrt" }
+dash-edgetpu = { path = "crates/dash-edgetpu" }

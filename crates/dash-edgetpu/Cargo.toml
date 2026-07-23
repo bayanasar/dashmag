@@ -1,0 +1,11 @@
+[package]
+name = "dash-edgetpu"
+description = "Coral Edge TPU backend for Dashmag. Phase-0.5 spike (UNPROVEN on hardware): drives a tflite+libedgetpu runner."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dash-core = { workspace = true }

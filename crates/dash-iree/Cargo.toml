@@ -1,0 +1,11 @@
+[package]
+name = "dash-iree"
+description = "IREE backend for Dashmag. Phase-0 spike: drives iree-run-module as a subprocess."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dash-core = { workspace = true }

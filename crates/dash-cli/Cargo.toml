@@ -1,0 +1,28 @@
+[package]
+name = "dash-cli"
+description = "Backend-agnostic command-line runner for Dashmag inference."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dash"
+path = "src/main.rs"
+
+[features]
+default = ["tract"]
+tract = ["dep:dash-tract"]
+iree = ["dep:dash-iree"]
+tensorrt = ["dep:dash-tensorrt"]
+edgetpu = ["dep:dash-edgetpu"]
+# convenience: every board accelerator behind one flag (the facade, not a merged crate)
+accelerators = ["tensorrt", "edgetpu"]
+
+[dependencies]
+dash-core = { workspace = true }
+dash-tract = { workspace = true, optional = true }
+dash-iree = { workspace = true, optional = true }
+dash-tensorrt = { workspace = true, optional = true }
+dash-edgetpu = { workspace = true, optional = true }

@@ -1,0 +1,12 @@
+[package]
+name = "dash-tract"
+description = "Pure-Rust CPU inference backend for Dashmag, built on tract. The portable floor."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dash-core = { workspace = true }
+tract-onnx = "0.21"
