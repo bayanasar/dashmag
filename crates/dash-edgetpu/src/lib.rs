@@ -7,8 +7,8 @@
 //! been executed on a real Edge TPU. Two things gate that proof:
 //!   1. An **Edge-TPU artifact**: an int8-quantized `.tflite` compiled by
 //!      `edgetpu_compiler`. MobileNetV3-Small's SE / hard-swish blocks are known
-//!      to map poorly to the Edge TPU (partial CPU fallback) — the risk the
-//!      execution plan flagged. Producing this artifact is a separate spike.
+//!      to map poorly to the Edge TPU (partial CPU fallback). Producing that
+//!      artifact is a separate piece of work.
 //!   2. A reachable Coral running the runner (`tflite_runtime` + `libedgetpu`).
 //!
 //! Design (matching `dash-iree`/`dash-tensorrt`): drive a subprocess runner that
