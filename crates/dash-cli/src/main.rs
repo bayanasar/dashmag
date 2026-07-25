@@ -22,16 +22,19 @@ fn accel_for_device(device: &str) -> AccelClass {
 }
 
 #[allow(unused_variables)]
-fn build_registry(device: &str, accel: AccelClass) -> Registry {
+fn build_registry(device: &str, accel: AccelClass, function: Option<&str>) -> Registry {
     #[allow(unused_mut)]
     let mut reg = Registry::new();
     #[cfg(feature = "tract")]
     reg.register(Box::new(dash_tract::TractRuntime::new()));
     #[cfg(feature = "iree")]
-    reg.register(Box::new(dash_iree::IreeRuntime::new(
-        device.to_string(),
-        accel,
-    )));
+    {
+        let mut rt = dash_iree::IreeRuntime::new(device.to_string(), accel);
+        if let Some(f) = function {
+            rt = rt.with_function(f);
+        }
+        reg.register(Box::new(rt));
+    }
     #[cfg(feature = "tensorrt")]
     reg.register(Box::new(dash_tensorrt::TensorRtRuntime::new()));
     #[cfg(feature = "edgetpu")]
@@ -68,7 +71,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: dash --backend <tract|iree|tensorrt|edgetpu> --model <artifact> \
          --input <blob> [--labels <txt>] [--shape N,C,H,W] [--out-shape N,C] \
-         [--device <local-task|cuda|vulkan>]\n\
+         [--device <local-task|cuda|vulkan>] \
+         [--function <entry>]\n\
          \n\
          --out-shape declares the model's output shape so every backend returns\n\
          the same shape (runners that emit raw buffers otherwise return flat)."
@@ -81,6 +85,7 @@ fn run() -> Result<(), String> {
     let mut shape = vec![1usize, 3, 224, 224];
     let mut out_shape: Option<Vec<usize>> = None;
     let mut device = String::from("local-task");
+    let mut function: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -90,6 +95,7 @@ fn run() -> Result<(), String> {
             "--input" => input = args.next(),
             "--labels" => labels = args.next(),
             "--device" => device = args.next().unwrap_or(device),
+            "--function" => function = args.next(),
             "--shape" => {
                 shape = parse_shape(&args.next().ok_or("--shape needs a value")?)?;
             }
@@ -126,7 +132,7 @@ fn run() -> Result<(), String> {
     };
 
     let accel = accel_for_device(&device);
-    let reg = build_registry(&device, accel);
+    let reg = build_registry(&device, accel, function.as_deref());
     let target = TargetProfile {
         accel,
         no_std: false,
