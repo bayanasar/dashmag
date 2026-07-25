@@ -119,7 +119,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "dash-cli"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "dash-core",
  "dash-edgetpu",
@@ -130,33 +130,36 @@ dependencies = [
 
 [[package]]
 name = "dash-core"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "dash-edgetpu"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "dash-core",
+ "tempfile",
 ]
 
 [[package]]
 name = "dash-iree"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "dash-core",
+ "tempfile",
 ]
 
 [[package]]
 name = "dash-tensorrt"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "dash-core",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
 name = "dash-tract"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "dash-core",
  "tract-onnx",
@@ -223,6 +226,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -257,6 +266,17 @@ dependencies = [
  "cfg-if",
  "libc",
  "wasi",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
 ]
 
 [[package]]
@@ -688,6 +708,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
 name = "rand"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -714,7 +740,7 @@ version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
- "getrandom",
+ "getrandom 0.2.17",
 ]
 
 [[package]]
@@ -951,6 +977,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys",
+]
+
+[[package]]
 name = "time"
 version = "0.3.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1125,7 +1164,7 @@ version = "0.21.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "148d0e0d08e120f3f5ae0e8ef5f78dae384cfbb82c978ce9613d5e9c540c3bdf"
 dependencies = [
- "getrandom",
+ "getrandom 0.2.17",
  "log",
  "rand",
  "rand_distr",

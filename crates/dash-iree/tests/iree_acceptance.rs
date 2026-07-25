@@ -4,9 +4,15 @@
 //! and a compiled `fixtures/mnv3_cpu.vmfb` (see `tools/compile_iree.sh`). Run:
 //!   DASH_IREE_RUN_MODULE=<path> cargo test -p dash-iree -- --ignored
 
-use dash_core::{AccelClass, Artifact, ArtifactMeta, BackendKind, HostTensor, Runtime, Tensor};
+use dash_core::{
+    argmax, AccelClass, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Runtime,
+    TensorSpec, Tensor,
+};
 use dash_iree::IreeRuntime;
 use std::{env, fs, path::PathBuf};
+
+const REF_CLASS: usize = 258;
+const REF_LOGIT: f32 = 11.7283;
 
 fn fixtures_dir() -> PathBuf {
     env::var("DASH_FIXTURES")
@@ -16,7 +22,7 @@ fn fixtures_dir() -> PathBuf {
 
 #[test]
 #[ignore = "needs iree-run-module + fixtures/mnv3_cpu.vmfb (tools/compile_iree.sh); run with --ignored"]
-fn iree_cpu_top1_is_samoyed() {
+fn iree_cpu_matches_torch_reference() {
     let dir = fixtures_dir();
     let vmfb = fs::read(dir.join("mnv3_cpu.vmfb"))
         .expect("mnv3_cpu.vmfb missing — run tools/compile_iree.sh");
@@ -25,22 +31,40 @@ fn iree_cpu_top1_is_samoyed() {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
+
     let art = Artifact {
         backend: BackendKind::Iree,
         bytes: vmfb,
-        meta: ArtifactMeta::default(),
+        meta: ArtifactMeta {
+            inputs: vec![TensorSpec::new(DType::F32, &[1, 3, 224, 224])],
+            outputs: vec![TensorSpec::new(DType::F32, &[1, 1000])],
+            ..Default::default()
+        },
     };
     let session = IreeRuntime::new("local-task", AccelClass::Cpu)
         .load(&art)
         .unwrap();
     let out = session
-        .run(&[Tensor::Host(HostTensor::from_f32(vec![1, 3, 224, 224], &floats))])
+        .run(&[Tensor::Host(HostTensor::from_f32(
+            vec![1, 3, 224, 224],
+            &floats,
+        ))])
         .unwrap();
+
+    assert_eq!(out.len(), 1);
+    // The raw buffer from iree-run-module carries no shape; ArtifactMeta must
+    // restore it so IREE agrees with tract instead of returning a flat [1000].
+    assert_eq!(
+        out[0].shape(),
+        &[1, 1000],
+        "declared output shape must be restored from ArtifactMeta"
+    );
+
     let logits = out[0].to_host().unwrap().as_f32().unwrap();
-    let (idx, _) = logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap();
-    assert_eq!(idx, 258, "IREE CPU top-1 must be class 258 (Samoyed)");
+    let (idx, val) = argmax(&logits).unwrap();
+    assert_eq!(idx, REF_CLASS, "IREE CPU top-1 must be class 258 (Samoyed)");
+    assert!(
+        (val - REF_LOGIT).abs() < 1e-3,
+        "logit {val} drifted from torch reference {REF_LOGIT}"
+    );
 }

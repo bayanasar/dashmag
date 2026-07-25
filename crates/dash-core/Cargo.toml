@@ -1,6 +1,9 @@
 [package]
 name = "dash-core"
 description = "Runtime-agnostic whole-model inference traits for Dashmag. No backend dependencies."
+readme = "README.md"
+keywords = ["inference", "edge", "machine-learning", "runtime", "tensor"]
+categories = ["science", "api-bindings"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,9 @@
 [package]
 name = "dash-cli"
 description = "Backend-agnostic command-line runner for Dashmag inference."
+readme = "README.md"
+keywords = ["inference", "edge", "machine-learning", "cli"]
+categories = ["command-line-utilities", "science"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

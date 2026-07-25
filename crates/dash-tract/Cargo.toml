@@ -1,6 +1,9 @@
 [package]
 name = "dash-tract"
 description = "Pure-Rust CPU inference backend for Dashmag, built on tract. The portable floor."
+readme = "README.md"
+keywords = ["inference", "edge", "machine-learning", "tract", "cpu"]
+categories = ["science"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

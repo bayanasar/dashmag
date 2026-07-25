@@ -1,8 +1,8 @@
 //! `dash-tract` — pure-Rust CPU inference backend for Dashmag.
 //!
 //! Wraps [`tract`](https://github.com/sonos/tract) behind the `dash-core`
-//! [`Runtime`] trait. This is the *portable floor*: no C dependencies, the only
-//! realistic runtime for seL4 / Fuchsia / RISC-V-bare / MCU-class targets, and a
+//! [`Runtime`] trait. This is the *portable floor*: no C dependencies, the
+//! realistic runtime for MCU-class and microkernel targets, and a
 //! zero-C-dependency fallback everywhere else.
 //!
 //! It is deliberately the "interpret-a-graph-file" extreme of the backend
@@ -28,7 +28,8 @@ impl TractRuntime {
         TractRuntime {
             cap: Capability {
                 accel: AccelClass::Cpu,
-                dtypes: DTypeSet::of(&[DType::F32]),
+                // f32 compute; i64 appears as detector index/label outputs.
+                dtypes: DTypeSet::of(&[DType::F32, DType::I64]),
                 // Phase 0 pins static shapes; dynamic-shape support is a later step.
                 dynamic_shapes: false,
                 quantized: false,
@@ -60,16 +61,15 @@ impl Runtime for TractRuntime {
         &self.cap
     }
 
-    fn can_run(&self, art: &Artifact) -> bool {
-        art.backend == BackendKind::Tract
-    }
-
     fn load(&self, art: &Artifact) -> DashResult<Box<dyn Session>> {
         if art.backend != BackendKind::Tract {
             return Err(Error::Unsupported(format!(
                 "dash-tract cannot run a {:?} artifact",
                 art.backend
             )));
+        }
+        if let Err(why) = self.cap.admits(&art.meta) {
+            return Err(Error::Unsupported(format!("dash-tract: {why}")));
         }
         let mut reader = std::io::Cursor::new(&art.bytes);
         let plan = tract_onnx::onnx()
@@ -87,7 +87,8 @@ impl Session for TractSession {
     fn run(&self, inputs: &[DashTensor]) -> DashResult<Vec<DashTensor>> {
         let mut tvals: TVec<TValue> = tvec!();
         for t in inputs {
-            let h = t.to_host()?;
+            // Borrow when already host-resident; only a device tensor downloads.
+            let h = t.host()?;
             if h.dtype != DType::F32 {
                 return Err(Error::Shape(format!(
                     "dash-tract expects f32 inputs, got {:?}",
@@ -105,12 +106,31 @@ impl Session for TractSession {
 
         let mut outs = Vec::with_capacity(result.len());
         for r in result {
-            let view = r
-                .to_array_view::<f32>()
-                .map_err(|e| Error::Run(e.to_string()))?;
-            let shape = view.shape().to_vec();
-            let data: Vec<f32> = view.iter().copied().collect();
-            outs.push(DashTensor::Host(HostTensor::from_f32(shape, &data)));
+            // tract keeps real output shape; carry it through unchanged so every
+            // backend agrees on the shape a caller sees.
+            match r.datum_type() {
+                DatumType::F32 => {
+                    let view = r
+                        .to_array_view::<f32>()
+                        .map_err(|e| Error::Run(e.to_string()))?;
+                    let shape = view.shape().to_vec();
+                    let data: Vec<f32> = view.iter().copied().collect();
+                    outs.push(DashTensor::Host(HostTensor::from_f32(shape, &data)));
+                }
+                DatumType::I64 => {
+                    let view = r
+                        .to_array_view::<i64>()
+                        .map_err(|e| Error::Run(e.to_string()))?;
+                    let shape = view.shape().to_vec();
+                    let data: Vec<i64> = view.iter().copied().collect();
+                    outs.push(DashTensor::Host(HostTensor::from_i64(shape, &data)));
+                }
+                dt => {
+                    return Err(Error::Shape(format!(
+                        "dash-tract: unsupported output dtype {dt:?} (f32 and i64 are supported)"
+                    )))
+                }
+            }
         }
         Ok(outs)
     }

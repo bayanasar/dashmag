@@ -3,12 +3,15 @@
 //! The abstraction seam is **whole-model inference**: load a model, tensors in,
 //! tensors out. Backends of very different shapes — interpret-a-graph-file
 //! (tract) vs. run-a-compiled-artifact (IREE) vs. drive-a-closed-appliance
-//! (Edge TPU) — all sit behind one trait. No backend dependencies live here.
+//! (Edge TPU / TensorRT) — all sit behind one trait. No backend dependencies
+//! live here.
 //!
 //! `Capability` is deliberately *not* a promise that backends are
 //! interchangeable; it is how we surface that they are not, so the [`Registry`]
-//! can negotiate rather than assume.
+//! can negotiate rather than assume. [`Capability::admits`] is where that
+//! negotiation actually happens, and it reads every field it advertises.
 
+use std::borrow::Cow;
 use std::fmt;
 
 /// Result type for all fallible `dash-core` operations.
@@ -25,6 +28,8 @@ pub enum Error {
     Run(String),
     /// Shape or dtype mismatch at the call boundary.
     Shape(String),
+    /// A numeric result was unusable (empty output, NaN) — not a crash condition.
+    Numeric(String),
 }
 
 impl fmt::Display for Error {
@@ -34,6 +39,7 @@ impl fmt::Display for Error {
             Error::Load(s) => write!(f, "load failed: {s}"),
             Error::Run(s) => write!(f, "run failed: {s}"),
             Error::Shape(s) => write!(f, "shape/dtype error: {s}"),
+            Error::Numeric(s) => write!(f, "numeric error: {s}"),
         }
     }
 }
@@ -64,6 +70,7 @@ pub enum AccelClass {
 pub enum DType {
     F32,
     F16,
+    I64,
     I32,
     I8,
     U8,
@@ -73,6 +80,7 @@ impl DType {
     /// Size of one element, in bytes.
     pub fn size(self) -> usize {
         match self {
+            DType::I64 => 8,
             DType::F32 | DType::I32 => 4,
             DType::F16 => 2,
             DType::I8 | DType::U8 => 1,
@@ -101,28 +109,98 @@ pub struct Capability {
     pub dtypes: DTypeSet,
     pub dynamic_shapes: bool,
     pub quantized: bool,
-    /// True only for a backend that can build without `std` (tract's embedded path).
+    /// True only for a backend that can build without `std`.
     pub no_std: bool,
+}
+
+impl Capability {
+    /// Can this backend honour what the artifact declares it needs?
+    ///
+    /// Every advertised field is consulted. An artifact that declares nothing
+    /// (an empty [`ArtifactMeta`]) is admitted — absence of a declaration is not
+    /// evidence of incompatibility, and inventing a rejection would be dishonest.
+    /// Returns the reason on rejection so dispatch can explain itself.
+    pub fn admits(&self, meta: &ArtifactMeta) -> std::result::Result<(), String> {
+        if meta.quantized && !self.quantized {
+            return Err("artifact is quantized, backend is not".to_string());
+        }
+        if meta.dynamic_shapes && !self.dynamic_shapes {
+            return Err("artifact needs dynamic shapes, backend is static-shape only".to_string());
+        }
+        for (label, specs) in [("input", &meta.inputs), ("output", &meta.outputs)] {
+            for (i, s) in specs.iter().enumerate() {
+                if !self.dtypes.contains(s.dtype) {
+                    return Err(format!(
+                        "{label} {i} dtype {:?} not supported (backend accepts {:?})",
+                        s.dtype, self.dtypes.0
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// IO specification for one tensor slot of an artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorSpec {
     pub dtype: DType,
-    /// Static dimensions. An empty shape means scalar; dynamic dims are a
-    /// Phase-1 concern (see `Capability::dynamic_shapes`).
+    /// Static dimensions. An empty shape means scalar or "not declared";
+    /// dynamic extents are signalled by [`ArtifactMeta::dynamic_shapes`].
     pub shape: Vec<usize>,
 }
 
+impl TensorSpec {
+    pub fn new(dtype: DType, shape: &[usize]) -> Self {
+        TensorSpec {
+            dtype,
+            shape: shape.to_vec(),
+        }
+    }
+    /// Element count implied by the shape.
+    pub fn numel(&self) -> usize {
+        self.shape.iter().product()
+    }
+}
+
 /// IO metadata carried alongside an artifact's bytes.
+///
+/// This is *load-bearing*, not documentation: backends whose native runner
+/// erases output shape (a raw buffer from a subprocess) recover it from
+/// [`ArtifactMeta::output_shape`], so the same model returns the same shape
+/// through every backend.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArtifactMeta {
     pub inputs: Vec<TensorSpec>,
     pub outputs: Vec<TensorSpec>,
+    /// The artifact's weights/activations are quantized.
+    pub quantized: bool,
+    /// The artifact requires dynamic-shape support at run time.
+    pub dynamic_shapes: bool,
+}
+
+impl ArtifactMeta {
+    /// Declared shape of output slot `i`, if any.
+    pub fn output_shape(&self, i: usize) -> Option<&[usize]> {
+        self.outputs.get(i).map(|s| s.shape.as_slice())
+    }
+    /// Declared dtype of output slot `i`, if any.
+    pub fn output_dtype(&self, i: usize) -> Option<DType> {
+        self.outputs.get(i).map(|s| s.dtype)
+    }
+    /// Convenience: declare f32 IO with the given shapes.
+    pub fn f32_io(inputs: &[&[usize]], outputs: &[&[usize]]) -> Self {
+        ArtifactMeta {
+            inputs: inputs.iter().map(|s| TensorSpec::new(DType::F32, s)).collect(),
+            outputs: outputs.iter().map(|s| TensorSpec::new(DType::F32, s)).collect(),
+            quantized: false,
+            dynamic_shapes: false,
+        }
+    }
 }
 
 /// An opaque, backend-tagged model artifact produced offline by the build-time
-/// pipeline (`.vmfb`, NNEF graph, edgetpu `.tflite`, ...).
+/// pipeline (`.vmfb`, ONNX/NNEF graph, edgetpu `.tflite`, TensorRT `.engine`).
 #[derive(Clone)]
 pub struct Artifact {
     pub backend: BackendKind,
@@ -142,8 +220,9 @@ impl fmt::Debug for Artifact {
 
 /// A host-resident tensor: dtype + shape + raw little-endian bytes.
 ///
-/// Bytes-backed (rather than typed) so a single representation carries f32 and
-/// quantized int8 alike; typed views are provided for the common cases.
+/// Bytes-backed (rather than typed) so a single representation carries f32,
+/// i64 indices and quantized int8 alike; typed views are provided for the
+/// common cases.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostTensor {
     pub dtype: DType,
@@ -154,14 +233,41 @@ pub struct HostTensor {
 impl HostTensor {
     /// Build an f32 tensor from a slice.
     pub fn from_f32(shape: Vec<usize>, v: &[f32]) -> Self {
-        let mut data = Vec::with_capacity(v.len() * 4);
-        for x in v {
-            data.extend_from_slice(&x.to_le_bytes());
+        let mut data = vec![0u8; v.len() * 4];
+        for (dst, x) in data.chunks_exact_mut(4).zip(v) {
+            dst.copy_from_slice(&x.to_le_bytes());
         }
         HostTensor {
             dtype: DType::F32,
             shape,
             data,
+        }
+    }
+
+    /// Build an i64 tensor from a slice (detector index outputs).
+    pub fn from_i64(shape: Vec<usize>, v: &[i64]) -> Self {
+        let mut data = vec![0u8; v.len() * 8];
+        for (dst, x) in data.chunks_exact_mut(8).zip(v) {
+            dst.copy_from_slice(&x.to_le_bytes());
+        }
+        HostTensor {
+            dtype: DType::I64,
+            shape,
+            data,
+        }
+    }
+
+    /// Build an f32 tensor, adopting `declared` when its element count matches.
+    ///
+    /// This is how a backend whose runner returns a shape-erased buffer restores
+    /// the model's real output shape, so callers never have to branch on which
+    /// backend ran.
+    pub fn f32_shaped(v: &[f32], declared: Option<&[usize]>) -> Self {
+        match declared {
+            Some(s) if !s.is_empty() && s.iter().product::<usize>() == v.len() => {
+                HostTensor::from_f32(s.to_vec(), v)
+            }
+            _ => HostTensor::from_f32(vec![v.len()], v),
         }
     }
 
@@ -218,7 +324,15 @@ impl Tensor {
             Tensor::Device(d) => d.dtype(),
         }
     }
-    /// Borrow-friendly host copy (clones a host tensor, downloads a device one).
+    /// Host view without copying when the tensor is already host-resident.
+    /// Only a device tensor pays for a download.
+    pub fn host(&self) -> Result<Cow<'_, HostTensor>> {
+        match self {
+            Tensor::Host(h) => Ok(Cow::Borrowed(h)),
+            Tensor::Device(d) => Ok(Cow::Owned(d.to_host()?)),
+        }
+    }
+    /// Owned host copy (clones a host tensor, downloads a device one).
     pub fn to_host(&self) -> Result<HostTensor> {
         match self {
             Tensor::Host(h) => Ok(h.clone()),
@@ -240,6 +354,28 @@ impl From<HostTensor> for Tensor {
     }
 }
 
+/// Index and value of the largest element.
+///
+/// Errors rather than panics on an empty slice or NaN — a model emitting NaN
+/// (a mis-quantized int8 graph, say) is a result to report, not a crash.
+pub fn argmax(v: &[f32]) -> Result<(usize, f32)> {
+    if v.is_empty() {
+        return Err(Error::Numeric("empty output, no argmax".into()));
+    }
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().enumerate() {
+        if x.is_nan() {
+            return Err(Error::Numeric(format!("output contains NaN at index {i}")));
+        }
+        if i == 0 || x > best_v {
+            best_v = x;
+            best = i;
+        }
+    }
+    Ok((best, best_v))
+}
+
 /// A loaded, ready-to-run model. Cheap to call repeatedly.
 pub trait Session: Send + Sync {
     fn run(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>>;
@@ -250,8 +386,10 @@ pub trait Session: Send + Sync {
 pub trait Runtime: Send + Sync {
     fn kind(&self) -> BackendKind;
     fn capability(&self) -> &Capability;
-    /// Honest gatekeeper: does this backend accept this artifact at all?
-    fn can_run(&self, art: &Artifact) -> bool;
+    /// Honest gatekeeper: right backend kind *and* capabilities the artifact needs.
+    fn can_run(&self, art: &Artifact) -> bool {
+        art.backend == self.kind() && self.capability().admits(&art.meta).is_ok()
+    }
     fn load(&self, art: &Artifact) -> Result<Box<dyn Session>>;
 }
 
@@ -316,6 +454,29 @@ impl Registry {
         }
         best.map(|(rt, _)| rt)
     }
+
+    /// Why each registered backend was refused, for diagnostics when
+    /// [`Registry::select`] returns `None`. Dispatch that cannot explain itself
+    /// is indistinguishable from dispatch that is broken.
+    pub fn explain(&self, art: &Artifact, target: &TargetProfile) -> Vec<(BackendKind, String)> {
+        self.backends
+            .iter()
+            .map(|b| {
+                let rt = b.as_ref();
+                let cap = rt.capability();
+                let why = if rt.kind() != art.backend {
+                    format!("wants a {:?} artifact, got {:?}", rt.kind(), art.backend)
+                } else if let Err(e) = cap.admits(&art.meta) {
+                    e
+                } else if target.no_std && !cap.no_std {
+                    "target is no_std, backend requires std".to_string()
+                } else {
+                    "admissible".to_string()
+                };
+                (rt.kind(), why)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -336,9 +497,6 @@ mod tests {
         }
         fn capability(&self) -> &Capability {
             &self.cap
-        }
-        fn can_run(&self, art: &Artifact) -> bool {
-            art.backend == self.kind
         }
         fn load(&self, _art: &Artifact) -> Result<Box<dyn Session>> {
             Ok(Box::new(EchoSession))
@@ -401,7 +559,6 @@ mod tests {
             kind: BackendKind::Iree,
         }));
 
-        // A tract artifact on a CPU target picks the tract backend.
         let sel = reg
             .select(
                 &art(BackendKind::Tract),
@@ -413,7 +570,6 @@ mod tests {
             .expect("a backend should admit");
         assert_eq!(sel.kind(), BackendKind::Tract);
 
-        // A no_std target rejects the non-no_std IREE backend outright.
         assert!(reg
             .select(
                 &art(BackendKind::Iree),
@@ -424,7 +580,6 @@ mod tests {
             )
             .is_none());
 
-        // No backend admits an EdgeTpu artifact — honest None, not a wrong pick.
         assert!(reg
             .select(
                 &art(BackendKind::EdgeTpu),
@@ -447,6 +602,107 @@ mod tests {
             .run(&[HostTensor::from_f32(vec![3], &[1.0, 2.0, 3.0]).into()])
             .unwrap();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].to_host().unwrap().as_f32().unwrap(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(
+            out[0].to_host().unwrap().as_f32().unwrap(),
+            vec![1.0, 2.0, 3.0]
+        );
+    }
+
+    // --- capability negotiation now reads every advertised field ---
+
+    #[test]
+    fn capability_rejects_unsupported_dtype() {
+        let c = cap(AccelClass::Cpu, false); // f32 only
+        let meta = ArtifactMeta {
+            inputs: vec![TensorSpec::new(DType::U8, &[1, 3, 224, 224])],
+            ..Default::default()
+        };
+        let err = c.admits(&meta).unwrap_err();
+        assert!(err.contains("U8"), "reason should name the dtype: {err}");
+    }
+
+    #[test]
+    fn capability_rejects_quantized_and_dynamic() {
+        let c = cap(AccelClass::Cpu, false);
+        assert!(c
+            .admits(&ArtifactMeta {
+                quantized: true,
+                ..Default::default()
+            })
+            .is_err());
+        assert!(c
+            .admits(&ArtifactMeta {
+                dynamic_shapes: true,
+                ..Default::default()
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn empty_meta_is_admitted_not_guessed() {
+        // No declaration is not evidence of incompatibility.
+        assert!(cap(AccelClass::Cpu, false)
+            .admits(&ArtifactMeta::default())
+            .is_ok());
+    }
+
+    #[test]
+    fn dispatch_refuses_artifact_needing_missing_capability() {
+        let mut reg = Registry::new();
+        reg.register(Box::new(EchoRuntime {
+            cap: cap(AccelClass::Cpu, false), // not quantized-capable
+            kind: BackendKind::Tract,
+        }));
+        let mut a = art(BackendKind::Tract);
+        a.meta.quantized = true;
+        let target = TargetProfile {
+            accel: AccelClass::Cpu,
+            no_std: false,
+        };
+        assert!(reg.select(&a, &target).is_none());
+        let why = reg.explain(&a, &target);
+        assert!(why[0].1.contains("quantized"), "explain: {:?}", why);
+    }
+
+    // --- output shape uniformity: the whole point of ArtifactMeta ---
+
+    #[test]
+    fn f32_shaped_adopts_declared_shape() {
+        let flat: Vec<f32> = vec![0.0; 1000];
+        let t = HostTensor::f32_shaped(&flat, Some(&[1, 1000]));
+        assert_eq!(t.shape, vec![1, 1000]);
+    }
+
+    #[test]
+    fn f32_shaped_falls_back_when_count_mismatches() {
+        let flat: Vec<f32> = vec![0.0; 999];
+        let t = HostTensor::f32_shaped(&flat, Some(&[1, 1000]));
+        assert_eq!(t.shape, vec![999], "must not adopt a shape that does not fit");
+    }
+
+    // --- argmax: report NaN, never panic ---
+
+    #[test]
+    fn argmax_finds_max() {
+        assert_eq!(argmax(&[1.0, 9.0, 3.0]).unwrap(), (1, 9.0));
+    }
+
+    #[test]
+    fn argmax_reports_nan_instead_of_panicking() {
+        assert!(matches!(
+            argmax(&[1.0, f32::NAN, 3.0]),
+            Err(Error::Numeric(_))
+        ));
+    }
+
+    #[test]
+    fn argmax_reports_empty() {
+        assert!(matches!(argmax(&[]), Err(Error::Numeric(_))));
+    }
+
+    #[test]
+    fn tensor_host_borrows_without_copying() {
+        let t: Tensor = HostTensor::from_f32(vec![2], &[1.0, 2.0]).into();
+        assert!(matches!(t.host().unwrap(), Cow::Borrowed(_)));
     }
 }

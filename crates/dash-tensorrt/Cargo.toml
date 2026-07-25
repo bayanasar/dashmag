@@ -1,6 +1,9 @@
 [package]
 name = "dash-tensorrt"
 description = "NVIDIA TensorRT backend for Dashmag (Jetson GPUs). Phase-0.5 spike: drives trtexec."
+readme = "README.md"
+keywords = ["inference", "edge", "tensorrt", "jetson", "cuda"]
+categories = ["science", "hardware-support"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,4 +12,5 @@ rust-version.workspace = true
 
 [dependencies]
 dash-core = { workspace = true }
+tempfile = "3"
 serde_json = "1"

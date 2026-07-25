@@ -1,11 +1,12 @@
 //! `dash` — backend-agnostic Dashmag inference runner.
 //!
 //! Builds a [`Registry`] of whatever backends are compiled in, tags the input
-//! artifact with its `BackendKind`, and lets the registry *dispatch* to an
-//! admissible backend. Same path the acceptance tests drive.
+//! artifact with its `BackendKind` and declared IO, and lets the registry
+//! *dispatch*. Same path the acceptance tests drive.
 
 use dash_core::{
-    AccelClass, Artifact, ArtifactMeta, BackendKind, HostTensor, Registry, TargetProfile, Tensor,
+    argmax, AccelClass, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Registry,
+    TensorSpec, TargetProfile, Tensor,
 };
 use std::fs;
 use std::process::ExitCode;
@@ -27,7 +28,10 @@ fn build_registry(device: &str, accel: AccelClass) -> Registry {
     #[cfg(feature = "tract")]
     reg.register(Box::new(dash_tract::TractRuntime::new()));
     #[cfg(feature = "iree")]
-    reg.register(Box::new(dash_iree::IreeRuntime::new(device.to_string(), accel)));
+    reg.register(Box::new(dash_iree::IreeRuntime::new(
+        device.to_string(),
+        accel,
+    )));
     #[cfg(feature = "tensorrt")]
     reg.register(Box::new(dash_tensorrt::TensorRtRuntime::new()));
     #[cfg(feature = "edgetpu")]
@@ -45,17 +49,37 @@ fn parse_backend(s: &str) -> Option<BackendKind> {
     }
 }
 
+/// Strict shape parsing: a malformed dimension is an error, never a silently
+/// different tensor.
+fn parse_shape(s: &str) -> Result<Vec<usize>, String> {
+    if s.trim().is_empty() {
+        return Err("shape is empty".to_string());
+    }
+    s.split(',')
+        .map(|p| {
+            p.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("invalid dimension {:?} in shape {:?}", p.trim(), s))
+        })
+        .collect()
+}
+
 fn usage() -> ! {
     eprintln!(
-        "usage: dash --backend <tract|iree|edgetpu> --model <artifact> --input <f32blob> \
-         [--labels <txt>] [--shape N,C,H,W] [--device <local-task|cuda|vulkan>]"
+        "usage: dash --backend <tract|iree|tensorrt|edgetpu> --model <artifact> \
+         --input <blob> [--labels <txt>] [--shape N,C,H,W] [--out-shape N,C] \
+         [--device <local-task|cuda|vulkan>]\n\
+         \n\
+         --out-shape declares the model's output shape so every backend returns\n\
+         the same shape (runners that emit raw buffers otherwise return flat)."
     );
     std::process::exit(2);
 }
 
-fn main() -> ExitCode {
+fn run() -> Result<(), String> {
     let (mut backend, mut model, mut input, mut labels) = (None, None, None, None);
     let mut shape = vec![1usize, 3, 224, 224];
+    let mut out_shape: Option<Vec<usize>> = None;
     let mut device = String::from("local-task");
 
     let mut args = std::env::args().skip(1);
@@ -67,18 +91,13 @@ fn main() -> ExitCode {
             "--labels" => labels = args.next(),
             "--device" => device = args.next().unwrap_or(device),
             "--shape" => {
-                shape = args
-                    .next()
-                    .unwrap_or_default()
-                    .split(',')
-                    .filter_map(|x| x.parse().ok())
-                    .collect()
+                shape = parse_shape(&args.next().ok_or("--shape needs a value")?)?;
+            }
+            "--out-shape" => {
+                out_shape = Some(parse_shape(&args.next().ok_or("--out-shape needs a value")?)?);
             }
             "-h" | "--help" => usage(),
-            other => {
-                eprintln!("unknown arg: {other}");
-                usage();
-            }
+            other => return Err(format!("unknown argument {other:?}")),
         }
     }
 
@@ -86,22 +105,24 @@ fn main() -> ExitCode {
         (Some(b), Some(m), Some(i)) => (b, m, i),
         _ => usage(),
     };
-    let kind = parse_backend(&backend).unwrap_or_else(|| {
-        eprintln!("unknown backend: {backend}");
-        usage()
-    });
+    let kind = parse_backend(&backend).ok_or_else(|| format!("unknown backend {backend:?}"))?;
 
-    let bytes = match fs::read(&model) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("read model {model}: {e}");
-            return ExitCode::FAILURE;
-        }
+    let bytes = fs::read(&model).map_err(|e| format!("read model {model}: {e}"))?;
+
+    // Declare IO so shape survives backends whose runner returns a raw buffer.
+    let meta = ArtifactMeta {
+        inputs: vec![TensorSpec::new(DType::F32, &shape)],
+        outputs: out_shape
+            .as_ref()
+            .map(|s| vec![TensorSpec::new(DType::F32, s)])
+            .unwrap_or_default(),
+        quantized: kind == BackendKind::EdgeTpu,
+        dynamic_shapes: false,
     };
     let art = Artifact {
         backend: kind,
         bytes,
-        meta: ArtifactMeta::default(),
+        meta,
     };
 
     let accel = accel_for_device(&device);
@@ -110,55 +131,67 @@ fn main() -> ExitCode {
         accel,
         no_std: false,
     };
-    let rt = match reg.select(&art, &target) {
-        Some(rt) => rt,
-        None => {
-            eprintln!(
-                "no compiled-in backend admits a {kind:?} artifact on {accel:?} ({} registered)",
-                reg.len()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    eprintln!("dispatch -> {:?} on {device}  {:?}", rt.kind(), rt.capability());
+    let rt = reg.select(&art, &target).ok_or_else(|| {
+        // Dispatch that cannot explain itself is indistinguishable from broken.
+        let why = reg
+            .explain(&art, &target)
+            .into_iter()
+            .map(|(k, r)| format!("\n  {k:?}: {r}"))
+            .collect::<String>();
+        format!(
+            "no compiled-in backend admits a {kind:?} artifact on {accel:?} \
+             ({} registered){why}",
+            reg.len()
+        )
+    })?;
+    eprintln!(
+        "dispatch -> {:?} on {device}  {:?}",
+        rt.kind(),
+        rt.capability()
+    );
 
-    let session = match rt.load(&art) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("load: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let session = rt.load(&art).map_err(|e| e.to_string())?;
 
-    let raw = match fs::read(&input) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("read input {input}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let raw = fs::read(&input).map_err(|e| format!("read input {input}: {e}"))?;
     let floats: Vec<f32> = raw
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
+    let expected: usize = shape.iter().product();
+    if floats.len() != expected {
+        return Err(format!(
+            "input has {} f32 values, shape {:?} needs {}",
+            floats.len(),
+            shape,
+            expected
+        ));
+    }
 
-    let out = match session.run(&[Tensor::Host(HostTensor::from_f32(shape, &floats))]) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("run: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let logits = out[0].to_host().and_then(|h| h.as_f32()).unwrap();
-    let (idx, val) = logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap();
+    let out = session
+        .run(&[Tensor::Host(HostTensor::from_f32(shape, &floats))])
+        .map_err(|e| e.to_string())?;
+    let first = out.first().ok_or("backend returned no outputs")?;
+    let host = first.host().map_err(|e| e.to_string())?;
+    let logits = host.as_f32().map_err(|e| e.to_string())?;
+    let (idx, val) = argmax(&logits).map_err(|e| e.to_string())?;
+
     let label = labels
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| s.lines().nth(idx).map(str::to_string))
         .unwrap_or_else(|| "<no labels>".into());
-    println!("top-1: class {idx}  logit {val:.4}  =>  {label}");
-    ExitCode::SUCCESS
+    println!(
+        "top-1: class {idx}  logit {val:.4}  =>  {label}   [shape {:?}]",
+        first.shape()
+    );
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }

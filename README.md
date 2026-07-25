@@ -15,18 +15,31 @@ runtime for the target and falls back to a pure-Rust CPU backend everywhere else
 once; correctness never depends on the silicon underneath.
 
 - **Runtime-agnostic** — one Rust API over compiled-native and pure-Rust backends.
-- **Correct everywhere** — deterministic outputs on every target, guaranteed by a `no_std`-friendly
-  pure-Rust CPU floor.
+- **Correct everywhere** — deterministic outputs on every target, anchored by a pure-Rust CPU
+  backend that builds wherever Rust does. (A `no_std` build for MCU-class targets is a design
+  goal, not yet implemented.)
 - **Native speed where it counts** — accelerator backends light up when the hardware exposes a usable path.
-- **Bring your own model** — export from PyTorch via `torch.export`; a build-time step lowers it per
-  target. The runtime API is identical regardless of which backend runs it.
+- **Bring your own model** — export it from PyTorch; a build-time step lowers it to each backend's
+  artifact format. The runtime API is identical regardless of which backend runs it.
 
 ## How it works
 
 The abstraction seam is **whole-model inference** — load a model, tensors in, tensors out — so backends of
 very different shapes sit behind one trait. Each backend advertises its real capabilities, and a registry
-selects the best admissible one per target. Backends are feature-gated crates, so every target compiles
-only what it can build.
+selects the best admissible one per target, refusing rather than guessing when nothing fits. Backends are
+feature-gated crates, so every target compiles only what it can build.
+
+| Crate | Backend | Status |
+|---|---|---|
+| [`dash-core`](https://crates.io/crates/dash-core) | traits, tensors, capability negotiation, dispatch | — |
+| [`dash-tract`](https://crates.io/crates/dash-tract) | pure-Rust CPU floor ([tract](https://github.com/sonos/tract)) | runs on x86 and aarch64 |
+| [`dash-iree`](https://crates.io/crates/dash-iree) | compiled artifacts via [IREE](https://iree.dev) (CPU, CUDA) | runs on CPU and CUDA GPUs |
+| [`dash-tensorrt`](https://crates.io/crates/dash-tensorrt) | NVIDIA TensorRT (Jetson GPUs) | runs on Jetson |
+| [`dash-edgetpu`](https://crates.io/crates/dash-edgetpu) | Coral Edge TPU | not yet run on hardware |
+
+The IREE, TensorRT and Edge TPU backends are currently **spikes** that drive their vendor tool as a
+subprocess; each crate's docs name the in-process FFI shim that replaces it. They are labelled as such
+in the source rather than presented as finished.
 
 ## License
 
