@@ -41,15 +41,29 @@ struct Binding {
     dims: Option<Vec<usize>>,
 }
 
-/// Scrape every `Created <kind> binding for NAME with dimensions AxBxC` line.
+/// Scrape every binding line `trtexec` prints, in either wording it uses.
+///
+/// TensorRT 8 writes `Created input binding for NAME with dimensions AxBxC`;
+/// TensorRT 10 writes `Input binding for NAME with dimensions AxBxC and type
+/// fp32 is created.` Matching only the first wording makes the whole backend
+/// fail to load an engine on a current JetPack — the discovery step returns no
+/// bindings and the session refuses the artifact, which reads like a bad engine
+/// rather than a log-format change. Accept both.
 ///
 /// All bindings, in order — taking only the first would silently drop outputs
 /// on any multi-output model (every detector).
 fn scrape_bindings(log: &str, kind: &str) -> Vec<Binding> {
-    let needle = format!("Created {kind} binding for ");
+    let mut capitalized = kind.to_string();
+    capitalized[..1].make_ascii_uppercase();
+    let needles = [
+        format!("Created {kind} binding for "),
+        format!("{capitalized} binding for "),
+    ];
     log.lines()
         .filter_map(|l| {
-            let i = l.find(&needle)?;
+            let (i, needle) = needles
+                .iter()
+                .find_map(|n| l.find(n.as_str()).map(|i| (i, n)))?;
             let rest = &l[i + needle.len()..];
             let mut it = rest.split_whitespace();
             let name = it.next()?.to_string();
@@ -236,10 +250,17 @@ impl Session for TensorRtSession {
 mod tests {
     use super::*;
 
+    /// TensorRT 8 wording.
     const LOG: &str = "\
 [I] Created input binding for input.1 with dimensions 1x3x224x224
 [I] Created output binding for 419 with dimensions 1x1000
 [I] Created output binding for boxes with dimensions 1x100x4";
+
+    /// TensorRT 10 wording, as printed by trtexec 10.16 on JetPack 7.2.
+    const LOG_TRT10: &str = "\
+[I] Input binding for input.1 with dimensions 1x3x224x224 and type fp32 is created.
+[I] Output binding for 419 with dimensions 1x1000 and type fp32 is created.
+[I] Output binding for boxes with dimensions 1x100x4 and type fp32 is created.";
 
     #[test]
     fn scrapes_all_bindings_with_dims() {
@@ -253,6 +274,19 @@ mod tests {
         assert_eq!(outs.len(), 2);
         assert_eq!(outs[0].name, "419");
         assert_eq!(outs[1].name, "boxes");
+        assert_eq!(outs[1].dims.as_deref(), Some(&[1usize, 100, 4][..]));
+    }
+
+    #[test]
+    fn scrapes_the_tensorrt_10_wording_too() {
+        let ins = scrape_bindings(LOG_TRT10, "input");
+        assert_eq!(ins.len(), 1);
+        assert_eq!(ins[0].name, "input.1");
+        assert_eq!(ins[0].dims.as_deref(), Some(&[1usize, 3, 224, 224][..]));
+
+        let outs = scrape_bindings(LOG_TRT10, "output");
+        assert_eq!(outs.len(), 2);
+        assert_eq!(outs[0].name, "419");
         assert_eq!(outs[1].dims.as_deref(), Some(&[1usize, 100, 4][..]));
     }
 
