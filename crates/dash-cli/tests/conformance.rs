@@ -13,7 +13,8 @@
 //! The environment names it, and nothing is inferred:
 //!
 //!   DASH_FIXTURES        fixture directory
-//!   DASH_IREE_CPU_VMFB   llvm-cpu module (default `mnv3_cpu.vmfb`)
+//!   DASH_IREE_CPU_VMFB   llvm-cpu module (default: the `mnv3_<arch>_cpu.vmfb`
+//!                        that `tools/compile_iree.sh` writes on this machine)
 //!   DASH_IREE_CUDA_VMFB  cuda module — when set, the CUDA path is held to the
 //!                        same bar as the CPU one
 //!
@@ -37,6 +38,13 @@ fn fixtures_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures"))
 }
 
+/// The name `tools/compile_iree.sh` gives the llvm-cpu module built *here*.
+/// This is a default, not a detection: an artifact compiled elsewhere and
+/// deployed to this machine is named by `DASH_IREE_CPU_VMFB` instead.
+fn default_cpu_vmfb() -> String {
+    format!("mnv3_{}_cpu.vmfb", env::consts::ARCH)
+}
+
 /// One IREE configuration to hold against tract: the device the runtime
 /// dispatches on, the class the registry ranks by, and the module built for it.
 struct IreeTarget {
@@ -53,7 +61,7 @@ fn iree_targets(dir: &Path) -> Vec<IreeTarget> {
     let mut targets = vec![IreeTarget {
         device: "local-task",
         accel: AccelClass::Cpu,
-        vmfb: dir.join(env::var("DASH_IREE_CPU_VMFB").unwrap_or_else(|_| "mnv3_cpu.vmfb".into())),
+        vmfb: dir.join(env::var("DASH_IREE_CPU_VMFB").unwrap_or_else(|_| default_cpu_vmfb())),
     }];
     if let Ok(path) = env::var("DASH_IREE_CUDA_VMFB") {
         targets.push(IreeTarget {

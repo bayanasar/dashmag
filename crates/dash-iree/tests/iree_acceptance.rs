@@ -9,7 +9,8 @@
 //! deployed, not where it was built:
 //!
 //!   DASH_FIXTURES        fixture directory
-//!   DASH_IREE_CPU_VMFB   llvm-cpu module (default `mnv3_cpu.vmfb`)
+//!   DASH_IREE_CPU_VMFB   llvm-cpu module (default: the `mnv3_<arch>_cpu.vmfb`
+//!                        that `tools/compile_iree.sh` writes on this machine)
 //!
 //! A relative value resolves against the fixture directory; an absolute one is
 //! used as given.
@@ -34,7 +35,10 @@ fn fixtures_dir() -> PathBuf {
 #[ignore = "needs iree-run-module + a cpu .vmfb (tools/compile_iree.sh); run with --ignored"]
 fn iree_cpu_matches_torch_reference() {
     let dir = fixtures_dir();
-    let path = dir.join(env::var("DASH_IREE_CPU_VMFB").unwrap_or_else(|_| "mnv3_cpu.vmfb".into()));
+    let path = dir.join(
+        env::var("DASH_IREE_CPU_VMFB")
+            .unwrap_or_else(|_| format!("mnv3_{}_cpu.vmfb", env::consts::ARCH)),
+    );
     let vmfb = fs::read(&path).unwrap_or_else(|e| {
         panic!(
             "{} unreadable: {e} — run tools/compile_iree.sh or set DASH_IREE_CPU_VMFB",
