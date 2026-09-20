@@ -63,8 +63,9 @@ CUDA_SUFFIX=""
 if [ "${IREE_CUDA_TUNED:-0}" = "1" ]; then
   # Three flags, each measured separately on the board. The tile-and-fuse
   # vectorize pipeline is what breaks the workgroup tiles down to something the
-  # 8 SMs can share; channels-last is worth nothing on its own (6.43 ms) and 0.4 ms
-  # on top of that pipeline; data tiling adds the last 0.4 ms.
+  # 8 SMs can share; channels-last on its own is a 16% regression (6.43 ms against
+  # 5.53 ms stock) and worth 0.4 ms on top of that pipeline; data tiling adds the
+  # last 0.4 ms. The flags are not additive — read them as a set, not a menu.
   CUDA_TUNING=(
     --iree-codegen-llvmgpu-test-tile-and-fuse-vectorize
     "--iree-preprocessing-pass-pipeline=builtin.module(iree-preprocessing-convert-conv-to-channels-last)"
