@@ -10,7 +10,8 @@
 #   IREE_CPU_TRIPLE    llvm-cpu triple    (default: this host's own, taken from
 #                                          rustc or llvm-config — never left
 #                                          implicit)
-#   IREE_CUDA_TUNED    1 to add the tuned CUDA codegen flags (default off)
+#   IREE_CUDA_TUNED    1 to add the tuned CUDA codegen flags (default off;
+#                                          the output is named ..._cuda_tuned.vmfb)
 #
 # The tuned flag set, measured on an Orin Nano (GA10B, sm_87, 8 SMs, 624.75 MHz)
 # with MobileNetV3-Small at batch 1: 5.53 ms stock -> 4.40 ms tuned, a 1.26x
@@ -27,7 +28,9 @@
 # output is named after the target it was built for, the host default included —
 # an unqualified mnv3_cpu.vmfb built on x86_64 and one built on aarch64 are
 # different machine code under one name, and the file gives no way to tell them
-# apart on the way to a board.
+# apart on the way to a board. Compile flags that change the machine code are part
+# of the target by that rule, so a tuned CUDA module carries `_tuned` in its name
+# and can sit beside the stock one. See ai-dashmag#14.
 set -euo pipefail
 DIR="${1:-fixtures}"
 TARGET="${IREE_CUDA_TARGET:-sm_75}"
@@ -56,6 +59,7 @@ iree-compile "$DIR/mnv3.mlir" --iree-hal-target-backends=llvm-cpu \
   --iree-llvmcpu-target-triple="$TRIPLE" -o "$CPU_OUT"
 
 CUDA_TUNING=()
+CUDA_SUFFIX=""
 if [ "${IREE_CUDA_TUNED:-0}" = "1" ]; then
   # Three flags, each measured separately on the board. The tile-and-fuse
   # vectorize pipeline is what breaks the workgroup tiles down to something the
@@ -66,9 +70,10 @@ if [ "${IREE_CUDA_TUNED:-0}" = "1" ]; then
     "--iree-preprocessing-pass-pipeline=builtin.module(iree-preprocessing-convert-conv-to-channels-last)"
     --iree-opt-data-tiling
   )
+  CUDA_SUFFIX="_tuned"
 fi
 
-CUDA_OUT="$DIR/mnv3_${TARGET}_cuda.vmfb"
+CUDA_OUT="$DIR/mnv3_${TARGET}_cuda${CUDA_SUFFIX}.vmfb"
 iree-compile "$DIR/mnv3.mlir" --iree-hal-target-backends=cuda \
   --iree-cuda-target="$TARGET" "${CUDA_TUNING[@]}" -o "$CUDA_OUT"
 
