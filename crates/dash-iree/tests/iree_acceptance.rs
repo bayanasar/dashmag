@@ -1,12 +1,23 @@
 //! Phase-0 known-answer acceptance for the IREE backend (CPU `.vmfb`).
 //!
 //! Ignored by default: needs `iree-run-module` (on PATH or `DASH_IREE_RUN_MODULE`)
-//! and a compiled `fixtures/mnv3_cpu.vmfb` (see `tools/compile_iree.sh`). Run:
+//! and a compiled llvm-cpu module (see `tools/compile_iree.sh`). Run:
 //!   DASH_IREE_RUN_MODULE=<path> cargo test -p dash-iree -- --ignored
+//!
+//! A `.vmfb` is per-target machine code, so the module is named by the
+//! environment rather than hardcoded — the test runs where the artifact was
+//! deployed, not where it was built:
+//!
+//!   DASH_FIXTURES        fixture directory
+//!   DASH_IREE_CPU_VMFB   llvm-cpu module (default: the `mnv3_<arch>_cpu.vmfb`
+//!                        that `tools/compile_iree.sh` writes on this machine)
+//!
+//! A relative value resolves against the fixture directory; an absolute one is
+//! used as given.
 
 use dash_core::{
-    argmax, AccelClass, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Runtime,
-    TensorSpec, Tensor,
+    argmax, AccelClass, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Runtime, Tensor,
+    TensorSpec,
 };
 use dash_iree::IreeRuntime;
 use std::{env, fs, path::PathBuf};
@@ -21,11 +32,19 @@ fn fixtures_dir() -> PathBuf {
 }
 
 #[test]
-#[ignore = "needs iree-run-module + fixtures/mnv3_cpu.vmfb (tools/compile_iree.sh); run with --ignored"]
+#[ignore = "needs iree-run-module + a cpu .vmfb (tools/compile_iree.sh); run with --ignored"]
 fn iree_cpu_matches_torch_reference() {
     let dir = fixtures_dir();
-    let vmfb = fs::read(dir.join("mnv3_cpu.vmfb"))
-        .expect("mnv3_cpu.vmfb missing — run tools/compile_iree.sh");
+    let path = dir.join(
+        env::var("DASH_IREE_CPU_VMFB")
+            .unwrap_or_else(|_| format!("mnv3_{}_cpu.vmfb", env::consts::ARCH)),
+    );
+    let vmfb = fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "{} unreadable: {e} — run tools/compile_iree.sh or set DASH_IREE_CPU_VMFB",
+            path.display()
+        )
+    });
     let raw = fs::read(dir.join("input_1x3x224x224.f32")).expect("input fixture missing");
     let floats: Vec<f32> = raw
         .chunks_exact(4)
