@@ -6,7 +6,10 @@
 //! the test that fails if the abstraction starts lying.
 //!
 //! Needs both fixtures and `iree-run-module`:
-//!   DASH_IREE_RUN_MODULE=<path> cargo test -p dash-cli --features iree -- --ignored
+//!   DASH_IREE_RUN_MODULE=<path> cargo test -p dash-cli --features iree -- --ignored --nocapture
+//!
+//! `--nocapture` is not decoration: the run prints which IREE targets it actually
+//! compared, and a passing test says nothing without it.
 //!
 //! A `.vmfb` is per-target machine code, so the artifact cannot be hardcoded: the
 //! test runs where the artifact was *deployed*, which is not where it was built.
@@ -17,6 +20,10 @@
 //!                        that `tools/compile_iree.sh` writes on this machine)
 //!   DASH_IREE_CUDA_VMFB  cuda module — when set, the CUDA path is held to the
 //!                        same bar as the CPU one
+//!   DASH_IREE_REQUIRE_CUDA=1
+//!                        fail instead of skipping when no CUDA module is named.
+//!                        A board run sets it, so a claim about that board's GPU
+//!                        cannot come from a run that never touched it.
 //!
 //! Relative values resolve against the fixture directory; absolute ones are used
 //! as given.
@@ -57,18 +64,32 @@ struct IreeTarget {
 /// something. The CUDA module is checked when the environment names one: a GPU
 /// artifact is built for one compute capability and cannot be defaulted, but
 /// where it exists it answers to exactly the same bar.
+///
+/// Opt-in is right; silence about it is not. A run that skipped the GPU leg is
+/// indistinguishable in its result from one that checked it, and the sentence
+/// written down afterwards — "conformance passes on the Orin" — is read as
+/// covering the GPU either way. So the caller reports the targets it compared,
+/// and `DASH_IREE_REQUIRE_CUDA=1` turns the skip into a failure for runs that
+/// are being made to stand behind a board's GPU.
 fn iree_targets(dir: &Path) -> Vec<IreeTarget> {
     let mut targets = vec![IreeTarget {
         device: "local-task",
         accel: AccelClass::Cpu,
         vmfb: dir.join(env::var("DASH_IREE_CPU_VMFB").unwrap_or_else(|_| default_cpu_vmfb())),
     }];
-    if let Ok(path) = env::var("DASH_IREE_CUDA_VMFB") {
-        targets.push(IreeTarget {
+    match env::var("DASH_IREE_CUDA_VMFB") {
+        Ok(path) => targets.push(IreeTarget {
             device: "cuda",
             accel: AccelClass::Cuda,
             vmfb: dir.join(path),
-        });
+        }),
+        Err(_) if env::var("DASH_IREE_REQUIRE_CUDA").is_ok_and(|v| v == "1") => {
+            panic!(
+                "DASH_IREE_REQUIRE_CUDA=1 but no DASH_IREE_CUDA_VMFB: the CUDA leg would \
+                    have been skipped, and this run is not allowed to pass without it"
+            )
+        }
+        Err(_) => {}
     }
     targets
 }
@@ -105,7 +126,20 @@ fn tract_and_iree_agree_on_the_same_model() {
         .run(&[input(&dir)])
         .unwrap();
 
-    for target in iree_targets(&dir) {
+    // The test records its own coverage: what was compared is part of the result,
+    // not something a reader has to reconstruct from the environment afterwards.
+    let targets = iree_targets(&dir);
+    let compared: Vec<String> = targets
+        .iter()
+        .map(|t| format!("{} <- {}", t.device, t.vmfb.display()))
+        .collect();
+    eprintln!(
+        "conformance: tract vs {} IREE target(s): {}",
+        targets.len(),
+        compared.join(", ")
+    );
+
+    for target in targets {
         let dev = target.device;
         let bytes = fs::read(&target.vmfb)
             .unwrap_or_else(|e| panic!("{dev} vmfb {} unreadable: {e}", target.vmfb.display()));
