@@ -75,7 +75,9 @@ fn usage() -> ! {
          [--function <entry>]\n\
          \n\
          --out-shape declares the model's output shape so every backend returns\n\
-         the same shape (runners that emit raw buffers otherwise return flat)."
+         the same shape (runners that emit raw buffers otherwise return flat).\n\
+         Repeat it once per output, in declaration order, for a model with more\n\
+         than one head: --out-shape 1,3 --out-shape 1,5 --out-shape 1,4"
     );
     std::process::exit(2);
 }
@@ -83,7 +85,9 @@ fn usage() -> ! {
 fn run() -> Result<(), String> {
     let (mut backend, mut model, mut input, mut labels) = (None, None, None, None);
     let mut shape = vec![1usize, 3, 224, 224];
-    let mut out_shape: Option<Vec<usize>> = None;
+    // One entry per output, in declaration order. Phase 1's model has five heads,
+    // and a single --out-shape cannot say that.
+    let mut out_shapes: Vec<Vec<usize>> = Vec::new();
     let mut device = String::from("local-task");
     let mut function: Option<String> = None;
 
@@ -100,7 +104,7 @@ fn run() -> Result<(), String> {
                 shape = parse_shape(&args.next().ok_or("--shape needs a value")?)?;
             }
             "--out-shape" => {
-                out_shape = Some(parse_shape(&args.next().ok_or("--out-shape needs a value")?)?);
+                out_shapes.push(parse_shape(&args.next().ok_or("--out-shape needs a value")?)?);
             }
             "-h" | "--help" => usage(),
             other => return Err(format!("unknown argument {other:?}")),
@@ -118,10 +122,10 @@ fn run() -> Result<(), String> {
     // Declare IO so shape survives backends whose runner returns a raw buffer.
     let meta = ArtifactMeta {
         inputs: vec![TensorSpec::new(DType::F32, &shape)],
-        outputs: out_shape
-            .as_ref()
-            .map(|s| vec![TensorSpec::new(DType::F32, s)])
-            .unwrap_or_default(),
+        outputs: out_shapes
+            .iter()
+            .map(|s| TensorSpec::new(DType::F32, s))
+            .collect(),
         quantized: kind == BackendKind::EdgeTpu,
         dynamic_shapes: false,
     };
@@ -176,19 +180,44 @@ fn run() -> Result<(), String> {
     let out = session
         .run(&[Tensor::Host(HostTensor::from_f32(shape, &floats))])
         .map_err(|e| e.to_string())?;
-    let first = out.first().ok_or("backend returned no outputs")?;
-    let host = first.host().map_err(|e| e.to_string())?;
-    let logits = host.as_f32().map_err(|e| e.to_string())?;
-    let (idx, val) = argmax(&logits).map_err(|e| e.to_string())?;
+    if out.is_empty() {
+        return Err("backend returned no outputs".into());
+    }
+    // A declared output count that the backend does not meet is the failure this
+    // CLI exists to surface, not something to discover one head later.
+    if !out_shapes.is_empty() && out.len() != out_shapes.len() {
+        return Err(format!(
+            "declared {} output(s), backend returned {}",
+            out_shapes.len(),
+            out.len()
+        ));
+    }
 
-    let label = labels
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|s| s.lines().nth(idx).map(str::to_string))
-        .unwrap_or_else(|| "<no labels>".into());
-    println!(
-        "top-1: class {idx}  logit {val:.4}  =>  {label}   [shape {:?}]",
-        first.shape()
-    );
+    // Labels name classes of one head, so they apply to the first output only;
+    // a multi-head model gets one top-1 line per head, in declaration order.
+    let names = labels.and_then(|p| fs::read_to_string(p).ok());
+    for (i, tensor) in out.iter().enumerate() {
+        let host = tensor.host().map_err(|e| e.to_string())?;
+        let logits = host.as_f32().map_err(|e| e.to_string())?;
+        let (idx, val) = argmax(&logits).map_err(|e| e.to_string())?;
+        let label = if i == 0 {
+            names
+                .as_deref()
+                .and_then(|s| s.lines().nth(idx))
+                .unwrap_or("<no labels>")
+        } else {
+            "<no labels>"
+        };
+        let head = if out.len() > 1 {
+            format!("output {i} ")
+        } else {
+            String::new()
+        };
+        println!(
+            "{head}top-1: class {idx}  logit {val:.4}  =>  {label}   [shape {:?}]",
+            tensor.shape()
+        );
+    }
     Ok(())
 }
 
