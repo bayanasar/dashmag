@@ -29,7 +29,6 @@ artifact is written whose target is not in its name.
 """
 import json
 import os
-import platform
 import subprocess
 import sys
 
@@ -107,23 +106,37 @@ def main():
     iree_compile(mlir, f"{OUT}/mh5_{triple.split('-')[0]}_cpu.vmfb",
                  "--iree-hal-target-backends=llvm-cpu",
                  f"--iree-llvmcpu-target-triple={triple}")
+    cuda_vmfb = f"{OUT}/mh5_{CUDA_TARGET}_cuda.vmfb"
+    cuda_failed = False
     try:
-        iree_compile(mlir, f"{OUT}/mh5_{CUDA_TARGET}_cuda.vmfb",
+        iree_compile(mlir, cuda_vmfb,
                      "--iree-hal-target-backends=cuda",
                      f"--iree-cuda-target={CUDA_TARGET}")
     except subprocess.CalledProcessError as e:
-        print(f"  cuda {CUDA_TARGET} FAILED: {e}")
+        # Remove any earlier build so a stale module cannot stand in for this one,
+        # and fail at the end: a script that exits 0 without the CUDA artifact is
+        # the same silent-coverage shape as #15. The ONNX is still written below.
+        cuda_failed = True
+        if os.path.exists(cuda_vmfb):
+            os.remove(cuda_vmfb)
+        print(f"  cuda {CUDA_TARGET} FAILED, {os.path.basename(cuda_vmfb)} not written: {e}")
 
     # tract has no torch frontend, so this fixture reaches it the way the MobileNet
     # one does — through ONNX, which architecture.md quarantines rather than blesses.
+    # The legacy exporter *at opset 13* is the recorded pair: torch's newer default
+    # opset emits ops tract 0.21 cannot parse. This file is the template the next
+    # torch->ONNX export gets copied from, so the pin stays even where it is moot.
     torch.onnx.export(model, (x,), f"{OUT}/mh5.onnx",
-                      input_names=["input"], output_names=list(HEADS), dynamo=False)
+                      input_names=["input"], output_names=list(HEADS),
+                      opset_version=13, dynamo=False)
     print("  wrote mh5.onnx")
     print("\nrun it (entry point is 'main' for turbine artifacts):\n"
           f"  dash --backend tract --model {OUT}/mh5.onnx \\\n"
           f"       --input {OUT}/mh5_input_1x3x64x64.f32 --shape 1,3,64,64 \\\n"
           + "".join(f"       --out-shape 1,{n} \\\n" for n in HEADS.values())
           + "       # one --out-shape per head, in declaration order")
+    if cuda_failed:
+        sys.exit(f"\nincomplete: no CUDA module for {CUDA_TARGET}")
 
 
 if __name__ == "__main__":

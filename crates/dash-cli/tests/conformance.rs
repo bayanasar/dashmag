@@ -163,21 +163,18 @@ fn assert_agrees(tract_out: &[Tensor], iree_out: &[Tensor], dev: &str) {
 /// Load and run one IREE target. `function` names the entry point: artifacts that
 /// came through `iree-import-onnx` call it `main_graph` (the runtime's default),
 /// iree-turbine calls it `main`.
+/// `target.vmfb` is already resolved against the fixture directory by
+/// `iree_targets_named`; joining it again doubles a relative `DASH_FIXTURES` (#18).
 fn run_iree(
-    dir: &Path,
     target: &IreeTarget,
     meta: &ArtifactMeta,
     input: Tensor,
     function: Option<&str>,
 ) -> Vec<Tensor> {
     let dev = target.device;
-    let path = if target.vmfb.is_absolute() {
-        target.vmfb.clone()
-    } else {
-        dir.join(&target.vmfb)
-    };
+    let path = &target.vmfb;
     let bytes =
-        fs::read(&path).unwrap_or_else(|e| panic!("{dev} vmfb {} unreadable: {e}", path.display()));
+        fs::read(path).unwrap_or_else(|e| panic!("{dev} vmfb {} unreadable: {e}", path.display()));
     let mut rt = dash_iree::IreeRuntime::new(dev, target.accel);
     if let Some(f) = function {
         rt = rt.with_function(f);
@@ -264,7 +261,7 @@ fn tract_and_iree_agree_on_the_same_model() {
     report("mobilenetv3, 1 output", &targets);
 
     for target in &targets {
-        let iree_out = run_iree(&dir, target, &meta(), input(&dir), None);
+        let iree_out = run_iree(target, &meta(), input(&dir), None);
         assert_agrees(&tract_out, &iree_out, target.device);
     }
 }
@@ -300,7 +297,7 @@ fn tract_and_iree_agree_on_every_output_of_a_five_head_model() {
 
     for target in &targets {
         // Turbine names the entry point `main`; the ONNX importer names it `main_graph`.
-        let iree_out = run_iree(&dir, target, &meta, mh5_input(&dir), Some("main"));
+        let iree_out = run_iree(target, &meta, mh5_input(&dir), Some("main"));
         assert_agrees(&tract_out, &iree_out, target.device);
     }
 }
