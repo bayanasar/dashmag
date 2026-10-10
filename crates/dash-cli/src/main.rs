@@ -85,8 +85,8 @@ fn usage() -> ! {
 fn run() -> Result<(), String> {
     let (mut backend, mut model, mut input, mut labels) = (None, None, None, None);
     let mut shape = vec![1usize, 3, 224, 224];
-    // One entry per output, in declaration order. Phase 1's model has five heads,
-    // and a single --out-shape cannot say that.
+    // One entry per output, in declaration order. A five-head attribute model needs
+    // five, and a single --out-shape cannot say that.
     let mut out_shapes: Vec<Vec<usize>> = Vec::new();
     let mut device = String::from("local-task");
     let mut function: Option<String> = None;

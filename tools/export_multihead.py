@@ -3,7 +3,7 @@
 
     python tools/export_multihead.py [out_dir]     # default: fixtures
 
-The Phase 1 model is one backbone with five independent
+The attribute model this mirrors is one backbone with five independent
 attribute heads, and until this fixture existed no test in the repo declared more
 than one output — the cross-backend conformance test, the thing that stands behind
 "one codebase, correct everywhere", had only ever compared output 0.
@@ -11,9 +11,8 @@ than one output — the cross-backend conformance test, the thing that stands be
 The weights of the heads are random and the model predicts nothing. That is the
 point: what is being tested is whether an artifact with five outputs survives
 torch.export, the IREE compiler, the runtime's buffer handling and the CLI, in
-declaration order, on every target. The head widths are the real ones from
-`nerekh/tools/calib/vocab.py` — 4, 6, 6, 4, 4 — so the shape is not a toy even
-though the numbers are.
+declaration order, on every target. The head widths are the real model's —
+4, 6, 6, 4, 4 — so the shape is not a toy even though the numbers are.
 
 Writes, into `out_dir`:
 
@@ -122,7 +121,7 @@ def main():
         print(f"  cuda {CUDA_TARGET} FAILED, {os.path.basename(cuda_vmfb)} not written: {e}")
 
     # tract has no torch frontend, so this fixture reaches it the way the MobileNet
-    # one does — through ONNX, which architecture.md quarantines rather than blesses.
+    # one does — through ONNX, which is tolerated for tract's sake, not a supported path.
     # The legacy exporter *at opset 13* is the recorded pair: torch's newer default
     # opset emits ops tract 0.21 cannot parse. This file is the template the next
     # torch->ONNX export gets copied from, so the pin stays even where it is moot.

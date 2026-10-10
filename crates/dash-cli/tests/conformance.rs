@@ -220,8 +220,8 @@ fn input(dir: &Path) -> Tensor {
     Tensor::Host(HostTensor::from_f32(vec![1, 3, 224, 224], &floats))
 }
 
-/// Five heads, the widths Phase 1 pinned: time_of_day 4, weather 6, road_type 6,
-/// surface 4, traffic 4.
+/// Five heads, at the widths of the attribute model this mirrors: time_of_day 4,
+/// weather 6, road_type 6, surface 4, traffic 4.
 fn mh5_meta() -> ArtifactMeta {
     ArtifactMeta {
         inputs: vec![TensorSpec::new(DType::F32, &[1, 3, 64, 64])],
@@ -242,7 +242,7 @@ fn mh5_input(dir: &Path) -> Tensor {
     Tensor::Host(HostTensor::from_f32(vec![1, 3, 64, 64], &floats))
 }
 
-/// The head order Phase 1 declares, and so the order its eval code reads outputs in:
+/// The head order the attribute model declares, and so the order its eval code reads outputs in:
 /// index 2 *is* road_type. Three heads are width 4 and two are width 6, so a swap
 /// between same-width heads passes every count, shape and argmax check; only the
 /// values pin position to meaning.
@@ -302,7 +302,7 @@ fn max_divergence(a: &[f32], b: &[f32]) -> f32 {
 fn assert_matches_reference(out: &[Tensor], reference: &Mh5Reference, backend: &str) {
     assert_eq!(
         reference.heads, MH5_HEADS,
-        "mh5_reference.json declares a different head order from Phase 1's"
+        "mh5_reference.json declares a different head order from MH5_HEADS"
     );
     assert_eq!(
         out.len(),
@@ -357,7 +357,7 @@ fn tract_and_iree_agree_on_the_same_model() {
     }
 }
 
-/// Phase 1's model is one backbone with five attribute heads, and until this test
+/// The attribute model is one backbone with five heads, and until this test
 /// existed nothing in the repo had ever declared more than one output — the plumbing
 /// was written for `Vec<TensorSpec>` and never exercised. `tools/export_multihead.py`
 /// builds the fixture; the head widths are the real ones (4, 6, 6, 4, 4).
