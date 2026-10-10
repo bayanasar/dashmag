@@ -21,7 +21,7 @@
 # experimental pipeline upstream: the win is real and verified on this model, but
 # a codegen pipeline carrying "test" in its name should be turned on deliberately,
 # and every artifact built with it belongs in the conformance test before it is
-# trusted on a board. See ai-dashmag#5.
+# trusted on a board.
 #
 # A .vmfb is per-target machine code, not a portable artifact: a host-triple CPU
 # module will not run on aarch64, and an sm_75 module will not run on sm_87. Every
@@ -30,7 +30,7 @@
 # different machine code under one name, and the file gives no way to tell them
 # apart on the way to a board. Compile flags that change the machine code are part
 # of the target by that rule, so a tuned CUDA module carries `_tuned` in its name
-# and can sit beside the stock one. See ai-dashmag#14.
+# and can sit beside the stock one.
 set -euo pipefail
 DIR="${1:-fixtures}"
 TARGET="${IREE_CUDA_TARGET:-sm_75}"
