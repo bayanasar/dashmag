@@ -242,6 +242,97 @@ fn mh5_input(dir: &Path) -> Tensor {
     Tensor::Host(HostTensor::from_f32(vec![1, 3, 64, 64], &floats))
 }
 
+/// The head order Phase 1 declares, and so the order its eval code reads outputs in:
+/// index 2 *is* road_type. Three heads are width 4 and two are width 6, so a swap
+/// between same-width heads passes every count, shape and argmax check; only the
+/// values pin position to meaning.
+const MH5_HEADS: [&str; 5] = ["time_of_day", "weather", "road_type", "surface", "traffic"];
+
+/// torch's own per-head outputs, written by `tools/export_multihead.py` in
+/// declaration order — the one point in the chain where index and meaning are
+/// still known together.
+struct Mh5Reference {
+    heads: Vec<String>,
+    values: Vec<Vec<f32>>,
+}
+
+/// Missing is a failure, not a skip: without the reference the five-head test only
+/// shows that tract and IREE agree with each other, which two backends reordering
+/// the same way would also satisfy.
+fn mh5_reference(dir: &Path) -> Mh5Reference {
+    let path = dir.join("mh5_reference.json");
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{} unreadable: {e}; without it the five-head test has no torch anchor",
+            path.display()
+        )
+    });
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("mh5_reference.json is not JSON");
+    let heads = v["heads"]
+        .as_array()
+        .expect("mh5_reference.json has no `heads`")
+        .iter()
+        .map(|h| h.as_str().expect("head name").to_string())
+        .collect();
+    let values = v["values"]
+        .as_array()
+        .expect("mh5_reference.json has no `values`")
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .expect("a `values` row")
+                .iter()
+                .map(|x| x.as_f64().expect("a logit") as f32)
+                .collect()
+        })
+        .collect();
+    Mh5Reference { heads, values }
+}
+
+fn max_divergence(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+/// Output i must match torch's head i by value, not only by width. When it does not,
+/// the message says which head it does match, because a reordering and a stale
+/// reference are different faults with different fixes.
+fn assert_matches_reference(out: &[Tensor], reference: &Mh5Reference, backend: &str) {
+    assert_eq!(
+        reference.heads, MH5_HEADS,
+        "mh5_reference.json declares a different head order from Phase 1's"
+    );
+    assert_eq!(
+        out.len(),
+        reference.values.len(),
+        "{backend} output count vs the torch reference"
+    );
+    for (i, (t, want)) in out.iter().zip(&reference.values).enumerate() {
+        let got = t.to_host().unwrap().as_f32().unwrap().to_vec();
+        if got.len() == want.len() && max_divergence(&got, want) < 1e-3 {
+            continue;
+        }
+        let name = &reference.heads[i];
+        match reference
+            .values
+            .iter()
+            .position(|w| w.len() == got.len() && max_divergence(&got, w) < 1e-3)
+        {
+            Some(j) => panic!(
+                "{backend} output {i} should be {name} but carries torch's {}: the heads are reordered",
+                reference.heads[j]
+            ),
+            None => panic!(
+                "{backend} output {i} ({name}) matches no head in mh5_reference.json: the fixture \
+                 was most likely regenerated without its reference; rebuild both with \
+                 tools/export_multihead.py"
+            ),
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs fixtures + iree-run-module; run with --ignored"]
 fn tract_and_iree_agree_on_the_same_model() {
@@ -270,6 +361,9 @@ fn tract_and_iree_agree_on_the_same_model() {
 /// existed nothing in the repo had ever declared more than one output — the plumbing
 /// was written for `Vec<TensorSpec>` and never exercised. `tools/export_multihead.py`
 /// builds the fixture; the head widths are the real ones (4, 6, 6, 4, 4).
+///
+/// The chain is torch -> tract -> IREE: tract is held to torch's recorded outputs
+/// head by head, then every IREE target to tract.
 #[test]
 #[ignore = "needs the mh5 fixtures + iree-run-module; run with --ignored"]
 fn tract_and_iree_agree_on_every_output_of_a_five_head_model() {
@@ -286,6 +380,7 @@ fn tract_and_iree_agree_on_every_output_of_a_five_head_model() {
         .run(&[mh5_input(&dir)])
         .unwrap();
     assert_eq!(tract_out.len(), 5, "the fixture must have five outputs");
+    assert_matches_reference(&tract_out, &mh5_reference(&dir), "tract");
 
     let targets = iree_targets_named(
         &dir,

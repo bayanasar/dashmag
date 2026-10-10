@@ -126,6 +126,7 @@ dependencies = [
  "dash-iree",
  "dash-tensorrt",
  "dash-tract",
+ "serde_json",
 ]
 
 [[package]]
