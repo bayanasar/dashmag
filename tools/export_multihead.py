@@ -3,7 +3,7 @@
 
     python tools/export_multihead.py [out_dir]     # default: fixtures
 
-Phase 1's model (alcuka/ai-nerekh#3) is one backbone with five independent
+The Phase 1 model is one backbone with five independent
 attribute heads, and until this fixture existed no test in the repo declared more
 than one output — the cross-backend conformance test, the thing that stands behind
 "one codebase, correct everywhere", had only ever compared output 0.
@@ -115,7 +115,7 @@ def main():
     except subprocess.CalledProcessError as e:
         # Remove any earlier build so a stale module cannot stand in for this one,
         # and fail at the end: a script that exits 0 without the CUDA artifact is
-        # the same silent-coverage shape as #15. The ONNX is still written below.
+        # a silent coverage gap. The ONNX is still written below.
         cuda_failed = True
         if os.path.exists(cuda_vmfb):
             os.remove(cuda_vmfb)

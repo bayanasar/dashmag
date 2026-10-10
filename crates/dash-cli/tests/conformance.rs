@@ -164,7 +164,7 @@ fn assert_agrees(tract_out: &[Tensor], iree_out: &[Tensor], dev: &str) {
 /// came through `iree-import-onnx` call it `main_graph` (the runtime's default),
 /// iree-turbine calls it `main`.
 /// `target.vmfb` is already resolved against the fixture directory by
-/// `iree_targets_named`; joining it again doubles a relative `DASH_FIXTURES` (#18).
+/// `iree_targets_named`; joining it again doubles a relative `DASH_FIXTURES`.
 fn run_iree(
     target: &IreeTarget,
     meta: &ArtifactMeta,
