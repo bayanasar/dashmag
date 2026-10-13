@@ -11,6 +11,9 @@ use dash_core::{
 use std::fs;
 use std::process::ExitCode;
 
+#[cfg(feature = "image")]
+mod preprocess;
+
 /// Map an IREE-style device string to the accelerator class the registry ranks by.
 fn accel_for_device(device: &str) -> AccelClass {
     match device {
@@ -67,12 +70,60 @@ fn parse_shape(s: &str) -> Result<Vec<usize>, String> {
         .collect()
 }
 
+fn parse_rgb(s: &str) -> Result<[f32; 3], String> {
+    let v: Vec<f32> = s
+        .split(',')
+        .map(|t| {
+            t.trim()
+                .parse::<f32>()
+                .map_err(|e| format!("bad value {t:?}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    v.try_into()
+        .map_err(|v: Vec<f32>| format!("expected three values R,G,B, got {}", v.len()))
+}
+
+#[cfg(feature = "image")]
+fn image_tensor(
+    path: &str,
+    shape: &[usize],
+    mean: Option<[f32; 3]>,
+    std: Option<[f32; 3]>,
+) -> Result<Vec<f32>, String> {
+    let [1, 3, h, w] = shape[..] else {
+        return Err(format!("--image needs --shape 1,3,H,W, got {shape:?}"));
+    };
+    let bytes = fs::read(path).map_err(|e| format!("read image {path}: {e}"))?;
+    preprocess::image_input(
+        &bytes,
+        h,
+        w,
+        mean.unwrap_or(preprocess::IMAGENET_MEAN),
+        std.unwrap_or(preprocess::IMAGENET_STD),
+    )
+}
+
+#[cfg(not(feature = "image"))]
+fn image_tensor(
+    _: &str,
+    _: &[usize],
+    _: Option<[f32; 3]>,
+    _: Option<[f32; 3]>,
+) -> Result<Vec<f32>, String> {
+    Err("--image needs dash built with the `image` feature".into())
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage: dash --backend <tract|iree|tensorrt|edgetpu> --model <artifact> \
-         --input <blob> [--labels <txt>] [--shape N,C,H,W] [--out-shape N,C] \
-         [--device <local-task|cuda|vulkan>] \
-         [--function <entry>]\n\
+         (--input <blob> | --image <jpeg>) [--labels <txt>] [--shape N,C,H,W] \
+         [--out-shape N,C] [--device <local-task|cuda|vulkan>] [--function <entry>] \
+         [--mean R,G,B] [--std R,G,B]\n\
+         \n\
+         --input takes a prepared little-endian f32 tensor. --image takes a JPEG and\n\
+         prepares it here: the whole frame resized to --shape's H x W exactly as\n\
+         Pillow's bilinear resize does, scaled to [0, 1], normalised by --mean and\n\
+         --std (ImageNet's by default), NCHW.\n\
          \n\
          --out-shape declares the model's output shape so every backend returns\n\
          the same shape (runners that emit raw buffers otherwise return flat).\n\
@@ -90,6 +141,9 @@ fn run() -> Result<(), String> {
     let mut out_shapes: Vec<Vec<usize>> = Vec::new();
     let mut device = String::from("local-task");
     let mut function: Option<String> = None;
+    let mut image: Option<String> = None;
+    let mut mean: Option<[f32; 3]> = None;
+    let mut std: Option<[f32; 3]> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -100,6 +154,9 @@ fn run() -> Result<(), String> {
             "--labels" => labels = args.next(),
             "--device" => device = args.next().unwrap_or(device),
             "--function" => function = args.next(),
+            "--image" => image = args.next(),
+            "--mean" => mean = Some(parse_rgb(&args.next().ok_or("--mean needs a value")?)?),
+            "--std" => std = Some(parse_rgb(&args.next().ok_or("--std needs a value")?)?),
             "--shape" => {
                 shape = parse_shape(&args.next().ok_or("--shape needs a value")?)?;
             }
@@ -111,8 +168,8 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let (backend, model, input) = match (backend, model, input) {
-        (Some(b), Some(m), Some(i)) => (b, m, i),
+    let (backend, model) = match (backend, model) {
+        (Some(b), Some(m)) if input.is_some() != image.is_some() => (b, m),
         _ => usage(),
     };
     let kind = parse_backend(&backend).ok_or_else(|| format!("unknown backend {backend:?}"))?;
@@ -162,11 +219,16 @@ fn run() -> Result<(), String> {
 
     let session = rt.load(&art).map_err(|e| e.to_string())?;
 
-    let raw = fs::read(&input).map_err(|e| format!("read input {input}: {e}"))?;
-    let floats: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let floats = match (input, image) {
+        (Some(input), _) => {
+            let raw = fs::read(&input).map_err(|e| format!("read input {input}: {e}"))?;
+            raw.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
+        (None, Some(image)) => image_tensor(&image, &shape, mean, std)?,
+        (None, None) => unreachable!("checked above"),
+    };
     let expected: usize = shape.iter().product();
     if floats.len() != expected {
         return Err(format!(
