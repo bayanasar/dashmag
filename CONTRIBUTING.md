@@ -24,7 +24,9 @@ does not qualify: it carries the forge's domain, which is one of the names above
 A forge writes new commits whenever a merge does anything but fast-forward — a merge
 commit, a squash, a rebase that has to rewrite — and their committer is the merging
 account. So fast-forward is the only merge style this repository allows. Making it the
-default is not enough: a merge through the API names its own style.
+default is not enough: a merge through the API names its own style. The forge will not
+rebase a branch that is behind `main` for you, so rebase onto `main` before asking for a
+merge.
 
 CI checks every commit a pull request adds and every push to `main`. The pull-request
 check cannot see a commit the forge creates at merge time; only the push check can, once
