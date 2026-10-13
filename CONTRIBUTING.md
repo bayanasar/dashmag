@@ -13,3 +13,11 @@ forge adds. When the reason for a line of code was settled in a review, write th
 reason down next to it — that is the part worth keeping.
 
 History already published is not rewritten for this.
+
+## Commit under a noreply address
+
+Every commit publishes its author's and committer's addresses, so both are a noreply
+address (`…@users.noreply.github.com`), never a personal or machine one. A merge commit
+made by a forge carries the merging account's address: merge fast-forward, or make sure
+that account's primary address is its noreply one. CI checks every commit a pull request
+adds and every push to `main`.

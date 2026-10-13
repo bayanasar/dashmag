@@ -1,0 +1,38 @@
+name: commit-identity
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  noreply:
+    runs-on: linux-docker
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: authors and committers use a noreply address
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -eu
+          if [ "$EVENT" = pull_request ]; then
+            range="origin/$BASE_REF..$PR_HEAD"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            range="$BEFORE..$AFTER"
+          else
+            range="$AFTER^!"
+          fi
+          echo "checking $range"
+          git log --format='%h %ae %ce' "$range" | tee /tmp/ids
+          bad=$(awk '$2 !~ /@users\.noreply\.github\.com$/ || $3 !~ /@users\.noreply\.github\.com$/' /tmp/ids)
+          if [ -n "$bad" ]; then
+            echo "commits not under a noreply address (see CONTRIBUTING.md):"
+            echo "$bad"
+            exit 1
+          fi
