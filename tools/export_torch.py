@@ -7,7 +7,18 @@ This is the integration contract's real path — **no ONNX anywhere**:
 
     python tools/export_torch.py [out_dir]        # default: fixtures
 
-Requires: torch, torchvision, iree-turbine.
+Requires: torch, torchvision, iree-turbine, iree-compile.
+
+Env, as in `tools/compile_iree.sh`:
+  IREE_CPU_TRIPLE    llvm-cpu triple (default: this host's own, from rustc —
+                     never left implicit); `aarch64-unknown-linux-gnu` for a board
+  IREE_CUDA_TARGET   CUDA arch (default sm_75; the Orin Nano is sm_87)
+
+Every module is named after its target — `mnv3_torch_<arch>_cpu.vmfb`,
+`mnv3_torch_<sm>_cuda.vmfb` — for the reason `compile_iree.sh` gives: a .vmfb is
+per-target machine code, and a name without its target cannot be told apart on
+the way to a board. The `torch` in the name separates these from the ONNX-path
+modules of the same model, which call their entry point `main_graph`.
 
 Three things this path needs that are easy to trip over, all validated here:
 
@@ -26,14 +37,31 @@ Three things this path needs that are easy to trip over, all validated here:
    `iree-import-onnx` names it `main_graph`; iree-turbine names it `main`.
    Pass `--function main` to `dash` / `iree-run-module`.
 """
-import sys, os, urllib.request, torch
-from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
-from torch.fx.experimental.optimization import fuse
+import os
+import subprocess
+import sys
+import urllib.request
+
+import torch
 from iree.turbine.aot import export as turbine_export
 from PIL import Image
+from torch.fx.experimental.optimization import fuse
+from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 
 out = sys.argv[1] if len(sys.argv) > 1 else "fixtures"
 os.makedirs(out, exist_ok=True)
+CUDA_TARGET = os.environ.get("IREE_CUDA_TARGET", "sm_75")
+
+
+def host_triple():
+    r = subprocess.run(["rustc", "-vV"], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if line.startswith("host: "):
+            return line[len("host: "):]
+    raise SystemExit("cannot determine the host triple (no rustc); set IREE_CPU_TRIPLE")
+
+
+TRIPLE = os.environ.get("IREE_CPU_TRIPLE") or host_triple()
 
 w = MobileNet_V3_Small_Weights.IMAGENET1K_V1
 model = mobilenet_v3_small(weights=w).eval()
@@ -59,15 +87,32 @@ print(f"conv+bn folded, max drift {drift:.2e}")
 
 # (2) export + decompose, then lower to IREE with no ONNX hop
 ep = torch.export.export(fused, (x,)).run_decompositions()
-exported = turbine_export(ep)
-for backend, name in (("llvm-cpu", "mnv3_torch_cpu.vmfb"), ("cuda", "mnv3_torch_cuda.vmfb")):
-    try:
-        exported.compile(save_to=f"{out}/{name}", target_backends=[backend])
-        print(f"  {backend:9} -> {name}")
-    except Exception as e:
-        print(f"  {backend:9} FAILED: {str(e).splitlines()[0][:120]}")
+mlir = f"{out}/mnv3_torch.mlir"
+turbine_export(ep).save_mlir(mlir)
+print(f"  wrote {os.path.basename(mlir)} (target-independent)")
+
+
+def iree_compile(out_file, *flags):
+    subprocess.run(["iree-compile", mlir, *flags, "-o", out_file], check=True)
+    print(f"  wrote {os.path.basename(out_file)}")
+
+
+cpu_vmfb = f"{out}/mnv3_torch_{TRIPLE.split('-')[0]}_cpu.vmfb"
+iree_compile(cpu_vmfb, "--iree-hal-target-backends=llvm-cpu",
+             f"--iree-llvmcpu-target-triple={TRIPLE}")
+cuda_vmfb = f"{out}/mnv3_torch_{CUDA_TARGET}_cuda.vmfb"
+try:
+    iree_compile(cuda_vmfb, "--iree-hal-target-backends=cuda",
+                 f"--iree-cuda-target={CUDA_TARGET}")
+except subprocess.CalledProcessError:
+    # No stale module may stand in for this one, and the run must not exit 0
+    # without it — the same rule as export_multihead.py.
+    if os.path.exists(cuda_vmfb):
+        os.remove(cuda_vmfb)
+    print(f"  cuda {CUDA_TARGET} FAILED, {os.path.basename(cuda_vmfb)} not written")
+    sys.exit(1)
 
 print(f"\nrun it (entry point is 'main', see note 3):\n"
       f"  dash --backend iree --device local-task --function main \\\n"
-      f"       --model {out}/mnv3_torch_cpu.vmfb --input {out}/input_1x3x224x224.f32 \\\n"
+      f"       --model {cpu_vmfb} --input {out}/input_1x3x224x224.f32 \\\n"
       f"       --labels {out}/imagenet_classes.txt --out-shape 1,1000")

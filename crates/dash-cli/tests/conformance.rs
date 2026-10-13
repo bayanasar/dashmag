@@ -23,6 +23,9 @@
 //!   DASH_IREE_MH_CPU_VMFB / DASH_IREE_MH_CUDA_VMFB
 //!                        the same, for the five-output fixture built by
 //!                        `tools/export_multihead.py`
+//!   DASH_IREE_TORCH_CPU_VMFB / DASH_IREE_TORCH_CUDA_VMFB
+//!                        the same, for MobileNetV3 lowered straight from
+//!                        `torch.export` by `tools/export_torch.py`
 //!   DASH_IREE_REQUIRE_CUDA=1
 //!                        fail instead of skipping when no CUDA module is named.
 //!                        A board run sets it, so a claim about that board's GPU
@@ -333,26 +336,56 @@ fn assert_matches_reference(out: &[Tensor], reference: &Mh5Reference, backend: &
     }
 }
 
-#[test]
-#[ignore = "needs fixtures + iree-run-module; run with --ignored"]
-fn tract_and_iree_agree_on_the_same_model() {
-    let dir = fixtures_dir();
-
-    let tract_out = dash_tract::TractRuntime::new()
+fn tract_mnv3(dir: &Path) -> Vec<Tensor> {
+    dash_tract::TractRuntime::new()
         .load(&Artifact {
             backend: BackendKind::Tract,
             bytes: fs::read(dir.join("mnv3_legacy.onnx")).expect("onnx fixture missing"),
             meta: meta(),
         })
         .unwrap()
-        .run(&[input(&dir)])
-        .unwrap();
+        .run(&[input(dir)])
+        .unwrap()
+}
+
+#[test]
+#[ignore = "needs fixtures + iree-run-module; run with --ignored"]
+fn tract_and_iree_agree_on_the_same_model() {
+    let dir = fixtures_dir();
+    let tract_out = tract_mnv3(&dir);
 
     let targets = iree_targets(&dir);
     report("mobilenetv3, 1 output", &targets);
 
     for target in &targets {
         let iree_out = run_iree(target, &meta(), input(&dir), None);
+        assert_agrees(&tract_out, &iree_out, target.device);
+    }
+}
+
+/// The integration contract's own path — `torch.export` -> iree-turbine -> `.vmfb`,
+/// no ONNX — held to the same bar as the ONNX-imported module of the same weights.
+/// tract still reads the ONNX export: it has no torch frontend, and the point is that
+/// two routes out of one checkpoint land on the same logits. BatchNorm is folded
+/// before export on this route (`tools/export_torch.py`), which moves no logit by
+/// anything near the tolerance.
+#[test]
+#[ignore = "needs fixtures + iree-run-module; run with --ignored"]
+fn tract_and_turbine_agree_on_the_same_model() {
+    let dir = fixtures_dir();
+    let tract_out = tract_mnv3(&dir);
+
+    let targets = iree_targets_named(
+        &dir,
+        "DASH_IREE_TORCH_CPU_VMFB",
+        "DASH_IREE_TORCH_CUDA_VMFB",
+        format!("mnv3_torch_{}_cpu.vmfb", env::consts::ARCH),
+    );
+    report("mobilenetv3 via torch.export, 1 output", &targets);
+
+    for target in &targets {
+        // Turbine names the entry point `main`; the ONNX importer names it `main_graph`.
+        let iree_out = run_iree(target, &meta(), input(&dir), Some("main"));
         assert_agrees(&tract_out, &iree_out, target.device);
     }
 }
