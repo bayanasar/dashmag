@@ -12,7 +12,9 @@ The weights of the heads are random and the model predicts nothing. That is the
 point: what is being tested is whether an artifact with five outputs survives
 torch.export, the IREE compiler, the runtime's buffer handling and the CLI, in
 declaration order, on every target. The head widths are the real model's —
-4, 6, 6, 4, 4 — so the shape is not a toy even though the numbers are.
+3, 3, 3, 2, 2, the classes it is trained to answer; `unclear` masks a head's loss
+in training and is never an output — so the shape is not a toy even though the
+numbers are.
 
 Writes, into `out_dir`:
 
@@ -35,7 +37,7 @@ import torch
 from iree.turbine.aot import export as turbine_export
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else "fixtures"
-HEADS = {"time_of_day": 4, "weather": 6, "road_type": 6, "surface": 4, "traffic": 4}
+HEADS = {"time_of_day": 3, "weather": 3, "road_type": 3, "surface": 2, "traffic": 2}
 SHAPE = (1, 3, 64, 64)  # small on purpose: this fixture tests plumbing, not compute
 CUDA_TARGET = os.environ.get("IREE_CUDA_TARGET", "sm_75")
 

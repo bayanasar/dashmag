@@ -220,12 +220,12 @@ fn input(dir: &Path) -> Tensor {
     Tensor::Host(HostTensor::from_f32(vec![1, 3, 224, 224], &floats))
 }
 
-/// Five heads, at the widths of the attribute model this mirrors: time_of_day 4,
-/// weather 6, road_type 6, surface 4, traffic 4.
+/// Five heads, at the widths of the attribute model this mirrors: time_of_day 3,
+/// weather 3, road_type 3, surface 2, traffic 2.
 fn mh5_meta() -> ArtifactMeta {
     ArtifactMeta {
         inputs: vec![TensorSpec::new(DType::F32, &[1, 3, 64, 64])],
-        outputs: [4, 6, 6, 4, 4]
+        outputs: [3, 3, 3, 2, 2]
             .iter()
             .map(|n| TensorSpec::new(DType::F32, &[1, *n]))
             .collect(),
@@ -243,7 +243,7 @@ fn mh5_input(dir: &Path) -> Tensor {
 }
 
 /// The head order the attribute model declares, and so the order its eval code reads outputs in:
-/// index 2 *is* road_type. Three heads are width 4 and two are width 6, so a swap
+/// index 2 *is* road_type. Three heads are width 3 and two are width 2, so a swap
 /// between same-width heads passes every count, shape and argmax check; only the
 /// values pin position to meaning.
 const MH5_HEADS: [&str; 5] = ["time_of_day", "weather", "road_type", "surface", "traffic"];
@@ -360,7 +360,7 @@ fn tract_and_iree_agree_on_the_same_model() {
 /// The attribute model is one backbone with five heads, and until this test
 /// existed nothing in the repo had ever declared more than one output — the plumbing
 /// was written for `Vec<TensorSpec>` and never exercised. `tools/export_multihead.py`
-/// builds the fixture; the head widths are the real ones (4, 6, 6, 4, 4).
+/// builds the fixture; the head widths are the real ones (3, 3, 3, 2, 2).
 ///
 /// The chain is torch -> tract -> IREE: tract is held to torch's recorded outputs
 /// head by head, then every IREE target to tract.
