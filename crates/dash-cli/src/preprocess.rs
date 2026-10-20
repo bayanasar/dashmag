@@ -199,6 +199,13 @@ pub fn image_input(
     mean: [f32; 3],
     std: [f32; 3],
 ) -> Result<Vec<f32>, String> {
+    // A zero output size divides by zero in the coefficients and surfaces as an
+    // allocation panic far from the cause; refuse it here, where the cause is known.
+    if height == 0 || width == 0 {
+        return Err(format!(
+            "cannot resize to {height}x{width}: both sides must be non-zero"
+        ));
+    }
     let img = decode_jpeg(bytes)?;
     Ok(to_nchw(&resize_bilinear(&img, width, height), mean, std))
 }
@@ -358,6 +365,14 @@ mod tests {
             worst <= DECODE_TOLERANCE,
             "tensor diverges by {worst} from Pillow's"
         );
+    }
+
+    #[test]
+    fn zero_output_size_is_an_error_not_a_panic() {
+        for (h, w) in [(0, 224), (224, 0)] {
+            let err = image_input(&[], h, w, IMAGENET_MEAN, IMAGENET_STD).unwrap_err();
+            assert!(err.contains("non-zero"), "{err}");
+        }
     }
 
     #[test]
