@@ -16,7 +16,7 @@ use dash_core::{
 use tract_onnx::prelude::*;
 
 /// A fully lowered, runnable tract plan.
-type Plan = TypedRunnableModel<TypedModel>;
+type Plan = std::sync::Arc<TypedRunnableModel>;
 
 /// The pure-Rust CPU backend.
 pub struct TractRuntime {
@@ -111,7 +111,7 @@ impl Session for TractSession {
             match r.datum_type() {
                 DatumType::F32 => {
                     let view = r
-                        .to_array_view::<f32>()
+                        .to_plain_array_view::<f32>()
                         .map_err(|e| Error::Run(e.to_string()))?;
                     let shape = view.shape().to_vec();
                     let data: Vec<f32> = view.iter().copied().collect();
@@ -119,7 +119,7 @@ impl Session for TractSession {
                 }
                 DatumType::I64 => {
                     let view = r
-                        .to_array_view::<i64>()
+                        .to_plain_array_view::<i64>()
                         .map_err(|e| Error::Run(e.to_string()))?;
                     let shape = view.shape().to_vec();
                     let data: Vec<i64> = view.iter().copied().collect();

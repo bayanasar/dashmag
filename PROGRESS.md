@@ -27,6 +27,7 @@ On `main`, and re-runnable by anyone who checks it out.
 - five-head at the deployed widths on CUDA and on a board — missing; only the x86-64 CPU leg has run at these widths. From here this is measured on Burn, not IREE.
 - `--image` on a board — missing; a decoder or resize difference on aarch64 would surface here first.
 - Edge TPU with more than one output — never run (no int8 `.tflite` exists).
+- tract 0.23 on the boards — the board results above ran tract 0.21. On x86-64, 0.23.9 returns the same bits as 0.21.17 for the MobileNetV3 and five-head fixtures; its aarch64 kernels have not run on a board.
 - `no_std` floor — not built at all; the MCU claim is unproven.
 
 ## Decisions
@@ -34,6 +35,7 @@ On `main`, and re-runnable by anyone who checks it out.
 - 2026-10-13 Commits carry a GitHub noreply address and merges are fast-forward only — because a forge-made merge commit publishes the merging account's address, which a pull-request check cannot see.
 - 2026-10-13 zune-jpeg is built without SIMD — so the host and every board decode through the same scalar code.
 - 2026-10-20 Models are defined, trained and run in Rust on Burn; Python, torch.export, iree-turbine and IREE retire; ONNX and int8 tflite become exits written from Rust for TensorRT and the Edge TPU compiler — because one definition that both trains and runs has no format crossing to prove equal, and every board result so far had to be proven across one. The torch.export-on-a-board item is retired with it, not pending.
+- 2026-10-20 tract moves from 0.21 to 0.23 — because tract 0.21.11 to 0.21.19 pin `half` to exactly 2.4.1 while Burn 0.22 needs 2.7.1 or later; one lockfile cannot hold both, and cargo's only other answer was to fall back to tract 0.21.10.
 
 ## Open
 - Next: `dash-core` running on Burn (CPU, CUDA, ROCm, Metal). Image preprocessing is already one crate, `dash-image`, for training and inference to share; the workspace is on Rust 1.95 and edition 2024, which Burn 0.22 needs.
