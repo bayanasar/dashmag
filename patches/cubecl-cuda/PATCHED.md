@@ -20,6 +20,10 @@ The crate as published on crates.io (`cubecl-cuda-0.11.1.crate`, sha256
          }
 ```
 
+Licensed as published, MIT OR Apache-2.0; `LICENSE-MIT` and `LICENSE-APACHE` are the
+crate's own, identical to those in cubecl's repository. The change is marked where it is
+made, in `src/runtime.rs`.
+
 ## Why
 
 On compute capability 8.0 and later (Ampere, Ada, Hopper, Blackwell, Jetson Orin),
@@ -32,7 +36,9 @@ turns the promotion off.
 ## Use
 
 Set `CUBECL_CUDA_TF32=0` in the environment of the process. It is read when a CUDA device
-is first initialised, so it holds for the whole process. Unset, nothing changes.
+is first initialised, so it holds for the whole process. Unset, nothing changes. Only
+builds of this workspace carry the patch; a crate depending on `dash-burn` from elsewhere
+builds the published cubecl-cuda, which ignores the variable.
 
 With TF32 unregistered, the tensor-core kernels find no f32 instruction and report
 themselves unavailable, and kernel selection falls back to kernels without tensor cores.

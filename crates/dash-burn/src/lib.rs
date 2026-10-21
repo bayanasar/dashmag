@@ -16,7 +16,9 @@
 //! On CUDA devices of compute capability 8.0 and later, Burn 0.22 runs f32 matmuls and
 //! convolutions in TF32 and has no setting to stop it. This workspace builds a patched
 //! cubecl-cuda (`patches/cubecl-cuda`) in which `CUBECL_CUDA_TF32=0` keeps them in IEEE f32;
-//! a CUDA result compared to another backend's is taken with it set.
+//! a CUDA result compared to another backend's is taken with it set. The patch is a
+//! `[patch]` of this workspace and reaches only builds of this repository: a crate that
+//! depends on `dash-burn` gets the published cubecl-cuda, where the variable does nothing.
 //!
 //! Outputs come back as host tensors for now. Burn's tensors live on their device, which
 //! makes this the first backend that could hand back `Tensor::Device`; that is a later step.
