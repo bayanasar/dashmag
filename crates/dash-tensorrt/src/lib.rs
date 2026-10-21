@@ -98,6 +98,7 @@ impl TensorRtRuntime {
                 // TensorRT engines are commonly built fp16/int8.
                 quantized: true,
                 no_std: false,
+                architectures: &[],
             },
         }
     }

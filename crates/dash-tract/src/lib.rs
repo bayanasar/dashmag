@@ -36,6 +36,7 @@ impl TractRuntime {
                 // This host build links std. A genuine no_std embedded build of
                 // tract is a separate cargo feature, not this default.
                 no_std: false,
+                architectures: &[],
             },
         }
     }

@@ -182,6 +182,7 @@ fn run() -> Result<(), String> {
             .collect(),
         quantized: kind == BackendKind::EdgeTpu,
         dynamic_shapes: false,
+        model: None,
     };
     let art = Artifact {
         backend: kind,

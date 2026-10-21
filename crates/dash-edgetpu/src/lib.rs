@@ -49,6 +49,7 @@ impl EdgeTpuRuntime {
                 dynamic_shapes: false,
                 quantized: true,
                 no_std: false,
+                architectures: &[],
             },
         }
     }

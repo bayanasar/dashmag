@@ -1,0 +1,30 @@
+[package]
+name = "dash-burn"
+description = "Burn backend for Dashmag: models built from code, weights loaded, run on any Burn device."
+readme = "README.md"
+keywords = ["burn", "inference", "edge", "cuda", "machine-learning"]
+categories = ["science"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["flex"]
+# One feature per Burn device. Flex is pure Rust and the only one a static musl binary can
+# hold; the GPU devices load their vendor's shared libraries at run time.
+flex = ["burn/flex"]
+cuda = ["burn/cuda"]
+rocm = ["burn/rocm"]
+metal = ["burn/metal"]
+
+[dependencies]
+burn = { workspace = true }
+dash-core = { workspace = true }
+dash-models = { workspace = true }
+
+[dev-dependencies]
+dash-models = { workspace = true, features = ["pytorch"] }
+burn = { workspace = true, features = ["flex"] }
+dash-tract = { workspace = true }

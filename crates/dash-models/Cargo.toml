@@ -10,11 +10,19 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Read published PyTorch checkpoints (`.pth`) directly, in Rust.
+pytorch = ["burn/pytorch"]
+
 [dependencies]
-burn = { workspace = true }
+burn = { workspace = true, features = ["safetensors"] }
+dash-core = { workspace = true }
 
 [dev-dependencies]
 burn = { workspace = true, features = ["flex", "pytorch"] }
-dash-core = { workspace = true }
 dash-image = { workspace = true }
 dash-tract = { workspace = true }
+
+[[test]]
+name = "torchvision"
+required-features = ["pytorch"]

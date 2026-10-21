@@ -8,15 +8,14 @@
 //! — at `DASH_TORCHVISION_MNV3` (default: torch hub's cache,
 //! `~/.cache/torch/hub/checkpoints/`), and the fixtures from `tools/export_mobilenet.py`
 //! (overridable via `DASH_FIXTURES`). Then:
-//!   cargo test -p dash-models -- --ignored
+//!   cargo test -p dash-models --features pytorch -- --ignored
 
-use burn::store::{ModuleSnapshot, PytorchStore};
 use burn::tensor::{Device, Tensor, TensorData};
 use dash_core::{
     Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Runtime, Tensor as DashTensor,
     TensorSpec, argmax,
 };
-use dash_models::MobileNetV3Small;
+use dash_models::{MobileNetV3Small, weights};
 use dash_tract::TractRuntime;
 use std::{env, fs, path::PathBuf};
 
@@ -47,31 +46,16 @@ fn checkpoint() -> PathBuf {
 fn imagenet_model(device: &Device) -> MobileNetV3Small {
     let mut model = MobileNetV3Small::new(&[1000], 0.2, device);
     // torchvision's classifier is `Sequential(Linear, Hardswish, Dropout, Linear)`: its
-    // linear layers are indices 0 and 3, the neck and the one head here. Indices are kept
-    // as written, so nothing else is renumbered.
-    let mut store = PytorchStore::from_file(checkpoint())
-        .map_indices_contiguous(false)
-        .with_key_remapping(r"^classifier\.0\.", "neck.0.")
-        .with_key_remapping(r"^classifier\.3\.", "heads.0.");
-    let result = model
-        .load_from(&mut store)
-        .expect("checkpoint did not load");
-    assert!(result.errors.is_empty(), "load errors: {:?}", result.errors);
-    assert!(
-        result.missing.is_empty(),
-        "parameters with no tensor: {:?}",
-        result.missing
-    );
-    // PyTorch counts batch-norm steps in a tensor; Burn has no such state.
-    let unused: Vec<_> = result
-        .unused
-        .iter()
-        .filter(|p| !p.ends_with("num_batches_tracked"))
-        .collect();
-    assert!(
-        unused.is_empty(),
-        "checkpoint tensors with no parameter: {unused:?}"
-    );
+    // linear layers are indices 0 and 3, the neck and the one head here.
+    weights::load_pytorch(
+        &mut model,
+        checkpoint(),
+        &[
+            (r"^classifier\.0\.", "neck.0."),
+            (r"^classifier\.3\.", "heads.0."),
+        ],
+    )
+    .expect("checkpoint did not load whole");
     model
 }
 

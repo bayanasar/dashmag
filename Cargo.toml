@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dash-core", "crates/dash-image", "crates/dash-models", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli"]
+members = ["crates/dash-core", "crates/dash-image", "crates/dash-models", "crates/dash-burn", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli"]
 
 [workspace.package]
 version = "0.0.1"
@@ -13,6 +13,7 @@ rust-version = "1.95"
 dash-core = { path = "crates/dash-core", version = "0.0.1" }
 dash-image = { path = "crates/dash-image", version = "0.0.1" }
 dash-models = { path = "crates/dash-models", version = "0.0.1" }
+dash-burn = { path = "crates/dash-burn", version = "0.0.1" }
 dash-tract = { path = "crates/dash-tract", version = "0.0.1" }
 dash-iree = { path = "crates/dash-iree", version = "0.0.1" }
 dash-tensorrt = { path = "crates/dash-tensorrt", version = "0.0.1" }

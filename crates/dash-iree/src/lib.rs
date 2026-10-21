@@ -54,6 +54,7 @@ impl IreeRuntime {
                 dynamic_shapes: false,
                 quantized: false,
                 no_std: false,
+                architectures: &[],
             },
         }
     }

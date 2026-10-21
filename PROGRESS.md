@@ -21,7 +21,7 @@ On `main`, and re-runnable by anyone who checks it out.
 - IREE agrees with tract per logit (1e-3) on x86-64 CPU, Tesla T4, RTX 2060, Orin Nano CPU and GPU (sm_87) — conformance test, `DASH_IREE_REQUIRE_CUDA=1` on the board run.
 - Five-output models agree across tract, IREE CPU/CUDA and TensorRT on the Orin Nano — five-head conformance test, at the earlier fixture widths (4, 6, 6, 4, 4).
 - Five-output models at the deployed widths (3, 3, 3, 2, 2) agree across tract and IREE CPU on x86-64 — `cargo test -p dash-cli --features iree -- --ignored`, 2 of 2 conformance tests green on `main` (2026-10-20), fixtures from `tools/export_multihead.py`.
-- Burn's MobileNetV3-Small (`dash-models`) is torchvision's: torchvision's published ImageNet checkpoint, read directly by burn-store, gives 258 @ 11.728306 on the recorded input on Flex (x86-64), and every one of the 1000 logits is within 2.6e-5 of tract on that input and within 2.2e-5 through `dash-image` — `cargo test -p dash-models -- --ignored`, with the checkpoint fetched as the test's docs say.
+- Burn's MobileNetV3-Small (`dash-models`) is torchvision's: torchvision's published ImageNet checkpoint, read directly by burn-store, gives 258 @ 11.728306 on the recorded input on Flex (x86-64), and every one of the 1000 logits is within 2.6e-5 of tract on that input and within 2.2e-5 through `dash-image` — `cargo test -p dash-models --features pytorch -- --ignored`, with the checkpoint fetched as the test's docs say. Through the `dash-core` trait too: the same weights written to safetensors and loaded by `dash-burn` as an artifact, chosen by the registry, give the same 258 @ 11.728306 and 2.6e-5 against tract — `cargo test -p dash-burn -- --ignored`; without fixtures, `cargo test -p dash-burn` holds the artifact path to the module bit for bit.
 - `--image` resizes exactly as Pillow does — byte-for-byte on Pillow's decoded pixels (2 synthetic cases, a public test image, 30 real 1280x854 frames); decode differs from libjpeg-turbo by at most 2 levels after resize. The code is the `dash-image` crate; `cargo test -p dash-image -- --include-ignored` runs the synthetic and public-image cases.
 
 ## Not sealed
@@ -29,7 +29,7 @@ On `main`, and re-runnable by anyone who checks it out.
 - `--image` on a board — missing; a decoder or resize difference on aarch64 would surface here first.
 - Edge TPU with more than one output — never run (no int8 `.tflite` exists).
 - tract 0.23 on the boards — the board results above ran tract 0.21. On x86-64, 0.23.9 returns the same bits as 0.21.17 for the MobileNetV3 and five-head fixtures; its aarch64 kernels have not run on a board.
-- Burn on a board, and on CUDA — missing; the static aarch64-musl build of the same test links (Flex needs no C), but has not run on an aarch64 CPU yet.
+- Burn on a board, and on CUDA — missing; the static aarch64-musl build of the same test links (Flex needs no C), but has not run on an aarch64 CPU yet. The CUDA, ROCm and Metal builds compile; none has run. Burn 0.22 runs f32 matmuls and convolutions in TF32 on CUDA GPUs of compute capability 8.0 and later and has no switch to stop it, so a CUDA result there is a TF32 result.
 - `no_std` floor — not built at all; the MCU claim is unproven.
 
 ## Decisions
@@ -37,9 +37,10 @@ On `main`, and re-runnable by anyone who checks it out.
 - 2026-10-13 Commits carry a GitHub noreply address and merges are fast-forward only — because a forge-made merge commit publishes the merging account's address, which a pull-request check cannot see.
 - 2026-10-13 zune-jpeg is built without SIMD — so the host and every board decode through the same scalar code.
 - 2026-10-20 Models are defined, trained and run in Rust on Burn; Python, torch.export, iree-turbine and IREE retire; ONNX and int8 tflite become exits written from Rust for TensorRT and the Edge TPU compiler — because one definition that both trains and runs has no format crossing to prove equal, and every board result so far had to be proven across one. The torch.export-on-a-board item is retired with it, not pending.
+- 2026-10-20 A Burn model's weights are stored as safetensors in PyTorch's convention (PyTorch's parameter names and layouts) — because such a file is also a PyTorch `state_dict` that any tool reads, and Burn's own record format stopped loading across 0.21 to 0.22.
 - 2026-10-20 tract moves from 0.21 to 0.23 — because tract 0.21.11 to 0.21.19 pin `half` to exactly 2.4.1 while Burn 0.22 needs 2.7.1 or later; one lockfile cannot hold both, and cargo's only other answer was to fall back to tract 0.21.10.
 
 ## Open
-- Next: `dash-core` running on Burn (CPU, CUDA, ROCm, Metal) — a `dash-burn` runtime over `dash-models`. Image preprocessing is already one crate, `dash-image`, for training and inference to share; the workspace is on Rust 1.95 and edition 2024, which Burn 0.22 needs.
+- Next: `dash` running Burn artifacts, reading the model's description (`model.json`: architecture, class names per output, outputs undefined under a condition) — `dash-burn` is behind the trait, the CLI does not offer it yet. Image preprocessing is already one crate, `dash-image`, for training and inference to share; the workspace is on Rust 1.95 and edition 2024, which Burn 0.22 needs.
 - IREE stays until Burn covers its targets, then is archived; tract stays only as an independent check over the exported ONNX.
 - `main` is not protected on the forge; the no-direct-push rule is a convention.

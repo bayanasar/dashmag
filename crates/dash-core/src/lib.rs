@@ -49,6 +49,8 @@ impl std::error::Error for Error {}
 /// Which backend produced and can consume an artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendKind {
+    /// The model is code (a Burn module); the artifact carries only its weights.
+    Burn,
     Iree,
     Tract,
     EdgeTpu,
@@ -60,6 +62,7 @@ pub enum BackendKind {
 pub enum AccelClass {
     Cpu,
     Cuda,
+    Rocm,
     Vulkan,
     Metal,
     VendorNpu,
@@ -111,6 +114,10 @@ pub struct Capability {
     pub quantized: bool,
     /// True only for a backend that can build without `std`.
     pub no_std: bool,
+    /// For a backend that builds the model from code and loads only weights: the
+    /// architectures compiled into it. Such a backend needs [`ArtifactMeta::model`] to know
+    /// what to build. Empty for a backend whose artifact carries its own graph.
+    pub architectures: &'static [&'static str],
 }
 
 impl Capability {
@@ -126,6 +133,20 @@ impl Capability {
         }
         if meta.dynamic_shapes && !self.dynamic_shapes {
             return Err("artifact needs dynamic shapes, backend is static-shape only".to_string());
+        }
+        if !self.architectures.is_empty() {
+            let Some(model) = &meta.model else {
+                return Err(
+                    "backend builds the model from code and needs meta.model, which is absent"
+                        .to_string(),
+                );
+            };
+            if !self.architectures.contains(&model.arch.as_str()) {
+                return Err(format!(
+                    "architecture {:?} is not compiled into this backend (it has {:?})",
+                    model.arch, self.architectures
+                ));
+            }
         }
         for (label, specs) in [("input", &meta.inputs), ("output", &meta.outputs)] {
             for (i, s) in specs.iter().enumerate() {
@@ -177,6 +198,88 @@ pub struct ArtifactMeta {
     pub quantized: bool,
     /// The artifact requires dynamic-shape support at run time.
     pub dynamic_shapes: bool,
+    /// What the model is, for a backend that builds it from code, and what its outputs
+    /// mean, for anyone reading them. `None` for a self-contained graph with unnamed outputs.
+    pub model: Option<ModelSpec>,
+}
+
+/// A model described by name rather than carried as a graph: its architecture, and its
+/// outputs in output order.
+///
+/// A backend that builds models from code ([`Capability::architectures`]) constructs the
+/// architecture with one output per entry of `outputs`, as wide as its class list, and
+/// then loads the artifact's weights into it. Any consumer reads `outputs` to name what
+/// it got, and [`ModelSpec::undefined`] to know which outputs carry no answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelSpec {
+    pub arch: String,
+    pub outputs: Vec<OutputSpec>,
+    pub undefined_when: Vec<UndefinedWhen>,
+}
+
+/// One output of a model: its name and its classes, in logit order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSpec {
+    pub name: String,
+    pub classes: Vec<String>,
+}
+
+/// Output `output` carries no meaning when output `when` takes class `is`. It still returns
+/// logits there, and they look as confident as any others — the condition is the only way
+/// a consumer can know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndefinedWhen {
+    pub output: String,
+    pub when: String,
+    pub is: String,
+}
+
+impl ModelSpec {
+    /// Width of each output, in output order.
+    pub fn widths(&self) -> Vec<usize> {
+        self.outputs.iter().map(|o| o.classes.len()).collect()
+    }
+
+    /// Given each output's top-1 class index, which outputs are undefined.
+    ///
+    /// Errors on a condition naming an output or class the model does not have, and on a
+    /// top-1 list of the wrong length: a condition that can never fire is a broken
+    /// description, not a quiet `false`.
+    pub fn undefined(&self, top1: &[usize]) -> Result<Vec<bool>> {
+        if top1.len() != self.outputs.len() {
+            return Err(Error::Shape(format!(
+                "{} top-1 indices for a model with {} outputs",
+                top1.len(),
+                self.outputs.len()
+            )));
+        }
+        let index = |name: &str| {
+            self.outputs
+                .iter()
+                .position(|o| o.name == name)
+                .ok_or_else(|| {
+                    Error::Shape(format!("undefined_when names unknown output {name:?}"))
+                })
+        };
+        let mut undefined = vec![false; self.outputs.len()];
+        for c in &self.undefined_when {
+            let (target, when) = (index(&c.output)?, index(&c.when)?);
+            let class = self.outputs[when]
+                .classes
+                .iter()
+                .position(|k| *k == c.is)
+                .ok_or_else(|| {
+                    Error::Shape(format!(
+                        "undefined_when: output {:?} has no class {:?}",
+                        c.when, c.is
+                    ))
+                })?;
+            if top1[when] == class {
+                undefined[target] = true;
+            }
+        }
+        Ok(undefined)
+    }
 }
 
 impl ArtifactMeta {
@@ -195,12 +298,15 @@ impl ArtifactMeta {
             outputs: outputs.iter().map(|s| TensorSpec::new(DType::F32, s)).collect(),
             quantized: false,
             dynamic_shapes: false,
+            model: None,
         }
     }
 }
 
-/// An opaque, backend-tagged model artifact produced offline by the build-time
-/// pipeline (`.vmfb`, ONNX/NNEF graph, edgetpu `.tflite`, TensorRT `.engine`).
+/// An opaque, backend-tagged model artifact: a graph file a runtime interprets or a
+/// compiled module (`.vmfb`, ONNX/NNEF graph, edgetpu `.tflite`, TensorRT `.engine`), or
+/// the weights of a model a runtime builds from code (Burn: safetensors, with
+/// [`ArtifactMeta::model`] naming the architecture).
 #[derive(Clone)]
 pub struct Artifact {
     pub backend: BackendKind,
@@ -518,6 +624,7 @@ mod tests {
             dynamic_shapes: false,
             quantized: false,
             no_std,
+            architectures: &[],
         }
     }
 
@@ -665,6 +772,67 @@ mod tests {
     }
 
     // --- output shape uniformity: the whole point of ArtifactMeta ---
+
+    fn attributes() -> ModelSpec {
+        let out = |name: &str, classes: &[&str]| OutputSpec {
+            name: name.to_string(),
+            classes: classes.iter().map(|c| c.to_string()).collect(),
+        };
+        ModelSpec {
+            arch: "mobilenet_v3_small".to_string(),
+            outputs: vec![
+                out("time_of_day", &["daytime", "night", "dawn_dusk"]),
+                out("weather", &["clear", "overcast", "rainy"]),
+            ],
+            undefined_when: vec![UndefinedWhen {
+                output: "weather".to_string(),
+                when: "time_of_day".to_string(),
+                is: "night".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_backend_that_builds_from_code_needs_a_model_it_has() {
+        let mut c = cap(AccelClass::Cpu, false);
+        c.architectures = &["mobilenet_v3_small"];
+        let mut meta = ArtifactMeta::default();
+        let why = c.admits(&meta).unwrap_err();
+        assert!(why.contains("needs meta.model"), "{why}");
+
+        meta.model = Some(ModelSpec {
+            arch: "resnet18".to_string(),
+            ..attributes()
+        });
+        let why = c.admits(&meta).unwrap_err();
+        assert!(why.contains("\"resnet18\" is not compiled"), "{why}");
+
+        meta.model = Some(attributes());
+        assert!(c.admits(&meta).is_ok());
+        // A backend that carries its own graph never reads the description.
+        assert!(cap(AccelClass::Cpu, false).admits(&meta).is_ok());
+    }
+
+    #[test]
+    fn an_output_is_undefined_only_under_its_condition() {
+        let m = attributes();
+        assert_eq!(m.widths(), [3, 3]);
+        assert_eq!(m.undefined(&[1, 2]).unwrap(), [false, true]); // night: weather undefined
+        assert_eq!(m.undefined(&[0, 2]).unwrap(), [false, false]); // daytime
+        assert!(m.undefined(&[1]).is_err(), "wrong number of outputs");
+
+        let mut broken = attributes();
+        broken.undefined_when[0].is = "midnight".to_string();
+        assert!(
+            broken.undefined(&[1, 2]).is_err(),
+            "a class the output does not have"
+        );
+        broken.undefined_when[0].when = "season".to_string();
+        assert!(
+            broken.undefined(&[1, 2]).is_err(),
+            "an output the model does not have"
+        );
+    }
 
     #[test]
     fn f32_shaped_adopts_declared_shape() {

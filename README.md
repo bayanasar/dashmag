@@ -34,6 +34,7 @@ feature-gated crates, so every target compiles only what it can build.
 | [`dash-core`](https://crates.io/crates/dash-core) | traits, tensors, capability negotiation, dispatch | — |
 | [`dash-image`](https://crates.io/crates/dash-image) | image preprocessing: JPEG decode, Pillow-exact bilinear resize, normalisation | byte-exact with Pillow's resize |
 | [`dash-models`](https://crates.io/crates/dash-models) | model architectures as [Burn](https://burn.dev) modules; MobileNetV3-Small with any number of heads | torchvision's weights give torch's answer on Burn's CPU backend |
+| [`dash-burn`](https://crates.io/crates/dash-burn) | [Burn](https://burn.dev): the model built from code, weights loaded, run on Flex (pure-Rust CPU), CUDA, ROCm or Metal | runs on x86-64 CPU (Flex) |
 | [`dash-tract`](https://crates.io/crates/dash-tract) | pure-Rust CPU floor ([tract](https://github.com/sonos/tract)) | runs on x86 and aarch64 |
 | [`dash-iree`](https://crates.io/crates/dash-iree) | compiled artifacts via [IREE](https://iree.dev) (CPU, CUDA) | runs on CPU and CUDA GPUs |
 | [`dash-tensorrt`](https://crates.io/crates/dash-tensorrt) | NVIDIA TensorRT (Jetson GPUs) | runs on Jetson |
