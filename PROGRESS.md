@@ -21,7 +21,7 @@ On `main`, and re-runnable by anyone who checks it out.
 - IREE agrees with tract per logit (1e-3) on x86-64 CPU, Tesla T4, RTX 2060, Orin Nano CPU and GPU (sm_87) — conformance test, `DASH_IREE_REQUIRE_CUDA=1` on the board run.
 - Five-output models agree across tract, IREE CPU/CUDA and TensorRT on the Orin Nano — five-head conformance test, at the earlier fixture widths (4, 6, 6, 4, 4).
 - Five-output models at the deployed widths (3, 3, 3, 2, 2) agree across tract and IREE CPU on x86-64 — `cargo test -p dash-cli --features iree -- --ignored`, 2 of 2 conformance tests green on `main` (2026-10-20), fixtures from `tools/export_multihead.py`.
-- `--image` resizes exactly as Pillow does — byte-for-byte on Pillow's decoded pixels (2 synthetic cases, a public test image, 30 real 1280x854 frames); decode differs from libjpeg-turbo by at most 2 levels after resize.
+- `--image` resizes exactly as Pillow does — byte-for-byte on Pillow's decoded pixels (2 synthetic cases, a public test image, 30 real 1280x854 frames); decode differs from libjpeg-turbo by at most 2 levels after resize. The code is the `dash-image` crate; `cargo test -p dash-image -- --include-ignored` runs the synthetic and public-image cases.
 
 ## Not sealed
 - five-head at the deployed widths on CUDA and on a board — missing; only the x86-64 CPU leg has run at these widths. From here this is measured on Burn, not IREE.
@@ -36,6 +36,6 @@ On `main`, and re-runnable by anyone who checks it out.
 - 2026-10-20 Models are defined, trained and run in Rust on Burn; Python, torch.export, iree-turbine and IREE retire; ONNX and int8 tflite become exits written from Rust for TensorRT and the Edge TPU compiler — because one definition that both trains and runs has no format crossing to prove equal, and every board result so far had to be proven across one. The torch.export-on-a-board item is retired with it, not pending.
 
 ## Open
-- Next: `dash-core` running on Burn (CPU, CUDA, ROCm, Metal), with image preprocessing in one crate that training and inference share.
+- Next: `dash-core` running on Burn (CPU, CUDA, ROCm, Metal). Image preprocessing is already one crate, `dash-image`, for training and inference to share; the workspace is on Rust 1.95 and edition 2024, which Burn 0.22 needs.
 - IREE stays until Burn covers its targets, then is archived; tract stays only as an independent check over the exported ONNX.
 - `main` is not protected on the forge; the no-direct-push rule is a convention.

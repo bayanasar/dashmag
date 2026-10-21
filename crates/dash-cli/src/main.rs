@@ -11,9 +11,6 @@ use dash_core::{
 use std::fs;
 use std::process::ExitCode;
 
-#[cfg(feature = "image")]
-mod preprocess;
-
 /// Map an IREE-style device string to the accelerator class the registry ranks by.
 fn accel_for_device(device: &str) -> AccelClass {
     match device {
@@ -94,12 +91,12 @@ fn image_tensor(
         return Err(format!("--image needs --shape 1,3,H,W, got {shape:?}"));
     };
     let bytes = fs::read(path).map_err(|e| format!("read image {path}: {e}"))?;
-    preprocess::image_input(
+    dash_image::image_input(
         &bytes,
         h,
         w,
-        mean.unwrap_or(preprocess::IMAGENET_MEAN),
-        std.unwrap_or(preprocess::IMAGENET_STD),
+        mean.unwrap_or(dash_image::IMAGENET_MEAN),
+        std.unwrap_or(dash_image::IMAGENET_STD),
     )
 }
 

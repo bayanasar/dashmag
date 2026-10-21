@@ -1,5 +1,9 @@
 //! From an image file to a model input: decode, resize, normalise, NCHW.
 //!
+//! One implementation for everything that feeds a model — the runner at inference time
+//! and a trainer building its frame cache — so the pixels a model learned from and the
+//! pixels it is later given come from the same code.
+//!
 //! A model sees whatever its training preprocessing produced, so the transform here is
 //! not a convenience — it is half of the model's contract. It reproduces Pillow's
 //! `Image.resize(size, Image.BILINEAR)` exactly: the same coefficients, the same 22-bit

@@ -32,6 +32,7 @@ feature-gated crates, so every target compiles only what it can build.
 | Crate | Backend | Status |
 |---|---|---|
 | [`dash-core`](https://crates.io/crates/dash-core) | traits, tensors, capability negotiation, dispatch | — |
+| [`dash-image`](https://crates.io/crates/dash-image) | image preprocessing: JPEG decode, Pillow-exact bilinear resize, normalisation | byte-exact with Pillow's resize |
 | [`dash-tract`](https://crates.io/crates/dash-tract) | pure-Rust CPU floor ([tract](https://github.com/sonos/tract)) | runs on x86 and aarch64 |
 | [`dash-iree`](https://crates.io/crates/dash-iree) | compiled artifacts via [IREE](https://iree.dev) (CPU, CUDA) | runs on CPU and CUDA GPUs |
 | [`dash-tensorrt`](https://crates.io/crates/dash-tensorrt) | NVIDIA TensorRT (Jetson GPUs) | runs on Jetson |
