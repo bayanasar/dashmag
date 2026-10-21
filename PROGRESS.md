@@ -30,7 +30,7 @@ On `main`, and re-runnable by anyone who checks it out.
 - `--image` on a board — missing; a decoder or resize difference on aarch64 would surface here first.
 - Edge TPU with more than one output — never run (no int8 `.tflite` exists).
 - tract 0.23 on the boards — the board results above ran tract 0.21. On x86-64, 0.23.9 returns the same bits as 0.21.17 for the MobileNetV3 and five-head fixtures; its aarch64 kernels have not run on a board.
-- Burn on a board, and on CUDA — missing; the static aarch64-musl build of the same test links (Flex needs no C), but has not run on an aarch64 CPU yet. The CUDA, ROCm and Metal builds compile; none has run. Burn 0.22 runs f32 matmuls and convolutions in TF32 on CUDA GPUs of compute capability 8.0 and later and has no switch to stop it, so a CUDA result there is a TF32 result.
+- Burn on a board, and on CUDA — missing; the static aarch64-musl build of the same test links (Flex needs no C), but has not run on an aarch64 CPU yet. The CUDA, ROCm and Metal builds compile; none has run. Burn 0.22 runs f32 matmuls and convolutions in TF32 on CUDA GPUs of compute capability 8.0 and later; the workspace's patched cubecl-cuda turns that off with `CUBECL_CUDA_TF32=0`, which compiles and has not run.
 - `no_std` floor — not built at all; the MCU claim is unproven.
 
 ## Decisions
@@ -40,8 +40,9 @@ On `main`, and re-runnable by anyone who checks it out.
 - 2026-10-20 Models are defined, trained and run in Rust on Burn; Python, torch.export, iree-turbine and IREE retire; ONNX and int8 tflite become exits written from Rust for TensorRT and the Edge TPU compiler — because one definition that both trains and runs has no format crossing to prove equal, and every board result so far had to be proven across one. The torch.export-on-a-board item is retired with it, not pending.
 - 2026-10-20 A Burn model's weights are stored as safetensors in PyTorch's convention (PyTorch's parameter names and layouts) — because such a file is also a PyTorch `state_dict` that any tool reads, and Burn's own record format stopped loading across 0.21 to 0.22.
 - 2026-10-20 tract moves from 0.21 to 0.23 — because tract 0.21.11 to 0.21.19 pin `half` to exactly 2.4.1 while Burn 0.22 needs 2.7.1 or later; one lockfile cannot hold both, and cargo's only other answer was to fall back to tract 0.21.10.
+- 2026-10-20 TF32 is turned off for comparisons by a patched cubecl-cuda (`patches/cubecl-cuda`, one hunk, opt-in through `CUBECL_CUDA_TF32=0`), not by widening tolerances for it — because every agreement recorded here is per logit at f32 precision, and TF32 rounds each matmul input to 10 mantissa bits. Upstream has the request (https://github.com/tracel-ai/burn/issues/6140); the patch goes when a Burn release has a setting.
 
 ## Open
-- Next on Burn: the CUDA leg, waiting on a free GPU and on how TF32 is handled (Burn 0.22 cannot turn it off); and Flex on an aarch64 CPU. Trained PyTorch weights come in through `dash-import` (checkpoint to `model.safetensors`, strict), and `tests/recorded.rs` holds an imported model to logits its old framework recorded. Image preprocessing is already one crate, `dash-image`, for training and inference to share; the workspace is on Rust 1.95 and edition 2024, which Burn 0.22 needs.
+- Next on Burn: the CUDA leg, waiting on a free GPU, run with `CUBECL_CUDA_TF32=0`; and Flex on an aarch64 CPU. Trained PyTorch weights come in through `dash-import` (checkpoint to `model.safetensors`, strict), and `tests/recorded.rs` holds an imported model to logits its old framework recorded. Image preprocessing is already one crate, `dash-image`, for training and inference to share; the workspace is on Rust 1.95 and edition 2024, which Burn 0.22 needs.
 - IREE stays until Burn covers its targets, then is archived; tract stays only as an independent check over the exported ONNX.
 - `main` is not protected on the forge; the no-direct-push rule is a convention.

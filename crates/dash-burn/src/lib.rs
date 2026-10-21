@@ -14,8 +14,9 @@
 //! run time and need a dynamically linked build.
 //!
 //! On CUDA devices of compute capability 8.0 and later, Burn 0.22 runs f32 matmuls and
-//! convolutions in TF32, and offers no switch to turn that off. Results there are not
-//! fp32 results and are compared as such.
+//! convolutions in TF32 and has no setting to stop it. This workspace builds a patched
+//! cubecl-cuda (`patches/cubecl-cuda`) in which `CUBECL_CUDA_TF32=0` keeps them in IEEE f32;
+//! a CUDA result compared to another backend's is taken with it set.
 //!
 //! Outputs come back as host tensors for now. Burn's tensors live on their device, which
 //! makes this the first backend that could hand back `Tensor::Device`; that is a later step.

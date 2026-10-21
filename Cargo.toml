@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/dash-core", "crates/dash-image", "crates/dash-models", "crates/dash-burn", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli"]
+exclude = ["patches"]
 
 [workspace.package]
 version = "0.0.1"
@@ -21,3 +22,9 @@ dash-edgetpu = { path = "crates/dash-edgetpu", version = "0.0.1" }
 # Pinned exactly: Burn changes its API and its record format between minor releases, and an
 # upgrade is its own change, checked against the same references.
 burn = { version = "=0.22.1", default-features = false, features = ["std"] }
+
+# cubecl-cuda 0.11.1 as published, but for one hunk: `CUBECL_CUDA_TF32=0` keeps f32 matmuls
+# and convolutions in IEEE f32 on compute capability 8.0 and later. Burn has no setting for
+# it yet; when it has, this and `patches/` go (patches/cubecl-cuda/PATCHED.md).
+[patch.crates-io]
+cubecl-cuda = { path = "patches/cubecl-cuda" }
