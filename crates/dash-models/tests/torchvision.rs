@@ -9,6 +9,12 @@
 //! `~/.cache/torch/hub/checkpoints/`), and the fixtures from `tools/export_mobilenet.py`
 //! (overridable via `DASH_FIXTURES`). Then:
 //!   cargo test -p dash-models --features pytorch -- --ignored
+//! For an architecture this machine is not, build the test for it and run it under qemu's
+//! user mode, which can pin the CPU model — a Cortex-A53 here (needs a musl cross linker):
+//!   cargo test -p dash-models --features pytorch --release \
+//!     --target aarch64-unknown-linux-musl --no-run
+//!   qemu-aarch64 -cpu cortex-a53 target/aarch64-unknown-linux-musl/release/deps/torchvision-* \
+//!     --ignored
 
 use burn::tensor::{Device, Tensor, TensorData};
 use dash_core::{
@@ -25,7 +31,7 @@ const REF_LOGIT: f32 = 11.7283;
 /// Per logit, against tract on the same input. tract runs torch's ONNX export, in which
 /// batch norm is folded into the convolutions; Burn runs them unfolded. Measured on x86-64
 /// (2026-10-20), over all 1000 logits: 2.6e-5 on the recorded input, 2.2e-5 through
-/// dash-image.
+/// dash-image; on aarch64 under qemu's Cortex-A53, 2.3e-5 and 2.0e-5.
 const TOLERANCE: f32 = 1e-4;
 
 fn fixtures_dir() -> PathBuf {
