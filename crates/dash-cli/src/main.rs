@@ -205,6 +205,20 @@ fn run() -> Result<(), String> {
     let shape = shape
         .or_else(|| desc.as_ref().and_then(|d| d.input.clone()))
         .unwrap_or_else(|| vec![1, 3, 224, 224]);
+    // A flag that contradicts the model's recorded preprocessing is almost always a mistake,
+    // and what it produces is a confident wrong answer, so it is said out loud.
+    if image.is_some() {
+        for (flag, given, recorded) in [
+            ("--mean", mean, desc.as_ref().and_then(|d| d.mean)),
+            ("--std", std, desc.as_ref().and_then(|d| d.std)),
+        ] {
+            if let (Some(g), Some(r)) = (given, recorded)
+                && g.iter().zip(&r).any(|(a, b)| (a - b).abs() > 1e-6)
+            {
+                eprintln!("warning: {flag} {g:?} overrides the model's recorded {r:?}");
+            }
+        }
+    }
     let mean = mean.or_else(|| desc.as_ref().and_then(|d| d.mean));
     let std = std.or_else(|| desc.as_ref().and_then(|d| d.std));
     if let (true, Some(d)) = (out_shapes.is_empty(), &desc) {

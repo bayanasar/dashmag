@@ -104,6 +104,39 @@ fn outputs_are_named_and_the_undefined_one_is_not_answered() {
 }
 
 #[test]
+fn a_flag_that_contradicts_the_recorded_preprocessing_is_warned_about() {
+    let meta = tmp("pre.json");
+    let text = description("night").replace(
+        r#""input": [1, 3, 64, 64],"#,
+        r#""input": [1, 3, 64, 64],
+  "preprocessing": {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]},"#,
+    );
+    fs::write(&meta, text).unwrap();
+    let stderr = |extra: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_dash"))
+            .args(["--backend", "tract", "--model"])
+            .arg(fixtures_dir().join("mh5.onnx"))
+            .arg("--image")
+            .arg(fixtures_dir().join("dog.jpg"))
+            .arg("--meta")
+            .arg(&meta)
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stderr).unwrap()
+    };
+    let wrong = stderr(&["--mean", "0.5,0.5,0.5"]);
+    let same = stderr(&["--mean", "0.485,0.456,0.406"]);
+    let none = stderr(&[]);
+    fs::remove_file(&meta).ok();
+    assert!(wrong.contains("warning: --mean [0.5, 0.5, 0.5] overrides"), "{wrong}");
+    assert!(!wrong.contains("--std"), "{wrong}");
+    assert!(!same.contains("warning"), "{same}");
+    assert!(!none.contains("warning"), "{none}");
+}
+
+#[test]
 fn a_description_that_does_not_fit_the_model_is_refused() {
     let meta = tmp("bad.json");
     fs::write(&meta, description("midnight")).unwrap();
