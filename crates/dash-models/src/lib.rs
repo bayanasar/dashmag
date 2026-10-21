@@ -50,6 +50,19 @@ impl Model {
         }
     }
 
+    /// See [`weights::load_pytorch`].
+    #[cfg(feature = "pytorch")]
+    pub fn load_pytorch(
+        &mut self,
+        path: impl Into<std::path::PathBuf>,
+        key: Option<&str>,
+        remap: &[(&str, &str)],
+    ) -> Result<(), String> {
+        match self {
+            Model::MobileNetV3Small(m) => weights::load_pytorch(m, path, key, remap),
+        }
+    }
+
     pub fn to_safetensors(&self) -> Result<Vec<u8>, String> {
         match self {
             Model::MobileNetV3Small(m) => weights::to_safetensors(m),

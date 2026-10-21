@@ -8,10 +8,9 @@ use dash_core::{
     argmax, AccelClass, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Registry,
     TensorSpec, TargetProfile, Tensor,
 };
+use dash_cli::model_json;
 use std::fs;
 use std::process::ExitCode;
-
-mod model_json;
 
 /// Map an IREE-style device string to the accelerator class the registry ranks by.
 fn accel_for_device(device: &str) -> AccelClass {

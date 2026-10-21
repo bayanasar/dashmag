@@ -50,6 +50,7 @@ fn imagenet_model(device: &Device) -> MobileNetV3Small {
     weights::load_pytorch(
         &mut model,
         checkpoint(),
+        None,
         &[
             (r"^classifier\.0\.", "neck.0."),
             (r"^classifier\.3\.", "heads.0."),

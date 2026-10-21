@@ -42,6 +42,6 @@ On `main`, and re-runnable by anyone who checks it out.
 - 2026-10-20 tract moves from 0.21 to 0.23 — because tract 0.21.11 to 0.21.19 pin `half` to exactly 2.4.1 while Burn 0.22 needs 2.7.1 or later; one lockfile cannot hold both, and cargo's only other answer was to fall back to tract 0.21.10.
 
 ## Open
-- Next on Burn: the CUDA leg, waiting on a free GPU and on how TF32 is handled (Burn 0.22 cannot turn it off); Flex on an aarch64 CPU; and importing trained PyTorch weights into `model.safetensors` + `model.json` from the command line. Image preprocessing is already one crate, `dash-image`, for training and inference to share; the workspace is on Rust 1.95 and edition 2024, which Burn 0.22 needs.
+- Next on Burn: the CUDA leg, waiting on a free GPU and on how TF32 is handled (Burn 0.22 cannot turn it off); and Flex on an aarch64 CPU. Trained PyTorch weights come in through `dash-import` (checkpoint to `model.safetensors`, strict), and `tests/recorded.rs` holds an imported model to logits its old framework recorded. Image preprocessing is already one crate, `dash-image`, for training and inference to share; the workspace is on Rust 1.95 and edition 2024, which Burn 0.22 needs.
 - IREE stays until Burn covers its targets, then is archived; tract stays only as an independent check over the exported ONNX.
 - `main` is not protected on the forge; the no-direct-push rule is a convention.

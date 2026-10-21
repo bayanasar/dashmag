@@ -53,17 +53,23 @@ pub fn load_safetensors<M: ModuleSnapshot>(model: &mut M, bytes: Vec<u8>) -> Res
     check(model.load_from(&mut store).map_err(|e| e.to_string())?)
 }
 
-/// Fill `model` from a PyTorch checkpoint (`.pth`), read in Rust. `remap` renames tensors
-/// first, as `(regex, replacement)` pairs, for checkpoints whose names differ from the
-/// module's (torchvision's `classifier.0` and `classifier.3`, for one).
+/// Fill `model` from a PyTorch checkpoint (`.pth`), read in Rust. `key` selects the entry
+/// holding the weights when the checkpoint is a dictionary of more than weights (a
+/// training checkpoint's `state_dict`). `remap` renames tensors first, as
+/// `(regex, replacement)` pairs, for checkpoints whose names differ from the module's
+/// (torchvision's `classifier.0` and `classifier.3`, for one).
 #[cfg(feature = "pytorch")]
 pub fn load_pytorch<M: ModuleSnapshot>(
     model: &mut M,
     path: impl Into<std::path::PathBuf>,
+    key: Option<&str>,
     remap: &[(&str, &str)],
 ) -> Result<(), String> {
     // Indices stay as written: renumbering gaps would move torchvision's `classifier.3`.
     let mut store = burn::store::PytorchStore::from_file(path).map_indices_contiguous(false);
+    if let Some(key) = key {
+        store = store.with_top_level_key(key);
+    }
     for (from, to) in remap {
         store = store.with_key_remapping(*from, *to);
     }

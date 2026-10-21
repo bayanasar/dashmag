@@ -50,6 +50,7 @@ fn burn_artifact_answers_as_tract_does_through_the_registry() {
     weights::load_pytorch(
         &mut module,
         checkpoint(),
+        None,
         &[
             (r"^classifier\.0\.", "neck.0."),
             (r"^classifier\.3\.", "heads.0."),

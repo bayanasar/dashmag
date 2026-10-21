@@ -14,6 +14,11 @@ rust-version.workspace = true
 name = "dash"
 path = "src/main.rs"
 
+[[bin]]
+name = "dash-import"
+path = "src/bin/dash-import.rs"
+required-features = ["import"]
+
 [features]
 default = ["tract", "image"]
 tract = ["dep:dash-tract"]
@@ -30,6 +35,8 @@ burn = ["dep:dash-burn"]
 burn-cuda = ["burn", "dash-burn/cuda"]
 burn-rocm = ["burn", "dash-burn/rocm"]
 burn-metal = ["burn", "dash-burn/metal"]
+# `dash-import`: a PyTorch checkpoint to model.safetensors, for a model dash-models builds.
+import = ["dep:dash-models", "dash-models/pytorch", "dep:burn", "burn/flex"]
 
 [dependencies]
 dash-core = { workspace = true }
@@ -39,6 +46,8 @@ dash-tensorrt = { workspace = true, optional = true }
 dash-edgetpu = { workspace = true, optional = true }
 dash-image = { workspace = true, optional = true }
 dash-burn = { workspace = true, optional = true }
+dash-models = { workspace = true, optional = true }
+burn = { workspace = true, optional = true }
 serde_json = "1"
 
 [dev-dependencies]
@@ -49,3 +58,7 @@ dash-models = { workspace = true }
 [[test]]
 name = "burn"
 required-features = ["burn"]
+
+[[test]]
+name = "recorded"
+required-features = ["burn", "image"]
