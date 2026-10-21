@@ -1,0 +1,20 @@
+[package]
+name = "dash-models"
+description = "Model architectures for Dashmag as Burn modules, named so that published PyTorch weights load unchanged."
+readme = "README.md"
+keywords = ["burn", "mobilenet", "edge", "machine-learning", "inference"]
+categories = ["science", "computer-vision"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+burn = { workspace = true }
+
+[dev-dependencies]
+burn = { workspace = true, features = ["flex", "pytorch"] }
+dash-core = { workspace = true }
+dash-image = { workspace = true }
+dash-tract = { workspace = true }

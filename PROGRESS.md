@@ -21,6 +21,7 @@ On `main`, and re-runnable by anyone who checks it out.
 - IREE agrees with tract per logit (1e-3) on x86-64 CPU, Tesla T4, RTX 2060, Orin Nano CPU and GPU (sm_87) — conformance test, `DASH_IREE_REQUIRE_CUDA=1` on the board run.
 - Five-output models agree across tract, IREE CPU/CUDA and TensorRT on the Orin Nano — five-head conformance test, at the earlier fixture widths (4, 6, 6, 4, 4).
 - Five-output models at the deployed widths (3, 3, 3, 2, 2) agree across tract and IREE CPU on x86-64 — `cargo test -p dash-cli --features iree -- --ignored`, 2 of 2 conformance tests green on `main` (2026-10-20), fixtures from `tools/export_multihead.py`.
+- Burn's MobileNetV3-Small (`dash-models`) is torchvision's: torchvision's published ImageNet checkpoint, read directly by burn-store, gives 258 @ 11.728306 on the recorded input on Flex (x86-64), and every one of the 1000 logits is within 2.6e-5 of tract on that input and within 2.2e-5 through `dash-image` — `cargo test -p dash-models -- --ignored`, with the checkpoint fetched as the test's docs say.
 - `--image` resizes exactly as Pillow does — byte-for-byte on Pillow's decoded pixels (2 synthetic cases, a public test image, 30 real 1280x854 frames); decode differs from libjpeg-turbo by at most 2 levels after resize. The code is the `dash-image` crate; `cargo test -p dash-image -- --include-ignored` runs the synthetic and public-image cases.
 
 ## Not sealed
@@ -28,6 +29,7 @@ On `main`, and re-runnable by anyone who checks it out.
 - `--image` on a board — missing; a decoder or resize difference on aarch64 would surface here first.
 - Edge TPU with more than one output — never run (no int8 `.tflite` exists).
 - tract 0.23 on the boards — the board results above ran tract 0.21. On x86-64, 0.23.9 returns the same bits as 0.21.17 for the MobileNetV3 and five-head fixtures; its aarch64 kernels have not run on a board.
+- Burn on a board, and on CUDA — missing; the static aarch64-musl build of the same test links (Flex needs no C), but has not run on an aarch64 CPU yet.
 - `no_std` floor — not built at all; the MCU claim is unproven.
 
 ## Decisions
@@ -38,6 +40,6 @@ On `main`, and re-runnable by anyone who checks it out.
 - 2026-10-20 tract moves from 0.21 to 0.23 — because tract 0.21.11 to 0.21.19 pin `half` to exactly 2.4.1 while Burn 0.22 needs 2.7.1 or later; one lockfile cannot hold both, and cargo's only other answer was to fall back to tract 0.21.10.
 
 ## Open
-- Next: `dash-core` running on Burn (CPU, CUDA, ROCm, Metal). Image preprocessing is already one crate, `dash-image`, for training and inference to share; the workspace is on Rust 1.95 and edition 2024, which Burn 0.22 needs.
+- Next: `dash-core` running on Burn (CPU, CUDA, ROCm, Metal) — a `dash-burn` runtime over `dash-models`. Image preprocessing is already one crate, `dash-image`, for training and inference to share; the workspace is on Rust 1.95 and edition 2024, which Burn 0.22 needs.
 - IREE stays until Burn covers its targets, then is archived; tract stays only as an independent check over the exported ONNX.
 - `main` is not protected on the forge; the no-direct-push rule is a convention.
