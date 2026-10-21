@@ -68,10 +68,13 @@ impl BurnRuntime {
         Self::on(Device::rocm(index), AccelClass::Rocm)
     }
 
-    /// A Metal device.
+    /// The default Metal device.
     #[cfg(feature = "metal")]
-    pub fn metal(kind: burn::tensor::DeviceKind) -> Self {
-        Self::on(Device::metal(kind), AccelClass::Metal)
+    pub fn metal() -> Self {
+        Self::on(
+            Device::metal(burn::tensor::DeviceKind::DefaultDevice),
+            AccelClass::Metal,
+        )
     }
 }
 

@@ -2227,10 +2227,13 @@ dependencies = [
 name = "dash-cli"
 version = "0.0.1"
 dependencies = [
+ "burn",
+ "dash-burn",
  "dash-core",
  "dash-edgetpu",
  "dash-image",
  "dash-iree",
+ "dash-models",
  "dash-tensorrt",
  "dash-tract",
  "serde_json",

@@ -24,6 +24,12 @@ edgetpu = ["dep:dash-edgetpu"]
 accelerators = ["tensorrt", "edgetpu"]
 # `--image`: decode and preprocess a JPEG in Rust instead of taking a prepared tensor
 image = ["dep:dash-image"]
+# Burn: models built from code, weights loaded. `burn` is Flex, the pure-Rust CPU device;
+# each GPU device is its own feature and needs a dynamically linked build.
+burn = ["dep:dash-burn"]
+burn-cuda = ["burn", "dash-burn/cuda"]
+burn-rocm = ["burn", "dash-burn/rocm"]
+burn-metal = ["burn", "dash-burn/metal"]
 
 [dependencies]
 dash-core = { workspace = true }
@@ -32,6 +38,14 @@ dash-iree = { workspace = true, optional = true }
 dash-tensorrt = { workspace = true, optional = true }
 dash-edgetpu = { workspace = true, optional = true }
 dash-image = { workspace = true, optional = true }
+dash-burn = { workspace = true, optional = true }
+serde_json = "1"
 
 [dev-dependencies]
 serde_json = "1"
+burn = { workspace = true, features = ["flex"] }
+dash-models = { workspace = true }
+
+[[test]]
+name = "burn"
+required-features = ["burn"]
