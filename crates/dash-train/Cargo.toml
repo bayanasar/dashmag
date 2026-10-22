@@ -1,0 +1,33 @@
+[package]
+name = "dash-train"
+description = "Train multi-head classifiers in Rust on any Burn device, to the recipe a PyTorch run used."
+readme = "README.md"
+keywords = ["burn", "training", "classification", "machine-learning"]
+categories = ["science"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dash-train"
+path = "src/main.rs"
+
+[features]
+default = ["flex"]
+# Flex trains on every core with SIMD; without `simd` and `rayon` it runs scalar on one core.
+flex = ["burn/flex", "burn/simd", "burn/rayon"]
+cuda = ["burn/cuda"]
+rocm = ["burn/rocm"]
+metal = ["burn/metal"]
+
+[dependencies]
+burn = { workspace = true, features = ["autodiff", "optim"] }
+dash-core = { workspace = true }
+dash-image = { workspace = true }
+# The published PyTorch checkpoint a run starts from is read directly.
+dash-models = { workspace = true, features = ["pytorch"] }
+# Only the library: the model description, read and written in one format.
+dash-cli = { path = "../dash-cli", version = "0.0.1", default-features = false }
+serde_json = "1"
