@@ -13,8 +13,10 @@ rust-version.workspace = true
 [features]
 default = ["flex"]
 # One feature per Burn device. Flex is pure Rust and the only one a static musl binary can
-# hold; the GPU devices load their vendor's shared libraries at run time.
-flex = ["burn/flex"]
+# hold; the GPU devices load their vendor's shared libraries at run time. Flex names `simd`
+# and `rayon` itself: without them it runs scalar on one core, and a crate that depends on
+# them elsewhere in the build would otherwise decide which kernels this one runs.
+flex = ["burn/flex", "burn/simd", "burn/rayon"]
 cuda = ["burn/cuda"]
 rocm = ["burn/rocm"]
 metal = ["burn/metal"]
