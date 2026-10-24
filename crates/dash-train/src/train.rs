@@ -1,5 +1,5 @@
-//! The training run: epochs over the training split, validation after each, the best
-//! epoch kept.
+//! The training run: epochs over the training split, validation after each, every epoch's
+//! weights kept and the best epoch's beside them.
 //!
 //! Burn switches batch norm and dropout by device, not by a call: a module whose tensors
 //! are on an autodiff device trains (batch statistics, dropout on), and
@@ -224,15 +224,16 @@ pub fn score(spec: &ModelSpec, split: &Split, pred: &[Vec<usize>]) -> (Value, f6
     (Value::Object(report), mean)
 }
 
-fn save(
+/// `model` after `epoch` as `model.safetensors` and `model.json` hold it: the weights, and
+/// the description with what the run adds.
+fn snapshot(
     run: &Run,
     model: &MobileNetV3Small,
     epoch: usize,
     report: &Value,
     steps: usize,
-) -> Result<(), String> {
+) -> Result<(Vec<u8>, String), String> {
     let bytes = weights::to_safetensors(&model.valid())?;
-    fs::write(run.out.join("model.safetensors"), bytes).map_err(|e| e.to_string())?;
     let mut d = run.description.clone();
     let r = &run.recipe;
     d["arch"] = json!(run.spec.arch);
@@ -259,12 +260,24 @@ fn save(
     d["val_mean_macro_f1"] = report["mean_macro_f1"].clone();
     d["val"] = report.clone();
     let text = serde_json::to_string_pretty(&d).map_err(|e| e.to_string())?;
-    fs::write(run.out.join("model.json"), text + "\n").map_err(|e| e.to_string())
+    Ok((bytes, text + "\n"))
 }
 
-/// Train, validating after each epoch; the best epoch's weights and description are
-/// written to `run.out` as `model.safetensors` and `model.json`, and every epoch's report
-/// is appended to `metrics.jsonl`.
+fn save(dir: &Path, (bytes, text): &(Vec<u8>, String)) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    fs::write(dir.join("model.safetensors"), bytes).map_err(|e| e.to_string())?;
+    fs::write(dir.join("model.json"), text).map_err(|e| e.to_string())
+}
+
+/// Where epoch `epoch` (counted from 0, as `metrics.jsonl` counts it) is kept.
+pub fn epoch_dir(out: &Path, epoch: usize) -> PathBuf {
+    out.join("epochs").join(format!("{epoch:02}"))
+}
+
+/// Train, validating after each epoch. Each epoch's weights and description are written
+/// to [`epoch_dir`] as `model.safetensors` and `model.json`, so that runs can be compared
+/// at a fixed epoch as well as at the one each selected; the best epoch's are written to
+/// `run.out` as well, and every epoch's report is appended to `metrics.jsonl`.
 pub fn train(run: &Run) -> Result<Outcome, String> {
     let r = &run.recipe;
     let heads = run.spec.outputs.len();
@@ -413,10 +426,12 @@ pub fn train(run: &Run) -> Result<Outcome, String> {
                 report["seconds"],
                 report["seconds_per_step"],
             );
+            let snap = snapshot(run, &model, epoch, &report, step)?;
+            save(&epoch_dir(&run.out, epoch), &snap)?;
             if mean > best {
                 best = mean;
                 best_epoch = Some(epoch);
-                save(run, &model, epoch, &report, step)?;
+                save(&run.out, &snap)?;
             }
         }
         drop(rx);
