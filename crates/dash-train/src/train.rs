@@ -14,8 +14,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use burn::module::{Module, ParamGroup};
-use burn::optim::lr_scheduler::module_lr_scheduler::ModuleLrScheduler;
-use burn::optim::{GradientsParams, ModuleOptimizer};
+use burn::optim::GradientsParams;
 use burn::tensor::{Device, Tensor, TensorData};
 use dash_cli::model_json;
 use dash_core::ModelSpec;
@@ -25,9 +24,9 @@ use serde_json::{Value, json};
 use crate::data::{Augment, Batch, Split, batch};
 use crate::loss::{self, ClassWeight, IGNORE};
 use crate::metrics::{argmax, macro_f1, round4};
-use crate::optim::{AdamW, Beta1};
+use crate::optim::OneCycleAdamW;
 use crate::rng::Rng;
-use crate::schedule::{OneCycle, OneCycleLr};
+use crate::schedule::OneCycle;
 
 /// The recipe. Defaults are the PyTorch recipe this crate reproduces.
 #[derive(Clone, Debug)]
@@ -302,18 +301,13 @@ pub fn train(run: &Run) -> Result<Outcome, String> {
         ));
     }
     let total = r.epochs * per_epoch;
-    let heads_schedule = OneCycle::new(r.lr, total, r.pct_start);
-    let backbone = ParamGroup::ids_from_module(model.features.clone());
-    let mut scheduler = ModuleLrScheduler::new(OneCycleLr::new(heads_schedule.clone())).with_group(
-        backbone,
-        OneCycleLr::new(OneCycle::new(
-            r.lr * r.backbone_lr_scale,
-            total,
-            r.pct_start,
-        )),
+    // The heads and the neck on the recipe's peak; the backbone on its own, lower one.
+    let mut optim = OneCycleAdamW::new(
+        OneCycle::new(r.lr, total, r.pct_start),
+        ParamGroup::ids_from_module(model.features.clone()),
+        OneCycle::new(r.lr * r.backbone_lr_scale, total, r.pct_start),
+        r.weight_decay,
     );
-    let beta1 = Beta1::new(heads_schedule.max_momentum);
-    let mut optim = ModuleOptimizer::from(AdamW::new(r.weight_decay, beta1.clone()));
     let infer = run.device.clone().without_autodiff();
 
     println!(
@@ -392,8 +386,7 @@ pub fn train(run: &Run) -> Result<Outcome, String> {
                     .try_to_vec::<f32>()
                     .map_err(|e| format!("{e:?}"))?[0];
                 let grads = GradientsParams::from_grads(loss.backward(), &model);
-                beta1.set(heads_schedule.at(step).1);
-                model = optim.step(scheduler.step(), model, grads);
+                model = optim.step(model, grads);
                 total_loss += f64::from(value);
                 count += 1;
                 step += 1;

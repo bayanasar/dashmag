@@ -5,7 +5,8 @@
 //! the noise of training and not by a different recipe:
 //! - [`loss`]: cross-entropy per head, class-weighted, masked targets dropped, reduced as
 //!   PyTorch's weighted mean; the heads with a target in the batch averaged.
-//! - [`optim`]: AdamW as `torch.optim.AdamW` computes it, with beta1 set per step.
+//! - [`optim`]: AdamW as `torch.optim.AdamW` computes it, with beta1 set per step; with
+//!   the schedules attached, held to PyTorch over a whole schedule.
 //! - [`schedule`]: `OneCycleLR` — learning rate per parameter group, and beta1.
 //! - [`metrics`]: macro-F1 per head on validation, rounded as the recipe rounds it before
 //!   it picks the best epoch.
