@@ -2309,6 +2309,8 @@ dependencies = [
  "dash-core",
  "dash-image",
  "dash-models",
+ "rayon",
+ "safetensors 0.8.0",
  "serde_json",
 ]
 

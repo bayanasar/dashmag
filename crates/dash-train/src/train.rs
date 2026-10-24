@@ -277,6 +277,10 @@ pub fn epoch_dir(out: &Path, epoch: usize) -> PathBuf {
 /// to [`epoch_dir`] as `model.safetensors` and `model.json`, so that runs can be compared
 /// at a fixed epoch as well as at the one each selected; the best epoch's are written to
 /// `run.out` as well, and every epoch's report is appended to `metrics.jsonl`.
+///
+/// The seed fixes the weights, whatever the number of threads. On Flex the initial weights
+/// and the dropout masks come from one generator per process, which this seeds, so two runs
+/// at once in one process interleave their draws and neither is reproducible.
 pub fn train(run: &Run) -> Result<Outcome, String> {
     let r = &run.recipe;
     let heads = run.spec.outputs.len();
