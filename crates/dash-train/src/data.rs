@@ -103,6 +103,8 @@ pub struct Split {
     pub width: usize,
     /// `targets[i][h]`: frame `i`'s class index on head `h`.
     pub targets: Vec<Vec<i64>>,
+    /// Frame `i`'s row's `image`, the path it was decoded from, where the row has one.
+    pub image_paths: Vec<Option<String>>,
 }
 
 impl Split {
@@ -115,6 +117,7 @@ impl Split {
         let reader =
             BufReader::new(File::open(&rows).map_err(|e| format!("{}: {e}", rows.display()))?);
         let mut targets = Vec::with_capacity(len);
+        let mut image_paths = Vec::with_capacity(len);
         for (i, line) in reader.lines().enumerate() {
             let line = line.map_err(|e| e.to_string())?;
             if line.trim().is_empty() {
@@ -137,6 +140,7 @@ impl Split {
                 ));
             }
             targets.push(t);
+            image_paths.push(row["image"].as_str().map(String::from));
         }
         if targets.len() != len {
             return Err(format!(
@@ -153,6 +157,7 @@ impl Split {
             height,
             width,
             targets,
+            image_paths,
         })
     }
 

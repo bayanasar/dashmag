@@ -204,23 +204,18 @@ pub fn predictions(
     device: &Device,
 ) -> Result<String, String> {
     let s = Split::open(cache, split, t.desc.spec.outputs.len())?;
-    let pred = predict(&t.model, &s, t.mean, t.std, batch_size, device)?;
-    let path = cache.join(format!("{split}.jsonl"));
-    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    // The rows `Split::open` read, blank lines skipped as it skips them.
-    let images = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
+    let rows = cache.join(format!("{split}.jsonl"));
+    let images = s
+        .image_paths
+        .iter()
         .enumerate()
-        .map(|(i, line)| {
-            let row: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
-            row["image"].as_str().map(String::from).ok_or(format!(
-                "{} row {}: no image",
-                path.display(),
-                i + 1
-            ))
+        .map(|(i, image)| {
+            image
+                .clone()
+                .ok_or_else(|| format!("{} row {}: no image", rows.display(), i + 1))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let pred = predict(&t.model, &s, t.mean, t.std, batch_size, device)?;
     Ok(written(&t.desc.spec, &images, &pred))
 }
 
