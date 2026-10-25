@@ -30,8 +30,9 @@ fn split(cache: &Path, name: &str, size: usize, targets: &[[i64; 2]], rng: &mut 
 }
 
 /// Flex draws initial weights and dropout masks from one generator per process, which
-/// `train` seeds; two trainings at once would interleave their draws, so the tests take
-/// turns.
+/// `train` seeds, and building a module to load weights into draws from it too; a test
+/// running beside a training would shift its draws, so each test holds this for its whole
+/// body.
 static TRAINING: Mutex<()> = Mutex::new(());
 
 /// A two-epoch run from scratch in batches of `batch`, over a synthetic cache of 32 x 32
@@ -72,11 +73,9 @@ fn run_in(dir: &Path, targets: &[[i64; 2]], batch: usize) -> Run {
 #[test]
 fn every_epoch_is_kept_and_the_best_is_at_the_top() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("every-epoch");
+    let _turn = TRAINING.lock().unwrap_or_else(PoisonError::into_inner);
     let run = run_in(&dir, &[[0, 0], [1, 1], [2, 0], [0, 1]], 2);
-    let outcome = {
-        let _turn = TRAINING.lock().unwrap_or_else(PoisonError::into_inner);
-        train::train(&run).unwrap()
-    };
+    let outcome = train::train(&run).unwrap();
     // The last epoch is not the best, so a run that wrote the top level after every epoch
     // would leave the last one there and fail below.
     assert_eq!(outcome.best_epoch, Some(0));
@@ -130,6 +129,7 @@ fn tensors(path: &Path) -> Vec<(String, String, Vec<usize>, Vec<u8>)> {
 /// enough to split.
 #[test]
 fn the_seed_fixes_the_weights_whatever_the_thread_count() {
+    let _turn = TRAINING.lock().unwrap_or_else(PoisonError::into_inner);
     let targets: Vec<[i64; 2]> = (0..32).map(|i| [i % 3, i % 2]).collect();
     let mut runs = Vec::new();
     for threads in [1, 4] {
@@ -139,7 +139,6 @@ fn the_seed_fixes_the_weights_whatever_the_thread_count() {
             .num_threads(threads)
             .build()
             .unwrap();
-        let _turn = TRAINING.lock().unwrap_or_else(PoisonError::into_inner);
         pool.install(|| train::train(&run)).unwrap();
         runs.push(
             (0..2)
