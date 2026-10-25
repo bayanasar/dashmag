@@ -192,6 +192,58 @@ pub fn predict(
     Ok(pred)
 }
 
+/// Each frame of the cache's `split` with each head's top-1 class, a JSON line a frame in
+/// the cache's order: `{"image": <the row's image>, "predicted": {<head>: <class>, ...}}`,
+/// the heads in the model's order — a model's answers, written down to be scored
+/// elsewhere.
+pub fn predictions(
+    t: &Trained,
+    cache: &Path,
+    split: &str,
+    batch_size: usize,
+    device: &Device,
+) -> Result<String, String> {
+    let s = Split::open(cache, split, t.desc.spec.outputs.len())?;
+    let pred = predict(&t.model, &s, t.mean, t.std, batch_size, device)?;
+    let path = cache.join(format!("{split}.jsonl"));
+    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // The rows `Split::open` read, blank lines skipped as it skips them.
+    let images = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .enumerate()
+        .map(|(i, line)| {
+            let row: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+            row["image"].as_str().map(String::from).ok_or(format!(
+                "{} row {}: no image",
+                path.display(),
+                i + 1
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(written(&t.desc.spec, &images, &pred))
+}
+
+/// What [`predictions`] writes for frames `images`, given `pred[head][frame]`.
+fn written(spec: &ModelSpec, images: &[String], pred: &[Vec<usize>]) -> String {
+    let quoted = |s: &str| serde_json::to_string(s).expect("a string");
+    let mut out = String::new();
+    for (i, image) in images.iter().enumerate() {
+        let classes: Vec<String> = spec
+            .outputs
+            .iter()
+            .zip(pred)
+            .map(|(o, p)| format!("{}: {}", quoted(&o.name), quoted(&o.classes[p[i]])))
+            .collect();
+        out += &format!(
+            "{{\"image\": {}, \"predicted\": {{{}}}}}\n",
+            quoted(image),
+            classes.join(", ")
+        );
+    }
+    out
+}
+
 /// Macro-F1 per head on `split`, rounded as the recipe rounds it, and their mean.
 pub fn score(spec: &ModelSpec, split: &Split, pred: &[Vec<usize>]) -> (Value, f64) {
     let mut report = serde_json::Map::new();
@@ -438,4 +490,36 @@ pub fn train(run: &Run) -> Result<Outcome, String> {
             steps: step,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use dash_core::OutputSpec;
+
+    use super::*;
+
+    #[test]
+    fn each_frame_is_written_with_its_own_classes_in_the_models_head_order() {
+        let head = |name: &str, classes: &[&str]| OutputSpec {
+            name: name.into(),
+            classes: classes.iter().map(|c| c.to_string()).collect(),
+        };
+        let spec = ModelSpec {
+            arch: "mobilenet_v3_small".into(),
+            outputs: vec![head("zone", &["x", "y", "z"]), head("angle", &["p", "q"])],
+            undefined_when: Vec::new(),
+        };
+        let images = [
+            "a.jpg".to_string(),
+            "b \"1\".jpg".to_string(),
+            "c.jpg".to_string(),
+        ];
+        let text = written(&spec, &images, &[vec![2, 0, 1], vec![0, 1, 1]]);
+        assert_eq!(
+            text,
+            "{\"image\": \"a.jpg\", \"predicted\": {\"zone\": \"z\", \"angle\": \"p\"}}\n\
+             {\"image\": \"b \\\"1\\\".jpg\", \"predicted\": {\"zone\": \"x\", \"angle\": \"q\"}}\n\
+             {\"image\": \"c.jpg\", \"predicted\": {\"zone\": \"y\", \"angle\": \"q\"}}\n"
+        );
+    }
 }

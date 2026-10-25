@@ -1,10 +1,12 @@
-//! `dash-train` — decode a training set, train a multi-head classifier, calibrate it.
+//! `dash-train` — decode a training set, train a multi-head classifier, calibrate it, and
+//! write down what it predicts.
 //!
 //! ```text
 //! dash-train cache     --trainset rows.jsonl --root DIR --meta model.json --out CACHE
 //! dash-train train     --cache CACHE --meta model.json --init imagenet.pth --out RUN [--seed N]
 //! dash-train calibrate --model RUN --cache CACHE --head H --class C --out RUN/calibrated
 //! dash-train evaluate  --model RUN --cache CACHE [--split val]
+//! dash-train predict   --model RUN --cache CACHE --split NAME [--split ...] --out FILE
 //! ```
 //!
 //! `--meta` is the model's description (`dash --meta` reads the same file): its heads and
@@ -32,7 +34,9 @@ fn usage() -> ! {
                    [--max-steps N] [--device flex|cuda:N|rocm:N|metal]
   dash-train calibrate --model DIR --cache DIR --head NAME --class NAME --out DIR
                    [--grid LO:HI:STEP] [--device ...]
-  dash-train evaluate --model DIR --cache DIR [--split val] [--device ...]"
+  dash-train evaluate --model DIR --cache DIR [--split val] [--device ...]
+  dash-train predict --model DIR --cache DIR --split NAME [--split ...] --out FILE
+                   [--batch N] [--device ...]"
     );
     std::process::exit(2)
 }
@@ -240,6 +244,36 @@ fn evaluate_cmd(mut a: Args) -> Result<(), String> {
     Ok(())
 }
 
+fn predict_cmd(mut a: Args) -> Result<(), String> {
+    let (mut model, mut cache, mut out) = (None, None, None);
+    let mut splits = Vec::new();
+    let mut batch = 128;
+    let mut dev = "flex".to_string();
+    while let Some(f) = a.0.next() {
+        match f.as_str() {
+            "--model" => model = Some(a.value(&f)?),
+            "--cache" => cache = Some(a.value(&f)?),
+            "--split" => splits.push(a.value(&f)?),
+            "--out" => out = Some(a.value(&f)?),
+            "--batch" => batch = a.parse(&f)?,
+            "--device" => dev = a.value(&f)?,
+            _ => usage(),
+        }
+    }
+    if splits.is_empty() {
+        return Err("--split is required".into());
+    }
+    let out = required(out, "--out")?;
+    let device = device(&dev)?;
+    let t = train::load(&PathBuf::from(required(model, "--model")?), &device)?;
+    let cache = PathBuf::from(required(cache, "--cache")?);
+    let mut text = String::new();
+    for split in &splits {
+        text += &train::predictions(&t, &cache, split, batch, &device)?;
+    }
+    fs::write(&out, text).map_err(|e| format!("{out}: {e}"))
+}
+
 fn main() -> ExitCode {
     let mut args = env::args()
         .skip(1)
@@ -253,6 +287,7 @@ fn main() -> ExitCode {
         "train" => train_cmd(a),
         "calibrate" => calibrate_cmd(a),
         "evaluate" => evaluate_cmd(a),
+        "predict" => predict_cmd(a),
         _ => usage(),
     };
     match result {
