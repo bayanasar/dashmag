@@ -1,0 +1,29 @@
+[package]
+name = "dash-ops"
+description = "Training operations Burn does not have built in, each a backend extension with its own backward pass: the gated delta rule, attention whose backward keeps no T x T scores, log-probabilities over a large vocabulary, causal depthwise conv1d."
+keywords = ["burn", "cuda", "kernels", "machine-learning"]
+categories = ["science"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["flex"]
+# Flex runs every operation through its reference, built from Burn's own tensor operations.
+flex = ["burn/flex", "burn/simd", "burn/rayon"]
+# CUDA, through the CubeCL backend; custom kernels are written against `burn-cubecl`.
+cuda = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl"]
+# Burn's lazy fusion. Off by default: it changes which kernels every Burn crate in the same build
+# runs, and the comparisons elsewhere in this workspace are made without it.
+fusion = ["burn/fusion"]
+
+[dependencies]
+burn = { workspace = true, features = ["autodiff", "extension"] }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true }
+
+[dev-dependencies]
+safetensors = "0.8"
+serde_json = "1"

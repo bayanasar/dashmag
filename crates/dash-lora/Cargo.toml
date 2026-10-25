@@ -1,0 +1,21 @@
+[package]
+name = "dash-lora"
+description = "LoRA for Burn: frozen low-precision base weights, full-precision adapters that alone receive gradients, never merged, read and written in PEFT's format."
+keywords = ["burn", "lora", "fine-tuning", "machine-learning"]
+categories = ["science"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["flex"]
+flex = ["burn/flex", "burn/simd", "burn/rayon"]
+cuda = ["burn/cuda"]
+
+[dependencies]
+burn = { workspace = true, features = ["autodiff", "optim"] }
+safetensors = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

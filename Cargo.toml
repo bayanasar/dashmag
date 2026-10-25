@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dash-core", "crates/dash-image", "crates/dash-models", "crates/dash-burn", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli", "crates/dash-train"]
+members = ["crates/dash-core", "crates/dash-image", "crates/dash-models", "crates/dash-burn", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli", "crates/dash-train", "crates/dash-ops", "crates/dash-lora"]
 exclude = ["patches"]
 
 [workspace.package]
@@ -19,9 +19,16 @@ dash-tract = { path = "crates/dash-tract", version = "0.0.1" }
 dash-iree = { path = "crates/dash-iree", version = "0.0.1" }
 dash-tensorrt = { path = "crates/dash-tensorrt", version = "0.0.1" }
 dash-edgetpu = { path = "crates/dash-edgetpu", version = "0.0.1" }
+dash-ops = { path = "crates/dash-ops", version = "0.0.1" }
+dash-lora = { path = "crates/dash-lora", version = "0.0.1" }
 # Pinned exactly: Burn changes its API and its record format between minor releases, and an
 # upgrade is its own change, checked against the same references.
 burn = { version = "=0.22.1", default-features = false, features = ["std"] }
+# For custom kernels: the CubeCL backend type and the kernel language, at the versions Burn 0.22.1
+# builds with. No default features, so that depending on them adds no feature (fusion, above all)
+# to the crates every other member shares.
+burn-cubecl = { version = "=0.22.1", default-features = false, features = ["std"] }
+cubecl = { version = "=0.11.1", default-features = false, features = ["std"] }
 
 # cubecl-cuda 0.11.1 as published, but for one hunk: `CUBECL_CUDA_TF32=0` keeps f32 matmuls
 # and convolutions in IEEE f32 on compute capability 8.0 and later. Burn has no setting for
