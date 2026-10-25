@@ -14,6 +14,11 @@
 //!
 //! and, for the image check, the JPEGs in `DASH_RECORDED_IMAGES`. Then:
 //!   cargo test -p dash-cli --features burn --test recorded -- --ignored --nocapture
+//!
+//! The model runs on Flex; with `DASH_BURN_DEVICE=cuda`, on the first CUDA device, in a
+//! build with `burn-cuda` and with TF32 off (`dash-burn`'s documentation says why):
+//!   CUBECL_CUDA_TF32=0 DASH_BURN_DEVICE=cuda cargo test -p dash-cli --features burn-cuda \
+//!     --test recorded -- --ignored --nocapture
 
 use dash_burn::BurnRuntime;
 use dash_cli::model_json;
@@ -27,6 +32,23 @@ use std::{env, fs};
 const TOLERANCE: f32 = 1e-4;
 const BATCH: usize = 32;
 
+/// The Burn device under test: Flex, or the first CUDA device with `DASH_BURN_DEVICE=cuda`.
+fn burn_runtime() -> BurnRuntime {
+    match env::var("DASH_BURN_DEVICE").as_deref() {
+        Err(_) | Ok("flex") => BurnRuntime::flex(),
+        #[cfg(feature = "burn-cuda")]
+        Ok("cuda") => {
+            assert_eq!(
+                env::var("CUBECL_CUDA_TF32").as_deref(),
+                Ok("0"),
+                "set CUBECL_CUDA_TF32=0: TF32 would round every matmul input to 10 mantissa bits"
+            );
+            BurnRuntime::cuda(0)
+        }
+        Ok(other) => panic!("DASH_BURN_DEVICE={other} is not a device this build has"),
+    }
+}
+
 fn session(dir: &Path) -> (Box<dyn Session>, model_json::Description) {
     let desc = model_json::parse(&fs::read_to_string(dir.join("model.json")).unwrap()).unwrap();
     let art = Artifact {
@@ -37,7 +59,7 @@ fn session(dir: &Path) -> (Box<dyn Session>, model_json::Description) {
             ..Default::default()
         },
     };
-    (BurnRuntime::flex().load(&art).unwrap(), desc)
+    (burn_runtime().load(&art).unwrap(), desc)
 }
 
 /// Logits per frame per output, for a batch of NCHW f32 frames.

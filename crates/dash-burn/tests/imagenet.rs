@@ -7,6 +7,10 @@
 //! `tests/torchvision.rs` for where and how to fetch it) and the MobileNetV3-Small
 //! fixtures. Then:
 //!   cargo test -p dash-burn -- --ignored
+//!
+//! `DASH_BURN_DEVICE=cuda` runs the Burn side on the first CUDA device instead, in a build
+//! with the `cuda` feature and with TF32 off (the crate's documentation says why):
+//!   CUBECL_CUDA_TF32=0 DASH_BURN_DEVICE=cuda cargo test -p dash-burn --features cuda -- --ignored
 
 use burn::tensor::Device;
 use dash_burn::BurnRuntime;
@@ -31,6 +35,23 @@ fn checkpoint() -> PathBuf {
             let home = env::var("HOME").expect("HOME unset; set DASH_TORCHVISION_MNV3");
             PathBuf::from(home).join(".cache/torch/hub/checkpoints/mobilenet_v3_small-047dcff4.pth")
         })
+}
+
+/// The Burn device under test: Flex, or the first CUDA device with `DASH_BURN_DEVICE=cuda`.
+fn burn_device() -> (BurnRuntime, AccelClass) {
+    match env::var("DASH_BURN_DEVICE").as_deref() {
+        Err(_) | Ok("flex") => (BurnRuntime::flex(), AccelClass::Cpu),
+        #[cfg(feature = "cuda")]
+        Ok("cuda") => {
+            assert_eq!(
+                env::var("CUBECL_CUDA_TF32").as_deref(),
+                Ok("0"),
+                "set CUBECL_CUDA_TF32=0: TF32 would round every matmul input to 10 mantissa bits"
+            );
+            (BurnRuntime::cuda(0), AccelClass::Cuda)
+        }
+        Ok(other) => panic!("DASH_BURN_DEVICE={other} is not a device this build has"),
+    }
 }
 
 fn meta(model: Option<ModelSpec>) -> ArtifactMeta {
@@ -77,11 +98,16 @@ fn burn_artifact_answers_as_tract_does_through_the_registry() {
         meta: meta(None),
     };
 
+    let (burn_rt, accel) = burn_device();
     let mut reg = Registry::new();
     reg.register(Box::new(TractRuntime::new()));
-    reg.register(Box::new(BurnRuntime::flex()));
+    reg.register(Box::new(burn_rt));
     let cpu = TargetProfile {
         accel: AccelClass::Cpu,
+        no_std: false,
+    };
+    let device = TargetProfile {
+        accel,
         no_std: false,
     };
     let raw = fs::read(dir.join("input_1x3x224x224.f32")).unwrap();
@@ -89,9 +115,9 @@ fn burn_artifact_answers_as_tract_does_through_the_registry() {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    let run = |art: &Artifact| {
+    let run = |art: &Artifact, target: &TargetProfile| {
         let rt = reg
-            .select(art, &cpu)
+            .select(art, target)
             .expect("no backend admitted the artifact");
         assert_eq!(rt.kind(), art.backend, "dispatch picked the wrong backend");
         let out = rt
@@ -102,7 +128,7 @@ fn burn_artifact_answers_as_tract_does_through_the_registry() {
         assert_eq!(out[0].shape(), &[1, 1000]);
         out[0].to_host().unwrap().as_f32().unwrap()
     };
-    let (got, want) = (run(&burn), run(&tract));
+    let (got, want) = (run(&burn, &device), run(&tract, &cpu));
 
     let (class, logit) = argmax(&got).unwrap();
     assert_eq!(class, 258, "top-1 must be class 258 (Samoyed)");
@@ -115,6 +141,8 @@ fn burn_artifact_answers_as_tract_does_through_the_registry() {
         .zip(&want)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f32::max);
-    eprintln!("Burn artifact: 258 @ {logit:.6}; max |Burn - tract| over 1000 logits {d:.2e}");
+    eprintln!(
+        "Burn artifact on {accel:?}: 258 @ {logit:.6}; max |Burn - tract| over 1000 logits {d:.2e}"
+    );
     assert!(d < 1e-4, "Burn and tract differ by {d:.2e} on some logit");
 }
