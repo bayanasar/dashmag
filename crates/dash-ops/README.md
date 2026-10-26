@@ -1,7 +1,7 @@
 # dash-ops
 
-Training operations Burn 0.22 does not have built in, for training a Gated DeltaNet hybrid such
-as Qwen3.5-0.8B on Burn. Each is a backend extension with its own backward pass:
+Training operations Burn 0.22 does not have built in. Each is a backend extension with its own
+backward pass:
 
 | module | operation | on CUDA |
 |---|---|---|
