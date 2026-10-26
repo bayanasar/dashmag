@@ -41,8 +41,9 @@
 //! five more per-chunk kernels. Wider heads run the reference on CUDA too.
 //!
 //! Measured against transformers' function at f32 (the tests' fixtures), the output, the final
-//! state and every gradient agree to within 1.2e-6 relative to each tensor's largest value; from
-//! bf16 inputs, to within 2.5e-3 of the exact result (torch's own bf16 path: within 8.1e-3). On an
+//! state and every gradient agree to within 1.12e-6 relative to each tensor's largest value; from
+//! bf16 inputs, to within 2.41e-3 of the exact result (torch's own bf16 path: 8.06e-3), and the
+//! CUDA kernels to within 3.17e-3 of the f32 reference at larger shapes. On an
 //! RTX 5070 Ti, one sequence of 6144 tokens with 16 heads of 128 and bf16 inputs takes 2.4 ms
 //! forward and 9.3 ms forward and backward, and grows the memory pool by 687 MiB
 //! (`examples/gated_delta_chunk_bench.rs`); fla 0.5.2, with bf16 tensor cores, takes 0.87 ms and

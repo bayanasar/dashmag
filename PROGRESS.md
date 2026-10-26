@@ -1,7 +1,7 @@
 # PROGRESS — dashmag
 
 <!-- progress -->
-updated: 2026-10-25
+updated: 2026-10-26
 owner: bayanasar
 stage: one model, correct on every target tried; models run on Burn and train in Rust (`dash-train`), held to PyTorch's arithmetic and, on data this repository does not hold, no more than 3 standard errors below its results, one cell of ten unresolved
 <!-- /progress -->
@@ -30,13 +30,13 @@ On `main`, and re-runnable by anyone who checks it out.
 - A seed fixes a `dash-train` run's weights on Flex, whatever the thread count — `cargo test -p dash-train --test epochs`: two epochs from scratch on a synthetic cache at 1 and at 4 threads, every tensor bit-identical, in batches of 16 so that the neck's matrix product splits across the pool as well as the convolutions. It holds for one run per process: Flex draws initial weights and dropout masks from one generator per process, and two runs at once interleave their draws. The safetensors files can still differ byte for byte, because Burn writes their metadata keys in hash order.
 - `dash-train predict` writes down a model's answers: each head's top-1 class for every frame of a cache's split, in the cache's order, the heads in the model's order — `cargo test -p dash-train --test predict`, against the module's own predictions, and the writer's unit test.
 - `--image` resizes exactly as Pillow does — byte-for-byte on Pillow's decoded pixels (2 synthetic cases, a public test image, 30 real 1280x854 frames); decode differs from libjpeg-turbo by at most 2 levels after resize. The code is the `dash-image` crate; `cargo test -p dash-image -- --include-ignored` runs the synthetic and public-image cases.
-- The training operations in `dash-ops` and `dash-lora` agree with values recorded from PyTorch 2.13, transformers 5.15 and PEFT 0.20 on seeded inputs: the references on the CPU, `cargo test -p dash-ops -p dash-lora`; the CUDA kernels against the recordings and the references, `CUBECL_CUDA_TF32=0 cargo test -p dash-ops -p dash-lora --features dash-ops/cuda,dash-lora/cuda`, also with `fusion` and `autotune` (2026-10-25). As a share of the largest reference value:
-  - the chunked gated delta rule: output, final state and all six gradients within 1.2e-6 of transformers in f32; from bf16 inputs within 2.4e-3 of the exact result, where transformers' own bf16 path is 8.1e-3 off;
-  - its recurrent step: output 4.3e-7, state 1.3e-7, also continuing from the state a chunked pass over a prompt leaves;
-  - causal attention: the reference 4.1e-7 from PyTorch's math attention in fp32; the bf16 kernels 3.3e-3 for the output and 4.5e-3 for the gradients, f16 4.5e-4;
-  - chosen-token log-probabilities: 5.0e-7, the gradient 4.2e-7, the entropy 9.1e-7;
-  - causal depthwise conv1d: 2.3e-7 in f32; 2.7e-3 in bf16, where PyTorch's own bf16 is 4.3e-3 off;
-  - LoRA: one layer bit-identical to PEFT on the CPU, and on CUDA with Burn's default kernels or fusion; a two-block model within 1.2e-6 in f32 after three AdamW steps (2.4e-6 with autotune); PEFT's adapter files read and written back byte for byte, and what dash-lora writes loaded by PEFT bit for bit.
+- The training operations in `dash-ops` and `dash-lora` agree with values recorded from PyTorch 2.13, transformers 5.15 and PEFT 0.20 on seeded inputs: the references on the CPU, `cargo test -p dash-ops -p dash-lora`; the CUDA kernels against the recordings and the references, `CUBECL_CUDA_TF32=0 cargo test -p dash-ops -p dash-lora --features dash-ops/cuda,dash-lora/cuda`, also with `fusion` and `autotune` (2026-10-25; measured again 2026-10-26). Each figure is the largest error, as a share of the largest reference value, that any comparison the tests print reaches in any of the five builds; with autotune, which picks kernels by timing and so varies between runs, over five runs:
+  - the chunked gated delta rule: output, final state and all six gradients within 1.12e-6 of transformers in f32; from bf16 inputs within 2.41e-3 of the exact result on the recorded case, where transformers' own bf16 path is 8.06e-3 off, and the CUDA kernels within 3.17e-3 of the f32 reference at larger shapes;
+  - its recurrent step: output 4.56e-7, state 1.91e-7, gradients 1.25e-6, also continuing from the state a chunked pass over a prompt leaves;
+  - causal attention: the reference 4.06e-7 from PyTorch's math attention in fp32, and 4.17e-7 run on CUDA (7.10e-7 with autotune); the bf16 kernels 3.26e-3 for the output and 4.48e-3 for the gradients, f16 4.46e-4;
+  - chosen-token log-probabilities: 5.01e-7, the gradient 7.01e-7 (3.29e-3 once rounded to bf16), the entropy 1.07e-6;
+  - causal depthwise conv1d: 1.12e-6 in f32; 2.65e-3 in bf16, where PyTorch's own bf16 is 4.26e-3 off;
+  - LoRA: one layer bit-identical to PEFT on the CPU, and on CUDA with Burn's default kernels or fusion (3.62e-7 in f32 with autotune); a two-block model within 1.31e-6 in f32 after three AdamW steps (within 2.5e-6 with autotune, in 21 runs); PEFT's adapter files read and written back byte for byte. What dash-lora writes, PEFT 0.20 loads bit for bit — checked outside this repository, as the recordings were made: `DASH_LORA_EXPORT=<dir>` makes `tests/tiny.rs` write its trained adapters there for PEFT to load (2026-10-26).
 
 ## Not sealed
 - five-head at the deployed widths on a board — missing. On CUDA it has run only on data this repository does not hold: a five-head model imported from PyTorch gives the logits PyTorch recorded on 307 frames within 3.72e-5 (5.15e-5 on Flex), and PyTorch's top-1 on all 1535 frame-outputs, from the recorded pixels and from the original images through `dash-image` — `tests/recorded.rs` with `DASH_BURN_DEVICE=cuda` (2026-10-25). From here this is measured on Burn, not IREE.
