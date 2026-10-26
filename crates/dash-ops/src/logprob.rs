@@ -50,11 +50,14 @@
 //! values a bf16 matmul cannot take as they are, so they are split into a bf16 part and a bf16
 //! remainder (16 significant bits in all) and both go through the matmul, which keeps the
 //! gradient within about 1e-6 of an f32 computation at the cost of one more matmul.
+//!
+//! [`crate::loss`] builds the cross-entropy loss on the same pass over the vocabulary, and adds
+//! the second pass a weight that trains needs.
 
-mod reference;
+pub(crate) mod reference;
 
 #[cfg(feature = "cuda")]
-mod cube;
+pub(crate) mod cube;
 
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
@@ -70,8 +73,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// How the vocabulary and the rows are chunked. The largest chunk of logits held at once is
 /// `rows x vocab_chunk` f32 values, 96 MiB at most at the defaults; with the gradient, the CUDA
-/// backend holds as much again for the softmax weights (in two bf16 parts) and three
-/// `[rows, D]` f32 buffers.
+/// backend holds as much again for the softmax weights (in two bf16 parts), two `[rows, D]` f32
+/// buffers and the `[n, D]` f32 gradient it fills.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogprobOptions {
     /// Vocabulary tokens per chunk (`C`), or 0 (the default) to choose by the size of the row
@@ -159,6 +162,18 @@ pub trait ChosenLogprobBackend: Backend {
 }
 
 impl ChosenLogprobBackend for burn::backend::Flex {}
+
+/// The per-row coefficients of the gradient pass ([`reference::gradient_pass`]), the rows of a
+/// `[COUNT, n]` f32 tensor: the log-sum-exp, the softmax term's factor `A`, the entropy's `E`,
+/// the target's extra term `T` and the term `C` every unmasked token takes.
+pub(crate) mod coefficient {
+    pub const LSE: usize = 0;
+    pub const SOFTMAX: usize = 1;
+    pub const ENTROPY: usize = 2;
+    pub const TARGET: usize = 3;
+    pub const UNIFORM: usize = 4;
+    pub const COUNT: usize = 5;
+}
 
 /// Output metadata for Burn's lazy fusion: every output is f32, `[n]` or `[n, D]`.
 #[cfg(feature = "fusion")]

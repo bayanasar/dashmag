@@ -1,0 +1,581 @@
+{
+ "basic": {
+  "n": 40,
+  "v": 300,
+  "d": 32,
+  "masked_target": 135,
+  "variants": {
+   "mean": {
+    "reduction": "mean",
+    "ignore_index": -100,
+    "eps": 0.0,
+    "lam": 0.0,
+    "mask": "none",
+    "masked": [],
+    "torch_f32_vs_f64_f32": {
+     "loss": {
+      "max_abs": 7.178873646651596e-07,
+      "rel_to_max": 1.0719614765104091e-07
+     },
+     "logprob": {
+      "max_abs": 8.968520361918308e-07,
+      "rel_to_max": 8.296139110025526e-08
+     },
+     "entropy": {
+      "max_abs": 1.4547619775484577e-06,
+      "rel_to_max": 2.829723538306438e-07
+     },
+     "grad_hidden": {
+      "max_abs": 2.5311940023142743e-08,
+      "rel_to_max": 5.04167759880968e-07
+     },
+     "grad_weight": {
+      "max_abs": 7.51626277120665e-08,
+      "rel_to_max": 3.8851410469220124e-07
+     }
+    },
+    "torch_f32_vs_f64_bf16": {
+     "loss": {
+      "max_abs": 2.3502836565825191e-07,
+      "rel_to_max": 3.509706963171713e-08
+     },
+     "logprob": {
+      "max_abs": 5.259862918549629e-07,
+      "rel_to_max": 4.864094208931299e-08
+     },
+     "entropy": {
+      "max_abs": 1.6944007681374273e-06,
+      "rel_to_max": 3.29566611341003e-07
+     },
+     "grad_hidden": {
+      "max_abs": 2.512495012041427e-08,
+      "rel_to_max": 4.993806614974105e-07
+     },
+     "grad_weight": {
+      "max_abs": 3.6017101696927956e-08,
+      "rel_to_max": 1.8619559191899237e-07
+     }
+    }
+   },
+   "smooth": {
+    "reduction": "mean",
+    "ignore_index": -100,
+    "eps": 0.1,
+    "lam": 0.01,
+    "mask": "some",
+    "masked": [
+     0,
+     230,
+     299
+    ],
+    "torch_f32_vs_f64_f32": {
+     "loss": {
+      "max_abs": 4.811585334607571e-07,
+      "rel_to_max": 6.649673248215732e-08
+     },
+     "logprob": {
+      "max_abs": 8.842036023359867e-07,
+      "rel_to_max": 8.199881961396774e-08
+     },
+     "entropy": {
+      "max_abs": 1.5065029579375278e-06,
+      "rel_to_max": 2.9348031589095625e-07
+     },
+     "grad_hidden": {
+      "max_abs": 2.437742271932386e-08,
+      "rel_to_max": 4.903254632461926e-07
+     },
+     "grad_weight": {
+      "max_abs": 4.602288213029215e-08,
+      "rel_to_max": 2.495423851308275e-07
+     }
+    },
+    "torch_f32_vs_f64_bf16": {
+     "loss": {
+      "max_abs": 3.578182790064943e-07,
+      "rel_to_max": 4.9453909580771444e-08
+     },
+     "logprob": {
+      "max_abs": 4.832990505576618e-07,
+      "rel_to_max": 4.480652709868358e-08
+     },
+     "entropy": {
+      "max_abs": 1.4373241867815523e-06,
+      "rel_to_max": 2.7998779873739445e-07
+     },
+     "grad_hidden": {
+      "max_abs": 2.4777397661379652e-08,
+      "rel_to_max": 4.974371113775023e-07
+     },
+     "grad_weight": {
+      "max_abs": 5.588120775834593e-08,
+      "rel_to_max": 3.030326576771e-07
+     }
+    }
+   },
+   "sum": {
+    "reduction": "sum",
+    "ignore_index": -100,
+    "eps": 0.2,
+    "lam": 0.001,
+    "mask": "all",
+    "masked": [
+     0,
+     135,
+     230,
+     299
+    ],
+    "torch_f32_vs_f64_f32": {
+     "loss": {
+      "max_abs": 0.0,
+      "rel_to_max": 0.0
+     },
+     "logprob": {
+      "max_abs": 1.0423953225036087e-06,
+      "rel_to_max": 9.668806538465128e-08
+     },
+     "entropy": {
+      "max_abs": 1.5659906349441144e-06,
+      "rel_to_max": 3.0541549614623654e-07
+     },
+     "grad_hidden": {
+      "max_abs": 4.204288004405754e-07,
+      "rel_to_max": 4.729611748577848e-07
+     },
+     "grad_weight": {
+      "max_abs": 9.699072975877243e-07,
+      "rel_to_max": 3.3694504512303464e-07
+     }
+    },
+    "torch_f32_vs_f64_bf16": {
+     "loss": {
+      "max_abs": 0.0,
+      "rel_to_max": 0.0
+     },
+     "logprob": {
+      "max_abs": 7.664283678820993e-07,
+      "rel_to_max": 7.106921200815437e-08
+     },
+     "entropy": {
+      "max_abs": 1.608339626812949e-06,
+      "rel_to_max": 3.136573033967811e-07
+     },
+     "grad_hidden": {
+      "max_abs": 3.6210586384921584e-07,
+      "rel_to_max": 4.0706080022091385e-07
+     },
+     "grad_weight": {
+      "max_abs": 5.670929676959702e-07,
+      "rel_to_max": 1.9688323878165875e-07
+     }
+    }
+   },
+   "none": {
+    "reduction": "none",
+    "ignore_index": 7,
+    "eps": 0.05,
+    "lam": 0.0001,
+    "mask": "all",
+    "masked": [
+     0,
+     135,
+     230,
+     299
+    ],
+    "torch_f32_vs_f64_f32": {
+     "loss": {
+      "max_abs": 1.3027685650257581e-06,
+      "rel_to_max": 1.2294566567685275e-07
+     },
+     "logprob": {
+      "max_abs": 1.0423953225036087e-06,
+      "rel_to_max": 9.668806538465128e-08
+     },
+     "entropy": {
+      "max_abs": 1.5659906349441144e-06,
+      "rel_to_max": 3.0541549614623654e-07
+     },
+     "grad_hidden": {
+      "max_abs": 1.937436884535959e-08,
+      "rel_to_max": 3.6706114090032404e-07
+     },
+     "grad_weight": {
+      "max_abs": 5.360733114356808e-08,
+      "rel_to_max": 2.517831008539424e-07
+     }
+    },
+    "torch_f32_vs_f64_bf16": {
+     "loss": {
+      "max_abs": 1.4063513980033804e-06,
+      "rel_to_max": 1.3268285956657482e-07
+     },
+     "logprob": {
+      "max_abs": 7.664283678820993e-07,
+      "rel_to_max": 7.106921200815437e-08
+     },
+     "entropy": {
+      "max_abs": 1.0633949329985626e-06,
+      "rel_to_max": 2.073825587392065e-07
+     },
+     "grad_hidden": {
+      "max_abs": 2.54664876964128e-08,
+      "rel_to_max": 4.820008637465017e-07
+     },
+     "grad_weight": {
+      "max_abs": 3.140572522875029e-08,
+      "rel_to_max": 1.4789656303358448e-07
+     }
+    }
+   }
+  },
+  "p_target_max": 0.04121057810937874,
+  "logit_abs_max": 7.311121951295206
+ },
+ "peaked": {
+  "n": 24,
+  "v": 257,
+  "d": 16,
+  "masked_target": 151,
+  "variants": {
+   "mean": {
+    "reduction": "mean",
+    "ignore_index": -100,
+    "eps": 0.0,
+    "lam": 0.0,
+    "mask": "none",
+    "masked": [],
+    "torch_f32_vs_f64_f32": {
+     "loss": {
+      "max_abs": 3.224691447201167e-08,
+      "rel_to_max": 2.4533120835376842e-09
+     },
+     "logprob": {
+      "max_abs": 3.0532887080880755e-06,
+      "rel_to_max": 7.417018581225226e-08
+     },
+     "entropy": {
+      "max_abs": 1.7806858411129056e-06,
+      "rel_to_max": 9.165253309527036e-07
+     },
+     "grad_hidden": {
+      "max_abs": 1.8733280093830018e-07,
+      "rel_to_max": 4.830537328252801e-07
+     },
+     "grad_weight": {
+      "max_abs": 3.9515870496609207e-07,
+      "rel_to_max": 7.387783959848944e-07
+     }
+    },
+    "torch_f32_vs_f64_bf16": {
+     "loss": {
+      "max_abs": 4.378078042321931e-07,
+      "rel_to_max": 3.330894032120571e-08
+     },
+     "logprob": {
+      "max_abs": 1.635029541091626e-06,
+      "rel_to_max": 3.9704161766258685e-08
+     },
+     "entropy": {
+      "max_abs": 1.6048386047157193e-06,
+      "rel_to_max": 8.301900917379306e-07
+     },
+     "grad_hidden": {
+      "max_abs": 2.0185744783584453e-07,
+      "rel_to_max": 5.202565181847934e-07
+     },
+     "grad_weight": {
+      "max_abs": 3.0810876535660933e-07,
+      "rel_to_max": 5.757807988040907e-07
+     }
+    }
+   },
+   "smooth": {
+    "reduction": "mean",
+    "ignore_index": -100,
+    "eps": 0.1,
+    "lam": 0.01,
+    "mask": "some",
+    "masked": [
+     12
+    ],
+    "torch_f32_vs_f64_f32": {
+     "loss": {
+      "max_abs": 5.297751712873833e-07,
+      "rel_to_max": 2.8704216577126467e-08
+     },
+     "logprob": {
+      "max_abs": 3.0532887080880755e-06,
+      "rel_to_max": 7.417018581225226e-08
+     },
+     "entropy": {
+      "max_abs": 1.7881364217098294e-06,
+      "rel_to_max": 9.203607341716274e-07
+     },
+     "grad_hidden": {
+      "max_abs": 2.4498844995723967e-07,
+      "rel_to_max": 5.720428150877412e-07
+     },
+     "grad_weight": {
+      "max_abs": 6.150528057968785e-07,
+      "rel_to_max": 1.1949243847319802e-06
+     }
+    },
+    "torch_f32_vs_f64_bf16": {
+     "loss": {
+      "max_abs": 1.7849808209291496e-06,
+      "rel_to_max": 9.671889686922767e-08
+     },
+     "logprob": {
+      "max_abs": 2.191237300053217e-06,
+      "rel_to_max": 5.321080631453701e-08
+     },
+     "entropy": {
+      "max_abs": 1.6048386047157193e-06,
+      "rel_to_max": 8.301905911581116e-07
+     },
+     "grad_hidden": {
+      "max_abs": 2.456642933940101e-07,
+      "rel_to_max": 5.73250155523571e-07
+     },
+     "grad_weight": {
+      "max_abs": 5.563870245084424e-07,
+      "rel_to_max": 1.0804777224673442e-06
+     }
+    }
+   },
+   "sum": {
+    "reduction": "sum",
+    "ignore_index": -100,
+    "eps": 0.2,
+    "lam": 0.001,
+    "mask": "all",
+    "masked": [
+     12,
+     151
+    ],
+    "torch_f32_vs_f64_f32": {
+     "loss": {
+      "max_abs": 0.0,
+      "rel_to_max": 0.0
+     },
+     "logprob": {
+      "max_abs": 3.053265984931386e-06,
+      "rel_to_max": 7.416963382362948e-08
+     },
+     "entropy": {
+      "max_abs": 1.7955128500529716e-06,
+      "rel_to_max": 9.241577448229069e-07
+     },
+     "grad_hidden": {
+      "max_abs": 3.7249173257536405e-06,
+      "rel_to_max": 1.1013820051243237e-06
+     },
+     "grad_weight": {
+      "max_abs": 9.967573018743181e-06,
+      "rel_to_max": 2.19717794455008e-06
+     }
+    },
+    "torch_f32_vs_f64_bf16": {
+     "loss": {
+      "max_abs": 0.0,
+      "rel_to_max": 0.0
+     },
+     "logprob": {
+      "max_abs": 2.191237300053217e-06,
+      "rel_to_max": 5.32108063145654e-08
+     },
+     "entropy": {
+      "max_abs": 1.6047648956490912e-06,
+      "rel_to_max": 8.301527537431952e-07
+     },
+     "grad_hidden": {
+      "max_abs": 3.585688542862009e-06,
+      "rel_to_max": 1.0581758148208436e-06
+     },
+     "grad_weight": {
+      "max_abs": 9.229693284096285e-06,
+      "rel_to_max": 2.029919935568976e-06
+     }
+    }
+   },
+   "none": {
+    "reduction": "none",
+    "ignore_index": 7,
+    "eps": 0.05,
+    "lam": 0.0001,
+    "mask": "all",
+    "masked": [
+     12,
+     151
+    ],
+    "torch_f32_vs_f64_f32": {
+     "loss": {
+      "max_abs": 2.6030922199993256e-06,
+      "rel_to_max": 6.321958810747049e-08
+     },
+     "logprob": {
+      "max_abs": 3.053265984931386e-06,
+      "rel_to_max": 7.416963382362948e-08
+     },
+     "entropy": {
+      "max_abs": 1.7955128500529716e-06,
+      "rel_to_max": 9.241577448229069e-07
+     },
+     "grad_hidden": {
+      "max_abs": 3.822283376146013e-07,
+      "rel_to_max": 1.8506853708210303e-06
+     },
+     "grad_weight": {
+      "max_abs": 9.711291012511752e-07,
+      "rel_to_max": 2.8517668059412697e-06
+     }
+    },
+    "torch_f32_vs_f64_bf16": {
+     "loss": {
+      "max_abs": 3.7420988263647814e-06,
+      "rel_to_max": 9.084737335463619e-08
+     },
+     "logprob": {
+      "max_abs": 2.191237300053217e-06,
+      "rel_to_max": 5.32108063145654e-08
+     },
+     "entropy": {
+      "max_abs": 1.6047648956490912e-06,
+      "rel_to_max": 8.301527537431952e-07
+     },
+     "grad_hidden": {
+      "max_abs": 3.7024719758485536e-07,
+      "rel_to_max": 1.7986656780802073e-06
+     },
+     "grad_weight": {
+      "max_abs": 9.306298994742751e-07,
+      "rel_to_max": 2.728807579759268e-06
+     }
+    }
+   }
+  },
+  "p_target_max": 0.9830737721664173,
+  "logit_abs_max": 38.056041216164154
+ },
+ "wide": {
+  "n": 12,
+  "v": 130,
+  "d": 256,
+  "masked_target": 91,
+  "variants": {
+   "smooth": {
+    "reduction": "mean",
+    "ignore_index": -100,
+    "eps": 0.1,
+    "lam": 0.01,
+    "mask": "some",
+    "masked": [
+     5,
+     126
+    ],
+    "torch_f32_vs_f64_f32": {
+     "loss": {
+      "max_abs": 2.563182546211351e-07,
+      "rel_to_max": 4.1507744222995864e-08
+     },
+     "logprob": {
+      "max_abs": 6.110594590325036e-07,
+      "rel_to_max": 8.764924033907044e-08
+     },
+     "entropy": {
+      "max_abs": 9.164332692712662e-07,
+      "rel_to_max": 2.1322809967454665e-07
+     },
+     "grad_hidden": {
+      "max_abs": 3.0892688893113807e-08,
+      "rel_to_max": 5.437330565715962e-07
+     },
+     "grad_weight": {
+      "max_abs": 9.176211979156079e-08,
+      "rel_to_max": 1.3866655674062937e-07
+     }
+    },
+    "torch_f32_vs_f64_bf16": {
+     "loss": {
+      "max_abs": 1.3678109489489998e-07,
+      "rel_to_max": 2.2149351101355904e-08
+     },
+     "logprob": {
+      "max_abs": 4.2381040010752713e-07,
+      "rel_to_max": 6.084419031968573e-08
+     },
+     "entropy": {
+      "max_abs": 1.089620555561055e-06,
+      "rel_to_max": 2.534708274559474e-07
+     },
+     "grad_hidden": {
+      "max_abs": 2.406351382738814e-08,
+      "rel_to_max": 4.233351077750858e-07
+     },
+     "grad_weight": {
+      "max_abs": 7.624436854092309e-08,
+      "rel_to_max": 1.1542089717514911e-07
+     }
+    }
+   },
+   "none": {
+    "reduction": "none",
+    "ignore_index": 7,
+    "eps": 0.05,
+    "lam": 0.0001,
+    "mask": "all",
+    "masked": [
+     5,
+     91,
+     126
+    ],
+    "torch_f32_vs_f64_f32": {
+     "loss": {
+      "max_abs": 4.651343452621859e-07,
+      "rel_to_max": 6.730175383972736e-08
+     },
+     "logprob": {
+      "max_abs": 6.86748273359683e-07,
+      "rel_to_max": 9.85406159356476e-08
+     },
+     "entropy": {
+      "max_abs": 1.5885849693475507e-06,
+      "rel_to_max": 3.7312120551671093e-07
+     },
+     "grad_hidden": {
+      "max_abs": 3.164137491601382e-08,
+      "rel_to_max": 6.513566501468932e-07
+     },
+     "grad_weight": {
+      "max_abs": 2.563622477358418e-07,
+      "rel_to_max": 3.875193241020878e-07
+     }
+    },
+    "torch_f32_vs_f64_bf16": {
+     "loss": {
+      "max_abs": 6.139156374374011e-07,
+      "rel_to_max": 8.890457654824825e-08
+     },
+     "logprob": {
+      "max_abs": 4.921166114613129e-07,
+      "rel_to_max": 7.067542487155787e-08
+     },
+     "entropy": {
+      "max_abs": 9.377097476281904e-07,
+      "rel_to_max": 2.2022886533544325e-07
+     },
+     "grad_hidden": {
+      "max_abs": 1.0010124895654116e-08,
+      "rel_to_max": 2.0652561611392642e-07
+     },
+     "grad_weight": {
+      "max_abs": 1.0280250850591699e-07,
+      "rel_to_max": 1.5539107297145022e-07
+     }
+    }
+   }
+  },
+  "p_target_max": 0.013587224080323701,
+  "logit_abs_max": 4.730438612488709
+ }
+}

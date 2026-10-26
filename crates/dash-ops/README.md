@@ -9,6 +9,7 @@ backward pass:
 | `gated_delta::recurrent` | the gated delta rule one token at a time, for decoding | one kernel a step |
 | `attention` | causal attention with grouped key-value heads, a backward pass that keeps no T x T scores, and decoding against a key-value cache | FlashAttention-2 style kernels on the tensor cores |
 | `logprob` | the log-probability of chosen tokens under a large vocabulary, with the entropy, without the n x V logits | chunked matmuls and a fused log-sum-exp kernel |
+| `loss` | cross-entropy fused with the output layer over a large vocabulary (mean, sum or none; ignore index, label smoothing, z-loss, masked ids), with each row's log-probability and entropy, gradients for the hidden states and the output weight, without the n x V logits | `logprob`'s pass, and a second pass for the weight's gradient |
 | `conv1d` | causal depthwise conv1d of any kernel width, with an optional bias and activation (none or SiLU), and its decoding state | forward, backward and step kernels for widths 1 to 8 |
 | `checkpoint` | activation checkpointing: a stack of layers run outside autodiff, each layer run again in the backward pass (built on Burn's tensor API, not an extension) | the layers' own |
 
@@ -55,6 +56,7 @@ with `cuda` only unless a row says otherwise:
 | attention, forward + backward | 6144 tokens, 8 query and 2 key-value heads of 256 | 9.2 ms, +60 MiB | 7.4 ms, +204 MiB (flash) |
 | attention, decoding | batch 8, 6144 cached keys | 200 us a layer, synchronised after each call (144 us over 24 calls; 454 us each with `fusion`) | 201 us |
 | log-probability, forward + backward | 3072 tokens, 248320 classes, width 1024 | 78.9 ms, +216 MiB (70.4 ms with `fusion` and `autotune`) | 86.4 ms, +8730 MiB |
+| linear + cross-entropy, forward + backward with the weight's gradient | 3072 / 8192 tokens, 248320 classes, width 1024 | 102 / 293 ms, +641 / +731 MiB (94 / 261 ms with `autotune`) | logits in f32: 95 / 1179 ms, +11672 / +31072 MiB; in bf16: 64 / 1241 ms, +5824 / +15520 MiB (at 8192 both spill past the card's 16 GB into host memory) |
 | conv1d, forward + backward | 6144 steps, 6144 channels, width 4, SiLU (widths 2 to 4, with or without a bias: 0.54 to 0.57 ms) | 0.56 ms | 2.63 ms (conv1d, then SiLU) |
 
 The chunked gated delta rule's kernels compute in f32 without tensor cores, which is most of its

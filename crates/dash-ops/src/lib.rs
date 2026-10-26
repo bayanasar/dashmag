@@ -13,6 +13,8 @@
 //! - [`attention`]: causal attention whose backward pass does not materialise the T x T scores.
 //! - [`logprob`]: the log-probability of chosen tokens under a large vocabulary, without the
 //!   n x V logits.
+//! - [`loss`]: cross-entropy fused with the output layer over a large vocabulary, with label
+//!   smoothing, z-loss, an ignore index and masked ids, training the output weight too.
 //! - [`conv1d`]: causal depthwise 1-D convolution, with the state a decoder carries.
 //! - [`checkpoint`]: activation checkpointing, not an operation but built on Burn's tensor API:
 //!   a stack of layers run outside autodiff, each layer run again in the backward pass.
@@ -85,3 +87,4 @@ pub mod checkpoint;
 pub mod conv1d;
 pub mod gated_delta;
 pub mod logprob;
+pub mod loss;
