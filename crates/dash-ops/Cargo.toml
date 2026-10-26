@@ -1,6 +1,7 @@
 [package]
 name = "dash-ops"
 description = "Training operations Burn does not have built in, each a backend extension with its own backward pass: the gated delta rule, attention whose backward keeps no T x T scores, log-probabilities over a large vocabulary, causal depthwise conv1d."
+readme = "README.md"
 keywords = ["burn", "cuda", "kernels", "machine-learning"]
 categories = ["science"]
 version.workspace = true

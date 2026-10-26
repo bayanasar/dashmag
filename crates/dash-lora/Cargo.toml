@@ -1,6 +1,7 @@
 [package]
 name = "dash-lora"
 description = "LoRA for Burn: frozen low-precision base weights, full-precision adapters that alone receive gradients, never merged, read and written in PEFT's format."
+readme = "README.md"
 keywords = ["burn", "lora", "fine-tuning", "machine-learning"]
 categories = ["science"]
 version.workspace = true
