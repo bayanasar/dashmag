@@ -4,6 +4,8 @@ description = "LoRA for Burn: frozen low-precision base weights, full-precision 
 readme = "README.md"
 keywords = ["burn", "lora", "fine-tuning", "machine-learning"]
 categories = ["science"]
+# The recorded references the tests read stay in the repository, out of the published crate.
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

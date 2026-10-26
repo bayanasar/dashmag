@@ -4,6 +4,8 @@ description = "Training operations Burn does not have built in, each a backend e
 readme = "README.md"
 keywords = ["burn", "cuda", "kernels", "machine-learning"]
 categories = ["science"]
+# The recorded references the tests read stay in the repository, out of the published crate.
+exclude = ["tests/fixtures"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
