@@ -1,0 +1,485 @@
+//! The chunked gated delta rule against transformers' `torch_chunk_gated_delta_rule`.
+//!
+//! The fixtures in `tests/fixtures/gated_delta_chunk/` hold inputs, the gradients fed back
+//! (`d_out`, `d_state`), and what torch computed from them: the output, the final state and the
+//! gradient of every input, at f32 (`out`, `dq`, ...), and with the function's f32 casts turned into
+//! f64 (`out_f64`, ...; stored rounded to f32). The bf16 case holds bf16 inputs (as f32 values),
+//! torch's own bf16 results (`out_torch_bf16`, ...) and the f64 results from the same inputs.
+//!
+//!   cargo test --release -p dash-ops --test gated_delta_chunk -- --nocapture
+//!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test gated_delta_chunk
+
+use burn::tensor::{DType, Device, Tensor, TensorData};
+use dash_ops::gated_delta::chunk::{backward_runs, chunk_gated_delta_rule};
+use safetensors::{Dtype, SafeTensors};
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
+
+/// One test at a time, so that the counters each test reads (written-out backward runs, kernel
+/// runs) count only that test's work.
+fn serial() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+struct Case {
+    name: &'static str,
+    meta: HashMap<String, serde_json::Value>,
+    tensors: HashMap<String, (Vec<usize>, Vec<f32>)>,
+}
+
+impl Case {
+    fn load(name: &'static str) -> Self {
+        let path = format!(
+            "{}/tests/fixtures/gated_delta_chunk/{name}.safetensors",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let (_, metadata) = SafeTensors::read_metadata(&bytes).unwrap();
+        let meta = metadata
+            .metadata()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::from_str(v).unwrap()))
+            .collect();
+        let st = SafeTensors::deserialize(&bytes).unwrap();
+        let tensors = st
+            .tensors()
+            .into_iter()
+            .map(|(name, view)| {
+                assert_eq!(view.dtype(), Dtype::F32, "{name}");
+                let data = view
+                    .data()
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                (name, (view.shape().to_vec(), data))
+            })
+            .collect();
+        Self {
+            name,
+            meta,
+            tensors,
+        }
+    }
+
+    fn flag(&self, key: &str) -> bool {
+        self.meta[key].as_bool().unwrap()
+    }
+
+    fn get(&self, key: &str) -> &[f32] {
+        &self.tensors[key].1
+    }
+
+    fn tensor<const D: usize>(&self, key: &str, device: &Device) -> Tensor<D> {
+        let (shape, data) = &self.tensors[key];
+        Tensor::from_data(TensorData::new(data.clone(), shape.clone()), device)
+    }
+}
+
+/// What one run of the operation gave: output, final state, and gradients, as f32 vectors.
+type Results = HashMap<&'static str, Vec<f32>>;
+
+fn to_vec<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+    t.cast(DType::F32)
+        .into_data()
+        .try_into_vec::<f32>()
+        .unwrap()
+}
+
+/// Runs the case's forward and backward on `device` with inputs in `dtype`.
+fn run(case: &Case, device: &Device, dtype: DType) -> Results {
+    let leaf3 = |key: &str| case.tensor::<3>(key, device).cast(dtype).require_grad();
+    let leaf4 = |key: &str| case.tensor::<4>(key, device).cast(dtype).require_grad();
+    let (q, k, v) = (leaf4("q"), leaf4("k"), leaf4("v"));
+    let (g, beta) = (leaf3("g"), leaf3("beta"));
+    let h0 = case
+        .flag("initial_state")
+        .then(|| case.tensor::<4>("h0", device).require_grad());
+    let state_grad = case.flag("final_state_grad");
+    let runs = backward_runs();
+    let (out, state) = chunk_gated_delta_rule(
+        q.clone(),
+        k.clone(),
+        v.clone(),
+        g.clone(),
+        beta.clone(),
+        h0.clone(),
+        state_grad,
+        case.flag("l2norm"),
+    );
+    let mut loss = (out.clone().cast(DType::F32) * case.tensor::<4>("d_out", device)).sum();
+    if state_grad {
+        let state = state.clone().unwrap();
+        assert_eq!(state.dtype(), DType::F32);
+        loss = loss + (state * case.tensor::<4>("d_state", device)).sum();
+    }
+    let grads = loss.backward();
+    assert!(
+        backward_runs() > runs,
+        "the written-out backward did not run"
+    );
+    assert_eq!(out.dtype(), dtype);
+    let mut res = Results::new();
+    res.insert("out", to_vec(out));
+    if let Some(state) = state {
+        res.insert("state", to_vec(state));
+    }
+    res.insert("dq", to_vec(q.grad(&grads).unwrap()));
+    res.insert("dk", to_vec(k.grad(&grads).unwrap()));
+    res.insert("dv", to_vec(v.grad(&grads).unwrap()));
+    res.insert("dg", to_vec(g.grad(&grads).unwrap()));
+    res.insert("dbeta", to_vec(beta.grad(&grads).unwrap()));
+    if let Some(h0) = h0 {
+        res.insert("dh0", to_vec(h0.grad(&grads).unwrap()));
+    }
+    res
+}
+
+/// Max abs error, and max abs error relative to the reference's max abs value.
+fn errors(actual: &[f32], expected: &[f32]) -> (f32, f32) {
+    assert_eq!(actual.len(), expected.len());
+    let mut max_err = 0f32;
+    let mut scale = 0f32;
+    for (a, e) in actual.iter().zip(expected) {
+        assert!(a.is_finite(), "non-finite value {a}");
+        max_err = max_err.max((a - e).abs());
+        scale = scale.max(e.abs());
+    }
+    (max_err, max_err / scale)
+}
+
+/// Compares every result with the reference `<name><suffix>`, printing the errors, and asserts
+/// the relative error is at most `tol`.
+fn check(case: &Case, label: &str, res: &Results, suffix: &str, tol: f32) {
+    let mut keys: Vec<_> = res.keys().copied().collect();
+    keys.sort();
+    let mut failed = Vec::new();
+    for key in keys {
+        let (abs, rel) = errors(&res[key], case.get(&format!("{key}{suffix}")));
+        println!(
+            "{:20} {label:12} {key:6} vs {:13} max abs {abs:.3e} rel {rel:.3e}",
+            case.name,
+            format!("torch{suffix}")
+        );
+        if rel > tol {
+            failed.push(format!("{key} {rel:.3e}"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} {label}: relative errors above {tol:.1e}: {failed:?}",
+        case.name
+    );
+}
+
+const F32_CASES: [&str; 3] = ["f32_l2norm_state", "f32_plain", "f32_short"];
+
+/// fp32 against torch at fp32 (and at f64): the requirement is 1e-5 relative; the measured errors
+/// are at most 1.2e-6, on Flex and on CUDA (printed with --nocapture).
+const F32_TOL: f32 = 2e-6;
+
+/// bf16 inputs, against the f64 reference from the same inputs. The operation computes in f32
+/// and rounds once, to the outputs' dtype, so its error is about one bf16 rounding of the largest
+/// values (2^-9 relative): measured at most 2.5e-3. torch's own bf16 path, which normalises
+/// queries and keys in bf16, is further off (up to 8.1e-3, printed beside it).
+const BF16_TOL: f32 = 3e-3;
+
+fn check_f32_cases(device: &Device, label: &str) {
+    for name in F32_CASES {
+        let case = Case::load(name);
+        let res = run(&case, device, DType::F32);
+        check(&case, label, &res, "", F32_TOL);
+        check(&case, label, &res, "_f64", F32_TOL);
+    }
+}
+
+fn check_bf16_case(device: &Device, label: &str) {
+    let case = Case::load("bf16_l2norm_state");
+    let res = run(&case, device, DType::BF16);
+    check(&case, label, &res, "_f64", BF16_TOL);
+    // For the record: torch's own bf16 path against the same f64 reference.
+    let mut keys: Vec<_> = res.keys().copied().collect();
+    keys.sort();
+    for key in keys {
+        let (abs, rel) = errors(
+            case.get(&format!("{key}_torch_bf16")),
+            case.get(&format!("{key}_f64")),
+        );
+        println!(
+            "{:20} {:12} {key:6} vs torch_f64     max abs {abs:.3e} rel {rel:.3e}",
+            case.name, "torch-bf16"
+        );
+    }
+}
+
+#[test]
+fn fp32_on_flex_matches_torch() {
+    let _serial = serial();
+    check_f32_cases(&Device::flex().autodiff(), "flex");
+}
+
+#[test]
+fn bf16_on_flex_matches_torch() {
+    let _serial = serial();
+    check_bf16_case(&Device::flex().autodiff(), "flex-bf16");
+}
+
+/// Without autodiff, and through Autodiff without a gradient, the output and the final state are
+/// those of the gradient run.
+#[test]
+fn forward_without_gradients_on_flex() {
+    let _serial = serial();
+    let case = Case::load("f32_l2norm_state");
+    for device in [Device::flex(), Device::flex().autodiff()] {
+        let t4 = |key: &str| case.tensor::<4>(key, &device);
+        let t3 = |key: &str| case.tensor::<3>(key, &device);
+        let (out, state) = chunk_gated_delta_rule(
+            t4("q"),
+            t4("k"),
+            t4("v"),
+            t3("g"),
+            t3("beta"),
+            Some(t4("h0")),
+            true,
+            true,
+        );
+        let (_, rel) = errors(&to_vec(out), case.get("out"));
+        assert!(rel <= F32_TOL);
+        let (_, rel) = errors(&to_vec(state.unwrap()), case.get("state"));
+        assert!(rel <= F32_TOL);
+    }
+}
+
+/// Seeded inputs for shapes too large to record: `(q, k, v, g, beta, h0, d_out, d_state)` as f32
+/// vectors, the model's distributions (`g = -softplus(x) 0.4`, `beta = sigmoid(x)`); keys and
+/// queries normalised when the l2norm is not done in the kernel.
+#[cfg(feature = "cuda")]
+fn seeded(
+    seed: u64,
+    [b, t, h, dk, dv]: [usize; 5],
+    normalise: bool,
+) -> [(Vec<usize>, Vec<f32>); 8] {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut uniform = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    let mut normal = move |len: usize| -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                let (u1, u2) = (uniform(), uniform());
+                ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32
+            })
+            .collect()
+    };
+    let rows = |x: Vec<f32>, d: usize| -> Vec<f32> {
+        x.chunks(d)
+            .flat_map(|r| {
+                let n = r.iter().map(|v| v * v).sum::<f32>().sqrt();
+                r.iter().map(move |v| v / n).collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    let (mut q, mut k) = (normal(b * t * h * dk), normal(b * t * h * dk));
+    if normalise {
+        q = rows(q, dk);
+        k = rows(k, dk);
+    }
+    let v = normal(b * t * h * dv);
+    let g = normal(b * t * h)
+        .into_iter()
+        .map(|x| -(1.0 + (x - 0.5).exp()).ln() * 0.4)
+        .collect();
+    let beta = normal(b * t * h)
+        .into_iter()
+        .map(|x| 1.0 / (1.0 + (-x).exp()))
+        .collect();
+    let h0 = normal(b * h * dk * dv)
+        .into_iter()
+        .map(|x| x * 0.5)
+        .collect();
+    [
+        (vec![b, t, h, dk], q),
+        (vec![b, t, h, dk], k),
+        (vec![b, t, h, dv], v),
+        (vec![b, t, h], g),
+        (vec![b, t, h], beta),
+        (vec![b, h, dk, dv], h0),
+        (vec![b, t, h, dv], normal(b * t * h * dv)),
+        (vec![b, h, dk, dv], normal(b * h * dk * dv)),
+    ]
+}
+
+#[cfg(feature = "cuda")]
+mod cuda {
+    use super::*;
+    use dash_ops::gated_delta::chunk::{
+        chunk_gated_delta_rule_reference, chunk_gated_delta_rule_reference_backward, kernel_runs,
+    };
+
+    fn t4(x: &(Vec<usize>, Vec<f32>), device: &Device) -> Tensor<4> {
+        Tensor::from_data(TensorData::new(x.1.clone(), x.0.clone()), device)
+    }
+
+    fn t3(x: &(Vec<usize>, Vec<f32>), device: &Device) -> Tensor<3> {
+        Tensor::from_data(TensorData::new(x.1.clone(), x.0.clone()), device)
+    }
+
+    /// The kernels (forward, and backward through Autodiff) against the reference (forward and
+    /// written-out backward, from Burn's tensor operations) on the same device, from the same
+    /// inputs rounded to `dtype`. Returns the largest relative error over the outputs and
+    /// gradients, printing each.
+    fn kernels_against_reference(label: &str, dims: [usize; 5], l2norm: bool, dtype: DType) -> f32 {
+        let device = Device::cuda(0);
+        let ad = device.clone().autodiff();
+        let x = seeded(7, dims, !l2norm);
+        let leaf4 = |i: usize| t4(&x[i], &ad).cast(dtype).require_grad();
+        let leaf3 = |i: usize| t3(&x[i], &ad).cast(dtype).require_grad();
+        let (q, k, v, g, beta) = (leaf4(0), leaf4(1), leaf4(2), leaf3(3), leaf3(4));
+        let h0 = t4(&x[5], &ad).require_grad();
+        let runs = kernel_runs();
+        let (out, state) = chunk_gated_delta_rule(
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            g.clone(),
+            beta.clone(),
+            Some(h0.clone()),
+            true,
+            l2norm,
+        );
+        let state = state.unwrap();
+        let loss = (out.clone().cast(DType::F32) * t4(&x[6], &ad)).sum()
+            + (state.clone() * t4(&x[7], &ad)).sum();
+        let grads = loss.backward();
+        let ours = [
+            to_vec(out),
+            to_vec(state),
+            to_vec(q.grad(&grads).unwrap()),
+            to_vec(k.grad(&grads).unwrap()),
+            to_vec(v.grad(&grads).unwrap()),
+            to_vec(g.grad(&grads).unwrap()),
+            to_vec(beta.grad(&grads).unwrap()),
+            to_vec(h0.grad(&grads).unwrap()),
+        ];
+        // After the reads: under Burn's fusion the kernels run when their results are needed.
+        assert!(kernel_runs() >= runs + 2, "the CUDA kernels did not run");
+        // The reference in f32 from the inputs as the kernels saw them.
+        let r4 = |i: usize| t4(&x[i], &device).cast(dtype).cast(DType::F32);
+        let r3 = |i: usize| t3(&x[i], &device).cast(dtype).cast(DType::F32);
+        let (out, state) = chunk_gated_delta_rule_reference(
+            r4(0),
+            r4(1),
+            r4(2),
+            r3(3),
+            r3(4),
+            t4(&x[5], &device),
+            l2norm,
+        );
+        let (dq, dk, dv, dg, dbeta, dh0) = chunk_gated_delta_rule_reference_backward(
+            r4(0),
+            r4(1),
+            r4(2),
+            r3(3),
+            r3(4),
+            t4(&x[5], &device),
+            t4(&x[6], &device),
+            t4(&x[7], &device),
+            l2norm,
+        );
+        let theirs = [
+            to_vec(out),
+            to_vec(state),
+            to_vec(dq),
+            to_vec(dk),
+            to_vec(dv),
+            to_vec(dg),
+            to_vec(dbeta),
+            to_vec(dh0),
+        ];
+        let names = ["out", "state", "dq", "dk", "dv", "dg", "dbeta", "dh0"];
+        let mut worst = 0f32;
+        for ((name, a), e) in names.iter().zip(&ours).zip(&theirs) {
+            let (abs, rel) = errors(a, e);
+            println!("{label:28} {name:6} vs reference  max abs {abs:.3e} rel {rel:.3e}");
+            worst = worst.max(rel);
+        }
+        worst
+    }
+
+    #[test]
+    fn fp32_on_cuda_runs_the_kernels_and_matches_torch() {
+        let _serial = serial();
+        let runs = kernel_runs();
+        check_f32_cases(&Device::cuda(0).autodiff(), "cuda");
+        assert!(kernel_runs() > runs, "the CUDA kernels did not run");
+    }
+
+    #[test]
+    fn bf16_on_cuda_runs_the_kernels_and_matches_torch() {
+        let _serial = serial();
+        let runs = kernel_runs();
+        check_bf16_case(&Device::cuda(0).autodiff(), "cuda-bf16");
+        assert!(kernel_runs() > runs, "the CUDA kernels did not run");
+    }
+
+    /// Qwen3.5-0.8B's head shapes (Dk = Dv = 128), a sequence ending mid-chunk, two batch
+    /// elements: the kernels within 1e-6 of the reference in fp32 (measured at most 4.9e-7).
+    #[test]
+    fn kernels_match_the_reference_at_model_shapes() {
+        let _serial = serial();
+        let dims = [2, 300, 3, 128, 128];
+        let worst = kernels_against_reference("cuda f32 l2norm D=128", dims, true, DType::F32);
+        assert!(worst <= 1e-6, "relative error {worst:.3e}");
+        let worst = kernels_against_reference("cuda f32 plain D=128", dims, false, DType::F32);
+        assert!(worst <= 1e-6, "relative error {worst:.3e}");
+    }
+
+    /// The same in bf16: the kernels compute in f32 from the bf16 inputs and round once, to the
+    /// outputs' dtype (2^-9 relative), so they stay within a bf16 rounding of the f32 reference
+    /// (measured at most 3.2e-3).
+    #[test]
+    fn kernels_match_the_reference_in_bf16() {
+        let _serial = serial();
+        let dims = [1, 200, 2, 128, 128];
+        let worst = kernels_against_reference("cuda bf16 l2norm D=128", dims, true, DType::BF16);
+        assert!(worst <= 4e-3, "relative error {worst:.3e}");
+    }
+
+    /// Heads larger than the kernels hold run the reference on CUDA, and agree with Flex.
+    #[test]
+    fn large_heads_fall_back_to_the_reference() {
+        let _serial = serial();
+        let dims = [1, 70, 2, 160, 144];
+        let x = seeded(3, dims, false);
+        let run = |device: &Device| {
+            let (out, state) = chunk_gated_delta_rule(
+                t4(&x[0], device),
+                t4(&x[1], device),
+                t4(&x[2], device),
+                t3(&x[3], device),
+                t3(&x[4], device),
+                Some(t4(&x[5], device)),
+                true,
+                true,
+            );
+            (to_vec(out), to_vec(state.unwrap()))
+        };
+        let runs = kernel_runs();
+        let (out, state) = run(&Device::cuda(0));
+        assert_eq!(
+            kernel_runs(),
+            runs,
+            "large heads must not reach the kernels"
+        );
+        let (out_flex, state_flex) = run(&Device::flex());
+        let (_, rel_out) = errors(&out, &out_flex);
+        let (_, rel_state) = errors(&state, &state_flex);
+        println!("large heads: out rel {rel_out:.3e}, state rel {rel_state:.3e} (cuda vs flex)");
+        assert!(rel_out <= 1e-6 && rel_state <= 1e-6);
+    }
+}
