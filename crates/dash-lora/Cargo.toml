@@ -13,6 +13,12 @@ rust-version.workspace = true
 default = ["flex"]
 flex = ["burn/flex", "burn/simd", "burn/rayon"]
 cuda = ["burn/cuda"]
+# Burn's autotune: each kernel chosen by timing the candidates on the device the first time a
+# shape runs, again in every new process (the tuning cache does not persist). Off by default for
+# the reason fusion is: it changes which kernels, and so which low bits, every Burn crate in the
+# same build runs. Matmul-heavy work wants it: on an RTX 5070 Ti, Burn's bf16
+# [6144x3584]x[3584x1024] runs at 6 TFLOPS without it and 75 with it.
+autotune = ["burn/autotune"]
 
 [dependencies]
 burn = { workspace = true, features = ["autodiff", "optim"] }
