@@ -2,8 +2,8 @@
 
 IREE inference backend for Dashmag: compiled artifacts on CPU and CUDA.
 
-Part of [Dashmag](https://github.com/bayanasar/dashmag) — a runtime-agnostic
-edge ML inference framework in Rust. See the repository for the full picture.
+Part of [Dashmag](https://github.com/bayanasar/dashmag) — a machine-learning library in Rust
+on Burn. See the repository for the full picture.
 
 > **Status:** pre-alpha. APIs will change.
 

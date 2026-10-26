@@ -14,6 +14,9 @@ the caller's layers is the caller's.
   pass, as `torch.utils.checkpoint` around each block does. Over 6144 tokens through 24 LoRA'd MLP
   blocks at Qwen3.5-0.8B's shapes it peaks 0.7 GiB above the weights, against 7.1 GiB without it.
 
+Part of [Dashmag](https://github.com/bayanasar/dashmag) — a machine-learning library in Rust
+on Burn. See the repository for the full picture.
+
 Features as in `dash-ops`: `flex` (default), `cuda`, and opt-in `autotune`.
 
     cargo test -p dash-lora

@@ -19,8 +19,8 @@ What is not reproduced — random streams, the crop's resize filter, batch norm'
 
 Flex, the pure-Rust CPU device, is the default build; `--features cuda`, `rocm` or `metal` add a GPU.
 
-Part of [Dashmag](https://github.com/bayanasar/dashmag) — a runtime-agnostic
-edge ML inference framework in Rust. See the repository for the full picture.
+Part of [Dashmag](https://github.com/bayanasar/dashmag) — a machine-learning library in Rust
+on Burn. See the repository for the full picture.
 
 > **Status:** pre-alpha. APIs will change.
 

@@ -7,13 +7,18 @@ stage: one model, correct on every target tried; models run on Burn and train in
 <!-- /progress -->
 
 ## What this is
-A runtime-agnostic inference framework: one `dash-core` trait, several backends (tract,
-IREE, TensorRT, Edge TPU), and a cross-backend conformance test that holds them to each
-other. The claim is "one model source, correct everywhere", with a pure-Rust CPU floor.
+A general machine-learning library in Rust on Burn: model architectures, training, the
+operations training needs that Burn lacks, inference across runtimes, and exits to
+accelerator compilers. With Burn beneath it, it is meant to do for Rust what PyTorch does for
+Python, and to grow more general, not narrower. Each part is held to values recorded from the
+implementation it replaces.
 
-Two crates carry training operations Burn 0.22 does not have, for training a Gated DeltaNet hybrid such as Qwen3.5-0.8B with LoRA: `dash-ops` (the gated delta rule, chunked and recurrent; causal attention with grouped key-value heads and a backward pass that keeps no T x T scores; the log-probability of chosen tokens over a large vocabulary; causal depthwise conv1d) and `dash-lora` (a frozen bf16 base, f32 adapters, PEFT's format). They depend on Burn alone.
+Built so far: one model family, MobileNetV3-Small with any number of heads (`dash-models`),
+trained by `dash-train` and run by Burn or by other runtimes behind one `dash-core` trait
+(tract, IREE, TensorRT, Edge TPU), with a cross-backend conformance test that holds them to
+each other and a pure-Rust CPU floor; and training operations Burn 0.22 does not have, for training a Gated DeltaNet hybrid such as Qwen3.5-0.8B with LoRA: `dash-ops` (the gated delta rule, chunked and recurrent; causal attention with grouped key-value heads and a backward pass that keeps no T x T scores; the log-probability of chosen tokens over a large vocabulary; causal depthwise conv1d) and `dash-lora` (a frozen bf16 base, f32 adapters, PEFT's format), which depend on Burn alone.
 
-Where it is going: the model defined once in Rust on Burn, trained and run by dashmag, with
+Where it is going: models defined once in Rust on Burn, trained and run by dashmag, with
 ONNX and int8 tflite written from Rust only as exits to NPU vendors' compilers.
 
 ## Sealed
@@ -61,6 +66,7 @@ On `main`, and re-runnable by anyone who checks it out.
 - 2026-10-21 Training runs on Flex, the CPU device, until a GPU is free — because a full run takes about 95 minutes on ten cores, and the one other GPU in reach, an RDNA2 card under WSL2, has no ROCm: AMD's WSL support starts at RDNA3.
 - 2026-10-24 `dash-models` names no Flex features; `dash-burn` and `dash-train` turn on its SIMD kernels and threads — because the crate that defines the model stays device-agnostic, and which kernels run is decided where the device is chosen.
 - 2026-10-25 Training operations Burn lacks live in `dash-ops` and `dash-lora`, which depend on Burn alone — because they extend Burn's backends and share this workspace's Burn pin, its patched cubecl-cuda and its way of holding results to recorded references, while nothing else here depends on them, so they can move out or upstream unchanged.
+- 2026-10-26 Dashmag is a general machine-learning library in Rust on Burn, not an inference framework for one model family — because what it holds is general (architectures, a trainer, training operations, runtimes, exits), and with Burn it is to serve Rust as PyTorch serves Python; the model it was first built for uses it and does not define it.
 - 2026-10-25 `fusion` and `autotune` are opt-in features — because they change which kernels every Burn crate in a build runs, and with autotune the kernel depends on timing, so results stop repeating bit for bit between runs; the agreements and the determinism recorded here are made without them.
 
 ## Open

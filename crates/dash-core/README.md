@@ -1,9 +1,9 @@
 # dash-core
 
-Runtime-agnostic whole-model inference traits, tensors, capability negotiation and dispatch. The Dashmag spine; no backend dependencies.
+Runtime-agnostic whole-model inference traits, tensors, capability negotiation and dispatch. The spine of Dashmag's inference; no backend dependencies.
 
-Part of [Dashmag](https://github.com/bayanasar/dashmag) — a runtime-agnostic
-edge ML inference framework in Rust. See the repository for the full picture.
+Part of [Dashmag](https://github.com/bayanasar/dashmag) — a machine-learning library in Rust
+on Burn. See the repository for the full picture.
 
 > **Status:** pre-alpha. APIs will change.
 

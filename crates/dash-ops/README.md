@@ -18,6 +18,9 @@ node instead of the reference's intermediate tensors. `tests/extension_pattern.r
 smallest complete example of that shape. Shapes, dtypes and what each operation matches are in
 its module's documentation.
 
+Part of [Dashmag](https://github.com/bayanasar/dashmag) — a machine-learning library in Rust
+on Burn. See the repository for the full picture.
+
 ## Features
 
 - `flex` (default): the references, on the CPU.
