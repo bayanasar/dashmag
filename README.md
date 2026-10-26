@@ -31,6 +31,17 @@ recording comes from.
 
 `PROGRESS.md` says what has been measured, on which hardware, and what has not run yet.
 
+## How a model gets here
+
+- **As code.** A model is a Burn module (`dash-models`), trained by `dash-train` and run by
+  `dash-burn`, or by `dash --backend burn`, on any Burn device. Published PyTorch weights for a
+  `dash-models` architecture load directly, and `dash-import` converts a PyTorch checkpoint into
+  the safetensors file `dash-burn` reads.
+- **As an artifact.** tract and TensorRT run an ONNX file, IREE a module compiled from one
+  (`tools/compile_iree.sh`), the Edge TPU an int8 TFLite file. Today the ONNX files are exported
+  from PyTorch (`tools/export_*.py`); writing them from a Burn module in Rust is planned, so that
+  both ways start from the same model.
+
 ## Inference across runtimes
 
 The inference seam is **whole-model inference** — load a model, tensors in, tensors out — so
