@@ -2325,6 +2325,7 @@ name = "dash-lora"
 version = "0.0.1"
 dependencies = [
  "burn",
+ "dash-ops",
  "safetensors 0.8.0",
  "serde",
  "serde_json",

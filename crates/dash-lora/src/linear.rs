@@ -59,7 +59,7 @@ pub struct Lora {
     pub scale: f64,
     /// PEFT's `lora_dropout`, applied to the adapter's input only, and only while training
     /// (on an autodiff device, outside `valid()`). A layer with dropout is random: it cannot be
-    /// run again identically by [`recompute`](crate::recompute).
+    /// run again identically by [`dash_ops::checkpoint`].
     pub dropout: Dropout,
 }
 

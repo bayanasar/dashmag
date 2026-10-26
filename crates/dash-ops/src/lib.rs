@@ -14,6 +14,8 @@
 //! - [`logprob`]: the log-probability of chosen tokens under a large vocabulary, without the
 //!   n x V logits.
 //! - [`conv1d`]: causal depthwise 1-D convolution, with the state a decoder carries.
+//! - [`checkpoint`]: activation checkpointing, not an operation but built on Burn's tensor API:
+//!   a stack of layers run outside autodiff, each layer run again in the backward pass.
 //!
 //! # Conventions
 //!
@@ -79,6 +81,7 @@
 //! inputs come from a seeded host generator, never from Burn's.
 
 pub mod attention;
+pub mod checkpoint;
 pub mod conv1d;
 pub mod gated_delta;
 pub mod logprob;

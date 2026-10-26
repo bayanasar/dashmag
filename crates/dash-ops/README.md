@@ -10,6 +10,7 @@ backward pass:
 | `attention` | causal attention with grouped key-value heads, a backward pass that keeps no T x T scores, and decoding against a key-value cache | FlashAttention-2 style kernels on the tensor cores |
 | `logprob` | the log-probability of chosen tokens under a large vocabulary, with the entropy, without the n x V logits | chunked matmuls and a fused log-sum-exp kernel |
 | `conv1d` | causal depthwise conv1d (kernel width 4, SiLU fused) and its decoding state | forward, backward and step kernels |
+| `checkpoint` | activation checkpointing: a stack of layers run outside autodiff, each layer run again in the backward pass (built on Burn's tensor API, not an extension) | the layers' own |
 
 Each operation has three parts: a reference built from Burn's tensor operations, which runs on
 every device and is what the tests hold the kernels to; CubeCL kernels on the CUDA backend; and

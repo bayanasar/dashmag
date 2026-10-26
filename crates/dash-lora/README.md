@@ -10,9 +10,12 @@ the caller's layers is the caller's.
 - `LoraLinear`, `Lora`: the layer; the base product at the weight's dtype, the low-rank product in
   f32, their sum rounded once, as PEFT computes it.
 - `PeftAdapter`, `PeftConfig`: PEFT's files, read and written back byte for byte.
-- `recompute`: a stack's forward pass run outside autodiff, each layer run again in the backward
-  pass, as `torch.utils.checkpoint` around each block does. Over 6144 tokens through 24 LoRA'd MLP
-  blocks at Qwen3.5-0.8B's shapes it peaks 0.7 GiB above the weights, against 7.1 GiB without it.
+
+Activation checkpointing (a stack's forward pass run outside autodiff, each layer run again in the
+backward pass, as `torch.utils.checkpoint` around each block does) lives in `dash-ops`, as
+`dash_ops::checkpoint`, for any model. `examples/recompute_memory.rs` measures it here: over 6144
+tokens through 24 LoRA'd MLP blocks at Qwen3.5-0.8B's shapes it peaks 0.69 GiB above the weights,
+against 7.2 GiB without it.
 
 Part of [Dashmag](https://github.com/bayanasar/dashmag) — a machine-learning library in Rust
 on Burn. See the repository for the full picture.

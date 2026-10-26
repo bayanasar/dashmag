@@ -5,7 +5,7 @@
 //! - `none`: plain autodiff, one graph through every block;
 //! - `balanced`: Burn's own gradient checkpointing (`Device::gradient_checkpointing()`), which
 //!   recomputes memory-bound operations from backed-up compute-bound parents;
-//! - `layer`: each block recomputed in the backward pass ([`dash_lora::recompute`]).
+//! - `layer`: each block recomputed in the backward pass (`dash_ops::checkpoint`).
 //!
 //! One mode per process, so that memory pools do not carry over. Peak memory is the largest
 //! `bytes_in_use` of the device's pools (live allocations, not padding or cached pages), sampled
@@ -18,16 +18,20 @@
 //!   ... -- <none|balanced|layer> [layers 24] [tokens 6144] [timed repetitions 3]
 //!
 //! On an RTX 5070 Ti, 24 layers, 6144 tokens: the peak in use above the weights and input
-//! (536 MiB), the largest over repeated runs (a sampled peak varies by some 60 MiB from run to
-//! run), and the median step; PyTorch 2.13 with PEFT 0.20 on the same blocks and card beside it
-//! (`torch.utils.checkpoint` around each block for `layer`; its peak is the allocator's exact
-//! `max_memory_allocated`):
+//! (536 MiB), the largest over repeated runs of this workspace's build (a sampled peak varies by
+//! some 60 MiB from run to run), and the median step, the median over runs; PyTorch 2.13 with
+//! PEFT 0.20 on the same blocks and card beside it (`torch.utils.checkpoint` around each block
+//! for `layer`; its peak is the allocator's exact `max_memory_allocated`):
 //!
 //! | mode       | peak above | step, this workspace's build | with Burn's `autotune` | `autotune` + `fusion` | PyTorch          |
 //! |------------|-----------:|-----------------------------:|-----------------------:|----------------------:|-----------------:|
-//! | `none`     |   7347 MiB |                       981 ms |                 403 ms |                269 ms | 6415 MiB, 202 ms |
-//! | `balanced` |  14595 MiB |     11.0 s (pools near full) |                        |                       |                  |
-//! | `layer`    |    733 MiB |                      1340 ms |                 563 ms |                334 ms |  743 MiB, 292 ms |
+//! | `none`     |   7324 MiB |                       979 ms |                 401 ms |                302 ms | 6415 MiB, 202 ms |
+//! | `balanced` |  14571 MiB |     12.1 s (pools near full) |                        |                       |                  |
+//! | `layer`    |    709 MiB |                      1340 ms |                 571 ms |                336 ms |  743 MiB, 292 ms |
+//!
+//! With `autotune` each process times its own kernel choices, and a step's time varies more
+//! from run to run (with `fusion` too, `none` took 290 to 429 ms over three runs); with both,
+//! the peaks are 7251 and 613 MiB.
 //!
 //! Without `autotune` two of the base products, M 6144, K 3584, N 1024, run a default kernel
 //! at 7.2 ms each (6 TFLOP/s) where the others take 0.6 ms: half the step. The rest of the gap
@@ -40,7 +44,8 @@ use std::time::{Duration, Instant};
 use burn::module::Module;
 use burn::optim::GradientsParams;
 use burn::tensor::{DType, Device, Tensor, TensorData, activation};
-use dash_lora::{Lora, LoraLinear, recompute};
+use dash_lora::{Lora, LoraLinear};
+use dash_ops::checkpoint;
 
 const HIDDEN: usize = 1024;
 const MLP: usize = 3584;
@@ -208,23 +213,19 @@ fn step(mode: &str, blocks: &[Block], x: &Tensor<2>, peak: &Peak) -> (f64, Gradi
             (loss.into_scalar::<f32>() as f64, params)
         }
         "layer" => {
-            let (out, saved) = recompute::forward(blocks, x.clone(), |b, h| b.forward(h));
+            let (out, saved) = checkpoint::forward(blocks, x.clone(), |b, h| b.forward(h));
             let loss = loss(out.clone());
             peak.mark();
-            let head = loss.backward();
-            let mut params = GradientsParams::new();
-            recompute::backward(
-                blocks,
-                saved,
-                out.grad(&head).unwrap(),
-                |b, h| {
-                    let y = b.forward(h);
-                    peak.mark();
-                    y
-                },
-                &mut params,
-            );
+            let mut grads = loss.backward();
+            let grad = out.grad_remove(&mut grads).unwrap();
+            let block = |b: &Block, h: Tensor<2>| {
+                let y = b.forward(h);
+                peak.mark();
+                y
+            };
+            checkpoint::backward(blocks, saved, grad, block, &mut grads);
             peak.mark();
+            let params = GradientsParams::from_grads(grads, &blocks.to_vec());
             (loss.into_scalar::<f32>() as f64, params)
         }
         other => panic!("mode {other}: none, balanced or layer"),

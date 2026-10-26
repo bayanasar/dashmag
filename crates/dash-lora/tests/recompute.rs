@@ -1,8 +1,10 @@
-//! A stack of LoRA'd blocks trained with each block recomputed in the backward pass gives the
-//! gradients plain autodiff gives: every adapter's, and the stack input's.
+//! A stack of LoRA'd blocks trained with each block recomputed in the backward pass
+//! (`dash_ops::checkpoint`) gives the gradients plain autodiff gives: every adapter's, and the
+//! stack input's.
 //!
 //! In f32 they are bit-identical, on Flex and on CUDA, and under Burn's own checkpointing too
-//! (on CUDA with Burn's autotune, within a few f32 roundings: see `same_computation`).
+//! (on CUDA with Burn's autotune and fusion together, within a few f32 roundings: see
+//! `same_computation`).
 //! In bf16 they are not, and need not be: Burn adds up a tensor's gradient contributions as
 //! they arrive, a block's input has five consumers, and the per-block graphs reach them in a
 //! different order than the whole-stack graph, so their bf16 sums round differently; the
@@ -16,11 +18,25 @@
 
 mod common;
 
+use std::sync::{Mutex, MutexGuard};
+
 use burn::module::Module;
 use burn::optim::GradientsParams;
 use burn::tensor::{DType, Device, Tensor, TensorData, activation};
 use common::*;
-use dash_lora::{Lora, LoraLinear, recompute};
+use dash_lora::{Lora, LoraLinear};
+use dash_ops::checkpoint;
+
+/// The tests take turns. With Burn's `autotune`, a thread that asks for a shape another thread
+/// is tuning runs an untuned candidate meanwhile, and the passes compared would then need not
+/// run the same kernels.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// `x + down(silu(gate(x)) * up(x))`, every projection LoRA'd: a language model's MLP block.
 #[derive(Module, Debug)]
@@ -135,18 +151,14 @@ fn plain(blocks: &[Block], x: &Tensor<2>) -> Result {
 }
 
 fn recomputed(blocks: &[Block], x: &Tensor<2>) -> Result {
-    let (out, saved) = recompute::forward(blocks, x.clone(), |b, h| b.forward(h));
+    let block = |b: &Block, h: Tensor<2>| b.forward(h);
+    let (out, saved) = checkpoint::forward(blocks, x.clone(), block);
     assert_eq!(saved.len(), blocks.len());
     let loss = loss(out.clone());
-    let head = loss.backward();
-    let mut params = GradientsParams::new();
-    let dx = recompute::backward(
-        blocks,
-        saved,
-        out.grad(&head).unwrap(),
-        |b, h| b.forward(h),
-        &mut params,
-    );
+    let mut grads = loss.backward();
+    let grad = out.grad_remove(&mut grads).unwrap();
+    let dx = checkpoint::backward(blocks, saved, grad, block, &mut grads);
+    let params = GradientsParams::from_grads(grads, &blocks.to_vec());
     assert_eq!(params.len(), distinct(blocks));
     Result {
         loss: loss.into_data(),
@@ -223,24 +235,26 @@ fn bf16_ratios(name: &str, device: &Device, seed: u64, verbose: bool) -> (f64, f
 }
 
 /// How far the recomputed stack may be from plain autodiff when both compute the same thing,
-/// relative to the largest value: nothing on Flex, a few f32 roundings on CUDA. On CUDA they
-/// agree bit for bit with Burn's default kernels and with `burn/fusion`, but with
-/// `burn/autotune` the two passes need not run the same kernels: autotune may settle on a
-/// different fused kernel for the whole-stack backward pass than for the per-block ones (their
-/// operation streams differ), and while one thread tunes a matrix product of a given shape,
-/// another asking for the same shape runs an untuned candidate. Measured over sixteen runs
-/// each of autotune with and without fusion, half with the tests in parallel: adapter
-/// gradients up to 7.7e-7, the input gradient 3.8e-7, the bf16 stack's loss 1.2e-7 (one ulp);
-/// the f32 stack's loss never differed.
+/// relative to the largest value. Nothing on Flex, nor on CUDA with Burn's default kernels,
+/// with `burn/fusion` or with `autotune`: they agree bit for bit. With `autotune` and
+/// `burn/fusion` together the two passes need not run the same kernels: autotune may settle on
+/// a different fused kernel for the whole-stack backward pass than for the per-block ones
+/// (their operation streams differ); over three runs, adapter gradients up to 5.4e-7. The
+/// tests take turns: while one thread tunes a matrix product of a given shape, another asking
+/// for the same shape runs an untuned candidate, and over fourteen runs of `autotune` builds
+/// with the tests in parallel the f32 gradients moved up to 1.2e-6 apart, the f32 loss twice by
+/// one rounding.
 fn same_computation(device_name: &str) -> (f64, f64) {
     match device_name {
         "flex" => (0.0, 0.0),
-        _ => (f64::INFINITY, 1e-6),
+        _ if cfg!(feature = "autotune") => (f64::INFINITY, 1e-6),
+        _ => (0.0, 0.0),
     }
 }
 
 #[test]
 fn recomputed_f32_stack_gives_plain_autodiff_s_gradients() {
+    let _serial = serial();
     for (name, device) in devices() {
         let (blocks, x) = stack(&device, DType::F32, 7);
         let (p, r) = (plain(&blocks, &x), recomputed(&blocks, &x));
@@ -266,6 +280,7 @@ fn recomputed_f32_stack_gives_plain_autodiff_s_gradients() {
 /// those maxima; the 8 stacks checked here include the worst of the 64 (seed 1).
 #[test]
 fn recomputed_bf16_stack_is_as_close_to_f32_as_plain_autodiff() {
+    let _serial = serial();
     for (name, device) in devices() {
         for seed in 0..8 {
             let (worst, overall) = bf16_ratios(name, &device, seed, seed == 0);
@@ -289,6 +304,7 @@ fn recomputed_bf16_stack_is_as_close_to_f32_as_plain_autodiff() {
 #[test]
 #[ignore]
 fn bf16_ratios_over_many_seeds() {
+    let _serial = serial();
     for (name, device) in devices() {
         let (mut worst, mut overall) = (Vec::new(), Vec::new());
         for seed in 0..64 {
@@ -312,6 +328,7 @@ fn bf16_ratios_over_many_seeds() {
 /// makes carry the parameters' strategy, so no operation mixes two.
 #[test]
 fn recompute_runs_under_balanced_checkpointing() {
+    let _serial = serial();
     let device = Device::flex().autodiff().gradient_checkpointing();
     let (blocks, x) = stack(&device, DType::F32, 7);
     let (p, r) = (plain(&blocks, &x), recomputed(&blocks, &x));
@@ -325,6 +342,7 @@ fn recompute_runs_under_balanced_checkpointing() {
 /// of both uses', as plain autodiff gives.
 #[test]
 fn shared_parameters_accumulate_across_layers() {
+    let _serial = serial();
     let device = Device::flex().autodiff();
     let (mut blocks, x) = stack(&device, DType::F32, 7);
     blocks[2] = blocks[0].clone();
