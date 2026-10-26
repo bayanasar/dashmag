@@ -2,21 +2,22 @@
 //! f16, head dimension 64, 128 or 256, a device with `mma.sync` and `ldmatrix` for that dtype)
 //! and runs the reference for the rest.
 //!
-//! Inputs are read through their strides. Every tensor the kernels write is allocated
-//! contiguous: CubeCL's default allocation pads rows to the device's pitch, and the kernels
-//! index their outputs and the per-row statistics densely.
+//! Inputs are read through their strides, in place where the kernels can (see [`readable`]).
+//! Every tensor the kernels write is allocated contiguous, in the layout the module
+//! documentation gives: CubeCL's default allocation pads rows to the device's pitch, and the
+//! kernels index their outputs and the per-row statistics densely.
 
 use super::kernels::{
     BLOCK_KV, BLOCK_Q, FORWARD_BLOCK_Q, decode_merge_kernel, decode_split_kernel, delta_kernel,
     dkdv_kernel, dq_kernel, forward_kernel,
 };
-use super::{CausalAttentionBackend, KERNEL_LAUNCHES, reference};
+use super::{CausalAttentionBackend, probe, reference};
 use burn::backend::cubecl::{dtype_to_elem_type, dtype_to_storage_type};
 use burn::backend::ops::FloatTensorOps;
 use burn::backend::tensor::FloatTensor;
 use burn::backend::{DType, FloatDType, Shape};
 use burn_cubecl::CubeBackend;
-use burn_cubecl::kernel::into_contiguous;
+use burn_cubecl::kernel::{into_contiguous, untile};
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::ir::features::MmaConfig;
@@ -39,13 +40,14 @@ fn shared_bytes(d: usize) -> usize {
     (2 * BLOCK_Q as usize + 2 * block_kv(d) as usize) * d * 2
 }
 
-/// Whether the kernels take these inputs.
+/// Whether the kernels take these inputs (`key` and `value` `[B, Tk, Hkv, D]`, `query` with `D`
+/// last).
 fn supported(query: &CubeTensor, key: &CubeTensor, value: &CubeTensor) -> bool {
     let dtype = query.dtype;
     if !matches!(dtype, DType::BF16 | DType::F16) || key.dtype != dtype || value.dtype != dtype {
         return false;
     }
-    let d = query.meta.shape()[3];
+    let d = key.meta.shape()[3];
     if !matches!(d, 64 | 128 | 256) {
         return false;
     }
@@ -68,26 +70,51 @@ fn supported(query: &CubeTensor, key: &CubeTensor, value: &CubeTensor) -> bool {
         && properties.hardware.max_shared_memory_size >= shared_bytes(d)
 }
 
-/// The input as the kernels read it: rows (not a matmul's storage tiles), last dimension
-/// contiguous, every stride a whole number of 16-byte vectors, the first element 16-byte
-/// aligned; copied to a contiguous tensor otherwise.
-fn readable(tensor: CubeTensor) -> CubeTensor {
+/// Whether the kernels read `tensor` as it is: rows (not a matmul's storage tiles), the last
+/// dimension contiguous, every other stride a whole number of 16-byte vectors, the first element
+/// 16-byte aligned.
+fn in_place(tensor: &CubeTensor) -> bool {
     let strides = tensor.meta.strides();
     let rank = strides.len();
-    let aligned_offset = tensor.handle.offset_start.unwrap_or(0).is_multiple_of(16);
-    let ok = !tensor.meta.is_tiled()
+    !tensor.meta.is_tiled()
         && strides[rank - 1] == 1
         && strides[..rank - 1]
             .iter()
             .all(|stride| stride % VECTOR == 0)
-        && aligned_offset;
-    if ok { tensor } else { into_contiguous(tensor) }
+        && tensor.handle.offset_start.unwrap_or(0).is_multiple_of(16)
 }
 
-/// The batch, head and row strides of a `[B, H, T, D]` input, in 16-byte vectors.
-fn vector_strides(tensor: &CubeTensor) -> [u32; 3] {
+/// The input as the kernels read it: itself when they can ([`in_place`]), a contiguous copy
+/// otherwise, counted by `probe::input_copies`.
+fn readable(tensor: CubeTensor) -> CubeTensor {
+    if in_place(&tensor) {
+        return tensor;
+    }
+    probe::INPUT_COPIES.fetch_add(1, Ordering::SeqCst);
+    let tensor = untile(tensor);
+    if in_place(&tensor) {
+        return tensor;
+    }
+    // A fresh allocation, so aligned even where the input was contiguous but not aligned.
+    let (client, device, dtype) = (tensor.client.clone(), tensor.device.clone(), tensor.dtype);
+    let copy = burn_cubecl::cubecl::std::tensor::into_contiguous(
+        &client,
+        tensor.binding(),
+        dtype_to_storage_type(dtype),
+    );
+    CubeTensor::new(client, copy.handle, *copy.metadata, device, dtype)
+}
+
+/// `strides[axes[i]]` in 16-byte vectors: `[0, 2, 1]` gives the batch, head and time strides of
+/// a `[B, T, H, D]` input, `[0, 1]` the batch and head strides of a `[B, H, D]` one.
+fn vector_strides<const N: usize>(tensor: &CubeTensor, axes: [usize; N]) -> [u32; N] {
     let strides = tensor.meta.strides();
-    [0, 1, 2].map(|i| u32::try_from(strides[i] / VECTOR).expect("strides fit in u32"))
+    axes.map(|axis| u32::try_from(strides[axis] / VECTOR).expect("strides fit in u32"))
+}
+
+/// The batch, head and time strides of a `[B, T, H, D]` input, in 16-byte vectors.
+fn sequence_strides(tensor: &CubeTensor) -> [u32; 3] {
+    vector_strides(tensor, [0, 2, 1])
 }
 
 fn dims(tensor: &CubeTensor) -> [usize; 4] {
@@ -96,10 +123,10 @@ fn dims(tensor: &CubeTensor) -> [usize; 4] {
 }
 
 fn launched() {
-    KERNEL_LAUNCHES.fetch_add(1, Ordering::SeqCst);
+    probe::KERNEL_LAUNCHES.fetch_add(1, Ordering::SeqCst);
 }
 
-/// The forward: output `[B, Hq, Tq, D]` and log-sum-exp `[B, Hq, Tq]` f32, both contiguous.
+/// The forward: output `[B, Tq, Hq, D]` and log-sum-exp `[B, Tq, Hq]` f32, both contiguous.
 fn forward(
     query: CubeTensor,
     key: CubeTensor,
@@ -107,21 +134,21 @@ fn forward(
     scale: f32,
 ) -> (CubeTensor, CubeTensor) {
     let (query, key, value) = (readable(query), readable(key), readable(value));
-    let [b, hq, tq, d] = dims(&query);
-    let [_, hkv, tk, _] = dims(&key);
+    let [b, tq, hq, d] = dims(&query);
+    let [_, tk, hkv, _] = dims(&key);
     let client = query.client.clone();
     let device = query.device.clone();
     let output = empty_device_contiguous_dtype(
         client.clone(),
         device.clone(),
-        Shape::new([b, hq, tq, d]),
+        Shape::new([b, tq, hq, d]),
         query.dtype,
     );
     let lse =
-        empty_device_contiguous_dtype(client.clone(), device, Shape::new([b, hq, tq]), DType::F32);
-    let [q_sb, q_sh, q_st] = vector_strides(&query);
-    let [k_sb, k_sh, k_st] = vector_strides(&key);
-    let [v_sb, v_sh, v_st] = vector_strides(&value);
+        empty_device_contiguous_dtype(client.clone(), device, Shape::new([b, tq, hq]), DType::F32);
+    let [q_sb, q_sh, q_st] = sequence_strides(&query);
+    let [k_sb, k_sh, k_st] = sequence_strides(&key);
+    let [v_sb, v_sh, v_st] = sequence_strides(&value);
     let q_blocks = tq.div_ceil(FORWARD_BLOCK_Q as usize);
     let cube_count = CubeCount::Static(q_blocks as u32, hq as u32, b as u32);
     let dtype = dtype_to_storage_type(query.dtype);
@@ -159,7 +186,22 @@ fn forward(
     (output, lse)
 }
 
-/// The backward: `delta`, then `dQ`, then `dK` and `dV`.
+/// The log-sum-exp as the backward kernels read it: f32, contiguous `[B, Tq, Hq]`.
+fn lse_readable(lse: CubeTensor) -> CubeTensor {
+    if lse.dtype == DType::F32 && !lse.meta.is_tiled() && lse.is_contiguous() {
+        return lse;
+    }
+    probe::INPUT_COPIES.fetch_add(1, Ordering::SeqCst);
+    let lse = if lse.dtype == DType::F32 {
+        lse
+    } else {
+        CubeBackend::float_cast(lse, FloatDType::F32)
+    };
+    into_contiguous(lse)
+}
+
+/// The backward: `delta`, then `dQ`, then `dK` and `dV`, each gradient contiguous in its input's
+/// layout.
 #[allow(clippy::too_many_arguments)]
 fn backward(
     query: CubeTensor,
@@ -172,28 +214,24 @@ fn backward(
 ) -> (CubeTensor, CubeTensor, CubeTensor) {
     let (query, key, value) = (readable(query), readable(key), readable(value));
     let (output, grad_output) = (readable(output), readable(grad_output));
-    let lse = into_contiguous(if lse.dtype == DType::F32 {
-        lse
-    } else {
-        CubeBackend::float_cast(lse, FloatDType::F32)
-    });
-    let [b, hq, tq, d] = dims(&query);
-    let [_, hkv, tk, _] = dims(&key);
+    let lse = lse_readable(lse);
+    let [b, tq, hq, d] = dims(&query);
+    let [_, tk, hkv, _] = dims(&key);
     let client = query.client.clone();
     let device = query.device.clone();
     let dtype = dtype_to_storage_type(query.dtype);
-    let [q_sb, q_sh, q_st] = vector_strides(&query);
-    let [k_sb, k_sh, k_st] = vector_strides(&key);
-    let [v_sb, v_sh, v_st] = vector_strides(&value);
-    let [o_sb, o_sh, o_st] = vector_strides(&output);
-    let [do_sb, do_sh, do_st] = vector_strides(&grad_output);
+    let [q_sb, q_sh, q_st] = sequence_strides(&query);
+    let [k_sb, k_sh, k_st] = sequence_strides(&key);
+    let [v_sb, v_sh, v_st] = sequence_strides(&value);
+    let [o_sb, o_sh, o_st] = sequence_strides(&output);
+    let [do_sb, do_sh, do_st] = sequence_strides(&grad_output);
     let group = (hq / hkv) as u32;
 
-    let rows = b * hq * tq;
+    let rows = b * tq * hq;
     let delta = empty_device_contiguous_dtype(
         client.clone(),
         device.clone(),
-        Shape::new([b, hq, tq]),
+        Shape::new([b, tq, hq]),
         DType::F32,
     );
     let rows_per_cube = 256 / (d / VECTOR);
@@ -223,7 +261,7 @@ fn backward(
     let grad_query = empty_device_contiguous_dtype(
         client.clone(),
         device.clone(),
-        Shape::new([b, hq, tq, d]),
+        Shape::new([b, tq, hq, d]),
         query.dtype,
     );
     launched();
@@ -265,13 +303,13 @@ fn backward(
     let grad_key = empty_device_contiguous_dtype(
         client.clone(),
         device.clone(),
-        Shape::new([b, hkv, tk, d]),
+        Shape::new([b, tk, hkv, d]),
         key.dtype,
     );
     let grad_value = empty_device_contiguous_dtype(
         client.clone(),
         device,
-        Shape::new([b, hkv, tk, d]),
+        Shape::new([b, tk, hkv, d]),
         value.dtype,
     );
     launched();
@@ -311,12 +349,13 @@ fn backward(
     (grad_query, grad_key, grad_value)
 }
 
-/// Decoding: the cache split so that there are about eight cubes per multiprocessor, each split
-/// a whole number of the first pass's key slots long.
+/// Decoding, `query` `[B, Hq, D]` against `key` and `value` `[B, S, Hkv, D]`: the cache split so
+/// that there are about eight cubes per multiprocessor, each split a whole number of the first
+/// pass's key slots long.
 fn decode(query: CubeTensor, key: CubeTensor, value: CubeTensor, scale: f32) -> CubeTensor {
     let (query, key, value) = (readable(query), readable(key), readable(value));
-    let [b, hq, _, d] = dims(&query);
-    let [_, hkv, len, _] = dims(&key);
+    let [b, len, hkv, d] = dims(&key);
+    let hq = query.meta.shape()[1];
     let client = query.client.clone();
     let device = query.device.clone();
     let dtype = dtype_to_storage_type(query.dtype);
@@ -344,9 +383,9 @@ fn decode(query: CubeTensor, key: CubeTensor, value: CubeTensor, scale: f32) -> 
         Shape::new([b, hq, splits]),
         DType::F32,
     );
-    let [q_sb, q_sh, _] = vector_strides(&query);
-    let [k_sb, k_sh, k_st] = vector_strides(&key);
-    let [v_sb, v_sh, v_st] = vector_strides(&value);
+    let [q_sb, q_sh] = vector_strides(&query, [0, 1]);
+    let [k_sb, k_sh, k_st] = sequence_strides(&key);
+    let [v_sb, v_sh, v_st] = sequence_strides(&value);
     launched();
     unsafe {
         decode_split_kernel::launch_unchecked(
@@ -375,12 +414,8 @@ fn decode(query: CubeTensor, key: CubeTensor, value: CubeTensor, scale: f32) -> 
         );
     }
 
-    let output = empty_device_contiguous_dtype(
-        client.clone(),
-        device,
-        Shape::new([b, hq, 1, d]),
-        query.dtype,
-    );
+    let output =
+        empty_device_contiguous_dtype(client.clone(), device, Shape::new([b, hq, d]), query.dtype);
     launched();
     unsafe {
         decode_merge_kernel::launch_unchecked(
@@ -444,13 +479,13 @@ impl CausalAttentionBackend for CubeBackend {
         value: FloatTensor<Self>,
         scale: f32,
     ) -> FloatTensor<Self> {
-        let group = query.meta.shape()[1] / key.meta.shape()[1];
+        let group = query.meta.shape()[1] / key.meta.shape()[2];
         // The first pass keeps `group` query rows of eight f32 per lane in registers and their
         // partial sums in shared memory; past 16 heads per group the reference is the safer path.
         if supported(&query, &key, &value) && group <= 16 {
             decode(query, key, value, scale)
         } else {
-            reference::forward::<Self>(query, key, value, scale).0
+            reference::decode::<Self>(query, key, value, scale)
         }
     }
 }

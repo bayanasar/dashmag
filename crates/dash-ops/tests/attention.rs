@@ -8,23 +8,20 @@
 //!
 //! The records (`tests/fixtures/attention/*.safetensors`) hold inputs drawn from a normal
 //! distribution and rounded to bf16, so that the same inputs feed f32 and bf16 runs, and
-//! torch's output, log-sum-exp and gradients computed from them in fp32. Errors are reported as
-//! the largest absolute difference and that difference over the largest reference magnitude.
+//! torch's output, log-sum-exp and gradients computed from them in fp32. They are in torch's
+//! order, the heads before the time (`[B, H, T, D]`, `[B, H, T]`); [`record`] swaps the two into
+//! the module's `[B, T, H, D]` and `[B, T, H]`. Errors are reported as the largest absolute
+//! difference and that difference over the largest reference magnitude.
 
 use burn::backend::{DType, FloatDType, bf16};
 use burn::tensor::{Device, Tensor, TensorData};
 #[cfg(feature = "cuda")]
-use dash_ops::attention::KERNEL_LAUNCHES;
-#[cfg(feature = "cuda")]
 use dash_ops::attention::causal_attention_backward;
-use dash_ops::attention::{
-    BACKWARD_RUNS, attention_decode, causal_attention, causal_attention_with_lse,
-};
+use dash_ops::attention::{attention_decode, causal_attention, causal_attention_with_lse, probe};
 use safetensors::{Dtype, SafeTensors};
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 
-/// The counters are global: tests that read them run one at a time.
+/// The probe counters are global: tests that read them run one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// A host tensor: values and shape.
@@ -49,6 +46,34 @@ impl Host {
             .expect("f32 data");
         Self { values, shape }
     }
+
+    /// Dimensions 1 and 2 swapped, the values moved with them: `[B, H, T, ...]` to
+    /// `[B, T, H, ...]` and back.
+    fn swap_1_2(&self) -> Self {
+        let [b, n1, n2] = [self.shape[0], self.shape[1], self.shape[2]];
+        let inner: usize = self.shape[3..].iter().product();
+        let mut values = Vec::with_capacity(self.values.len());
+        for i in 0..b {
+            for j in 0..n2 {
+                for k in 0..n1 {
+                    let at = ((i * n1 + k) * n2 + j) * inner;
+                    values.extend_from_slice(&self.values[at..at + inner]);
+                }
+            }
+        }
+        let mut shape = self.shape.clone();
+        shape.swap(1, 2);
+        Self { values, shape }
+    }
+
+    /// The same values in another shape of as many elements (row-major order kept).
+    fn reshaped(&self, shape: &[usize]) -> Self {
+        assert_eq!(shape.iter().product::<usize>(), self.values.len());
+        Self {
+            values: self.values.clone(),
+            shape: shape.to_vec(),
+        }
+    }
 }
 
 /// One record: inputs, the scale, and torch's results.
@@ -71,6 +96,7 @@ struct Results {
     dv: Host,
 }
 
+/// Tensor `name` of a record, its heads and time swapped into the module's layout.
 fn read(tensors: &SafeTensors, name: &str) -> Host {
     let view = tensors.tensor(name).expect("tensor in record");
     let bytes = view.data();
@@ -89,6 +115,7 @@ fn read(tensors: &SafeTensors, name: &str) -> Host {
         values,
         shape: view.shape().to_vec(),
     }
+    .swap_1_2()
 }
 
 fn record(name: &'static str) -> Record {
@@ -212,10 +239,10 @@ fn reference_and_its_backward_match_torch_on_flex() {
     let device = Device::flex().autodiff();
     for name in RECORDS {
         let r = record(name);
-        let runs = BACKWARD_RUNS.load(Ordering::SeqCst);
+        let runs = probe::backward_runs();
         let actual = run(&device, &r.q, &r.k, &r.v, &r.grad, r.scale, DType::F32);
         assert!(
-            BACKWARD_RUNS.load(Ordering::SeqCst) > runs,
+            probe::backward_runs() > runs,
             "the written-out backward did not run"
         );
         check(
@@ -245,16 +272,25 @@ fn host(shape: &[usize], seed: u64) -> Host {
     }
 }
 
-/// `[B, Hq, Hkv, Tq, Tk, D]` inputs, the output gradient and the scale, from a seed.
+/// The queries `[B, Tq, Hq, D]`, keys and values `[B, Tk, Hkv, D]`, the output gradient and the
+/// scale, from a seed, for `dims` `[B, Hq, Hkv, Tq, Tk, D]`. The values are drawn in torch's
+/// order, the heads before the time, as the records hold them.
 fn inputs(dims: [usize; 6], seed: u64) -> (Host, Host, Host, Host, f32) {
     let [b, hq, hkv, tq, tk, d] = dims;
     (
-        host(&[b, hq, tq, d], seed),
-        host(&[b, hkv, tk, d], seed + 1),
-        host(&[b, hkv, tk, d], seed + 2),
-        host(&[b, hq, tq, d], seed + 3),
+        host(&[b, hq, tq, d], seed).swap_1_2(),
+        host(&[b, hkv, tk, d], seed + 1).swap_1_2(),
+        host(&[b, hkv, tk, d], seed + 2).swap_1_2(),
+        host(&[b, hq, tq, d], seed + 3).swap_1_2(),
         (d as f32).powf(-0.5),
     )
+}
+
+/// A decoding step's query, `[B, Hq, D]`, from the `[B, 1, Hq, D]` queries of [`inputs`].
+fn step_query(q: &Host) -> Host {
+    let [b, tq, hq, d] = [q.shape[0], q.shape[1], q.shape[2], q.shape[3]];
+    assert_eq!(tq, 1, "one query per sequence");
+    q.reshaped(&[b, hq, d])
 }
 
 #[test]
@@ -262,7 +298,7 @@ fn decode_is_attention_with_one_query_on_flex() {
     let device = Device::flex();
     let (q, k, v, _, scale) = inputs([2, 4, 2, 1, 37, 64], 7);
     let decoded = attention_decode(
-        q.on::<4>(&device, DType::F32),
+        step_query(&q).on::<3>(&device, DType::F32),
         k.on::<4>(&device, DType::F32),
         v.on::<4>(&device, DType::F32),
         scale,
@@ -273,11 +309,58 @@ fn decode_is_attention_with_one_query_on_flex() {
         v.on::<4>(&device, DType::F32),
         scale,
     );
-    let (abs, _) = errors(&Host::from_tensor(decoded), &Host::from_tensor(full));
+    let decoded = Host::from_tensor(decoded);
+    assert_eq!(decoded.shape, [2, 4, 64], "decoding returns [B, Hq, D]");
+    let full = Host::from_tensor(full).reshaped(&decoded.shape);
+    let (abs, _) = errors(&decoded, &full);
     assert!(
         abs == 0.0,
         "decode and attention with Tq = 1 differ by {abs}"
     );
+}
+
+/// A decoding step that requires gradients takes the training path: its query's gradient is
+/// that of attention with one query.
+#[test]
+fn decode_with_gradients_is_attention_with_one_query_on_flex() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let device = Device::flex().autodiff();
+    let (q, k, v, grad, scale) = inputs([2, 4, 2, 1, 37, 64], 8);
+    let leaf = |h: &Host| h.on::<4>(&device, DType::F32).require_grad();
+
+    let (full_q, full_k, full_v) = (leaf(&q), leaf(&k), leaf(&v));
+    let full = causal_attention(full_q.clone(), full_k.clone(), full_v.clone(), scale);
+    let full_grads = (full * grad.on::<4>(&device, DType::F32)).sum().backward();
+
+    let step_q = step_query(&q).on::<3>(&device, DType::F32).require_grad();
+    let (step_k, step_v) = (leaf(&k), leaf(&v));
+    let runs = probe::backward_runs();
+    let step = attention_decode(step_q.clone(), step_k.clone(), step_v.clone(), scale);
+    let step_grads = (step * step_query(&grad).on::<3>(&device, DType::F32))
+        .sum()
+        .backward();
+    assert!(
+        probe::backward_runs() > runs,
+        "the written-out backward did not run"
+    );
+    let pairs = [
+        (
+            Host::from_tensor(step_q.grad(&step_grads).unwrap()),
+            Host::from_tensor(full_q.grad(&full_grads).unwrap()).reshaped(&[2, 4, 64]),
+        ),
+        (
+            Host::from_tensor(step_k.grad(&step_grads).unwrap()),
+            Host::from_tensor(full_k.grad(&full_grads).unwrap()),
+        ),
+        (
+            Host::from_tensor(step_v.grad(&step_grads).unwrap()),
+            Host::from_tensor(full_v.grad(&full_grads).unwrap()),
+        ),
+    ];
+    for (name, (step, full)) in ["dq", "dk", "dv"].into_iter().zip(&pairs) {
+        let (abs, _) = errors(step, full);
+        assert!(abs == 0.0, "{name}: decode and attention differ by {abs}");
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -297,19 +380,25 @@ mod cuda {
                 (DType::BF16, "bf16", BF16_TOLERANCE),
                 (DType::F16, "f16", F16_TOLERANCE),
             ] {
-                let (launches, runs) = (
-                    KERNEL_LAUNCHES.load(Ordering::SeqCst),
-                    BACKWARD_RUNS.load(Ordering::SeqCst),
+                let (launches, runs, copies) = (
+                    probe::kernel_launches(),
+                    probe::backward_runs(),
+                    probe::input_copies(),
                 );
                 let actual = run(&cuda(), &r.q, &r.k, &r.v, &r.grad, r.scale, dtype);
                 // The forward, then delta, dQ, and dK with dV.
                 assert!(
-                    KERNEL_LAUNCHES.load(Ordering::SeqCst) >= launches + 4,
+                    probe::kernel_launches() >= launches + 4,
                     "the CUDA kernels did not run"
                 );
                 assert!(
-                    BACKWARD_RUNS.load(Ordering::SeqCst) > runs,
+                    probe::backward_runs() > runs,
                     "the written-out backward did not run"
+                );
+                assert_eq!(
+                    probe::input_copies(),
+                    copies,
+                    "contiguous inputs were copied"
                 );
                 check(
                     &format!("cuda {label} {}", r.name),
@@ -325,10 +414,10 @@ mod cuda {
     fn f32_runs_the_reference_on_cuda() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let r = record(RECORDS[0]);
-        let launches = KERNEL_LAUNCHES.load(Ordering::SeqCst);
+        let launches = probe::kernel_launches();
         let actual = run(&cuda(), &r.q, &r.k, &r.v, &r.grad, r.scale, DType::F32);
         assert_eq!(
-            KERNEL_LAUNCHES.load(Ordering::SeqCst),
+            probe::kernel_launches(),
             launches,
             "f32 should take the reference"
         );
@@ -362,9 +451,10 @@ mod cuda {
                 scale,
                 DType::F32,
             );
-            let launches = KERNEL_LAUNCHES.load(Ordering::SeqCst);
+            let (launches, copies) = (probe::kernel_launches(), probe::input_copies());
             let actual = run(&cuda(), &q, &k, &v, &grad, scale, DType::BF16);
-            assert!(KERNEL_LAUNCHES.load(Ordering::SeqCst) >= launches + 4);
+            assert!(probe::kernel_launches() >= launches + 4);
+            assert_eq!(probe::input_copies(), copies);
             check(
                 &format!("cuda bf16 {dims:?}"),
                 &actual,
@@ -374,11 +464,15 @@ mod cuda {
         }
     }
 
-    /// Strided inputs (`[B, T, H, D]` storage seen as `[B, H, T, D]`) are read in place.
-    #[test]
-    fn kernels_read_transposed_inputs() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let (q, k, v, grad, scale) = inputs([2, 8, 2, 96, 96, 256], 5);
+    /// The forward and backward through autodiff, every input given as a view of other storage
+    /// through `layout`, against the reference on Flex from contiguous inputs. Returns the
+    /// inputs the kernels copied.
+    fn run_with_layout(
+        dims: [usize; 6],
+        seed: u64,
+        layout: impl Fn(&Host, &Device) -> Tensor<4>,
+    ) -> usize {
+        let (q, k, v, grad, scale) = inputs(dims, seed);
         let expected = run(
             &Device::flex().autodiff(),
             &q,
@@ -389,14 +483,9 @@ mod cuda {
             DType::F32,
         );
         let device = cuda();
-        let transposed = |h: &Host| {
-            // Store as [B, T, H, D], then swap to [B, H, T, D] without copying.
-            let t = h.on::<4>(&device, DType::BF16).swap_dims(1, 2);
-            let t = Tensor::<4>::from_data(t.into_data(), &device).cast(DType::BF16);
-            t.swap_dims(1, 2).detach().require_grad()
-        };
-        let (qt, kt, vt) = (transposed(&q), transposed(&k), transposed(&v));
-        let launches = KERNEL_LAUNCHES.load(Ordering::SeqCst);
+        let leaf = |h: &Host| layout(h, &device).detach().require_grad();
+        let (qt, kt, vt) = (leaf(&q), leaf(&k), leaf(&v));
+        let (launches, copies) = (probe::kernel_launches(), probe::input_copies());
         let (o, lse) = causal_attention_with_lse(qt.clone(), kt.clone(), vt.clone(), scale);
         let grads = (o.clone() * grad.on::<4>(&device, DType::BF16))
             .sum()
@@ -408,8 +497,43 @@ mod cuda {
             dk: Host::from_tensor(kt.grad(&grads).unwrap()),
             dv: Host::from_tensor(vt.grad(&grads).unwrap()),
         };
-        assert!(KERNEL_LAUNCHES.load(Ordering::SeqCst) >= launches + 4);
-        check("cuda bf16 transposed", &actual, &expected, BF16_TOLERANCE);
+        assert!(probe::kernel_launches() >= launches + 4);
+        check(
+            &format!("cuda bf16 strided {dims:?}"),
+            &actual,
+            &expected,
+            BF16_TOLERANCE,
+        );
+        probe::input_copies() - copies
+    }
+
+    /// Inputs stored in torch's order, `[B, H, T, D]`, and seen as `[B, T, H, D]` through
+    /// `swap_dims(1, 2)` are read in place: nothing is copied on the way in. Inputs whose last
+    /// dimension is not contiguous are copied, and give the same results.
+    #[test]
+    fn kernels_read_head_major_inputs_in_place() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dims = [2, 8, 2, 96, 96, 256];
+        let head_major = |h: &Host, device: &Device| {
+            let t = h.on::<4>(device, DType::BF16).swap_dims(1, 2);
+            Tensor::<4>::from_data(t.into_data(), device)
+                .cast(DType::BF16)
+                .swap_dims(1, 2)
+        };
+        let copies = run_with_layout(dims, 5, head_major);
+        assert_eq!(copies, 0, "inputs the kernels read in place were copied");
+
+        let features_first = |h: &Host, device: &Device| {
+            let t = h.on::<4>(device, DType::BF16).swap_dims(2, 3);
+            Tensor::<4>::from_data(t.into_data(), device)
+                .cast(DType::BF16)
+                .swap_dims(2, 3)
+        };
+        let copies = run_with_layout(dims, 6, features_first);
+        assert!(
+            copies >= 3,
+            "inputs with a strided last dimension were not copied"
+        );
     }
 
     /// Decoding against the reference, including a cache read through a slice of a longer one.
@@ -427,21 +551,23 @@ mod cuda {
         .enumerate()
         {
             let (q, k, v, _, scale) = inputs(dims, 200 + 10 * i as u64);
+            let q = step_query(&q);
             let flex = Device::flex();
             let expected = Host::from_tensor(attention_decode(
-                q.on::<4>(&flex, DType::F32),
+                q.on::<3>(&flex, DType::F32),
                 k.on::<4>(&flex, DType::F32),
                 v.on::<4>(&flex, DType::F32),
                 scale,
             ));
-            let launches = KERNEL_LAUNCHES.load(Ordering::SeqCst);
+            let (launches, copies) = (probe::kernel_launches(), probe::input_copies());
             let actual = Host::from_tensor(attention_decode(
-                q.on::<4>(&device, DType::BF16),
+                q.on::<3>(&device, DType::BF16),
                 k.on::<4>(&device, DType::BF16),
                 v.on::<4>(&device, DType::BF16),
                 scale,
             ));
-            assert!(KERNEL_LAUNCHES.load(Ordering::SeqCst) >= launches + 2);
+            assert!(probe::kernel_launches() >= launches + 2);
+            assert_eq!(probe::input_copies(), copies);
             let (abs, rel) = errors(&actual, &expected);
             println!("decode bf16 {dims:?}: max abs {abs:.3e}, relative {rel:.3e}");
             assert!(
@@ -450,24 +576,51 @@ mod cuda {
             );
         }
 
-        // A cache of 512 positions of which the first 300 are filled: read as a slice.
+        // On an autodiff device, a step that takes no gradient runs the same kernels.
+        let (q, k, v, _, scale) = inputs([3, 8, 2, 1, 1000, 256], 200);
+        let q = step_query(&q);
+        let step = |device: &Device| {
+            Host::from_tensor(attention_decode(
+                q.on::<3>(device, DType::BF16),
+                k.on::<4>(device, DType::BF16),
+                v.on::<4>(device, DType::BF16),
+                scale,
+            ))
+        };
+        let plain = step(&device);
+        let launches = probe::kernel_launches();
+        let autodiff = step(&device.clone().autodiff());
+        assert!(
+            probe::kernel_launches() >= launches + 2,
+            "the autodiff device did not run the decoding kernels"
+        );
+        let (abs, _) = errors(&autodiff, &plain);
+        assert!(
+            abs == 0.0,
+            "decoding on an autodiff device differs by {abs}"
+        );
+
+        // A cache of 512 positions of which the first 300 are filled: read as a slice, in place.
         let (q, k, v, _, scale) = inputs([2, 8, 2, 1, 512, 256], 300);
+        let q = step_query(&q);
         let flex = Device::flex();
         let slice = |h: &Host, device: &Device, dtype| {
-            h.on::<4>(device, dtype).slice([0..2, 0..2, 0..300, 0..256])
+            h.on::<4>(device, dtype).slice([0..2, 0..300, 0..2, 0..256])
         };
         let expected = Host::from_tensor(attention_decode(
-            q.on::<4>(&flex, DType::F32),
+            q.on::<3>(&flex, DType::F32),
             slice(&k, &flex, DType::F32),
             slice(&v, &flex, DType::F32),
             scale,
         ));
+        let copies = probe::input_copies();
         let actual = Host::from_tensor(attention_decode(
-            q.on::<4>(&device, DType::BF16),
+            q.on::<3>(&device, DType::BF16),
             slice(&k, &device, DType::BF16),
             slice(&v, &device, DType::BF16),
             scale,
         ));
+        assert_eq!(probe::input_copies(), copies, "the sliced cache was copied");
         let (abs, rel) = errors(&actual, &expected);
         println!("decode bf16 sliced cache: max abs {abs:.3e}, relative {rel:.3e}");
         assert!(
@@ -534,7 +687,7 @@ mod cuda {
             start.largest_tensor
         );
 
-        let launches = KERNEL_LAUNCHES.load(Ordering::SeqCst);
+        let (launches, copies) = (probe::kernel_launches(), probe::input_copies());
         let (o, lse) = causal_attention_with_lse(q.clone(), k.clone(), v.clone(), scale);
         device.sync().unwrap();
         let forward = memory();
@@ -550,10 +703,11 @@ mod cuda {
         device.sync().unwrap();
         let backward = memory();
         assert_eq!(
-            KERNEL_LAUNCHES.load(Ordering::SeqCst),
+            probe::kernel_launches(),
             launches + 4,
             "the forward and the three backward kernels ran, and no other path"
         );
+        assert_eq!(probe::input_copies(), copies, "an input was copied");
         for gradient in [dq, dk, dv] {
             let sample = Host::from_tensor(gradient.slice([0..1, 0..1, 0..1, 0..8]));
             assert!(sample.values.iter().all(|x| x.is_finite()));

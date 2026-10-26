@@ -26,9 +26,7 @@
 //! Without the `cuda` feature it runs on Flex (CPU), as a smoke test.
 
 use burn::tensor::{DType, Device, Tensor, TensorData};
-use dash_ops::gated_delta::recurrent::{
-    gated_delta_step, gated_delta_step_reference, kernel_launches,
-};
+use dash_ops::gated_delta::recurrent::{gated_delta_step, gated_delta_step_reference, probe};
 use std::time::{Duration, Instant};
 
 const B: usize = 8;
@@ -249,9 +247,9 @@ fn main() {
             ("reference", gated_delta_step_reference as Step),
         ] {
             // Warm-up: compile the kernels, fill the memory pools.
-            let launches = kernel_launches();
+            let launches = probe::kernel_launches();
             let _ = back_to_back(&inputs, step, &device, 50, 1);
-            let ran_kernel = kernel_launches() > launches;
+            let ran_kernel = probe::kernel_launches() > launches;
             let (median, min) = one_step(&inputs, step, &device, reps);
             let per_step = back_to_back(&inputs, step, &device, steps, rounds);
             let per_layer = layers_in_turn(&inputs, step, &device, layer_rounds, rounds, false);

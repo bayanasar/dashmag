@@ -1,13 +1,18 @@
 //! The reference: attention as the textbook writes it, built from Burn's tensor operations, in
-//! f32 whatever the input dtype. It expands the key-value heads and materialises the T x T
-//! scores; it is what Flex runs and what the kernels are held to, not what training on a GPU
-//! should run.
+//! f32 whatever the input dtype. It works on `[B, H, T, D]` views of the inputs (one batched
+//! matmul per head), expands the key-value heads and materialises the T x T scores; it is what
+//! Flex runs and what the kernels are held to, not what training on a GPU should run.
 
 use burn::backend::tensor::{BoolTensor, FloatTensor};
 use burn::backend::{Backend, FloatDType, Shape, TensorMetadata, get_or_init_device_settings};
 
 fn dims4<B: Backend>(tensor: &FloatTensor<B>) -> [usize; 4] {
     tensor.shape().dims::<4>()
+}
+
+/// `[B, T, H, ...]` as `[B, H, T, ...]` and back: a view, no copy.
+fn swap_time_and_heads<B: Backend>(tensor: FloatTensor<B>) -> FloatTensor<B> {
+    B::float_swap_dims(tensor, 1, 2)
 }
 
 /// `[B, Hkv, T, D]` to `[B, Hkv * group, T, D]`, each key-value head repeated for the query heads
@@ -54,7 +59,7 @@ fn causal_mask<B: Backend>(scores: &FloatTensor<B>) -> BoolTensor<B> {
 }
 
 /// `scale * q k^T` with the causal mask applied as `-inf`, in f32, `[B, Hq, Tq, Tk]`, and the
-/// expanded f32 keys.
+/// expanded f32 keys, from `[B, H, T, D]` views.
 fn masked_scores<B: Backend>(
     query: FloatTensor<B>,
     key: FloatTensor<B>,
@@ -71,8 +76,8 @@ fn masked_scores<B: Backend>(
     )
 }
 
-/// The output, in the dtype of `query`, and the natural log-sum-exp of each query's scaled,
-/// masked scores, `[B, Hq, Tq]` in f32.
+/// The output `[B, Tq, Hq, D]`, in the dtype of `query`, and the natural log-sum-exp of each
+/// query's scaled, masked scores, `[B, Tq, Hq]` in f32.
 pub(crate) fn forward<B: Backend>(
     query: FloatTensor<B>,
     key: FloatTensor<B>,
@@ -80,10 +85,12 @@ pub(crate) fn forward<B: Backend>(
     scale: f32,
 ) -> (FloatTensor<B>, FloatTensor<B>) {
     let dtype = query.dtype();
-    let [b, hq, tq, _] = dims4::<B>(&query);
-    let group = hq / dims4::<B>(&key)[1];
-    let query = B::float_cast(query, FloatDType::F32);
-    let value = expand_heads::<B>(B::float_cast(value, FloatDType::F32), group);
+    let [b, tq, hq, _] = dims4::<B>(&query);
+    let group = hq / dims4::<B>(&key)[2];
+    let query = swap_time_and_heads::<B>(B::float_cast(query, FloatDType::F32));
+    let key = swap_time_and_heads::<B>(key);
+    let value = swap_time_and_heads::<B>(B::float_cast(value, FloatDType::F32));
+    let value = expand_heads::<B>(value, group);
     let (scores, _) = masked_scores::<B>(query, key, scale);
     // Every query sees at least key 0 (Tk >= Tq), so each row's maximum is finite.
     let max = B::float_max_dim(scores.clone(), 3);
@@ -91,14 +98,15 @@ pub(crate) fn forward<B: Backend>(
     let sum = B::float_sum_dim(exp.clone(), 3);
     let output = B::float_matmul(B::float_div(exp, sum.clone()), value);
     let lse = B::float_add(max, B::float_log(sum));
+    let lse = B::float_reshape(lse, Shape::new([b, hq, tq]));
     (
-        B::float_cast(output, FloatDType::from(dtype)),
-        B::float_reshape(lse, Shape::new([b, hq, tq])),
+        swap_time_and_heads::<B>(B::float_cast(output, FloatDType::from(dtype))),
+        swap_time_and_heads::<B>(lse),
     )
 }
 
-/// The gradients of `query`, `key` and `value`, in their dtypes: with `P = exp(S - lse)`,
-/// `dV = P^T dO`, `dS = P * (dO V^T - rowsum(dO * O))`, `dQ = scale dS K`,
+/// The gradients of `query`, `key` and `value`, each in its input's layout and dtype: with
+/// `P = exp(S - lse)`, `dV = P^T dO`, `dS = P * (dO V^T - rowsum(dO * O))`, `dQ = scale dS K`,
 /// `dK = scale dS^T Q`, each key-value gradient summed over the query heads of its group.
 pub(crate) fn backward<B: Backend>(
     query: FloatTensor<B>,
@@ -110,14 +118,18 @@ pub(crate) fn backward<B: Backend>(
     scale: f32,
 ) -> (FloatTensor<B>, FloatTensor<B>, FloatTensor<B>) {
     let (query_dtype, key_dtype, value_dtype) = (query.dtype(), key.dtype(), value.dtype());
-    let [b, hq, tq, _] = dims4::<B>(&query);
-    let group = hq / dims4::<B>(&key)[1];
-    let f32 = FloatDType::F32;
-    let query = B::float_cast(query, f32);
-    let value = expand_heads::<B>(B::float_cast(value, f32), group);
-    let output = B::float_cast(output, f32);
-    let grad_output = B::float_cast(grad_output, f32);
-    let lse = B::float_reshape(B::float_cast(lse, f32), Shape::new([b, hq, tq, 1]));
+    let [b, tq, hq, _] = dims4::<B>(&query);
+    let group = hq / dims4::<B>(&key)[2];
+    let f32 = |tensor| B::float_cast(tensor, FloatDType::F32);
+    let query = swap_time_and_heads::<B>(f32(query));
+    let key = swap_time_and_heads::<B>(key);
+    let value = expand_heads::<B>(swap_time_and_heads::<B>(f32(value)), group);
+    let output = swap_time_and_heads::<B>(f32(output));
+    let grad_output = swap_time_and_heads::<B>(f32(grad_output));
+    let lse = B::float_reshape(
+        B::float_swap_dims(f32(lse), 1, 2),
+        Shape::new([b, hq, tq, 1]),
+    );
 
     let (scores, key) = masked_scores::<B>(query.clone(), key, scale);
     let probs = B::float_exp(B::float_sub(scores, lse));
@@ -130,15 +142,25 @@ pub(crate) fn backward<B: Backend>(
         B::float_matmul(B::float_transpose(grad_scores), query),
         scale.into(),
     );
+    let back =
+        |tensor, dtype| swap_time_and_heads::<B>(B::float_cast(tensor, FloatDType::from(dtype)));
     (
-        B::float_cast(grad_query, FloatDType::from(query_dtype)),
-        B::float_cast(
-            sum_groups::<B>(grad_key, group),
-            FloatDType::from(key_dtype),
-        ),
-        B::float_cast(
-            sum_groups::<B>(grad_value, group),
-            FloatDType::from(value_dtype),
-        ),
+        back(grad_query, query_dtype),
+        back(sum_groups::<B>(grad_key, group), key_dtype),
+        back(sum_groups::<B>(grad_value, group), value_dtype),
     )
+}
+
+/// Decoding: `query` `[B, Hq, D]` against `key` and `value` `[B, S, Hkv, D]`, the forward with
+/// one query; returns `[B, Hq, D]` in the dtype of `query`.
+pub(crate) fn decode<B: Backend>(
+    query: FloatTensor<B>,
+    key: FloatTensor<B>,
+    value: FloatTensor<B>,
+    scale: f32,
+) -> FloatTensor<B> {
+    let [b, hq, d] = query.shape().dims::<3>();
+    let query = B::float_reshape(query, Shape::new([b, 1, hq, d]));
+    let output = forward::<B>(query, key, value, scale).0;
+    B::float_reshape(output, Shape::new([b, hq, d]))
 }

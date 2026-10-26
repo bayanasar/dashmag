@@ -19,8 +19,8 @@
 //! staged in shared memory, rows padded against bank conflicts. The state passes run one cube per
 //! batch element, head and block of 32 state columns.
 
-use super::ChunkGatedDeltaBackend;
 use super::reference::{self, CHUNK};
+use super::{ChunkGatedDeltaBackend, probe};
 use burn::backend::TensorMetadata;
 use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::ops::FloatTensorOps;
@@ -31,9 +31,7 @@ use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-pub(super) static KERNEL_RUNS: AtomicUsize = AtomicUsize::new(0);
+use std::sync::atomic::Ordering;
 
 /// Columns of the state (of `Dv`) one cube carries through the state passing.
 const BV: usize = 32;
@@ -2150,6 +2148,11 @@ fn combine_kernel<E: Float>(
     }
 }
 
+/// Counts one kernel launch in `probe::kernel_launches`.
+fn launched() {
+    probe::KERNEL_LAUNCHES.fetch_add(1, Ordering::SeqCst);
+}
+
 fn empty_like(reference: &CubeTensor, shape: Shape) -> CubeTensor {
     empty_device_contiguous_dtype(
         reference.client.clone(),
@@ -2174,6 +2177,7 @@ fn state_forward(
     let states = empty_like(&w, Shape::new([b, h, n, dk, dv]));
     let v_new = empty_like(&w, Shape::new([b, h, n, CHUNK, dv]));
     let last = empty_like(&w, Shape::new([b, h, dk, dv]));
+    launched();
     state_forward_kernel::launch(
         &w.client.clone(),
         CubeCount::Static(dv.div_ceil(BV) as u32, (b * h) as u32, 1),
@@ -2210,6 +2214,7 @@ fn state_backward(
     let ds_next = empty_like(&w, Shape::new([b, h, n, dk, dv]));
     let dvn = empty_like(&w, Shape::new([b, h, n, CHUNK, dv]));
     let d_first = empty_like(&w, Shape::new([b, h, dk, dv]));
+    launched();
     state_backward_kernel::launch(
         &w.client.clone(),
         CubeCount::Static(dv.div_ceil(BV) as u32, (b * h) as u32, 1),
@@ -2273,6 +2278,7 @@ fn forward_fused(
         q.dtype,
     );
     let dtype = dtype_to_storage_type(q.dtype);
+    launched();
     output_kernel::launch(
         &q.client.clone(),
         CubeCount::Static((b * h * n) as u32, 1, 1),
@@ -2329,6 +2335,7 @@ fn prep(
     };
     let tm = empty_like(k, ta.clone());
     let am = empty_like(k, ta);
+    launched();
     prep_kernel::launch(
         &k.client.clone(),
         CubeCount::Static((b * h * n) as u32, 1, 1),
@@ -2420,6 +2427,7 @@ fn backward_fused(
     let dv_local = empty_like(&q, chunked(dv));
     let qg = empty_like(&q, chunked(dk));
     let d_o = empty_like(&q, chunked(dv));
+    launched();
     dvlocal_kernel::launch(
         &client,
         count.clone(),
@@ -2458,6 +2466,7 @@ fn backward_fused(
     );
     let dvb = empty_like(&q, chunked(dv));
     let dbeta_v = empty_like(&q, per_token.clone());
+    launched();
     dvb_kernel::launch(
         &client,
         count.clone(),
@@ -2480,6 +2489,7 @@ fn backward_fused(
     let dkt = empty_like(&q, chunked(dk));
     let dkbg = empty_like(&q, chunked(dk));
     let s_ds = empty_like(&q, Shape::new([b, h, n]));
+    launched();
     dstate_kernel::launch(
         &client,
         count.clone(),
@@ -2500,6 +2510,7 @@ fn backward_fused(
     let dq_attn = empty_like(&q, chunked(dk));
     let dk_attn = empty_like(&q, chunked(dk));
     let dg_p = empty_like(&q, per_token.clone());
+    launched();
     dattn_kernel::launch(
         &client,
         count.clone(),
@@ -2525,6 +2536,7 @@ fn backward_fused(
     let dk_a = empty_like(&q, chunked(dk));
     let dbeta_a = empty_like(&q, per_token.clone());
     let dg_a = empty_like(&q, per_token);
+    launched();
     dwy_kernel::launch(
         &client,
         count.clone(),
@@ -2563,6 +2575,7 @@ fn backward_fused(
     );
     let dg = empty_like(&q, Shape::new([b, t, h]));
     let dbeta = empty_like(&q, Shape::new([b, t, h]));
+    launched();
     combine_kernel::launch(
         &client,
         count,
@@ -2619,7 +2632,6 @@ impl ChunkGatedDeltaBackend for CubeBackend {
         if dk > MAX_HEAD_DIM || dv > MAX_HEAD_DIM {
             return reference::forward::<Self>(q, k, v, g, beta, initial_state, use_qk_l2norm);
         }
-        KERNEL_RUNS.fetch_add(1, Ordering::SeqCst);
         forward_fused(q, k, v, g, beta, initial_state, use_qk_l2norm)
     }
 
@@ -2655,7 +2667,6 @@ impl ChunkGatedDeltaBackend for CubeBackend {
                 use_qk_l2norm,
             );
         }
-        KERNEL_RUNS.fetch_add(1, Ordering::SeqCst);
         backward_fused(
             q,
             k,

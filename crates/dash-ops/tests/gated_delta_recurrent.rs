@@ -324,7 +324,7 @@ fn untracked_inputs_on_an_autodiff_device_on_flex() {
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
-    use dash_ops::gated_delta::recurrent::{gated_delta_step_reference, kernel_launches};
+    use dash_ops::gated_delta::recurrent::{gated_delta_step_reference, probe};
     use std::sync::{Mutex, MutexGuard};
 
     /// bf16 output of the kernel against the reference's: both round nearly equal f32 values to
@@ -345,9 +345,9 @@ mod cuda {
     /// Asserts that `f` launched the step's kernel at least `n` times. Under fusion the kernel
     /// runs when its results are read, so `f` reads them.
     fn launches_kernel<R>(n: usize, f: impl FnOnce() -> R) -> R {
-        let before = kernel_launches();
+        let before = probe::kernel_launches();
         let result = f();
-        let launched = kernel_launches() - before;
+        let launched = probe::kernel_launches() - before;
         assert!(
             launched >= n,
             "the CUDA kernel ran {launched} times, expected {n}"
@@ -376,9 +376,13 @@ mod cuda {
     #[test]
     fn tracked_inputs_take_the_reference_and_its_gradients_on_cuda() {
         let _turn = serial();
-        let before = kernel_launches();
+        let before = probe::kernel_launches();
         check_gradients(&device().autodiff());
-        assert_eq!(kernel_launches(), before, "a tracked step ran the kernel");
+        assert_eq!(
+            probe::kernel_launches(),
+            before,
+            "a tracked step ran the kernel"
+        );
     }
 
     #[test]
@@ -546,14 +550,18 @@ mod cuda {
             state.clone(),
             true,
         );
-        let before = kernel_launches();
+        let before = probe::kernel_launches();
         let (out, new_state) = gated_delta_step(q, k, v, g, beta, state, true);
         // Under fusion the reference above runs fused and the fallback inside the step does not.
         let (_, rel) = errors(&out.into_data(), &ref_out.into_data());
         assert!(rel <= F32_OUT, "fallback out: relative error {rel:.3e}");
         let (_, rel) = errors(&new_state.into_data(), &ref_state.into_data());
         assert!(rel <= F32_STATE, "fallback state: relative error {rel:.3e}");
-        assert_eq!(kernel_launches(), before, "the kernel ran for Dk = 264");
+        assert_eq!(
+            probe::kernel_launches(),
+            before,
+            "the kernel ran for Dk = 264"
+        );
     }
 
     /// `q`, `k`, `v` sliced out of one projection and `g`, `beta` transposed views: the kernel

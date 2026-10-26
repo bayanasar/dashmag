@@ -16,10 +16,11 @@
 //! Shapes follow [`crate::gated_delta`]: `q`, `k` `[B, H, Dk]`, `v` `[B, H, Dv]`, `g` and
 //! `beta` `[B, H]`, the state `[B, H, Dk, Dv]` in f32. Queries, keys and values share one float
 //! dtype, which the output takes, as transformers casts its output back to the queries' dtype;
-//! `g` and `beta` may each have their own (Qwen3.5 computes `g` in f32 and `beta` in the model's
-//! dtype). Everything is computed in f32, the l2 normalisation included: on bf16 inputs this is
-//! what fla's kernels do, while transformers' torch path normalises in the input dtype, so the
-//! two differ there by the rounding of the normalised `q` and `k` to bf16.
+//! `g` and `beta` may each be in that dtype or in f32 (models compute `g` in f32 and `beta` in
+//! their own dtype), and are read as f32 whatever their dtype. Everything is computed in f32, the
+//! l2 normalisation included: on bf16 inputs this is what fla's kernels do, while transformers'
+//! torch path normalises in the input dtype, so the two differ there by the rounding of the
+//! normalised `q` and `k` to bf16.
 //!
 //! The step is a backend extension. Flex runs the reference built from Burn's tensor operations;
 //! CUDA runs one fused CubeCL kernel per step, which reads the state once and writes the new
@@ -38,7 +39,6 @@ use burn::backend::{
     Autodiff, AutodiffBackend, Backend, Dispatch, Flex, TensorMetadata, backend_extension,
 };
 use burn::tensor::{DType, FloatDType, Shape, Tensor};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "cuda")]
 mod kernel;
@@ -46,14 +46,18 @@ mod kernel;
 /// The epsilon of transformers' (and fla's) l2 normalisation of `q` and `k`.
 const L2NORM_EPS: f32 = 1e-6;
 
-/// Launches of the CUDA kernel in this process.
-static KERNEL_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
-
-/// How many times this process has launched the step's CUDA kernel. Tests and benchmarks use it
-/// to tell the kernel ran rather than the reference.
+/// Counters tests read to tell which path ran. Not part of the API. The step has no written-out
+/// backward pass to count: a tracked step runs the reference on the autodiff backend.
 #[doc(hidden)]
-pub fn kernel_launches() -> usize {
-    KERNEL_LAUNCHES.load(Ordering::SeqCst)
+pub mod probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) static KERNEL_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+
+    /// Launches of the step's kernel, one a step.
+    pub fn kernel_launches() -> usize {
+        KERNEL_LAUNCHES.load(Ordering::SeqCst)
+    }
 }
 
 #[backend_extension(Flex, Cube: cfg(feature = "cuda"), Fusion: cfg(feature = "fusion"), Autodiff)]
@@ -121,7 +125,8 @@ impl<B: Backend + GatedDeltaStepBackend, C: CheckpointStrategy> GatedDeltaStepBa
 /// One token of the recurrent gated delta rule.
 ///
 /// - `q`, `k`: `[B, H, Dk]`; `v`: `[B, H, Dv]`, all three of one float dtype;
-/// - `g`: `[B, H]`, the log of the decay (`<= 0`); `beta`: `[B, H]`; any float dtype;
+/// - `g`: `[B, H]`, the log of the decay (`<= 0`); `beta`: `[B, H]`; each in `q`'s dtype or f32
+///   (read as f32 whatever their dtype);
 /// - `state`: `[B, H, Dk, Dv]`, f32: zeros before the first token, or the final state of a
 ///   chunked pass over the prompt;
 /// - `use_qk_l2norm`: transformers' `use_qk_l2norm_in_kernel`, which Qwen3.5 sets.

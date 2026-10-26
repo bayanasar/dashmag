@@ -14,8 +14,9 @@
 //! is `[Dk, Dv]` per head and always f32.
 //!
 //! - Inputs: queries and keys `[B, T, H, Dk]`, values `[B, T, H, Dv]` in one float dtype (f32,
-//!   bf16 or f16); `g`, the log of the decay (`<= 0`), and `beta`, both `[B, T, H]`, in any float
-//!   dtype; an optional initial state `[B, H, Dk, Dv]`, f32.
+//!   bf16 or f16); `g`, the log of the decay (`<= 0`), and `beta`, both `[B, T, H]`, each in that
+//!   dtype or in f32 (models compute `g` in f32); both are read as f32, so another float dtype
+//!   works too; an optional initial state `[B, H, Dk, Dv]`, f32.
 //! - Outputs: `o` `[B, T, H, Dv]` in the queries' dtype, and when asked the final state
 //!   `[B, H, Dk, Dv]` in f32, from which [`super::recurrent`] continues decoding.
 //! - Options: `use_qk_l2norm_in_kernel` normalises queries and keys to unit length first (with
@@ -64,23 +65,28 @@ use burn::backend::{
     Autodiff, AutodiffBackend, Backend, Dispatch, TensorMetadata, backend_extension,
 };
 use burn::tensor::{DType, FloatDType, Shape, Slice, Tensor, TensorCreationOptions};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 pub use reference::CHUNK as CHUNK_SIZE;
 
-static BACKWARD_RUNS: AtomicUsize = AtomicUsize::new(0);
+/// Counters tests read to tell which path ran. Not part of the API.
+#[doc(hidden)]
+pub mod probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// How many times the written-out backward pass has run in this process. A diagnostic: tests use
-/// it to tell the written-out backward from the autodiff of the reference.
-pub fn backward_runs() -> usize {
-    BACKWARD_RUNS.load(Ordering::SeqCst)
-}
+    pub(super) static KERNEL_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static BACKWARD_RUNS: AtomicUsize = AtomicUsize::new(0);
 
-/// How many forward and backward passes have run the CUDA kernels in this process. A diagnostic,
-/// as [`backward_runs`].
-#[cfg(feature = "cuda")]
-pub fn kernel_runs() -> usize {
-    cube::KERNEL_RUNS.load(Ordering::SeqCst)
+    /// Launches of this module's CubeCL kernels: three for a forward pass, nine for a backward
+    /// pass.
+    pub fn kernel_launches() -> usize {
+        KERNEL_LAUNCHES.load(Ordering::SeqCst)
+    }
+
+    /// Runs of the written-out backward pass on `Autodiff`.
+    pub fn backward_runs() -> usize {
+        BACKWARD_RUNS.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(feature = "fusion")]
@@ -229,7 +235,7 @@ impl<B: ChunkGatedDeltaBackend> Backward<B, 6> for ChunkBackward {
     type State = Saved<B>;
 
     fn backward(self, ops: Ops<Self::State, 6>, grads: &mut Gradients, _: &mut Checkpointer) {
-        BACKWARD_RUNS.fetch_add(1, Ordering::SeqCst);
+        probe::BACKWARD_RUNS.fetch_add(1, Ordering::SeqCst);
         let s = ops.state;
         let grad = grads.consume::<B>(&ops.node);
         let state_shape = s.initial_state.shape();
@@ -408,7 +414,8 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
 /// query scale `1/sqrt(Dk)`).
 ///
 /// - `q`, `k`: `[B, T, H, Dk]`; `v`: `[B, T, H, Dv]`, one float dtype for the three.
-/// - `g`: `[B, T, H]`, the log of the decay, `<= 0`; `beta`: `[B, T, H]`; any float dtype.
+/// - `g`: `[B, T, H]`, the log of the decay, `<= 0`; `beta`: `[B, T, H]`; each in the queries'
+///   dtype or f32 (read as f32 whatever their dtype).
 /// - `initial_state`: `[B, H, Dk, Dv]`, f32 (other dtypes are cast); zeros when `None`.
 /// - `output_final_state`: return the state after the last token, `[B, H, Dk, Dv]` in f32.
 /// - `use_qk_l2norm_in_kernel`: normalise queries and keys to unit length first.

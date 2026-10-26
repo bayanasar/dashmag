@@ -5,11 +5,13 @@
 //!   ... --example attention_bench -- 8192        # another sequence length
 //!   ... --example attention_bench -- 6144 burn   # also time Burn's own attention (needs ~5 GB)
 //!
-//! Training: one sequence of T tokens, causal; the forward (with its log-sum-exp), the backward
-//! (`delta`, `dQ`, `dK`/`dV`), and both through `Autodiff` with `sum(o * dO)` as the loss.
-//! Decoding: batch 8, one query each, against a 6144-token cache, per layer. Beside them, Burn's
-//! own `attention`, which takes no grouped heads (the key-value heads are expanded for it), and,
-//! for decoding, its flash kernel asked for by name. Each time is the median of 20 runs after 3
+//! Training: one sequence of T tokens, causal, queries `[1, T, 8, 256]`, keys and values
+//! `[1, T, 2, 256]`; the forward (with its log-sum-exp), the backward (`delta`, `dQ`,
+//! `dK`/`dV`), and both through `Autodiff` with `sum(o * dO)` as the loss. Decoding: batch 8, one
+//! query each (`[8, 8, 256]`), against a 6144-token cache (`[8, 6144, 2, 256]`), per layer.
+//! Beside them, Burn's own `attention`, on inputs of its own in its layout, `[B, H, T, D]`, which
+//! takes no grouped heads (the key-value heads are expanded for it), and, for decoding, its flash
+//! kernel asked for by name. Each time is the median of 20 runs after 3
 //! warm-ups, with the device synchronised around each run, so a time includes one launch and
 //! synchronisation; decoding is also timed over 24 calls between synchronisations, as a step
 //! over the layers runs. Memory is the growth of the bytes CubeCL's pools hold in use, read
@@ -74,8 +76,8 @@ mod bench {
         bytes as f64 / (1u64 << 20) as f64
     }
 
-    fn random(shape: [usize; 4], device: &Device) -> Tensor<4> {
-        Tensor::<4>::random(shape, Distribution::Normal(0.0, 1.0), device).cast(DType::BF16)
+    fn random<const N: usize>(shape: [usize; N], device: &Device) -> Tensor<N> {
+        Tensor::<N>::random(shape, Distribution::Normal(0.0, 1.0), device).cast(DType::BF16)
     }
 
     pub fn run() {
@@ -89,10 +91,10 @@ mod bench {
         let scale = (d as f32).powf(-0.5);
         println!("training: B {b}, Hq {hq}, Hkv {hkv}, T {t}, D {d}, bf16, causal");
 
-        let q = random([b, hq, t, d], &device);
-        let k = random([b, hkv, t, d], &device);
-        let v = random([b, hkv, t, d], &device);
-        let grad = random([b, hq, t, d], &device);
+        let q = random([b, t, hq, d], &device);
+        let k = random([b, t, hkv, d], &device);
+        let v = random([b, t, hkv, d], &device);
+        let grad = random([b, t, hq, d], &device);
         device.sync().unwrap();
 
         let forward = median_ms(&device, || {
@@ -191,24 +193,24 @@ mod bench {
         );
         drop((kept, grads));
 
+        drop((q, k, v, grad));
         if burn_too {
-            burn_attention(&device, &q, &k, &v, &grad, hq / hkv);
+            burn_attention(&device, [b, hq, hkv, t, d]);
         }
 
         decode(&device, scale);
     }
 
-    /// Burn's own `attention` at the training shape, the key-value heads expanded (it takes no
-    /// grouped heads): the forward on CUDA, and the forward and backward through `Autodiff`,
-    /// whose backward is the unfused fallback.
-    fn burn_attention(
-        device: &Device,
-        q: &Tensor<4>,
-        k: &Tensor<4>,
-        v: &Tensor<4>,
-        grad: &Tensor<4>,
-        group: usize,
-    ) {
+    /// Burn's own `attention` at the training shape, on inputs of its own in its layout,
+    /// `[B, H, T, D]`, the key-value heads expanded (it takes no grouped heads): the forward on
+    /// CUDA, and the forward and backward through `Autodiff`, whose backward is the unfused
+    /// fallback.
+    fn burn_attention(device: &Device, [b, hq, hkv, t, d]: [usize; 5]) {
+        let group = hq / hkv;
+        let q = &random([b, hq, t, d], device);
+        let k = &random([b, hkv, t, d], device);
+        let v = &random([b, hkv, t, d], device);
+        let grad = &random([b, hq, t, d], device);
         let options = AttentionModuleOptions {
             scale: None,
             softcap: None,
@@ -263,9 +265,9 @@ mod bench {
     fn decode(device: &Device, scale: f32) {
         let (b, hq, hkv, s, d) = (8, 8, 2, 6144, 256);
         println!("decoding: B {b}, Hq {hq}, Hkv {hkv}, cache {s}, D {d}, bf16");
-        let q = random([b, hq, 1, d], device);
-        let k = random([b, hkv, s, d], device);
-        let v = random([b, hkv, s, d], device);
+        let q = random([b, hq, d], device);
+        let k = random([b, s, hkv, d], device);
+        let v = random([b, s, hkv, d], device);
         device.sync().unwrap();
         let ms = median_ms(device, || {
             let _ = attention_decode(q.clone(), k.clone(), v.clone(), scale);
@@ -286,7 +288,12 @@ mod bench {
             bytes / (step * 1e-3) / 1e9
         );
 
-        // Burn's attention takes no grouped heads: the cache expanded to 8 heads first.
+        // Burn's attention takes no grouped heads and its own layout: a query and a cache of its
+        // own, `[B, H, T, D]`, the cache expanded to 8 heads first.
+        drop((q, k, v));
+        let q = random([b, hq, 1, d], device);
+        let k = random([b, hkv, s, d], device);
+        let v = random([b, hkv, s, d], device);
         let options = AttentionModuleOptions {
             scale: None,
             softcap: None,

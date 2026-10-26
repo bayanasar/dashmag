@@ -10,13 +10,13 @@
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test gated_delta_chunk
 
 use burn::tensor::{DType, Device, Tensor, TensorData};
-use dash_ops::gated_delta::chunk::{backward_runs, chunk_gated_delta_rule};
+use dash_ops::gated_delta::chunk::{chunk_gated_delta_rule, probe};
 use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
 /// One test at a time, so that the counters each test reads (written-out backward runs, kernel
-/// runs) count only that test's work.
+/// launches) count only that test's work.
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -98,7 +98,7 @@ fn run(case: &Case, device: &Device, dtype: DType) -> Results {
         .flag("initial_state")
         .then(|| case.tensor::<4>("h0", device).require_grad());
     let state_grad = case.flag("final_state_grad");
-    let runs = backward_runs();
+    let runs = probe::backward_runs();
     let (out, state) = chunk_gated_delta_rule(
         q.clone(),
         k.clone(),
@@ -117,7 +117,7 @@ fn run(case: &Case, device: &Device, dtype: DType) -> Results {
     }
     let grads = loss.backward();
     assert!(
-        backward_runs() > runs,
+        probe::backward_runs() > runs,
         "the written-out backward did not run"
     );
     assert_eq!(out.dtype(), dtype);
@@ -318,7 +318,7 @@ fn seeded(
 mod cuda {
     use super::*;
     use dash_ops::gated_delta::chunk::{
-        chunk_gated_delta_rule_reference, chunk_gated_delta_rule_reference_backward, kernel_runs,
+        chunk_gated_delta_rule_reference, chunk_gated_delta_rule_reference_backward,
     };
 
     fn t4(x: &(Vec<usize>, Vec<f32>), device: &Device) -> Tensor<4> {
@@ -341,7 +341,7 @@ mod cuda {
         let leaf3 = |i: usize| t3(&x[i], &ad).cast(dtype).require_grad();
         let (q, k, v, g, beta) = (leaf4(0), leaf4(1), leaf4(2), leaf3(3), leaf3(4));
         let h0 = t4(&x[5], &ad).require_grad();
-        let runs = kernel_runs();
+        let launches = probe::kernel_launches();
         let (out, state) = chunk_gated_delta_rule(
             q.clone(),
             k.clone(),
@@ -367,7 +367,11 @@ mod cuda {
             to_vec(h0.grad(&grads).unwrap()),
         ];
         // After the reads: under Burn's fusion the kernels run when their results are needed.
-        assert!(kernel_runs() >= runs + 2, "the CUDA kernels did not run");
+        // Three for the forward pass, nine for the backward.
+        assert!(
+            probe::kernel_launches() >= launches + 12,
+            "the CUDA kernels did not run"
+        );
         // The reference in f32 from the inputs as the kernels saw them.
         let r4 = |i: usize| t4(&x[i], &device).cast(dtype).cast(DType::F32);
         let r3 = |i: usize| t3(&x[i], &device).cast(dtype).cast(DType::F32);
@@ -414,17 +418,23 @@ mod cuda {
     #[test]
     fn fp32_on_cuda_runs_the_kernels_and_matches_torch() {
         let _serial = serial();
-        let runs = kernel_runs();
+        let launches = probe::kernel_launches();
         check_f32_cases(&Device::cuda(0).autodiff(), "cuda");
-        assert!(kernel_runs() > runs, "the CUDA kernels did not run");
+        assert!(
+            probe::kernel_launches() > launches,
+            "the CUDA kernels did not run"
+        );
     }
 
     #[test]
     fn bf16_on_cuda_runs_the_kernels_and_matches_torch() {
         let _serial = serial();
-        let runs = kernel_runs();
+        let launches = probe::kernel_launches();
         check_bf16_case(&Device::cuda(0).autodiff(), "cuda-bf16");
-        assert!(kernel_runs() > runs, "the CUDA kernels did not run");
+        assert!(
+            probe::kernel_launches() > launches,
+            "the CUDA kernels did not run"
+        );
     }
 
     /// Qwen3.5-0.8B's head shapes (Dk = Dv = 128), a sequence ending mid-chunk, two batch
@@ -469,11 +479,11 @@ mod cuda {
             );
             (to_vec(out), to_vec(state.unwrap()))
         };
-        let runs = kernel_runs();
+        let launches = probe::kernel_launches();
         let (out, state) = run(&Device::cuda(0));
         assert_eq!(
-            kernel_runs(),
-            runs,
+            probe::kernel_launches(),
+            launches,
             "large heads must not reach the kernels"
         );
         let (out_flex, state_flex) = run(&Device::flex());

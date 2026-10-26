@@ -18,6 +18,10 @@ node instead of the reference's intermediate tensors. `tests/extension_pattern.r
 smallest complete example of that shape. Shapes, dtypes and what each operation matches are in
 its module's documentation.
 
+Every operation follows one set of conventions (layout, `[B, T, H, D]` for tensors split into
+heads; masks; dtypes; options; parts; tests), written out under "Conventions" in the crate
+documentation (`src/lib.rs`).
+
 Part of [Dashmag](https://github.com/bayanasar/dashmag) — a machine-learning library in Rust
 on Burn. See the repository for the full picture.
 

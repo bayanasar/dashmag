@@ -9,7 +9,7 @@
 //! The two sums over Dk (`S^T k`, `S^T q`) and the l2 norms of `q` and `k` go through shared
 //! memory, not plane operations, so the kernel does not depend on the plane width.
 
-use super::{GatedDeltaStepBackend, KERNEL_LAUNCHES, check_inputs, reference};
+use super::{GatedDeltaStepBackend, check_inputs, probe, reference};
 use burn::backend::TensorMetadata;
 use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::tensor::FloatTensor;
@@ -259,7 +259,7 @@ impl GatedDeltaStepBackend for CubeBackend {
         } else {
             new_state.clone().into_tensor_arg()
         };
-        KERNEL_LAUNCHES.fetch_add(1, Ordering::SeqCst);
+        probe::KERNEL_LAUNCHES.fetch_add(1, Ordering::SeqCst);
         // SAFETY: the shapes were checked against each other above, so every index the kernel
         // forms is in bounds: rows below Dk, columns below Dv, batch rows and heads from the
         // cube count.

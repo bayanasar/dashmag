@@ -27,6 +27,12 @@
 //!
 //! Every loop reads its next tile from global memory into registers while it computes on the
 //! current one in shared memory, and writes it there after a barrier.
+//!
+//! Inputs are read through their batch, head and time strides, counted in 16-byte vectors; a
+//! row of `D` elements is contiguous. Outputs are written contiguous in the module's layout:
+//! row `i` of head `h` of batch element `b` of a `[B, T, H, D]` tensor is row `(b T + i) H + h`
+//! of it seen as `[B T H, D]`, and that is also the element of the `[B, T, H]` statistics (the
+//! log-sum-exp, `delta`) that belongs to it.
 
 // Kernel code is expanded by CubeCL's frontend, which takes the plain operators: `div_ceil` and
 // the compound assignments on vector elements are written out.
@@ -383,8 +389,8 @@ fn accumulate_pv<E: Float>(
 
 /// The training forward. One cube per (`block_q`-query block, query head, batch), a warp per 16
 /// query rows; query blocks are taken last first, so that the longest causal rows start first.
-/// Writes the output, contiguous `[B, Hq, Tq, D]`, and the natural log-sum-exp of each query's
-/// scaled scores, contiguous `[B, Hq, Tq]`. Input strides are in 8-element vectors.
+/// Writes the output, contiguous `[B, Tq, Hq, D]`, and the natural log-sum-exp of each query's
+/// scaled scores, contiguous `[B, Tq, Hq]`. Input strides are in 8-element vectors.
 #[cube(launch_unchecked)]
 pub(crate) fn forward_kernel<E: Float>(
     q: &Tensor<Vector<E, V8>>,
@@ -594,13 +600,16 @@ pub(crate) fn forward_kernel<E: Float>(
     let total_b = quad_sum(sum_b);
     let inv_a = select(total_a > 0.0f32, 1.0f32 / total_a, 0.0f32);
     let inv_b = select(total_b > 0.0f32, 1.0f32 / total_b, 0.0f32);
-    let head_row = (b * hq + h) as usize * tq as usize;
+    // Rows `row_a` and `row_b` of this head in `[B, Tq, Hq]` order.
+    let first = b as usize * tq as usize * hq as usize + h as usize;
+    let at_a = first + row_a as usize * hq as usize;
+    let at_b = first + row_b as usize * hq as usize;
     if t == 0 {
         if row_a < tq {
-            lse[head_row + row_a as usize] = max_a + total_a.ln();
+            lse[at_a] = max_a + total_a.ln();
         }
         if row_b < tq {
-            lse[head_row + row_b as usize] = max_b + total_b.ln();
+            lse[at_b] = max_b + total_b.ln();
         }
     }
     let half_d = comptime!(d / 2) as usize;
@@ -608,18 +617,18 @@ pub(crate) fn forward_kernel<E: Float>(
     for nt in 0..comptime!(d / 8) {
         let col = (nt * 4 + t) as usize;
         if row_a < tq {
-            o[(head_row + row_a as usize) * half_d + col] =
+            o[at_a * half_d + col] =
                 Vector::cast_from(acc_o[(2 * nt) as usize] * Vector::new(inv_a));
         }
         if row_b < tq {
-            o[(head_row + row_b as usize) * half_d + col] =
+            o[at_b * half_d + col] =
                 Vector::cast_from(acc_o[(2 * nt + 1) as usize] * Vector::new(inv_b));
         }
     }
 }
 
-/// `delta = rowsum(dO * O)` in f32, contiguous `[B, Hq, Tq]`: `d / 8` lanes per row, eight
-/// elements each, 256 threads per cube.
+/// `delta = rowsum(dO * O)` in f32, contiguous `[B, Tq, Hq]` like the log-sum-exp: `d / 8` lanes
+/// per row, eight elements each, 256 threads per cube, rows taken in that order.
 #[cube(launch_unchecked)]
 pub(crate) fn delta_kernel<E: Float>(
     o: &Tensor<Vector<E, V8>>,
@@ -642,9 +651,9 @@ pub(crate) fn delta_kernel<E: Float>(
     let c = UNIT_POS % chunks;
     let mut acc = 0.0f32;
     if row < rows {
-        let i = row % tq;
-        let h = (row / tq) % hq;
-        let b = row / (tq * hq);
+        let h = row % hq;
+        let i = (row / hq) % tq;
+        let b = row / (hq * tq);
         let ov = o[b as usize * o_sb as usize
             + h as usize * o_sh as usize
             + i as usize * o_st as usize
@@ -671,7 +680,8 @@ pub(crate) fn delta_kernel<E: Float>(
 /// `dQ`. One cube per (64-query block, query head, batch), eight warps: two per 16 query rows,
 /// each taking half of every key block, their partial `dQ` added at the end. Sweeps the key
 /// blocks up to the diagonal: `S` and `dP = dO V^T` recomputed per block, `P` from the
-/// forward's log-sum-exp, `dS = P (dP - delta)`, `dQ += dS K`. Writes `dQ` contiguous.
+/// forward's log-sum-exp, `dS = P (dP - delta)`, `dQ += dS K`. Writes `dQ` contiguous
+/// `[B, Tq, Hq, D]`.
 #[cube(launch_unchecked)]
 pub(crate) fn dq_kernel<E: Float>(
     q: &Tensor<Vector<E, V8>>,
@@ -788,20 +798,23 @@ pub(crate) fn dq_kernel<E: Float>(
         256u32,
     );
 
-    let head_row = (b * hq + h) as usize * tq as usize;
     let row_a = q0 + rows * 16 + g;
     let row_b = row_a + 8;
+    // Rows `row_a` and `row_b` of this head in `[B, Tq, Hq]` order.
+    let first = b as usize * tq as usize * hq as usize + h as usize;
+    let at_a = first + row_a as usize * hq as usize;
+    let at_b = first + row_b as usize * hq as usize;
     let mut lse_a = 0.0f32;
     let mut lse_b = 0.0f32;
     let mut delta_a = 0.0f32;
     let mut delta_b = 0.0f32;
     if row_a < tq {
-        lse_a = lse[head_row + row_a as usize];
-        delta_a = delta[head_row + row_a as usize];
+        lse_a = lse[at_a];
+        delta_a = delta[at_a];
     }
     if row_b < tq {
-        lse_b = lse[head_row + row_b as usize];
-        delta_b = delta[head_row + row_b as usize];
+        lse_b = lse[at_b];
+        delta_b = delta[at_b];
     }
     let mut acc_dq = zeros(comptime!(d / 4));
 
@@ -930,12 +943,10 @@ pub(crate) fn dq_kernel<E: Float>(
             // Accumulator vector 2j is row g, 2j + 1 row g + 8, both columns 8 j + 2 t.
             let col = (j * 4 + t) as usize;
             if row_a < tq {
-                dq[(head_row + row_a as usize) * half_d + col] =
-                    Vector::cast_from(lo * Vector::new(scale));
+                dq[at_a * half_d + col] = Vector::cast_from(lo * Vector::new(scale));
             }
             if row_b < tq {
-                dq[(head_row + row_b as usize) * half_d + col] =
-                    Vector::cast_from(hi * Vector::new(scale));
+                dq[at_b * half_d + col] = Vector::cast_from(hi * Vector::new(scale));
             }
         }
     }
@@ -945,7 +956,7 @@ pub(crate) fn dq_kernel<E: Float>(
 /// query heads of the group and, for each, the 32-query steps from the diagonal down. `S` and
 /// `dP` are split 2 x 4 over the warps (16 queries x 8 keys each); `P` and `dS` go through
 /// shared memory to the 2 x 4 split of `dV += P^T dO` and `dK += dS^T Q` (16 keys x D/4
-/// columns each). Writes `dK` and `dV` contiguous `[B, Hkv, Tk, D]`.
+/// columns each). Writes `dK` and `dV` contiguous `[B, Tk, Hkv, D]`.
 #[cube(launch_unchecked)]
 pub(crate) fn dkdv_kernel<E: Float>(
     q: &Tensor<Vector<E, V8>>,
@@ -1047,11 +1058,12 @@ pub(crate) fn dkdv_kernel<E: Float>(
     // next step's queries, output gradients and row statistics into registers while it computes.
     let per_head = n_steps - first_step;
     let total = group * per_head;
+    // The statistics of query `i` of head `h` are element `stats + i Hq + h`, `[B, Tq, Hq]`.
+    let stats = b as usize * tq as usize * hq as usize;
     if total > 0 {
         let h = hk * group;
         let q_base = b as usize * q_sb as usize + h as usize * q_sh as usize;
         let do_base = b as usize * do_sb as usize + h as usize * do_sh as usize;
-        let head_row = (b * hq + h) as usize * tq as usize;
         let q0 = first_step * BLOCK_KV;
         load_rows::<E>(
             q,
@@ -1080,8 +1092,9 @@ pub(crate) fn dkdv_kernel<E: Float>(
             let mut l = 0.0f32;
             let mut dl = 0.0f32;
             if row < tq {
-                l = lse[head_row + row as usize];
-                dl = delta[head_row + row as usize];
+                let at = stats + row as usize * hq as usize + h as usize;
+                l = lse[at];
+                dl = delta[at];
             }
             s_lse[UNIT_POS as usize] = l;
             s_delta[UNIT_POS as usize] = dl;
@@ -1122,7 +1135,7 @@ pub(crate) fn dkdv_kernel<E: Float>(
         let mut lse_next = 0.0f32;
         let mut delta_next = 0.0f32;
         if UNIT_POS < BLOCK_KV && next_q0 + UNIT_POS < next_limit {
-            let at = (b * hq + next_h) as usize * tq as usize + (next_q0 + UNIT_POS) as usize;
+            let at = stats + (next_q0 + UNIT_POS) as usize * hq as usize + next_h as usize;
             lse_next = lse[at];
             delta_next = delta[at];
         }
@@ -1200,20 +1213,23 @@ pub(crate) fn dkdv_kernel<E: Float>(
         }
     }
 
-    let kv_row = (b * hkv + hk) as usize * tk as usize;
     let key_a = k0 + 16 * rg + g;
     let key_b = key_a + 8;
+    // Keys `key_a` and `key_b` of this head as rows of `[B Tk Hkv, D]`.
+    let first = b as usize * tk as usize * hkv as usize + hk as usize;
+    let row_a = first + key_a as usize * hkv as usize;
+    let row_b = first + key_b as usize * hkv as usize;
     let half_d = comptime!(d / 2) as usize;
     #[unroll]
     for nt in 0..comptime!(d / 32) {
         let col = ((cg * cols + nt * 8) / 2 + t) as usize;
         if key_a < tk {
-            let at = (kv_row + key_a as usize) * half_d + col;
+            let at = row_a * half_d + col;
             dk[at] = Vector::cast_from(acc_dk[(2 * nt) as usize] * Vector::new(scale));
             dv[at] = Vector::cast_from(acc_dv[(2 * nt) as usize]);
         }
         if key_b < tk {
-            let at = (kv_row + key_b as usize) * half_d + col;
+            let at = row_b * half_d + col;
             dk[at] = Vector::cast_from(acc_dk[(2 * nt + 1) as usize] * Vector::new(scale));
             dv[at] = Vector::cast_from(acc_dv[(2 * nt + 1) as usize]);
         }
@@ -1366,7 +1382,7 @@ pub(crate) fn decode_split_kernel<E: Float>(
 }
 
 /// Decoding, second pass: one cube per (query head, batch), one thread per output element,
-/// merging the splits by their log-sum-exp. Writes the output contiguous `[B, Hq, 1, D]`.
+/// merging the splits by their log-sum-exp. Writes the output contiguous `[B, Hq, D]`.
 #[cube(launch_unchecked)]
 pub(crate) fn decode_merge_kernel<E: Float>(
     part_o: &Tensor<f32>,
