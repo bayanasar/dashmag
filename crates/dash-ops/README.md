@@ -9,7 +9,7 @@ backward pass:
 | `gated_delta::recurrent` | the gated delta rule one token at a time, for decoding | one kernel a step |
 | `attention` | causal attention with grouped key-value heads, a backward pass that keeps no T x T scores, and decoding against a key-value cache | FlashAttention-2 style kernels on the tensor cores |
 | `logprob` | the log-probability of chosen tokens under a large vocabulary, with the entropy, without the n x V logits | chunked matmuls and a fused log-sum-exp kernel |
-| `conv1d` | causal depthwise conv1d (kernel width 4, SiLU fused) and its decoding state | forward, backward and step kernels |
+| `conv1d` | causal depthwise conv1d of any kernel width, with an optional bias and activation (none or SiLU), and its decoding state | forward, backward and step kernels for widths 1 to 8 |
 | `checkpoint` | activation checkpointing: a stack of layers run outside autodiff, each layer run again in the backward pass (built on Burn's tensor API, not an extension) | the layers' own |
 
 Each operation has three parts: a reference built from Burn's tensor operations, which runs on
@@ -55,7 +55,7 @@ with `cuda` only unless a row says otherwise:
 | attention, forward + backward | 6144 tokens, 8 query and 2 key-value heads of 256 | 9.2 ms, +60 MiB | 7.4 ms, +204 MiB (flash) |
 | attention, decoding | batch 8, 6144 cached keys | 200 us a layer, synchronised after each call (144 us over 24 calls; 454 us each with `fusion`) | 201 us |
 | log-probability, forward + backward | 3072 tokens, 248320 classes, width 1024 | 78.9 ms, +216 MiB (70.4 ms with `fusion` and `autotune`) | 86.4 ms, +8730 MiB |
-| conv1d, forward + backward | 6144 steps, 6144 channels | 0.56 ms | 2.13 ms |
+| conv1d, forward + backward | 6144 steps, 6144 channels, width 4, SiLU (widths 2 to 4, with or without a bias: 0.54 to 0.57 ms) | 0.56 ms | 2.63 ms (conv1d, then SiLU) |
 
 The chunked gated delta rule's kernels compute in f32 without tensor cores, which is most of its
 distance from fla; attention's backward does seven T x T x D products to FlashAttention-2's five,

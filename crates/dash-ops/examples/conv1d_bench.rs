@@ -1,5 +1,7 @@
 //! Times the causal depthwise conv1d on CUDA, and the reserved device memory it adds: dash-ops'
-//! kernels against Burn's own `conv1d` with `groups = C`, at Qwen3.5-0.8B's width by default.
+//! kernels against Burn's own `conv1d` with `groups = C`. By default one sequence of 6144 steps
+//! and 6144 channels in bf16 (Qwen3.5-0.8B's width), kernel width 4 with SiLU and no bias, then
+//! widths 2, 3 and 4, with and without a bias, beside it.
 //!
 //!   CUBECL_CUDA_TF32=0 cargo run --release -p dash-ops --features cuda --example conv1d_bench \
 //!     -- [B=1] [T=6144] [C=6144] [bf16|f32]
@@ -9,16 +11,16 @@
 //! autotuner settle).
 //!
 //! - "op": the operation's own forward and backward, as the backward pass of a training step
-//!   runs them: `causal_conv1d` then `causal_conv1d_backward` (input and weight gradients from
-//!   the output gradient), or Burn's `conv1d`, `conv1d_x_backward` and `conv1d_weight_backward`.
-//!   This is the work PyTorch's `out.backward(grad)` does.
+//!   runs them: `causal_conv1d` then `causal_conv1d_backward` (input, weight and bias gradients
+//!   from the output gradient), or Burn's `conv1d`, `conv1d_x_backward` and
+//!   `conv1d_weight_backward`. This is the work PyTorch's `out.backward(grad)` does.
 //! - "autodiff": through `Autodiff`, with `(out * grad).sum()` as the loss, so the loss's own
 //!   multiply and sum (and their backward) are in it too, the same for both.
 //! - memory: growth of the device's reserved pool memory over one pass, after a cleanup, with
 //!   the inputs and the output gradient already allocated; and what a forward pass through
 //!   `Autodiff` holds until its backward pass (live bytes while its output is alive: the output
 //!   and whatever the backward pass keeps).
-//! - decoding: one token at batch 8, the state `[8, C, 3]` carried from step to step.
+//! - decoding: one token at batch 8, the f32 state `[8, K - 1, C]` carried from step to step.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -38,7 +40,10 @@ mod bench {
     use burn::tensor::module::conv1d;
     use burn::tensor::ops::ConvOptions;
     use burn::tensor::{DType, Device, Distribution, Tensor};
-    use dash_ops::conv1d::{CausalConv1dBackend, causal_conv1d, causal_conv1d_update};
+    use dash_ops::conv1d::{
+        Activation, Bias, CausalConv1dBackend, CausalConv1dOptions, causal_conv1d,
+        causal_conv1d_update,
+    };
     use std::time::Instant;
 
     const WARMUP: usize = 5;
@@ -92,6 +97,64 @@ mod bench {
             .into_scalar::<f32>()
     }
 
+    /// The op-level backward: input, weight and bias gradients from the output gradient.
+    fn backward(
+        x: &Tensor<3>,
+        weight: &Tensor<2>,
+        bias: Option<&Tensor<1>>,
+        grad: &Tensor<3>,
+        options: CausalConv1dOptions,
+    ) -> impl Sized {
+        <Dispatch as CausalConv1dBackend>::causal_conv1d_backward(
+            x.clone().into_dispatch(),
+            weight.clone().into_dispatch(),
+            Bias::from(bias.map(|bias| bias.clone().into_dispatch())),
+            grad.clone().into_dispatch(),
+            options,
+        )
+    }
+
+    /// Forward, forward + backward (ms) and one decoding step at batch 8 (us), for width `k`,
+    /// with or without a bias, SiLU.
+    fn general(device: &Device, [b, t, c]: [usize; 3], dtype: DType, k: usize, with_bias: bool) {
+        let options = CausalConv1dOptions::default().with_activation(Activation::Silu);
+        let normal = |shape: Vec<usize>, std: f64| {
+            Tensor::<3>::random(shape, Distribution::Normal(0.0, std), (device, dtype))
+        };
+        let x = normal(vec![b, t, c], 1.0);
+        let grad = normal(vec![b, t, c], 1.0);
+        let weight = normal(vec![1, c, k], 0.5).reshape([c, k]);
+        let bias = with_bias.then(|| normal(vec![1, 1, c], 0.5).reshape([c]));
+        let forward = time(device, (WARMUP, REPS), || {
+            let _ = causal_conv1d(x.clone(), weight.clone(), bias.clone(), options);
+        });
+        let both = time(device, (WARMUP, REPS), || {
+            let _ = causal_conv1d(x.clone(), weight.clone(), bias.clone(), options);
+            let _ = backward(&x, &weight, bias.as_ref(), &grad, options);
+        });
+        let tokens = normal(vec![1, 8, c], 1.0).reshape([8, c]);
+        let mut state = Tensor::<3>::random(
+            [8, k - 1, c],
+            Distribution::Normal(0.0, 1.0),
+            (device, DType::F32),
+        );
+        let step = time(device, (20, 200), || {
+            let (_, next) = causal_conv1d_update(
+                tokens.clone(),
+                state.clone(),
+                weight.clone(),
+                bias.clone(),
+                options,
+            );
+            state = next;
+        });
+        println!(
+            "K={k} bias={with_bias:<5} SiLU: forward {forward:.3} ms, forward+backward {both:.3} ms, \
+             decode B=8 {:.1} us per step",
+            step * 1e3
+        );
+    }
+
     pub fn run() {
         let args: Vec<String> = std::env::args().collect();
         let arg = |i: usize, default: usize| args.get(i).map_or(default, |s| s.parse().unwrap());
@@ -104,34 +167,27 @@ mod bench {
         let normal = |shape: [usize; 3], std: f64| {
             Tensor::<3>::random(shape, Distribution::Normal(0.0, std), (&device, dtype))
         };
+        let silu_options = CausalConv1dOptions::default().with_activation(Activation::Silu);
         // dash-ops' layout: [B, T, C].
         let x = normal([b, t, c], 1.0);
         let grad = normal([b, t, c], 1.0);
         let weight = Tensor::<2>::random([c, 4], Distribution::Normal(0.0, 0.5), (&device, dtype));
-        println!("B={b} T={t} C={c} {dtype:?}");
+        println!("B={b} T={t} C={c} {dtype:?}, K=4, SiLU, no bias");
 
         // dash-ops, op level.
         let forward = time(&device, (WARMUP, REPS), || {
-            let _ = causal_conv1d(x.clone(), weight.clone(), true);
+            let _ = causal_conv1d(x.clone(), weight.clone(), None, silu_options);
         });
-        let backward = || {
-            <Dispatch as CausalConv1dBackend>::causal_conv1d_backward(
-                x.clone().into_dispatch(),
-                weight.clone().into_dispatch(),
-                grad.clone().into_dispatch(),
-                true,
-            )
-        };
         let both = time(&device, (WARMUP, REPS), || {
-            let _ = causal_conv1d(x.clone(), weight.clone(), true);
-            let _ = backward();
+            let _ = causal_conv1d(x.clone(), weight.clone(), None, silu_options);
+            let _ = backward(&x, &weight, None, &grad, silu_options);
         });
         let mem_forward = reserved_mib(&device, || {
-            let _ = causal_conv1d(x.clone(), weight.clone(), true);
+            let _ = causal_conv1d(x.clone(), weight.clone(), None, silu_options);
         });
         let mem_both = reserved_mib(&device, || {
-            let out = causal_conv1d(x.clone(), weight.clone(), true);
-            let grads = backward();
+            let out = causal_conv1d(x.clone(), weight.clone(), None, silu_options);
+            let grads = backward(&x, &weight, None, &grad, silu_options);
             drop((out, grads));
         });
         println!(
@@ -145,7 +201,7 @@ mod bench {
         let step = || {
             let x = x.clone().autodiff().require_grad();
             let weight = weight.clone().autodiff().require_grad();
-            let out = causal_conv1d(x.clone(), weight.clone(), true);
+            let out = causal_conv1d(x.clone(), weight.clone(), None, silu_options);
             let grads = (out * grad_ad.clone()).sum().backward();
             (x.grad(&grads).unwrap(), weight.grad(&grads).unwrap())
         };
@@ -159,7 +215,9 @@ mod bench {
             x.clone().autodiff().require_grad(),
             weight.clone().autodiff().require_grad(),
         );
-        let held = held_mib(&autodiff, || causal_conv1d(xg.clone(), wg.clone(), true));
+        let held = held_mib(&autodiff, || {
+            causal_conv1d(xg.clone(), wg.clone(), None, silu_options)
+        });
         println!(
             "dash-ops autodiff forward: holds {held:.0} MiB until the backward (output included)"
         );
@@ -268,7 +326,12 @@ mod bench {
         println!("burn conv1d + SiLU autodiff forward: holds {held:.0} MiB until the backward");
 
         // The two agree (no activation), and the gradients through Autodiff agree.
-        let ours = causal_conv1d(x.clone(), weight.clone(), false);
+        let ours = causal_conv1d(
+            x.clone(),
+            weight.clone(),
+            None,
+            CausalConv1dOptions::default(),
+        );
         let burns = conv1d(
             x.clone().swap_dims(1, 2),
             weight3.clone(),
@@ -282,19 +345,33 @@ mod bench {
             max_abs_diff(ours, burns)
         );
 
-        // Decoding: one token at batch 8, the state [8, C, 3] carried from step to step.
+        // Decoding: one token at batch 8, the f32 state [8, 3, C] carried from step to step.
         let tokens = Tensor::<2>::random([8, c], Distribution::Normal(0.0, 1.0), (&device, dtype));
-        let state0 =
-            Tensor::<3>::random([8, c, 3], Distribution::Normal(0.0, 1.0), (&device, dtype));
-        let mut state = state0.clone();
+        let mut state = Tensor::<3>::random(
+            [8, 3, c],
+            Distribution::Normal(0.0, 1.0),
+            (&device, DType::F32),
+        );
         let per_step = time(&device, (20, 200), || {
-            let (_, next) =
-                causal_conv1d_update(tokens.clone(), state.clone(), weight.clone(), true);
+            let (_, next) = causal_conv1d_update(
+                tokens.clone(),
+                state.clone(),
+                weight.clone(),
+                None,
+                silu_options,
+            );
             state = next;
         });
         println!(
-            "decode B=8 C={c} state [8, C, 3]: {:.1} us per step",
+            "decode B=8 C={c} state [8, 3, C] f32: {:.1} us per step",
             per_step * 1e3
         );
+
+        // The general cases.
+        for k in [2, 3, 4] {
+            for with_bias in [false, true] {
+                general(&device, [b, t, c], dtype, k, with_bias);
+            }
+        }
     }
 }
