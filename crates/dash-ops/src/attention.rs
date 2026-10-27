@@ -131,16 +131,17 @@
 //!
 //! Against PyTorch 2.13's `scaled_dot_product_attention` in float64 with an explicit boolean
 //! mask (the tests' records: every mask above, grouped heads, `Tq != Tk`, queries that see no
-//! key; packed sequences one call per sequence), the reference in f32 agrees to within 4.1e-7 of
-//! each output's and gradient's largest value, and the kernels to within 4.2e-3 in bf16 and
-//! 7.1e-4 in f16. Against the f32 reference at shapes of several tiles and sequences, the bf16
-//! kernels agree to within 4.6e-3, but for the query gradient's 7.3e-3 at the queries that see
-//! few keys (the start of a causal sequence), whose `delta = rowsum(dO * O)` comes from the
-//! output rounded to bf16, as in FlashAttention-2; f16 to within 7.0e-4. Both ways of summing
-//! the query gradient are held to the same bounds; with atomics its bits move from run to run by
-//! up to 5.2e-4 of its largest value, and its error moves less. A causal sequence run in two
-//! segments, the second's queries against both segments' keys, composes into the whole
-//! sequence's outputs and gradients to f32 rounding (7.6e-7).
+//! key; packed sequences one call per sequence), the reference in f32 agrees to within 4.06e-7 of
+//! each output's and gradient's largest value on Flex (on CUDA 5.29e-7, 7.11e-7 with autotune;
+//! 8.12e-7 on lavapipe), and the kernels to within 4.15e-3 in bf16 and 7.09e-4 in f16. Against
+//! the f32 reference at shapes of several tiles and sequences, the bf16 kernels agree to within
+//! 4.53e-3, but for the query gradient's 7.31e-3 at the queries that see few keys (the start of a
+//! causal sequence), whose `delta = rowsum(dO * O)` comes from the output rounded to bf16, as in
+//! FlashAttention-2; f16 to within 6.94e-4. Both ways of summing the query gradient are held to
+//! the same bounds; with atomics its bits move from run to run by up to 5.24e-4 of its largest
+//! value, and its error moves less. A causal sequence run in two segments, the second's queries
+//! against both segments' keys, composes into the whole sequence's outputs and gradients to f32
+//! rounding (7.23e-7).
 //!
 //! On an RTX 5070 Ti with 6144 tokens, 8 query and 2 key-value heads of 256 in bf16
 //! (`examples/attention_bench.rs`, PyTorch 2.13 run in turn with it on an otherwise idle card),
@@ -154,9 +155,11 @@
 //! (the query gradient's too). With no mask they take 17.6 ms, 14.9 ms with atomics (14.7 ms); four
 //! packed sequences of 1536, 2.59 ms and 2.33 ms (2.34 ms as a padded batch of four); causal within
 //! a window of 1024, 3.07 ms and 2.69 ms (PyTorch has no fused window at this head width:
-//! flex_attention 4.35 ms). Decoding a batch of 8 against 6144 cached keys takes 147 us a layer
-//! (140 us), 52 us with cache lengths from 100 to 6144 (3729 us through a padding mask) and 42 us
-//! within a window of 1024 (37 us on the last 1025 keys).
+//! flex_attention 4.35 ms). Decoding a batch of 8 against 6144 cached keys takes 131 us a layer of
+//! device time (130 us), 36 us with cache lengths from 100 to 6144 (3663 us through a padding mask)
+//! and 15 us within a window of 1024 (26 us on the last 1025 keys); by wall clock over 24 calls
+//! between synchronisations 146, 59 and 37 us (137, 3716 and 34 us), the last two set by the host's
+//! dispatch rather than the device.
 
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;

@@ -453,7 +453,7 @@ fn devices() -> Vec<(&'static str, Device)> {
 /// `autotune`), the passes through one layer fuse its operations otherwise than the pass through
 /// the whole stack: f32 gradients up to 2.5e-7 apart over five runs, bf16 ones bit-identical on
 /// these stacks. With `fusion` and `autotune` both, each pass's fused kernels are tuned apart
-/// too, differently from run to run: f32 gradients up to 4.1e-7 apart over 27 runs, bf16 ones
+/// too, differently from run to run: f32 gradients up to 4.12e-7 apart over 37 runs, bf16 ones
 /// still bit-identical; the f32 bound is 1e-6, a few roundings, for the run that goes further. The
 /// tests take turns: with `autotune` and the tests in parallel, a thread that asks for a shape
 /// another is tuning runs an untuned candidate meanwhile, and over eight runs the passes moved up

@@ -12,11 +12,16 @@ the mapping from PEFT's module paths to the caller's layers is the caller's.
   f32, their sum rounded once, as PEFT computes it. On a CubeCL device the low-rank products are
   `dash_ops::lowrank`'s kernels, which add the base and round in the same pass. Per layer at a
   language model's projection shapes (r 16, 2048 and 6144 tokens, `examples/lora_layer.rs`), on an
-  RTX 5070 Ti against PEFT by device time: the low-rank products within 1.1x of PEFT's and mostly
-  ahead in every build; a training step with Burn's `fusion` and `autotune` 0.75x to 1.08x of
-  PEFT's; with Burn's default kernels 0.91x to 1.09x where Burn's default bf16 matrix product is
-  near cuBLAS, and 2x to 10x where it is not (the base product of a 1024 -> 256 projection, and of
-  every projection over 6144 tokens), which autotune fixes.
+  otherwise idle RTX 5070 Ti against PEFT by device time: the low-rank products within 1.1x of
+  PEFT's and mostly ahead in every build; a layer's forward and backward, or a step of one adapter
+  over another's frozen output, with Burn's `fusion` and `autotune` 0.63x to 0.94x of PEFT's over
+  6144 tokens and 0.78x to 1.12x over 2048; with Burn's default kernels 0.83x to 1.09x where
+  Burn's default bf16 matrix product is near cuBLAS, and 2.2x to 9.1x where it is not (the base
+  product of a 1024 -> 256 projection, and of every projection over 6144 tokens), which autotune
+  fixes. These are the passes the example runs back to back before its timed ones: in the timed
+  passes, each followed by a sync, the device is busy too little of the time, and an idle card
+  lowers its clocks within two seconds of them (memory 13.8 to 7.0 GHz), PyTorch's passes losing
+  more than these.
 - `AdapterChoice`: `model.set_adapter(Some(name))` makes every layer of any Burn module use its
   adapter `name` from then on, and `set_adapter(None)` the base alone (PEFT's `set_adapter` and
   `disable_adapter()`), without the model's code passing anything through its forward pass. The

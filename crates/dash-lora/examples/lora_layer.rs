@@ -31,44 +31,48 @@
 //!   CUBECL_CUDA_TF32=0 cargo run --release -p dash-lora --features cuda --example lora_layer
 //!   ... -- [tokens, e.g. 2048 6144]
 //!
-//! On an RTX 5070 Ti, device time in ms (the fastest of the seven timed runs), this example built
-//! with `cuda` alone (Burn's default kernels), with `dash-ops/fusion`, with `autotune`, and with
-//! both, beside PyTorch 2.13 with PEFT 0.20 on the same layer and card
-//! (`lora_B(lora_A(x.float())) * scaling` on cuBLAS), the five runs one after another on a card
-//! shared with other work (whose clocks ran lower than when idle, the same for all five):
+//! On an otherwise idle RTX 5070 Ti, device time in ms of each pass in the warm-up, which runs the
+//! passes without gaps: the timed passes are [`GAP`] of idle device apart, too little work for the
+//! card, which lowers its clocks within two seconds of them (memory 13.8 to 7.0 GHz), PyTorch's
+//! passes losing more than these. This example built with `cuda` alone (Burn's default kernels) and
+//! with `dash-ops/fusion` and `autotune`, beside PyTorch 2.13 with PEFT 0.20 on the same layer and
+//! card (`lora_B(lora_A(x.float())) * scaling` on cuBLAS), each run in turn over three rounds, which
+//! agree to 1% (2026-10-27):
 //!
-//! | `in -> out` | tokens | pass | PEFT | default | fusion | autotune | both |
-//! |---|---|---|---:|---:|---:|---:|---:|
-//! | 1024 -> 3584 | 2048 | layer fwd+bwd | 1.01 | 0.94 | 0.91 | 0.87 | 0.85 |
-//! | 3584 -> 1024 | 2048 | layer fwd+bwd | 0.86 | 0.94 | 0.89 | 0.89 | 0.85 |
-//! | 1024 -> 2048 | 2048 | layer fwd+bwd | 0.58 | 0.60 | 0.57 | 0.55 | 0.54 |
-//! | 1024 -> 256 | 2048 | layer fwd+bwd | 0.16 | 1.13 | 1.12 | 0.17 | 0.17 |
-//! | 1024 -> 3584 | 6144 | layer fwd+bwd | 3.48 | 13.99 | 15.71 | 2.74 | 2.65 |
-//! | 3584 -> 1024 | 6144 | layer fwd+bwd | 2.75 | 10.55 | 10.39 | 2.69 | 2.38 |
-//! | 1024 -> 2048 | 6144 | layer fwd+bwd | 1.99 | 6.10 | 6.09 | 1.53 | 1.55 |
-//! | 1024 -> 256 | 6144 | layer fwd+bwd | 0.41 | 1.92 | 1.92 | 0.38 | 0.38 |
-//! | 1024 -> 3584 | 2048 | two-adapter step | 1.50 | 1.37 | 1.36 | 1.26 | 1.29 |
-//! | 3584 -> 1024 | 2048 | two-adapter step | 1.31 | 1.36 | 1.36 | 1.31 | 1.28 |
-//! | 1024 -> 2048 | 2048 | two-adapter step | 0.86 | 0.84 | 0.84 | 0.78 | 0.79 |
-//! | 1024 -> 256 | 2048 | two-adapter step | 0.23 | 2.16 | 2.16 | 0.24 | 0.24 |
-//! | 1024 -> 3584 | 6144 | two-adapter step | 5.31 | 15.63 | 11.79 | 4.29 | 4.15 |
-//! | 3584 -> 1024 | 6144 | two-adapter step | 4.03 | 19.65 | 20.84 | 3.82 | 3.81 |
-//! | 1024 -> 2048 | 6144 | two-adapter step | 3.00 | 6.79 | 6.79 | 2.25 | 2.26 |
-//! | 1024 -> 256 | 6144 | two-adapter step | 0.61 | 3.00 | 3.00 | 0.53 | 0.55 |
-//! | 1024 -> 3584 | 2048 | low-rank fwd+bwd | 0.35 | 0.27 | 0.27 | 0.27 | 0.27 |
-//! | 3584 -> 1024 | 2048 | low-rank fwd+bwd | 0.33 | 0.24 | 0.24 | 0.24 | 0.25 |
-//! | 1024 -> 2048 | 2048 | low-rank fwd+bwd | 0.20 | 0.20 | 0.20 | 0.20 | 0.20 |
-//! | 1024 -> 256 | 2048 | low-rank fwd+bwd | 0.09 | 0.10 | 0.10 | 0.10 | 0.10 |
-//! | 1024 -> 3584 | 6144 | low-rank fwd+bwd | 1.26 | 1.35 | 1.27 | 1.37 | 1.37 |
-//! | 3584 -> 1024 | 6144 | low-rank fwd+bwd | 1.04 | 0.67 | 0.67 | 0.85 | 0.84 |
-//! | 1024 -> 2048 | 6144 | low-rank fwd+bwd | 0.78 | 0.51 | 0.51 | 0.68 | 0.66 |
-//! | 1024 -> 256 | 6144 | low-rank fwd+bwd | 0.27 | 0.21 | 0.21 | 0.21 | 0.21 |
+//! | `in -> out` | tokens | pass | PEFT | default | `fusion` and `autotune` |
+//! |---|---|---|---:|---:|---:|
+//! | 1024 -> 3584 | 2048 | layer fwd+bwd | 0.734 | 0.626 | 0.570 |
+//! | 3584 -> 1024 | 2048 | layer fwd+bwd | 0.585 | 0.640 | 0.566 |
+//! | 1024 -> 2048 | 2048 | layer fwd+bwd | 0.396 | 0.396 | 0.364 |
+//! | 1024 -> 256 | 2048 | layer fwd+bwd | 0.105 | 0.730 | 0.118 |
+//! | 1024 -> 3584 | 6144 | layer fwd+bwd | 2.73 | 8.41 | 1.73 |
+//! | 3584 -> 1024 | 6144 | layer fwd+bwd | 2.02 | 8.50 | 1.57 |
+//! | 1024 -> 2048 | 6144 | layer fwd+bwd | 1.53 | 4.85 | 1.01 |
+//! | 1024 -> 256 | 6144 | layer fwd+bwd | 0.283 | 1.37 | 0.267 |
+//! | 1024 -> 3584 | 2048 | two-adapter step | 1.10 | 0.907 | 0.863 |
+//! | 3584 -> 1024 | 2048 | two-adapter step | 0.890 | 0.921 | 0.838 |
+//! | 1024 -> 2048 | 2048 | two-adapter step | 0.596 | 0.561 | 0.518 |
+//! | 1024 -> 256 | 2048 | two-adapter step | 0.153 | 1.39 | 0.163 |
+//! | 1024 -> 3584 | 6144 | two-adapter step | 4.23 | 9.36 | 3.17 |
+//! | 3584 -> 1024 | 6144 | two-adapter step | 2.94 | 16.0 | 2.44 |
+//! | 1024 -> 2048 | 6144 | two-adapter step | 2.33 | 5.34 | 1.46 |
+//! | 1024 -> 256 | 6144 | two-adapter step | 0.425 | 2.07 | 0.365 |
+//! | 1024 -> 3584 | 2048 | low-rank fwd+bwd | 0.270 | 0.189 | 0.189 |
+//! | 3584 -> 1024 | 2048 | low-rank fwd+bwd | 0.238 | 0.166 | 0.166 |
+//! | 1024 -> 2048 | 2048 | low-rank fwd+bwd | 0.146 | 0.138 | 0.138 |
+//! | 1024 -> 256 | 2048 | low-rank fwd+bwd | 0.0640 | 0.0700 | 0.0700 |
+//! | 1024 -> 3584 | 6144 | low-rank fwd+bwd | 1.05 | 0.794 | 0.800 |
+//! | 3584 -> 1024 | 6144 | low-rank fwd+bwd | 0.869 | 0.523 | 0.539 |
+//! | 1024 -> 2048 | 6144 | low-rank fwd+bwd | 0.642 | 0.380 | 0.411 |
+//! | 1024 -> 256 | 6144 | low-rank fwd+bwd | 0.193 | 0.141 | 0.141 |
 //!
 //! The low-rank products are `dash_ops::lowrank`'s kernels in every build, within 1.1x of PEFT's
 //! and mostly ahead of them. Where the default build's layer is far behind, the base product is:
-//! Burn's default bf16 matrix product, which takes 1.0 ms for `[2048, 1024] x [1024, 256]` (cuBLAS
-//! 0.02) and 8.8 ms for `[6144, 3584] x [3584, 1024]` (cuBLAS 0.73), forward or for the input's
-//! gradient; autotune finds kernels for them that take 0.04 and 0.84 ms. Before the low-rank kernels,
+//! Burn's default bf16 matrix product, which on a card shared with other work took 1.0 ms for
+//! `[2048, 1024] x [1024, 256]` (cuBLAS 0.02) and 8.8 ms for `[6144, 3584] x [3584, 1024]` (cuBLAS
+//! 0.73), forward or for the input's gradient, where autotune found kernels for them that took 0.04
+//! and 0.84 ms; on an idle card the second takes 7.2 ms by default and 0.59 with autotune (cuBLAS
+//! 0.46, `dash-ops`' `matmul_bench`). Before the low-rank kernels,
 //! with Burn's matrix products for them too, the default build's layer took 2.4 / 2.3 / 1.6 / 1.5
 //! ms forward and backward at 2048 tokens (`in -> out` as above, an idle card; PEFT 0.73 / 0.58 /
 //! 0.39 / 0.11 ms). Memory above the weights and inputs, at the peak of a pass: for 1024 -> 3584
@@ -92,8 +96,9 @@ const REFERENCE: &str = "reference";
 const WARMUP: usize = 3;
 /// Timed runs of each pass.
 const REPS: usize = 7;
-/// The idle time after each pass's timed runs, which sets them apart in a trace: short enough
-/// that the device keeps its clocks, which half a second idle lowers.
+/// The idle time after each pass's timed runs, which sets them apart in a trace. On an idle card
+/// the timed passes this many apart lower the device's clocks within two seconds (module
+/// documentation): their times run high, PyTorch's more than these.
 const GAP: Duration = Duration::from_millis(100);
 /// The least time each pass's warm-up runs for.
 const WARM: Duration = Duration::from_millis(200);

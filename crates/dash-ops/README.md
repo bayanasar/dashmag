@@ -63,46 +63,53 @@ then leaves it no room.
 
 ## Measured
 
-On one RTX 5070 Ti (sm_120) under WSL2, bf16, against PyTorch 2.13 on the same card, built
-with `cuda` only unless a row says otherwise (attention's training row measured run in turn
-with PyTorch's while the card ran about a fifth slower than for the other rows):
+On one RTX 5070 Ti (sm_120) under WSL2 with nothing else on the card, bf16, against PyTorch 2.13
+on the same card, the two run in turn (2026-10-27), built with `cuda` only unless a row says
+otherwise:
 
 | operation | shape | dash-ops | PyTorch |
 |---|---|---|---|
-| gated delta rule, chunked, forward + backward | 6144 tokens, 16 heads of 128: one sequence / four packed of 1536 | this operation's kernels 2.87 / 2.72 ms on the device (with the benchmark's loss 3.90 / 3.75; 4.4 / 4.6 ms on the host), +400 / +408 MiB; forward alone 0.89 / 0.86 ms on the device | fla's kernels 2.67 / 2.50 ms (with the loss 3.25 / 3.10), +398 / +398 MiB; forward 0.73 / 0.71 ms (fla 0.5.2) |
-| gated delta rule, chunked, forward + backward | the same with 16 heads of 256 (the f32 kernels) | 21.8 / 22.5 ms on the device, +1548 / +1985 MiB; forward 6.1 / 6.4 ms | 7.5 / 6.8 ms; forward 2.2 / 1.8 ms (fla 0.5.2) |
-| gated delta rule, one decoding step | batch 8, 16 heads of 128, 18 layers in turn | 21 us a layer | 34 us (fla 0.5.2) |
+| gated delta rule, chunked, forward + backward | 6144 tokens, 16 heads of 128: one sequence / four packed of 1536 | this operation's kernels 2.72 / 2.60 ms on the device (with the benchmark's loss 3.68 / 3.58; 4.1 / 4.0 ms on the host), +400 / +408 MiB; forward alone 0.81 / 0.79 ms on the device | fla's kernels 2.59 / 2.35 ms (with the loss 3.16 / 2.92; 3.5 / 3.3 ms on the host), +398 / +398 MiB; forward 0.68 / 0.69 ms (fla 0.5.2) |
+| gated delta rule, chunked, forward + backward | the same with 16 heads of 256 (the f32 kernels) | 19.7 / 20.0 ms on the device, +1548 / +1985 MiB; forward 5.4 / 5.7 ms | 6.6 / 6.2 ms; forward 1.9 / 1.7 ms (fla 0.5.2) |
+| gated delta rule, one decoding step | batch 8, 16 heads of 128, 18 layers in turn | 21.7 us a layer (bf16 inputs 21.5) | 30.5 us (bf16 31.1; fla 0.5.2) |
 | attention, forward + backward | 6144 tokens, 8 query and 2 key-value heads of 256: causal; no mask; 4 packed sequences of 1536; causal within a window of 1024 | on the device, deterministic (the default): 9.17 ms, +60 MiB (and 24 MiB of f32 accumulators during the backward); 17.6 ms; 2.59 ms; 3.07 ms; with atomics: 7.62 ms (72 MiB of accumulators); 14.9 ms; 2.33 ms; 2.69 ms (wall clock 9.6; 18.1; 2.9; 3.4 ms and with atomics 8.0; 15.3; 2.7; 3.0 ms) | flash on the device: 7.30 ms, +204 MiB; 14.7 ms; 2.34 ms as a padded batch of 4; the window through flex_attention 4.35 ms |
-| attention, decoding | batch 8, 6144 cached keys: the whole cache; lengths from 100 to 6144; a window of 1024 | 147 us; 52 us; 42 us a layer, over 24 calls between synchronisations | 140 us; 3729 us (a padding mask); 37 us (the last 1025 keys) |
-| log-probability, forward + backward | 3072 tokens, 248320 classes, width 1024 | 78.9 ms, +216 MiB (70.4 ms with `fusion` and `autotune`) | 86.4 ms, +8730 MiB |
-| linear + cross-entropy, forward + backward with the weight's gradient | 3072 / 8192 tokens, 248320 classes, width 1024 | 102 / 293 ms, +641 / +731 MiB (94 / 261 ms with `autotune`) | logits in f32: 95 / 1179 ms, +11672 / +31072 MiB; in bf16: 64 / 1241 ms, +5824 / +15520 MiB (at 8192 both spill past the card's 16 GB into host memory) |
-| low-rank product `scale · (x U) V`, r 16, bf16 x, f32 factors | 2048 tokens, `in -> out` 1024 -> 3584 / 3584 -> 1024 / 1024 -> 2048 / 1024 -> 256: forward; forward + backward | on the device 0.043 / 0.052 / 0.032 / 0.018 ms; 0.19 / 0.17 / 0.14 / 0.069 ms (Burn's own matmuls: 0.32 / 0.89 / 0.29 / 0.26; 1.6 / 1.7 / 1.2 / 0.84 ms) | PEFT's LoRA term: 0.087 / 0.107 / 0.048 / 0.027; 0.27 / 0.23 / 0.14 / 0.063 ms |
-| conv1d, forward + backward | 6144 steps, 6144 channels, width 4, SiLU (widths 2 to 4, with or without a bias: 0.54 to 0.57 ms); from initial states / with final states too; as 4 packed sequences of 1536 / 4 calls on 1536 / a batch of 4 | 0.56 ms; 0.57 / 0.57 ms; 0.56 / 0.55 / 0.57 ms (on the device 0.55; 0.55 / 0.56; 0.55 / 0.51 / 0.55 ms) | 2.63 ms (conv1d, then SiLU); 2.76 / 3.14 ms (`torch.cat` of the state first); 4 calls 2.46 ms |
+| attention, decoding | batch 8, 6144 cached keys: the whole cache; lengths from 100 to 6144; a window of 1024 | on the device 131 us; 36 us; 15 us a layer (wall clock over 24 calls between synchronisations: 146; 59; 37 us, the last two bound by the host's dispatch) | on the device 130 us; 3663 us (a padding mask); 26 us (the last 1025 keys) (wall clock 137; 3716; 34 us) |
+| log-probability, forward + backward | 3072 tokens, 248320 classes, width 1024 | 78.9 ms, +216 MiB (70.4 ms with `fusion` and `autotune`) | 86.7 ms, +8730 MiB |
+| linear + cross-entropy, forward + backward with the weight's gradient | 3072 / 8192 tokens, 248320 classes, width 1024 | 102 / 293 ms, +641 / +731 MiB (94 / 261 ms with `autotune`) | logits in f32: 94 / 1112 to 1137 ms, +11672 / +31072 MiB; in bf16: 64 / 2249 to 2271 ms, +5824 / +15520 MiB (at 8192 both spill past the card's 16 GB into host memory, and their times move with it) |
+| low-rank product `scale · (x U) V`, r 16, bf16 x, f32 factors | 2048 tokens, `in -> out` 1024 -> 3584 / 3584 -> 1024 / 1024 -> 2048 / 1024 -> 256: forward; forward + backward | on the device 0.042 / 0.052 / 0.032 / 0.018 ms; 0.19 / 0.17 / 0.14 / 0.069 ms (Burn's own matmuls: 0.32 / 0.90 / 0.29 / 0.26; 1.6 / 1.8 / 1.2 / 0.84 ms) | PEFT's LoRA term: 0.088 / 0.108 / 0.048 / 0.027; 0.27 / 0.24 / 0.15 / 0.063 ms |
+| conv1d, forward + backward | 6144 steps, 6144 channels, width 4, SiLU (widths 2 to 4, with or without a bias: 0.54 to 0.57 ms); from initial states / with final states too; as 4 packed sequences of 1536 / 4 calls on 1536 / a batch of 4 | 0.56 ms; 0.57 / 0.57 ms; 0.56 / 0.54 / 0.56 ms (on the device 0.55; 0.55 / 0.55; 0.55 / 0.51 / 0.55 ms) | 2.64 ms (conv1d, then SiLU); 2.75 / 3.13 ms (`torch.cat` of the state first); 4 calls 2.44 ms |
 
-The chunked gated delta rule's device times are sums over `nsys`'s kernels, fla's measured beside
-them under the same load on the card's host (the wall-clock times rise with it). At heads of 128,
-forward and backward, its kernels on tensor cores take 1.07 times fla's time (1.09 packed): the
-state passings and the WY part are faster than fla's (0.26 ms forward, twice, and 0.40 backward,
-against 0.23 and 0.54; 0.28 against 0.37 with the keys' l2 normalisation), the other per-chunk
-kernels slower. Its first kernel inverts `I + A` with 64 units in f32, on CUDA cores (0.37 ms with
-the forward's other work, fla's 0.28 in three kernels, its inversion on tensor cores in TF32), and
-the backward's kernel for all but the WY part holds 77 KiB of shared memory, so that one cube fits
-on a multiprocessor and waits on memory between its phases more than fla's pipelined kernels do
-(0.64 ms, against 0.49 for fla's and the queries' l2 normalisation, `dv` going to fla's WY kernel).
-The backward keeps the forward's `T` (8 KiB a chunk of each head) as fla does. The loss around it in
-the benchmark (a cast, a product and a sum over the output) takes 1.0 ms in Burn's kernels and 0.6
-in PyTorch's. Heads of 256 run the f32 kernels, three times fla's time. Packed sequences cost about
-what one sequence of their length does: the state passings take each sequence's chunks in turn, two
-of their cubes fitting on a multiprocessor on tensor cores (44 and 48 KiB of shared memory), one in
-f32. Attention's backward by default gives the same bits on every run: a kernel of its own sums the
-query gradient over the key blocks in a fixed order, seven T x T x D products in all, the backward
-1.30 times the time of FlashAttention-2's five. `AttentionOptions::deterministic` set to `false` runs
-the five, adding the query gradient with f32 atomics as FlashAttention-2 does by default, and its
-last bits then vary from run to run (the output and the key and value gradients do not). Attention's
-training row was measured on an otherwise idle card, PyTorch's in turn with it. The low-rank product's row is by device time
-under Nsight Systems, from `dash-lora`'s `examples/lora_layer.rs`, PEFT's term the same way;
-`lowrank_bench` times it against Burn's own matmuls by wall clock. Each example in `examples/`
-reproduces its row (`--features cuda`).
+The device times are sums over `nsys`'s kernels; each row's two sides ran alternately, two or three
+rounds each, and the figures are their medians. At heads of 128, forward and backward, the chunked
+gated delta rule's kernels on tensor cores take 1.05 times fla's time (1.11 packed): the state
+passings take 0.87 ms against fla's 0.92 (0.25 ms forward, twice, and 0.38 backward, against 0.20
+and 0.51), and the WY part 0.26 against 0.35 with the keys' l2 normalisation; the other per-chunk
+kernels are slower. Its first kernel inverts `I + A` with 64 units in f32, on CUDA cores (0.33 ms
+with the forward's other work, fla's 0.27 in three kernels and the l2 normalisation, its inversion
+on tensor cores in TF32), and the backward's kernel for all but the WY part holds 77 KiB of shared
+memory, so that one cube fits on a multiprocessor and waits on memory between its phases more than
+fla's pipelined kernels do (0.62 ms, against 0.56 for fla's and the queries' l2 normalisation, `dv`
+going to fla's WY kernel). The backward keeps the forward's `T` (8 KiB a chunk of each head) as fla
+does. The loss around it in the benchmark (a cast, a product and a sum over the output) takes
+0.96 ms in Burn's kernels and 0.57 in PyTorch's. Heads of 256 run the f32 kernels, three times fla's
+time. Packed sequences cost about what one sequence of their length does: the state passings take
+each sequence's chunks in turn, two of their cubes fitting on a multiprocessor on tensor cores (44
+and 48 KiB of shared memory), one in f32.
+
+Attention's backward by default gives the same bits on every run: a kernel of its own sums the
+query gradient over the key blocks in a fixed order, seven T x T x D products in all, which take
+1.30 times the backward's time with five. `AttentionOptions::deterministic` set to `false` runs the
+five, adding the query gradient with f32 atomics as FlashAttention-2 does by default, and its last
+bits then vary from run to run (the output and the key and value gradients do not). Attention's
+decoding is timed over 24 calls between synchronisations; with cache lengths or a window its kernels
+take 15 to 36 us of the device's time, and the wall clock, 37 to 59 us, is the host dispatching
+them.
+
+The low-rank product's row is by device time under Nsight Systems: the kernels and Burn's own
+matmuls from `lowrank_bench`, PEFT's term the same way on PyTorch, from its timed passes but for
+1024 -> 2048 forward and backward, where the card had lowered its clocks during them (0.19 ms) and
+the passes run back to back before them give 0.15 (`dash-lora`'s README says why). Each example
+in `examples/` reproduces its row (`--features cuda`).
 `matmul_bench` and `dispatch_bench` measure Burn itself: bf16 matmul against cuBLAS, and the
 host-side cost of each unfused operation.
 

@@ -76,7 +76,7 @@
 //! on CUDA with Burn's default kernels or with `autotune`, the attention kernels' blocks with
 //! their default deterministic backward. With that backward's query gradient summed with atomics
 //! (`AttentionOptions::deterministic` off) they are not: its last bits move from one backward
-//! pass to the next, and the gradients below it with them (up to 3.0e-5 of a gradient's largest
+//! pass to the next, and the gradients below it with them (up to 1.65e-3 of a gradient's largest
 //! value in bf16). What can move them by roundings, none of it costing accuracy:
 //!
 //! - An operation a backend computes one way outside autodiff and another way when recorded.

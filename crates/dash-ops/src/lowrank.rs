@@ -54,16 +54,18 @@
 //!
 //! # Measured
 //!
-//! On an RTX 5070 Ti, `scale · (x U) V` alone with r 16 and bf16 `x`, by device time (the sum
-//! of the kernels' times under Nsight Systems), against PEFT's `lora_B(lora_A(x.float())) *
-//! scaling` on PyTorch 2.13 (cuBLAS), for `in -> out` 1024 -> 3584, 3584 -> 1024, 1024 -> 2048
-//! and 1024 -> 256 (dash-lora's `examples/lora_layer.rs`):
+//! On an otherwise idle RTX 5070 Ti (2026-10-27), `scale · (x U) V` alone with r 16 and bf16 `x`,
+//! by device time (the sum of the kernels' times under Nsight Systems), against PEFT's
+//! `lora_B(lora_A(x.float())) * scaling` on PyTorch 2.13 (cuBLAS), for `in -> out` 1024 -> 3584,
+//! 3584 -> 1024, 1024 -> 2048 and 1024 -> 256 (`examples/lowrank_bench.rs` and dash-lora's
+//! `examples/lora_layer.rs`, the latter's passes as its documentation says; Burn's matrix
+//! products over 6144 tokens were timed on a card shared with other work):
 //!
 //! | tokens | pass | dash-ops | PEFT | Burn's matrix products |
 //! |---|---|---|---|---|
-//! | 2048 | forward | 0.043 / 0.052 / 0.032 / 0.018 ms | 0.087 / 0.107 / 0.048 / 0.027 ms | 0.32 / 0.89 / 0.29 / 0.26 ms |
-//! | 2048 | forward + backward | 0.19 / 0.17 / 0.14 / 0.069 ms | 0.27 / 0.23 / 0.14 / 0.063 ms | 1.6 / 1.7 / 1.2 / 0.84 ms |
-//! | 6144 | forward + backward | 0.80 / 0.52 / 0.38 / 0.14 ms | 1.05 / 0.86 / 0.64 / 0.19 ms | 3.6 / 3.3 / 2.8 / 2.1 ms |
+//! | 2048 | forward | 0.042 / 0.052 / 0.032 / 0.018 ms | 0.088 / 0.108 / 0.048 / 0.027 ms | 0.32 / 0.90 / 0.29 / 0.26 ms |
+//! | 2048 | forward + backward | 0.19 / 0.17 / 0.14 / 0.069 ms | 0.27 / 0.24 / 0.15 / 0.063 ms | 1.6 / 1.8 / 1.2 / 0.84 ms |
+//! | 6144 | forward + backward | 0.79 / 0.52 / 0.38 / 0.14 ms | 1.06 / 0.87 / 0.64 / 0.19 ms | 3.6 / 3.3 / 2.8 / 2.1 ms |
 //!
 //! The kernels read `x` in bf16, where PEFT copies it to f32 first, and with a base write the
 //! rounded sum where PEFT writes, scales and adds the f32 term in three more passes over it. The

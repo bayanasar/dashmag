@@ -75,23 +75,23 @@
 //! plane operations, and on CubeCL's CPU runtime (as many units per cube as cores), for instance.
 //!
 //! Measured against transformers' function at f32 (the tests' fixtures), the output, the final
-//! state and every gradient agree to within 1.12e-6 relative to each tensor's largest value; from
+//! state and every gradient agree to within 1.13e-6 relative to each tensor's largest value; from
 //! bf16 inputs, through the reference and the f32 kernels, to within 2.41e-3 of the exact result
 //! (torch's own bf16 path: 8.06e-3). Packed, against transformers in float64 called once per
-//! sequence, to within 1.23e-6, and to fla's packed f32 path within 2.03e-6; packed and
+//! sequence, to within 1.23e-6, and to fla's packed f32 path within 2.04e-6; packed and
 //! per-sequence calls agree to the bit. The f32 kernels agree with the f32 reference to within
-//! 1.2e-6 (heads up to 256 wide), and 3.31e-3 from bf16 inputs. On tensor cores, from bf16 inputs,
+//! 1.20e-6 (heads up to 256 wide), and 3.31e-3 from bf16 inputs. On tensor cores, from bf16 inputs,
 //! the errors grow to those of fla's own bf16 path: against float64 to within 6.12e-3 (packed,
 //! 5.58e-3 where fla's is 6.36e-3, the output and final states agreeing with fla's errors to three
-//! digits), and against the f32 reference to within 7.01e-3 (the final states), and 1.12e-2 for
+//! digits), and against the f32 reference to within 7.02e-3 (the final states), and 1.13e-2 for
 //! the gate's gradient without the l2 normalisation, a difference of sums within each chunk; from
-//! f16 inputs, to within 7.5e-4 of the f32 reference. On an RTX 5070 Ti, 6144 tokens with 16 heads
-//! of 128 and bf16 inputs take 2.87 ms of device time forward and backward in this operation's
-//! kernels as one sequence, 2.72 ms as four packed ones (fla 0.5.2, measured beside them: 2.67
-//! and 2.50 ms), and 0.89 and 0.86 ms forward (fla: 0.73 and 0.71 ms); the loss around it in the
-//! benchmark adds 1.0 ms of Burn's kernels (PyTorch's: 0.6). With heads of 256, on the f32
-//! kernels, 21.8 and 6.1 ms (fla: 7.5 and 2.2 ms) (`examples/gated_delta_chunk_bench.rs`, device
-//! times summed from `nsys`).
+//! f16 inputs, to within 7.46e-4 of the f32 reference. On an otherwise idle RTX 5070 Ti, 6144
+//! tokens with 16 heads of 128 and bf16 inputs take 2.72 ms of device time forward and backward in
+//! this operation's kernels as one sequence, 2.60 ms as four packed ones (fla 0.5.2, run in turn
+//! with them: 2.59 and 2.35 ms), and 0.81 and 0.79 ms forward (fla: 0.68 and 0.69 ms); the loss
+//! around it in the benchmark adds 0.96 ms of Burn's kernels (PyTorch's: 0.57). With heads of 256,
+//! on the f32 kernels, 19.7 and 5.4 ms (fla: 6.6 and 1.9 ms) (`examples/gated_delta_chunk_bench.rs`,
+//! device times summed from `nsys`).
 
 mod reference;
 
@@ -343,7 +343,7 @@ mod fusion_meta {
 pub trait ChunkGatedDeltaBackend: Backend {
     /// The forward pass: the output `[B, T, H, Dv]` in the queries' dtype, the final states
     /// `[B, H, Dk, Dv]` (packed, `[S, H, Dk, Dv]`) in f32, and what it keeps for the backward
-    /// pass when `save_for_backward` (shaped by [`saved_shape`]; the kernels on tensor cores keep
+    /// pass when `save_for_backward` (shaped by `saved_shape`; the kernels on tensor cores keep
     /// the per-chunk `T`, the reference nothing). `output_final_state` only tells Autodiff whether
     /// the final states take part in the graph; they are always computed.
     #[fusion(meta = fusion_meta::forward)]
