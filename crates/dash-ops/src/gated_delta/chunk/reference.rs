@@ -1,12 +1,14 @@
 //! The chunked gated delta rule built from Burn's tensor operations: the forward pass, and the
 //! backward pass written out from the forward's chunked form. Every backend can run it; the
-//! tests hold the CUDA kernels to it.
+//! tests hold the kernels to it.
 //!
 //! Work within a chunk is batched over all chunks of all heads (`[B, H, N, C, ...]` tensors, `N`
 //! chunks of `C = 64` tokens); only the passing of the state from chunk to chunk, forward and
-//! backward, is a loop. Everything is computed in f32, whatever the inputs' dtype.
+//! backward, is a loop. Everything is computed in f32, whatever the inputs' dtype. Packed
+//! sequences run one at a time, each as a batch of one ([`forward_packed`], [`backward_packed`]):
+//! what the operation promises them, by construction.
 //!
-//! Notation, per chunk (`Q` already scaled by `1/sqrt(Dk)`):
+//! Notation, per chunk (`Q` already scaled):
 //!
 //! - `G = cumsum(g)` within the chunk, `gamma = exp(G)`, `lam = exp(G_last - G)`;
 //! - `A[i, j] = beta_i (k_i . k_j) exp(G_i - G_j)` for `i > j`, else 0; `T = (I + A)^-1`;
@@ -248,7 +250,7 @@ fn l2norm_backward<B: Backend>(xn: Ft<B>, inv: Ft<B>, dxn: Ft<B>) -> Ft<B> {
 /// The inputs in chunked f32 form.
 struct Prepared<B: Backend> {
     pub d: Dims,
-    /// `[B, H, N, C, Dk]`, normalised if asked, scaled by `1/sqrt(Dk)`.
+    /// `[B, H, N, C, Dk]`, normalised if asked, scaled.
     pub q: Ft<B>,
     /// `[B, H, N, C, Dk]`, normalised if asked.
     pub k: Ft<B>,
@@ -263,10 +265,6 @@ struct Prepared<B: Backend> {
     pub norms: Option<[Ft<B>; 4]>,
 }
 
-pub(crate) fn scale(dk: usize) -> f32 {
-    1.0 / (dk as f32).sqrt()
-}
-
 fn prepare<B: Backend>(
     q: Ft<B>,
     k: Ft<B>,
@@ -274,6 +272,7 @@ fn prepare<B: Backend>(
     g: Ft<B>,
     beta: Ft<B>,
     use_qk_l2norm: bool,
+    scale: f32,
 ) -> Prepared<B> {
     let d = Dims::of(&q.shape(), &v.shape());
     let (q, k) = (to_f32::<B>(q), to_f32::<B>(k));
@@ -284,7 +283,7 @@ fn prepare<B: Backend>(
     } else {
         (q, k, None)
     };
-    let q = B::float_mul_scalar(q, scale(d.dk).into());
+    let q = B::float_mul_scalar(q, scale.into());
     Prepared {
         q: chunk4::<B>(q, &d, d.dk),
         k: chunk4::<B>(k, &d, d.dk),
@@ -478,6 +477,7 @@ fn lam<B: Backend>(gcum: Ft<B>) -> Ft<B> {
 
 /// The forward pass: the output `[B, T, H, Dv]` in the queries' dtype and the final state
 /// `[B, H, Dk, Dv]` in f32.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn forward<B: Backend>(
     q: Ft<B>,
     k: Ft<B>,
@@ -486,9 +486,10 @@ pub(crate) fn forward<B: Backend>(
     beta: Ft<B>,
     initial_state: Ft<B>,
     use_qk_l2norm: bool,
+    scale: f32,
 ) -> (Ft<B>, Ft<B>) {
     let dtype = q.dtype();
-    let p = prepare::<B>(q, k, v, g, beta, use_qk_l2norm);
+    let p = prepare::<B>(q, k, v, g, beta, use_qk_l2norm, scale);
     let d = p.d;
     let Intra {
         gcum,
@@ -525,9 +526,10 @@ pub(crate) fn backward<B: Backend>(
     d_out: Ft<B>,
     d_final_state: Ft<B>,
     use_qk_l2norm: bool,
+    scale: f32,
 ) -> Grads<B> {
     let dtypes = [q.dtype(), k.dtype(), v.dtype(), g.dtype(), beta.dtype()];
-    let p = prepare::<B>(q, k, v, g, beta, use_qk_l2norm);
+    let p = prepare::<B>(q, k, v, g, beta, use_qk_l2norm, scale);
     let d = p.d;
     let device = p.q.device();
     let Intra {
@@ -659,7 +661,7 @@ pub(crate) fn backward<B: Backend>(
     let total = B::float_expand(B::float_sum_dim(d_g.clone(), 3), d_g.shape());
     let dg = add::<B>(sub::<B>(total, B::float_cumsum(d_g.clone(), 3)), d_g);
 
-    let mut dq = unchunk4::<B>(B::float_mul_scalar(dq, scale(d.dk).into()), &d, d.dk);
+    let mut dq = unchunk4::<B>(B::float_mul_scalar(dq, scale.into()), &d, d.dk);
     let mut dk = unchunk4::<B>(dk, &d, d.dk);
     if let Some([qn, qi, kn, ki]) = p.norms {
         dq = l2norm_backward::<B>(qn, qi, dq);
@@ -673,4 +675,106 @@ pub(crate) fn backward<B: Backend>(
         to_dtype::<B>(unchunk3::<B>(d_beta, &d), dtypes[4]),
         d_initial,
     )
+}
+
+/// Tokens `range` of a packed `[1, T, ...]` tensor of rank `D`.
+fn tokens<B: Backend>(x: &Ft<B>, range: std::ops::Range<usize>) -> Ft<B> {
+    let rank = x.shape().num_dims();
+    let mut slices = vec![full(); rank];
+    slices[1] = Slice::from(range);
+    B::float_slice(x.clone(), &slices)
+}
+
+/// State `s` of a `[S, H, Dk, Dv]` tensor, as `[1, H, Dk, Dv]`.
+fn state_of<B: Backend>(x: &Ft<B>, s: usize) -> Ft<B> {
+    B::float_slice(x.clone(), &[Slice::from(s..s + 1), full(), full(), full()])
+}
+
+/// [`forward`] over packed sequences: `q`, `k`, `v` `[1, T, H, D]`, `g`, `beta` `[1, T, H]`,
+/// `initial_state` `[S, H, Dk, Dv]`, sequence `s` being tokens `cu[s]..cu[s + 1]`. Each sequence
+/// runs as a batch of one; an empty one leaves its state as it was.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_packed<B: Backend>(
+    q: Ft<B>,
+    k: Ft<B>,
+    v: Ft<B>,
+    g: Ft<B>,
+    beta: Ft<B>,
+    initial_state: Ft<B>,
+    cu: &[usize],
+    use_qk_l2norm: bool,
+    scale: f32,
+) -> (Ft<B>, Ft<B>) {
+    let initial_state = to_f32::<B>(initial_state);
+    let mut outs = Vec::new();
+    let mut states = Vec::with_capacity(cu.len() - 1);
+    for (s, span) in cu.windows(2).enumerate() {
+        let h0 = state_of::<B>(&initial_state, s);
+        if span[0] == span[1] {
+            states.push(h0);
+            continue;
+        }
+        let at = |x: &Ft<B>| tokens::<B>(x, span[0]..span[1]);
+        let (out, state) = forward::<B>(
+            at(&q),
+            at(&k),
+            at(&v),
+            at(&g),
+            at(&beta),
+            h0,
+            use_qk_l2norm,
+            scale,
+        );
+        outs.push(out);
+        states.push(state);
+    }
+    (B::float_cat(outs, 1), B::float_cat(states, 0))
+}
+
+/// [`backward`] over packed sequences, laid out as [`forward_packed`]: `d_out` `[1, T, H, Dv]`,
+/// `d_final_state` `[S, H, Dk, Dv]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn backward_packed<B: Backend>(
+    q: Ft<B>,
+    k: Ft<B>,
+    v: Ft<B>,
+    g: Ft<B>,
+    beta: Ft<B>,
+    initial_state: Ft<B>,
+    cu: &[usize],
+    d_out: Ft<B>,
+    d_final_state: Ft<B>,
+    use_qk_l2norm: bool,
+    scale: f32,
+) -> Grads<B> {
+    let initial_state = to_f32::<B>(initial_state);
+    let d_final_state = to_f32::<B>(d_final_state);
+    let mut parts: [Vec<Ft<B>>; 5] = Default::default();
+    let mut d_initial = Vec::with_capacity(cu.len() - 1);
+    for (s, span) in cu.windows(2).enumerate() {
+        let d_last = state_of::<B>(&d_final_state, s);
+        if span[0] == span[1] {
+            d_initial.push(d_last);
+            continue;
+        }
+        let at = |x: &Ft<B>| tokens::<B>(x, span[0]..span[1]);
+        let (dq, dk, dv, dg, d_beta, d_h0) = backward::<B>(
+            at(&q),
+            at(&k),
+            at(&v),
+            at(&g),
+            at(&beta),
+            state_of::<B>(&initial_state, s),
+            at(&d_out),
+            d_last,
+            use_qk_l2norm,
+            scale,
+        );
+        for (part, grad) in parts.iter_mut().zip([dq, dk, dv, dg, d_beta]) {
+            part.push(grad);
+        }
+        d_initial.push(d_h0);
+    }
+    let [dq, dk, dv, dg, d_beta] = parts.map(|part| B::float_cat(part, 1));
+    (dq, dk, dv, dg, d_beta, B::float_cat(d_initial, 0))
 }

@@ -1,6 +1,15 @@
 //! The chunked gated delta rule on the CubeCL backend, in CubeCL kernels, all in f32 (no tensor
-//! cores), for heads up to [`MAX_HEAD_DIM`] wide, on devices with what [`requirements`] lists.
-//! Notation as in `reference.rs`.
+//! cores), for heads up to [`MAX_KERNEL_HEAD_DIM`] wide (queries and keys wider than 128 in the
+//! kernels of [`wide`]), on devices with what [`requirements`] lists. Notation as in
+//! `reference.rs`.
+//!
+//! The per-chunk kernels run one cube per chunk of each head, `cube = (b H + h) N + c`. Batch
+//! element `b` is a sequence of `T` tokens in `N = ceil(T / 64)` chunks. Packed sequences (`B =
+//! 1`) are laid out first by [`plan_kernel`]: sequence `s` takes chunks `offsets[s]..offsets[s +
+//! 1]`, starting at its first token, and `N` is the most chunks the sequences can need; chunk `c`
+//! reads its first token and its count of tokens from the plan (none past the last chunk, whose
+//! cubes return at once). The state passes run one cube per sequence, head and block of state
+//! columns, over the sequence's chunks.
 //!
 //! Forward: [`prep_kernel`] per chunk (`G`, `A`, `T = (I + A)^-1`, `W`, `U`, `kt` from the raw
 //! inputs, normalising keys when asked); [`state_forward_kernel`] passes the state from chunk to
@@ -21,8 +30,9 @@
 //! batch element, head and block of 32 state columns.
 
 use super::reference::{self, CHUNK};
-use super::{ChunkGatedDeltaBackend, probe};
+use super::{ChunkGatedDeltaBackend, MAX_KERNEL_HEAD_DIM, probe};
 use crate::cube::Requirements;
+use crate::gated_delta::Sequences;
 use burn::backend::TensorMetadata;
 use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::ops::FloatTensorOps;
@@ -36,24 +46,187 @@ use cubecl::client::Client;
 use cubecl::prelude::*;
 use std::sync::atomic::Ordering;
 
+mod wide;
+
+/// Launches `$narrow`, or `$wide` when `$is_wide` (heads wider than [`wide::HALF`]), with the
+/// same arguments.
+macro_rules! launch_either {
+    ($is_wide:expr, $narrow:expr, $wide:expr, $($arg:expr),+ $(,)?) => {
+        if $is_wide {
+            $wide($($arg),+)
+        } else {
+            $narrow($($arg),+)
+        }
+    };
+}
+
 /// Columns of the state (of `Dv`) one cube carries through the state passing.
 const BV: usize = 32;
 /// Threads per cube, in every kernel here.
 const THREADS: u32 = 256;
-/// The largest head dimensions the kernels hold in shared memory; larger heads run the
-/// reference.
-pub(super) const MAX_HEAD_DIM: usize = 128;
 
 type V4 = Vector<f32, Const<4>>;
 type V2 = Vector<f32, Const<2>>;
 
-/// The state passing, forward. One cube per (batch and head, block of 32 state columns), 256
+/// The chunks of `S` packed sequences, from their boundaries `cu_seqlens` `[S + 1]` over `T`
+/// tokens: sequence `s`, `len` tokens long, takes `ceil(len / 64)` chunks of its own, the last
+/// one shorter, numbered in order of the sequences. Writes `offsets[s]`, the number of sequence
+/// `s`'s first chunk (`offsets[S]` the count of chunks), and for each chunk `c` up to
+/// `max_chunks` its first token `plan[2 c]` and its count of tokens `plan[2 c + 1]`, zero past
+/// the last chunk. One cube of 256 units, the sequences 256 at a time with a scan over each
+/// group's chunk counts. Every offset is clamped to `[0, T]` and every chunk number below
+/// `max_chunks`, so that malformed boundaries cannot send a later kernel out of its tensors. The
+/// offsets are compared in i32, which every device computes with (OpenGL has no i64): `T` is at
+/// most `i32::MAX` (`kernels_take`), and a boundary outside it is clamped whatever its cast gives.
+#[cube(launch)]
+fn plan_kernel<I: Numeric>(
+    cu_seqlens: &Tensor<I>,
+    offsets: &mut Tensor<u32>,
+    plan: &mut Tensor<u32>,
+    sequences: u32,
+    tokens: u32,
+    max_chunks: u32,
+    #[define(I)] _dtype: ElemType,
+) {
+    let tid = UNIT_POS_X as usize;
+    let seqs = sequences as usize;
+    let t_len = i32::cast_from(tokens);
+    let cap = max_chunks as usize;
+    let mut scan = Shared::<[u32]>::new_slice(256usize);
+    let mut total = 0usize;
+    for group in 0..seqs.div_ceil(256usize) {
+        let s = group * 256usize + tid;
+        let mut start = 0usize;
+        let mut len = 0usize;
+        if s < seqs {
+            let mut a = i32::cast_from(cu_seqlens[s]);
+            let mut e = i32::cast_from(cu_seqlens[s + 1usize]);
+            a = clamp(a, 0, t_len);
+            e = clamp(e, 0, t_len);
+            start = usize::cast_from(a);
+            if e > a {
+                len = usize::cast_from(e - a);
+            }
+        }
+        let n = len.div_ceil(64usize);
+        scan[tid] = n as u32;
+        sync_cube();
+        // Inclusive scan of the group's counts.
+        let mut step = 1usize;
+        while step < 256usize {
+            let mut x = scan[tid];
+            if tid >= step {
+                x += scan[tid - step];
+            }
+            sync_cube();
+            scan[tid] = x;
+            sync_cube();
+            step *= 2usize;
+        }
+        let first = total + scan[tid] as usize - n;
+        if s < seqs {
+            let mut at = first;
+            if at > cap {
+                at = cap;
+            }
+            offsets[s] = at as u32;
+            for j in 0..n {
+                let c = first + j;
+                if c < cap {
+                    let mut count = len - 64usize * j;
+                    if count > 64usize {
+                        count = 64usize;
+                    }
+                    plan[2usize * c] = (start + 64usize * j) as u32;
+                    plan[2usize * c + 1usize] = count as u32;
+                }
+            }
+        }
+        total += scan[255usize] as usize;
+        sync_cube();
+    }
+    if tid == 0usize {
+        let mut at = total;
+        if at > cap {
+            at = cap;
+        }
+        offsets[seqs] = at as u32;
+    }
+    let mut c = total + tid;
+    while c < cap {
+        plan[2usize * c] = 0u32;
+        plan[2usize * c + 1usize] = 0u32;
+        c += 256usize;
+    }
+}
+
+/// `x` within `[lo, hi]`.
+#[cube]
+fn clamp(x: i32, lo: i32, hi: i32) -> i32 {
+    let mut y = x;
+    if y < lo {
+        y = lo;
+    }
+    if y > hi {
+        y = hi;
+    }
+    y
+}
+
+/// The first token of chunk `c` of batch element `b` (a row of the `[B T, H, D]` inputs) and its
+/// count of tokens: one of the `ceil(T / 64)` chunks of the batch element, or, `packed`, as
+/// [`plan_kernel`] laid them out.
+#[cube]
+fn chunk_tokens(
+    plan: &Tensor<u32>,
+    b: usize,
+    c: usize,
+    t_len: usize,
+    #[comptime] packed: bool,
+) -> (usize, usize) {
+    // Unpacked; past the last chunk of `T` tokens (packed) this wraps, and is replaced below.
+    let mut first = b * t_len + c * 64usize;
+    let mut count = t_len - c * 64usize;
+    if count > 64usize {
+        count = 64usize;
+    }
+    if packed {
+        first = plan[2usize * c] as usize;
+        count = plan[2usize * c + 1usize] as usize;
+    }
+    (first, count)
+}
+
+/// The chunks a state passing cube `y` (`CUBE_POS_Y`) walks: the number of its first chunk and
+/// how many. Unpacked, `y = b H + h` walks the batch element's `n` chunks; packed, `y = s H + h`
+/// walks sequence `s`'s chunks of head `h`, `n` being the chunks of each head.
+#[cube]
+fn state_chunks(
+    offsets: &Tensor<u32>,
+    y: usize,
+    heads: usize,
+    n: usize,
+    #[comptime] packed: bool,
+) -> (usize, usize) {
+    let mut base = y * n;
+    let mut count = n;
+    if packed {
+        let s = y / heads;
+        let h = y % heads;
+        let first = offsets[s] as usize;
+        base = h * n + first;
+        count = offsets[s + 1usize] as usize - first;
+    }
+    (base, count)
+}
+
+/// The state passing, forward. One cube per (sequence and head, block of 32 state columns), 256
 /// threads; thread `(ty, tx)` owns the block's columns `2 tx, 2 tx + 1`, rows `4 ty .. 4 ty + 4` of
 /// `V'` and rows `8 ty .. 8 ty + 8` of the state (in registers), so that each step of the inner
-/// products reads its operands with one or two vector loads from shared memory. For each chunk
-/// in turn: store the entering state; stage `W` (transposed) and `kt`, loaded into registers
-/// during the previous chunk; form `V' = U - W S`; then `S = exp(G_last) S + kt^T V'`.
-/// `Dk <= 128`.
+/// products reads its operands with one or two vector loads from shared memory. For each of the
+/// sequence's chunks in turn: store the entering state; stage `W` (transposed) and `kt`, loaded
+/// into registers during the previous chunk; form `V' = U - W S`; then
+/// `S = exp(G_last) S + kt^T V'`. `Dk <= 128`.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn state_forward_kernel(
@@ -62,19 +235,22 @@ fn state_forward_kernel(
     u: &Tensor<f32>,
     gl: &Tensor<f32>,
     h0: &Tensor<f32>,
+    offsets: &Tensor<u32>,
     states: &mut Tensor<f32>,
     v_new: &mut Tensor<f32>,
     last: &mut Tensor<f32>,
     n_chunks: u32,
+    heads: u32,
     #[comptime] dk: usize,
     #[comptime] dv: usize,
+    #[comptime] packed: bool,
 ) {
     let bh = CUBE_POS_Y as usize;
     let tid = UNIT_POS_X as usize;
     let tx = tid % 16usize;
     let ty = tid / 16usize;
     let col0 = CUBE_POS_X as usize * 32usize + 2usize * tx;
-    let n = n_chunks as usize;
+    let (base, n) = state_chunks(offsets, bh, heads as usize, n_chunks as usize, packed);
     // W^T by vectors of 4 rows: wt[k * 17 + i / 4] (rows padded to 17 vectors).
     let mut wt: Shared<[V4]> = Shared::new_slice(128usize * 17usize);
     // kt by vectors of 4 columns: ks[i * 32 + k / 4].
@@ -106,8 +282,10 @@ fn state_forward_kernel(
     }
 
     // The first chunk's W and kt into the prefetch registers: W element (4 i4 + r, k) and kt
-    // element (i, 4 k4 + r), for this thread's 8 (k, i4) and (i, k4) pairs.
-    let first = bh * n * 64usize * dk;
+    // element (i, 4 k4 + r), for this thread's 8 (k, i4) and (i, k4) pairs. A sequence may have
+    // no chunk.
+    let first = base * 64usize * dk;
+    let some = n > 0usize;
     #[unroll]
     for m in 0..8usize {
         let e = tid + 256usize * m;
@@ -119,10 +297,10 @@ fn state_forward_kernel(
         for r in 0..4usize {
             let mut wv = f32::new(0.0f32);
             let mut kv = f32::new(0.0f32);
-            if k < dk {
+            if some && k < dk {
                 wv = w[first + (4usize * i4 + r) * dk + k];
             }
-            if 4usize * k4 + r < dk {
+            if some && 4usize * k4 + r < dk {
                 kv = kt[first + i * dk + 4usize * k4 + r];
             }
             pre_w[m * 4usize + r] = wv;
@@ -135,16 +313,19 @@ fn state_forward_kernel(
         for cc in 0..2usize {
             let col = col0 + cc;
             let mut x = f32::new(0.0f32);
-            if col < dv {
-                x = u[(bh * n * 64usize + 4usize * ty + p) * dv + col];
+            if some && col < dv {
+                x = u[(base * 64usize + 4usize * ty + p) * dv + col];
             }
             pre_u[p * 2usize + cc] = x;
         }
     }
-    let mut pre_gl = gl[bh * n];
+    let mut pre_gl = f32::new(0.0f32);
+    if some {
+        pre_gl = gl[base];
+    }
 
     for c in 0..n {
-        let chunk = bh * n + c;
+        let chunk = base + c;
         #[unroll]
         for m in 0..8usize {
             let e = tid + 256usize * m;
@@ -289,10 +470,11 @@ fn state_forward_kernel(
     }
 }
 
-/// The state passing, backward, laid out as [`state_forward_kernel`]. For each chunk from the
-/// last: store `dS_{c+1}`; form `dV' = kt dS + dv_local` (`kt` staged transposed); then
-/// `dS = exp(G_last) dS + qg^T dO - W^T dV'` (`qg` staged where `kt` was). The next chunk's `kt`,
-/// `W`, `qg`, `dv_local`, `dO` are loaded into registers during the current one. `Dk <= 128`.
+/// The state passing, backward, laid out as [`state_forward_kernel`]. For each of the sequence's
+/// chunks from the last: store `dS_{c+1}`; form `dV' = kt dS + dv_local` (`kt` staged
+/// transposed); then `dS = exp(G_last) dS + qg^T dO - W^T dV'` (`qg` staged where `kt` was). The
+/// next chunk's `kt`, `W`, `qg`, `dv_local`, `dO` are loaded into registers during the current
+/// one. `Dk <= 128`.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn state_backward_kernel(
@@ -303,19 +485,22 @@ fn state_backward_kernel(
     dv_local: &Tensor<f32>,
     gl: &Tensor<f32>,
     d_last: &Tensor<f32>,
+    offsets: &Tensor<u32>,
     ds_next: &mut Tensor<f32>,
     dvn: &mut Tensor<f32>,
     d_first: &mut Tensor<f32>,
     n_chunks: u32,
+    heads: u32,
     #[comptime] dk: usize,
     #[comptime] dv: usize,
+    #[comptime] packed: bool,
 ) {
     let bh = CUBE_POS_Y as usize;
     let tid = UNIT_POS_X as usize;
     let tx = tid % 16usize;
     let ty = tid / 16usize;
     let col0 = CUBE_POS_X as usize * 32usize + 2usize * tx;
-    let n = n_chunks as usize;
+    let (base, n) = state_chunks(offsets, bh, heads as usize, n_chunks as usize, packed);
     // kt^T by vectors of 4 rows (xs[k * 17 + i / 4]) for dV', then qg by vectors of 4 columns
     // (xs[i * 32 + k / 4]) for dS.
     let mut xs: Shared<[V4]> = Shared::new_slice(128usize * 17usize);
@@ -348,7 +533,12 @@ fn state_backward_kernel(
         dss[k * 16usize + tx] = pair;
     }
 
-    let last_chunk = bh * n + n - 1usize;
+    // A sequence may have no chunk.
+    let some = n > 0usize;
+    let mut last_chunk = base;
+    if some {
+        last_chunk = base + n - 1usize;
+    }
     let first = last_chunk * 64usize * dk;
     #[unroll]
     for m in 0..8usize {
@@ -362,10 +552,10 @@ fn state_backward_kernel(
             let mut kv = f32::new(0.0f32);
             let mut wv = f32::new(0.0f32);
             let mut qv = f32::new(0.0f32);
-            if k < dk {
+            if some && k < dk {
                 kv = kt[first + (4usize * i4 + r) * dk + k];
             }
-            if 4usize * k4 + r < dk {
+            if some && 4usize * k4 + r < dk {
                 wv = w[first + i * dk + 4usize * k4 + r];
                 qv = qg[first + i * dk + 4usize * k4 + r];
             }
@@ -381,7 +571,7 @@ fn state_backward_kernel(
             let col = col0 + cc;
             let mut x = f32::new(0.0f32);
             let mut y = f32::new(0.0f32);
-            if col < dv {
+            if some && col < dv {
                 let idx = (last_chunk * 64usize + 4usize * ty + p) * dv + col;
                 x = dv_local[idx];
                 y = d_o[idx];
@@ -390,10 +580,13 @@ fn state_backward_kernel(
             pre_o[p * 2usize + cc] = y;
         }
     }
-    let mut pre_gl = gl[last_chunk];
+    let mut pre_gl = f32::new(0.0f32);
+    if some {
+        pre_gl = gl[last_chunk];
+    }
 
     for cr in 0..n {
-        let chunk = bh * n + (n - 1usize - cr);
+        let chunk = base + (n - 1usize - cr);
         #[unroll]
         for m in 0..8usize {
             let e = tid + 256usize * m;
@@ -567,19 +760,18 @@ fn state_backward_kernel(
     }
 }
 
-/// Loads chunk `c` of a `[B, T, H, D]` tensor into shared memory as f32, rows padded to `D + 1`
-/// (`dst[i * (D + 1) + d]`), zero past the sequence's end; optionally normalises each row
-/// (transformers' l2norm) and scales it.
+/// Loads a chunk of head `h` of a `[B T, H, D]` tensor into shared memory as f32, rows padded to
+/// `D + 1` (`dst[i * (D + 1) + d]`): its `count` tokens from token `first`, zero past them;
+/// optionally normalises each row (transformers' l2norm) and scales it.
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn load_rows<E: Float>(
     src: &Tensor<E>,
     dst: &mut Shared<[f32]>,
     norm: &mut Shared<[f32]>,
-    b: usize,
+    first: usize,
+    count: usize,
     h: usize,
-    c: usize,
-    seq_len: usize,
     heads: usize,
     scale: f32,
     #[comptime] depth: usize,
@@ -593,10 +785,9 @@ fn load_rows<E: Float>(
         if e < 64usize * depth {
             let i = e / depth;
             let d = e % depth;
-            let t = c * 64usize + i;
             let mut x = f32::new(0.0f32);
-            if t < seq_len {
-                x = f32::cast_from(src[((b * seq_len + t) * heads + h) * depth + d]);
+            if i < count {
+                x = f32::cast_from(src[((first + i) * heads + h) * depth + d]);
             }
             dst[i * stride + d] = x;
         }
@@ -644,6 +835,7 @@ fn prep_kernel<E: Float>(
     gcum: &mut Tensor<f32>,
     tmat: &mut Tensor<f32>,
     amat: &mut Tensor<f32>,
+    plan: &Tensor<u32>,
     seq_len: u32,
     n_chunks: u32,
     heads: u32,
@@ -651,6 +843,7 @@ fn prep_kernel<E: Float>(
     #[comptime] dv: usize,
     #[comptime] l2norm: bool,
     #[comptime] store_ta: bool,
+    #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let dmax = comptime![if dk > dv { dk } else { dv }];
@@ -666,6 +859,10 @@ fn prep_kernel<E: Float>(
     let bh = cube / n;
     let b = bh / hh;
     let h = bh % hh;
+    let (first, count) = chunk_tokens(plan, b, c, t_len, packed);
+    if packed && count == 0usize {
+        terminate!();
+    }
     let tid = UNIT_POS_X as usize;
     let tx = tid % 16usize;
     let ty = tid / 16usize;
@@ -678,12 +875,11 @@ fn prep_kernel<E: Float>(
     let mut norm = Shared::<[f32]>::new_slice(64usize);
 
     if tid < 64usize {
-        let t = c * 64usize + tid;
         let mut gv = f32::new(0.0f32);
         let mut bv = f32::new(0.0f32);
-        if t < t_len {
-            gv = g[(b * t_len + t) * hh + h];
-            bv = beta[(b * t_len + t) * hh + h];
+        if tid < count {
+            gv = g[(first + tid) * hh + h];
+            bv = beta[(first + tid) * hh + h];
         }
         gs[tid] = gv;
         bs[tid] = bv;
@@ -692,10 +888,9 @@ fn prep_kernel<E: Float>(
         k,
         &mut rows,
         &mut norm,
-        b,
+        first,
+        count,
         h,
-        c,
-        t_len,
         hh,
         f32::new(1.0f32),
         dk,
@@ -867,10 +1062,9 @@ fn prep_kernel<E: Float>(
         v,
         &mut rows,
         &mut norm,
-        b,
+        first,
+        count,
         h,
-        c,
-        t_len,
         hh,
         f32::new(1.0f32),
         dv,
@@ -926,6 +1120,7 @@ fn output_kernel<E: Float>(
     states: &Tensor<f32>,
     v_new: &Tensor<f32>,
     out: &mut Tensor<E>,
+    plan: &Tensor<u32>,
     seq_len: u32,
     n_chunks: u32,
     heads: u32,
@@ -933,6 +1128,7 @@ fn output_kernel<E: Float>(
     #[comptime] dk: usize,
     #[comptime] dv: usize,
     #[comptime] l2norm: bool,
+    #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let dks = comptime![dk + 1usize];
@@ -946,6 +1142,10 @@ fn output_kernel<E: Float>(
     let bh = cube / n;
     let b = bh / hh;
     let h = bh % hh;
+    let (first, count) = chunk_tokens(plan, b, c, t_len, packed);
+    if packed && count == 0usize {
+        terminate!();
+    }
     let tid = UNIT_POS_X as usize;
     let tx = tid % 16usize;
     let ty = tid / 16usize;
@@ -965,15 +1165,16 @@ fn output_kernel<E: Float>(
     if tid < 64usize {
         gs[tid] = gcum[cube * 64usize + tid];
     }
-    load_rows::<E>(q, &mut qs, &mut norm, b, h, c, t_len, hh, scale, dk, l2norm);
+    load_rows::<E>(
+        q, &mut qs, &mut norm, first, count, h, hh, scale, dk, l2norm,
+    );
     load_rows::<E>(
         k,
         &mut ks,
         &mut norm,
-        b,
+        first,
+        count,
         h,
-        c,
-        t_len,
         hh,
         f32::new(1.0f32),
         dk,
@@ -1108,12 +1309,12 @@ fn output_kernel<E: Float>(
     }
     #[unroll]
     for a in 0..4usize {
-        let t = c * 64usize + ty + 16usize * a;
+        let i = ty + 16usize * a;
         #[unroll]
         for bb in 0..nbv {
             let col = tx + 16usize * bb;
-            if t < t_len && col < dv {
-                out[((b * t_len + t) * hh + h) * dv + col] = E::cast_from(o[a * nbv + bb]);
+            if i < count && col < dv {
+                out[((first + i) * hh + h) * dv + col] = E::cast_from(o[a * nbv + bb]);
             }
         }
     }
@@ -1131,6 +1332,7 @@ fn dvlocal_kernel<E: Float>(
     dv_local: &mut Tensor<f32>,
     qg: &mut Tensor<f32>,
     d_o: &mut Tensor<f32>,
+    plan: &Tensor<u32>,
     seq_len: u32,
     n_chunks: u32,
     heads: u32,
@@ -1138,6 +1340,7 @@ fn dvlocal_kernel<E: Float>(
     #[comptime] dk: usize,
     #[comptime] dv: usize,
     #[comptime] l2norm: bool,
+    #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let dks = comptime![dk + 1usize];
@@ -1150,6 +1353,10 @@ fn dvlocal_kernel<E: Float>(
     let bh = cube / n;
     let b = bh / hh;
     let h = bh % hh;
+    let (first, count) = chunk_tokens(plan, b, c, t_len, packed);
+    if packed && count == 0usize {
+        terminate!();
+    }
     let tid = UNIT_POS_X as usize;
     let tx = tid % 16usize;
     let ty = tid / 16usize;
@@ -1168,15 +1375,16 @@ fn dvlocal_kernel<E: Float>(
     if tid < 64usize {
         gs[tid] = gcum[cube * 64usize + tid];
     }
-    load_rows::<E>(q, &mut qs, &mut norm, b, h, c, t_len, hh, scale, dk, l2norm);
+    load_rows::<E>(
+        q, &mut qs, &mut norm, first, count, h, hh, scale, dk, l2norm,
+    );
     load_rows::<E>(
         k,
         &mut ks,
         &mut norm,
-        b,
+        first,
+        count,
         h,
-        c,
-        t_len,
         hh,
         f32::new(1.0f32),
         dk,
@@ -1241,10 +1449,9 @@ fn dvlocal_kernel<E: Float>(
             if e < 16usize * dv {
                 let i = i0 * 16usize + e / dv;
                 let col = e % dv;
-                let t = c * 64usize + i;
                 let mut x = f32::new(0.0f32);
-                if t < t_len {
-                    x = d_out[((b * t_len + t) * hh + h) * dv + col];
+                if i < count {
+                    x = d_out[((first + i) * hh + h) * dv + col];
                 }
                 ks[e] = x;
                 d_o[(cube * 64usize + i) * dv + col] = x;
@@ -1298,10 +1505,12 @@ fn dvb_kernel<E: Float>(
     dv_out: &mut Tensor<E>,
     dvb: &mut Tensor<f32>,
     dbeta_v: &mut Tensor<f32>,
+    plan: &Tensor<u32>,
     seq_len: u32,
     n_chunks: u32,
     heads: u32,
     #[comptime] dv: usize,
+    #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let dvs = comptime![dv + 1usize];
@@ -1314,6 +1523,10 @@ fn dvb_kernel<E: Float>(
     let bh = cube / n;
     let b = bh / hh;
     let h = bh % hh;
+    let (first, count) = chunk_tokens(plan, b, c, t_len, packed);
+    if packed && count == 0usize {
+        terminate!();
+    }
     let tid = UNIT_POS_X as usize;
     let tx = tid % 16usize;
     let ty = tid / 16usize;
@@ -1337,10 +1550,9 @@ fn dvb_kernel<E: Float>(
         }
     }
     if tid < 64usize {
-        let t = c * 64usize + tid;
         let mut x = f32::new(0.0f32);
-        if t < t_len {
-            x = beta[(b * t_len + t) * hh + h];
+        if tid < count {
+            x = beta[(first + tid) * hh + h];
         }
         bs[tid] = x;
     }
@@ -1373,7 +1585,6 @@ fn dvb_kernel<E: Float>(
     #[unroll]
     for a in 0..4usize {
         let j = ty + 16usize * a;
-        let t = c * 64usize + j;
         let mut part = f32::new(0.0f32);
         #[unroll]
         for bb in 0..nbv {
@@ -1381,8 +1592,8 @@ fn dvb_kernel<E: Float>(
             if d < dv {
                 let x = acc[a * nbv + bb];
                 dvb[(cube * 64usize + j) * dv + d] = x;
-                if t < t_len {
-                    let idx = ((b * t_len + t) * hh + h) * dv + d;
+                if j < count {
+                    let idx = ((first + j) * hh + h) * dv + d;
                     dv_out[idx] = E::cast_from(x * bs[j]);
                     part += x * f32::cast_from(v[idx]);
                 }
@@ -1566,6 +1777,7 @@ fn dattn_kernel<E: Float>(
     dq_attn: &mut Tensor<f32>,
     dk_attn: &mut Tensor<f32>,
     dg_p: &mut Tensor<f32>,
+    plan: &Tensor<u32>,
     seq_len: u32,
     n_chunks: u32,
     heads: u32,
@@ -1573,6 +1785,7 @@ fn dattn_kernel<E: Float>(
     #[comptime] dk: usize,
     #[comptime] dv: usize,
     #[comptime] l2norm: bool,
+    #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let dks = comptime![dk + 1usize];
@@ -1586,6 +1799,10 @@ fn dattn_kernel<E: Float>(
     let bh = cube / n;
     let b = bh / hh;
     let h = bh % hh;
+    let (first, count) = chunk_tokens(plan, b, c, t_len, packed);
+    if packed && count == 0usize {
+        terminate!();
+    }
     let tid = UNIT_POS_X as usize;
     let tx = tid % 16usize;
     let ty = tid / 16usize;
@@ -1656,15 +1873,16 @@ fn dattn_kernel<E: Float>(
             dpm[i * 65usize + j] = x;
         }
     }
-    load_rows::<E>(q, &mut qs, &mut norm, b, h, c, t_len, hh, scale, dk, l2norm);
+    load_rows::<E>(
+        q, &mut qs, &mut norm, first, count, h, hh, scale, dk, l2norm,
+    );
     load_rows::<E>(
         k,
         &mut ks,
         &mut norm,
-        b,
+        first,
+        count,
         h,
-        c,
-        t_len,
         hh,
         f32::new(1.0f32),
         dk,
@@ -1832,12 +2050,14 @@ fn dwy_kernel<E: Float>(
     dk_a: &mut Tensor<f32>,
     dbeta_a: &mut Tensor<f32>,
     dg_a: &mut Tensor<f32>,
+    plan: &Tensor<u32>,
     seq_len: u32,
     n_chunks: u32,
     heads: u32,
     #[comptime] dk: usize,
     #[comptime] dv: usize,
     #[comptime] l2norm: bool,
+    #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let dks = comptime![dk + 1usize];
@@ -1852,6 +2072,10 @@ fn dwy_kernel<E: Float>(
     let bh = cube / n;
     let b = bh / hh;
     let h = bh % hh;
+    let (first, count) = chunk_tokens(plan, b, c, t_len, packed);
+    if packed && count == 0usize {
+        terminate!();
+    }
     let tid = UNIT_POS_X as usize;
     let tx = tid % 16usize;
     let ty = tid / 16usize;
@@ -1866,10 +2090,9 @@ fn dwy_kernel<E: Float>(
 
     if tid < 64usize {
         gs[tid] = gcum[cube * 64usize + tid];
-        let t = c * 64usize + tid;
         let mut x = f32::new(0.0f32);
-        if t < t_len {
-            x = beta[(b * t_len + t) * hh + h];
+        if tid < count {
+            x = beta[(first + tid) * hh + h];
         }
         bs[tid] = x;
     }
@@ -1906,10 +2129,9 @@ fn dwy_kernel<E: Float>(
         k,
         &mut ks,
         &mut norm,
-        b,
+        first,
+        count,
         h,
-        c,
-        t_len,
         hh,
         f32::new(1.0f32),
         dk,
@@ -2005,12 +2227,14 @@ fn combine_kernel<E: Float>(
     dk_out: &mut Tensor<E>,
     dg: &mut Tensor<f32>,
     dbeta: &mut Tensor<f32>,
+    plan: &Tensor<u32>,
     seq_len: u32,
     n_chunks: u32,
     heads: u32,
     scale: f32,
     #[comptime] dk: usize,
     #[comptime] l2norm: bool,
+    #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let nm = comptime![dk.div_ceil(32usize)];
@@ -2022,6 +2246,10 @@ fn combine_kernel<E: Float>(
     let bh = cube / n;
     let b = bh / hh;
     let h = bh % hh;
+    let (first, count) = chunk_tokens(plan, b, c, t_len, packed);
+    if packed && count == 0usize {
+        terminate!();
+    }
     let tid = UNIT_POS_X as usize;
     let lane = tid % 32usize;
     let warp = tid / 32usize;
@@ -2032,9 +2260,8 @@ fn combine_kernel<E: Float>(
 
     for j in 0..8usize {
         let i = warp + 8usize * j;
-        let t = c * 64usize + i;
-        let live = t < t_len;
-        let raw = ((b * t_len + t) * hh + h) * dk;
+        let live = i < count;
+        let raw = ((first + i) * hh + h) * dk;
         let chunked = (cube * 64usize + i) * dk;
         let mut qv = Array::<f32>::new(nm);
         let mut kv = Array::<f32>::new(nm);
@@ -2067,7 +2294,7 @@ fn combine_kernel<E: Float>(
         let lam = (g_last - gi).exp();
         let mut bi = f32::new(0.0f32);
         if live {
-            bi = beta[(b * t_len + t) * hh + h];
+            bi = beta[(first + i) * hh + h];
         }
         let mut s_qg = f32::new(0.0f32);
         let mut s_bg = f32::new(0.0f32);
@@ -2143,12 +2370,9 @@ fn combine_kernel<E: Float>(
         }
     }
     sync_cube();
-    if tid < 64usize {
-        let t = c * 64usize + tid;
-        if t < t_len {
-            dg[(b * t_len + t) * hh + h] = rg[tid];
-            dbeta[(b * t_len + t) * hh + h] = rb[tid];
-        }
+    if tid < count {
+        dg[(first + tid) * hh + h] = rg[tid];
+        dbeta[(first + tid) * hh + h] = rb[tid];
     }
 }
 
@@ -2158,53 +2382,173 @@ fn launched() {
 }
 
 fn empty_like(reference: &CubeTensor, shape: Shape) -> CubeTensor {
+    empty_with(reference, shape, DType::F32)
+}
+
+fn empty_with(reference: &CubeTensor, shape: Shape, dtype: DType) -> CubeTensor {
     empty_device_contiguous_dtype(
         reference.client.clone(),
         reference.device.clone(),
         shape,
-        DType::F32,
+        dtype,
     )
 }
 
+/// How one call's tokens fall into chunks.
+struct Layout {
+    /// The inputs' `[B, T, H, Dk, Dv]`.
+    b: usize,
+    t: usize,
+    h: usize,
+    dk: usize,
+    dv: usize,
+    /// Chunks per batch element and head: `ceil(T / 64)`; packed, the most chunks `S` sequences
+    /// over `T` tokens can need, `ceil(T / 64) + S - 1`.
+    n: usize,
+    /// The sequences, one state each: `B`, or `S` packed.
+    seqs: usize,
+    /// Packed: the plan of [`plan_kernel`], the chunk offsets `[S + 1]` and each chunk's first
+    /// token and count of tokens `[2 n]`; unpacked, one-element placeholders.
+    offsets: CubeTensor,
+    plan: CubeTensor,
+    packed: bool,
+}
+
+/// The most chunks `S` sequences over `T` tokens can take, each chunked on its own:
+/// `sum ceil(len / 64) <= ceil(T / 64) + S - 1`.
+fn max_chunks(t: usize, sequences: usize) -> usize {
+    t.div_ceil(CHUNK) + sequences.saturating_sub(1)
+}
+
+/// The layout of a call over `q` `[B, T, H, Dk]` and `v`, launching [`plan_kernel`] for packed
+/// sequences.
+fn layout(q: &CubeTensor, v: &CubeTensor, sequences: Sequences<CubeBackend>) -> Layout {
+    let [b, t, h, dk] = q.shape().dims::<4>();
+    let dv = v.shape()[3];
+    let placeholder = || empty_with(q, Shape::new([1]), DType::U32);
+    match sequences {
+        Sequences::Batch => Layout {
+            b,
+            t,
+            h,
+            dk,
+            dv,
+            n: t.div_ceil(CHUNK),
+            seqs: b,
+            offsets: placeholder(),
+            plan: placeholder(),
+            packed: false,
+        },
+        Sequences::Packed(cu_seqlens) => {
+            let cu_seqlens = into_contiguous(cu_seqlens);
+            let seqs = cu_seqlens.shape()[0] - 1;
+            let n = max_chunks(t, seqs);
+            let offsets = empty_with(q, Shape::new([seqs + 1]), DType::U32);
+            let plan = empty_with(q, Shape::new([2 * n]), DType::U32);
+            let dtype = dtype_to_storage_type(cu_seqlens.dtype);
+            launched();
+            plan_kernel::launch(
+                &q.client.clone(),
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(THREADS),
+                cu_seqlens.into_tensor_arg(),
+                offsets.clone().into_tensor_arg(),
+                plan.clone().into_tensor_arg(),
+                seqs as u32,
+                t as u32,
+                n as u32,
+                dtype,
+            );
+            Layout {
+                b,
+                t,
+                h,
+                dk,
+                dv,
+                n,
+                seqs,
+                offsets,
+                plan,
+                packed: true,
+            }
+        }
+    }
+}
+
+impl Layout {
+    /// `[B, H, N, C, depth]`, the chunked layout of the intermediates.
+    fn chunked(&self, depth: usize) -> Shape {
+        Shape::new([self.b, self.h, self.n, CHUNK, depth])
+    }
+
+    /// `[B, H, N, C]`.
+    fn per_token(&self) -> Shape {
+        Shape::new([self.b, self.h, self.n, CHUNK])
+    }
+
+    /// One cube per chunk of each batch element and head.
+    fn per_chunk(&self) -> (CubeCount, CubeDim) {
+        (
+            CubeCount::Static((self.b * self.h * self.n) as u32, 1, 1),
+            CubeDim::new_1d(THREADS),
+        )
+    }
+
+    /// One cube per sequence, head and block of `BV` state columns.
+    fn per_state(&self) -> (CubeCount, CubeDim) {
+        (
+            CubeCount::Static(self.dv.div_ceil(BV) as u32, (self.seqs * self.h) as u32, 1),
+            CubeDim::new_1d(THREADS),
+        )
+    }
+}
+
 /// The state passing, forward: the state entering each chunk `[B, H, N, Dk, Dv]`, `V'`
-/// `[B, H, N, C, Dv]`, and the final state, from `kt`, `W` `[B, H, N, C, Dk]`, `U`
-/// `[B, H, N, C, Dv]`, `exp(G_last)` `[B, H, N]` and the initial state.
+/// `[B, H, N, C, Dv]`, and the final states, from `kt`, `W` `[B, H, N, C, Dk]`, `U`
+/// `[B, H, N, C, Dv]`, `exp(G_last)` `[B, H, N]` and the initial states.
 fn state_forward(
+    l: &Layout,
     kt: CubeTensor,
     w: CubeTensor,
     u: CubeTensor,
     gl: CubeTensor,
     initial_state: CubeTensor,
 ) -> (CubeTensor, CubeTensor, CubeTensor) {
-    let [b, h, n, _, dk] = w.shape().dims::<5>();
-    let dv = u.shape()[4];
-    let states = empty_like(&w, Shape::new([b, h, n, dk, dv]));
-    let v_new = empty_like(&w, Shape::new([b, h, n, CHUNK, dv]));
-    let last = empty_like(&w, Shape::new([b, h, dk, dv]));
+    let states = empty_like(&w, Shape::new([l.b, l.h, l.n, l.dk, l.dv]));
+    let v_new = empty_like(&w, l.chunked(l.dv));
+    let last = empty_like(&w, Shape::new([l.seqs, l.h, l.dk, l.dv]));
+    let (count, dim) = l.per_state();
     launched();
-    state_forward_kernel::launch(
+    launch_either!(
+        l.dk > wide::HALF,
+        state_forward_kernel::launch,
+        wide::state_forward_wide_kernel::launch,
         &w.client.clone(),
-        CubeCount::Static(dv.div_ceil(BV) as u32, (b * h) as u32, 1),
-        CubeDim::new_1d(THREADS),
+        count,
+        dim,
         kt.into_tensor_arg(),
         w.into_tensor_arg(),
         u.into_tensor_arg(),
         gl.into_tensor_arg(),
         initial_state.into_tensor_arg(),
+        l.offsets.clone().into_tensor_arg(),
         states.clone().into_tensor_arg(),
         v_new.clone().into_tensor_arg(),
         last.clone().into_tensor_arg(),
-        n as u32,
-        dk,
-        dv,
+        l.n as u32,
+        l.h as u32,
+        l.dk,
+        l.dv,
+        l.packed,
     );
     (states, v_new, last)
 }
 
 /// The state passing, backward: the gradient of the state leaving each chunk
-/// `[B, H, N, Dk, Dv]`, `dV'` `[B, H, N, C, Dv]`, and the initial state's gradient.
+/// `[B, H, N, Dk, Dv]`, `dV'` `[B, H, N, C, Dv]`, and the initial states' gradient.
 #[allow(clippy::too_many_arguments)]
 fn state_backward(
+    l: &Layout,
     kt: CubeTensor,
     w: CubeTensor,
     qg: CubeTensor,
@@ -2213,16 +2557,18 @@ fn state_backward(
     gl: CubeTensor,
     d_final_state: CubeTensor,
 ) -> (CubeTensor, CubeTensor, CubeTensor) {
-    let [b, h, n, _, dk] = w.shape().dims::<5>();
-    let dv = d_o.shape()[4];
-    let ds_next = empty_like(&w, Shape::new([b, h, n, dk, dv]));
-    let dvn = empty_like(&w, Shape::new([b, h, n, CHUNK, dv]));
-    let d_first = empty_like(&w, Shape::new([b, h, dk, dv]));
+    let ds_next = empty_like(&w, Shape::new([l.b, l.h, l.n, l.dk, l.dv]));
+    let dvn = empty_like(&w, l.chunked(l.dv));
+    let d_first = empty_like(&w, Shape::new([l.seqs, l.h, l.dk, l.dv]));
+    let (count, dim) = l.per_state();
     launched();
-    state_backward_kernel::launch(
+    launch_either!(
+        l.dk > wide::HALF,
+        state_backward_kernel::launch,
+        wide::state_backward_wide_kernel::launch,
         &w.client.clone(),
-        CubeCount::Static(dv.div_ceil(BV) as u32, (b * h) as u32, 1),
-        CubeDim::new_1d(THREADS),
+        count,
+        dim,
         kt.into_tensor_arg(),
         w.into_tensor_arg(),
         qg.into_tensor_arg(),
@@ -2230,17 +2576,21 @@ fn state_backward(
         dv_local.into_tensor_arg(),
         gl.into_tensor_arg(),
         d_final_state.into_tensor_arg(),
+        l.offsets.clone().into_tensor_arg(),
         ds_next.clone().into_tensor_arg(),
         dvn.clone().into_tensor_arg(),
         d_first.clone().into_tensor_arg(),
-        n as u32,
-        dk,
-        dv,
+        l.n as u32,
+        l.h as u32,
+        l.dk,
+        l.dv,
+        l.packed,
     );
     (ds_next, dvn, d_first)
 }
 
-/// `exp(G_last)` per chunk, `[B, H, N, 1]`, contiguous.
+/// `exp(G_last)` per chunk, `[B, H, N, 1]`, contiguous. Past a sequence's last token `g` is
+/// zero, so `G` at the chunk's last row is `G` at its last token.
 fn state_decay(gcum: &CubeTensor) -> CubeTensor {
     type B = CubeBackend;
     into_contiguous(<B as FloatTensorOps<B>>::float_exp(<B as FloatTensorOps<
@@ -2257,7 +2607,7 @@ fn state_decay(gcum: &CubeTensor) -> CubeTensor {
 }
 
 /// The forward pass: the prep kernel, the state passing, the output kernel.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn forward_fused(
     q: CubeTensor,
     k: CubeTensor,
@@ -2265,41 +2615,42 @@ fn forward_fused(
     g: CubeTensor,
     beta: CubeTensor,
     initial_state: CubeTensor,
+    sequences: Sequences<CubeBackend>,
     use_qk_l2norm: bool,
+    scale: f32,
 ) -> (CubeTensor, CubeTensor) {
-    let [b, t, h, dk] = q.shape().dims::<4>();
-    let dv = v.shape()[3];
-    let n = t.div_ceil(CHUNK);
     let (q, k, v) = (into_contiguous(q), into_contiguous(k), into_contiguous(v));
-    let p = prep(&k, v, g, beta, use_qk_l2norm, false, [b, t, h, dk, dv]);
+    let l = layout(&q, &v, sequences);
+    let p = prep(&l, &k, v, g, beta, use_qk_l2norm, false);
     let gl = state_decay(&p.gcum);
     let h0 = into_contiguous(reference::to_f32::<CubeBackend>(initial_state));
-    let (states, v_new, last) = state_forward(p.kt, p.w, p.u, gl, h0);
-    let out = empty_device_contiguous_dtype(
-        q.client.clone(),
-        q.device.clone(),
-        Shape::new([b, t, h, dv]),
-        q.dtype,
-    );
+    let (states, v_new, last) = state_forward(&l, p.kt, p.w, p.u, gl, h0);
+    let out = empty_with(&q, Shape::new([l.b, l.t, l.h, l.dv]), q.dtype);
     let dtype = dtype_to_storage_type(q.dtype);
+    let (count, dim) = l.per_chunk();
     launched();
-    output_kernel::launch(
+    launch_either!(
+        l.dk > wide::HALF,
+        output_kernel::launch,
+        wide::output_wide_kernel::launch,
         &q.client.clone(),
-        CubeCount::Static((b * h * n) as u32, 1, 1),
-        CubeDim::new_1d(THREADS),
+        count,
+        dim,
         q.into_tensor_arg(),
         k.into_tensor_arg(),
         p.gcum.into_tensor_arg(),
         states.into_tensor_arg(),
         v_new.into_tensor_arg(),
         out.clone().into_tensor_arg(),
-        t as u32,
-        n as u32,
-        h as u32,
-        reference::scale(dk),
-        dk,
-        dv,
+        l.plan.clone().into_tensor_arg(),
+        l.t as u32,
+        l.n as u32,
+        l.h as u32,
+        scale,
+        l.dk,
+        l.dv,
         use_qk_l2norm,
+        l.packed,
         dtype,
     );
     (out, last)
@@ -2317,33 +2668,33 @@ struct Prep {
 }
 
 fn prep(
+    l: &Layout,
     k: &CubeTensor,
     v: CubeTensor,
     g: CubeTensor,
     beta: CubeTensor,
     use_qk_l2norm: bool,
     store_ta: bool,
-    [b, t, h, dk, dv]: [usize; 5],
 ) -> Prep {
-    let n = t.div_ceil(CHUNK);
     let g = into_contiguous(reference::to_f32::<CubeBackend>(g));
     let beta = into_contiguous(reference::to_f32::<CubeBackend>(beta));
-    let w = empty_like(k, Shape::new([b, h, n, CHUNK, dk]));
-    let u = empty_like(k, Shape::new([b, h, n, CHUNK, dv]));
-    let kt = empty_like(k, Shape::new([b, h, n, CHUNK, dk]));
-    let gcum = empty_like(k, Shape::new([b, h, n, CHUNK]));
+    let w = empty_like(k, l.chunked(l.dk));
+    let u = empty_like(k, l.chunked(l.dv));
+    let kt = empty_like(k, l.chunked(l.dk));
+    let gcum = empty_like(k, l.per_token());
     let ta = if store_ta {
-        Shape::new([b, h, n, CHUNK, CHUNK])
+        l.chunked(CHUNK)
     } else {
         Shape::new([1])
     };
     let tm = empty_like(k, ta.clone());
     let am = empty_like(k, ta);
+    let (count, dim) = l.per_chunk();
     launched();
     prep_kernel::launch(
         &k.client.clone(),
-        CubeCount::Static((b * h * n) as u32, 1, 1),
-        CubeDim::new_1d(THREADS),
+        count,
+        dim,
         k.clone().into_tensor_arg(),
         v.into_tensor_arg(),
         g.into_tensor_arg(),
@@ -2354,13 +2705,15 @@ fn prep(
         gcum.clone().into_tensor_arg(),
         tm.clone().into_tensor_arg(),
         am.clone().into_tensor_arg(),
-        t as u32,
-        n as u32,
-        h as u32,
-        dk,
-        dv,
+        l.plan.clone().into_tensor_arg(),
+        l.t as u32,
+        l.n as u32,
+        l.h as u32,
+        l.dk,
+        l.dv,
         use_qk_l2norm,
         store_ta,
+        l.packed,
         dtype_to_storage_type(k.dtype),
     );
     Prep {
@@ -2373,13 +2726,6 @@ fn prep(
     }
 }
 
-fn launch_dims(b: usize, h: usize, n: usize) -> (CubeCount, CubeDim) {
-    (
-        CubeCount::Static((b * h * n) as u32, 1, 1),
-        CubeDim::new_1d(THREADS),
-    )
-}
-
 /// The backward pass: the forward's prep and state passing again, then the kernels above.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn backward_fused(
@@ -2389,9 +2735,11 @@ fn backward_fused(
     g: CubeTensor,
     beta: CubeTensor,
     initial_state: CubeTensor,
+    sequences: Sequences<CubeBackend>,
     d_out: CubeTensor,
     d_final_state: CubeTensor,
     use_qk_l2norm: bool,
+    scale: f32,
 ) -> (
     CubeTensor,
     CubeTensor,
@@ -2401,38 +2749,31 @@ fn backward_fused(
     CubeTensor,
 ) {
     type B = CubeBackend;
-    let [b, t, h, dk] = q.shape().dims::<4>();
-    let dv = v.shape()[3];
-    let n = t.div_ceil(CHUNK);
     let (g_dtype, beta_dtype) = (g.dtype, beta.dtype);
     let (q, k, v) = (into_contiguous(q), into_contiguous(k), into_contiguous(v));
+    let l = layout(&q, &v, sequences);
+    let (t, h, dk, dv, n) = (l.t, l.h, l.dk, l.dv, l.n);
     let g = into_contiguous(reference::to_f32::<B>(g));
     let beta = into_contiguous(reference::to_f32::<B>(beta));
-    let p = prep(
-        &k,
-        v.clone(),
-        g,
-        beta.clone(),
-        use_qk_l2norm,
-        true,
-        [b, t, h, dk, dv],
-    );
+    let p = prep(&l, &k, v.clone(), g, beta.clone(), use_qk_l2norm, true);
     let gl = state_decay(&p.gcum);
     let h0 = into_contiguous(reference::to_f32::<B>(initial_state));
-    let (states, v_new, _) = state_forward(p.kt.clone(), p.w.clone(), p.u.clone(), gl.clone(), h0);
+    let (states, v_new, _) =
+        state_forward(&l, p.kt.clone(), p.w.clone(), p.u.clone(), gl.clone(), h0);
 
     let client = q.client.clone();
     let dtype = dtype_to_storage_type(q.dtype);
-    let (count, dim) = launch_dims(b, h, n);
-    let scale = reference::scale(dk);
-    let chunked = |depth: usize| Shape::new([b, h, n, CHUNK, depth]);
-    let per_token = Shape::new([b, h, n, CHUNK]);
+    let (count, dim) = l.per_chunk();
     let d_out = into_contiguous(reference::to_f32::<B>(d_out));
-    let dv_local = empty_like(&q, chunked(dv));
-    let qg = empty_like(&q, chunked(dk));
-    let d_o = empty_like(&q, chunked(dv));
+    let dv_local = empty_like(&q, l.chunked(dv));
+    let qg = empty_like(&q, l.chunked(dk));
+    let d_o = empty_like(&q, l.chunked(dv));
+    let is_wide = dk > wide::HALF;
     launched();
-    dvlocal_kernel::launch(
+    launch_either!(
+        is_wide,
+        dvlocal_kernel::launch,
+        wide::dvlocal_wide_kernel::launch,
         &client,
         count.clone(),
         dim,
@@ -2443,6 +2784,7 @@ fn backward_fused(
         dv_local.clone().into_tensor_arg(),
         qg.clone().into_tensor_arg(),
         d_o.clone().into_tensor_arg(),
+        l.plan.clone().into_tensor_arg(),
         t as u32,
         n as u32,
         h as u32,
@@ -2450,9 +2792,11 @@ fn backward_fused(
         dk,
         dv,
         use_qk_l2norm,
+        l.packed,
         dtype,
     );
     let (ds_next, dvn, d_initial) = state_backward(
+        &l,
         p.kt,
         p.w.clone(),
         qg,
@@ -2462,14 +2806,9 @@ fn backward_fused(
         into_contiguous(reference::to_f32::<B>(d_final_state)),
     );
 
-    let dv_out = empty_device_contiguous_dtype(
-        client.clone(),
-        q.device.clone(),
-        Shape::new([b, t, h, dv]),
-        q.dtype,
-    );
-    let dvb = empty_like(&q, chunked(dv));
-    let dbeta_v = empty_like(&q, per_token.clone());
+    let dv_out = empty_with(&q, Shape::new([l.b, t, h, dv]), q.dtype);
+    let dvb = empty_like(&q, l.chunked(dv));
+    let dbeta_v = empty_like(&q, l.per_token());
     launched();
     dvb_kernel::launch(
         &client,
@@ -2482,19 +2821,24 @@ fn backward_fused(
         dv_out.clone().into_tensor_arg(),
         dvb.clone().into_tensor_arg(),
         dbeta_v.clone().into_tensor_arg(),
+        l.plan.clone().into_tensor_arg(),
         t as u32,
         n as u32,
         h as u32,
         dv,
+        l.packed,
         dtype,
     );
 
-    let dqg = empty_like(&q, chunked(dk));
-    let dkt = empty_like(&q, chunked(dk));
-    let dkbg = empty_like(&q, chunked(dk));
-    let s_ds = empty_like(&q, Shape::new([b, h, n]));
+    let dqg = empty_like(&q, l.chunked(dk));
+    let dkt = empty_like(&q, l.chunked(dk));
+    let dkbg = empty_like(&q, l.chunked(dk));
+    let s_ds = empty_like(&q, Shape::new([l.b, h, n]));
     launched();
-    dstate_kernel::launch(
+    launch_either!(
+        is_wide,
+        dstate_kernel::launch,
+        wide::dstate_wide_kernel::launch,
         &client,
         count.clone(),
         dim,
@@ -2511,11 +2855,14 @@ fn backward_fused(
         dv,
     );
 
-    let dq_attn = empty_like(&q, chunked(dk));
-    let dk_attn = empty_like(&q, chunked(dk));
-    let dg_p = empty_like(&q, per_token.clone());
+    let dq_attn = empty_like(&q, l.chunked(dk));
+    let dk_attn = empty_like(&q, l.chunked(dk));
+    let dg_p = empty_like(&q, l.per_token());
     launched();
-    dattn_kernel::launch(
+    launch_either!(
+        is_wide,
+        dattn_kernel::launch,
+        wide::dattn_wide_kernel::launch,
         &client,
         count.clone(),
         dim,
@@ -2527,6 +2874,7 @@ fn backward_fused(
         dq_attn.clone().into_tensor_arg(),
         dk_attn.clone().into_tensor_arg(),
         dg_p.clone().into_tensor_arg(),
+        l.plan.clone().into_tensor_arg(),
         t as u32,
         n as u32,
         h as u32,
@@ -2534,14 +2882,18 @@ fn backward_fused(
         dk,
         dv,
         use_qk_l2norm,
+        l.packed,
         dtype,
     );
 
-    let dk_a = empty_like(&q, chunked(dk));
-    let dbeta_a = empty_like(&q, per_token.clone());
-    let dg_a = empty_like(&q, per_token);
+    let dk_a = empty_like(&q, l.chunked(dk));
+    let dbeta_a = empty_like(&q, l.per_token());
+    let dg_a = empty_like(&q, l.per_token());
     launched();
-    dwy_kernel::launch(
+    launch_either!(
+        is_wide,
+        dwy_kernel::launch,
+        wide::dwy_wide_kernel::launch,
         &client,
         count.clone(),
         dim,
@@ -2556,29 +2908,21 @@ fn backward_fused(
         dk_a.clone().into_tensor_arg(),
         dbeta_a.clone().into_tensor_arg(),
         dg_a.clone().into_tensor_arg(),
+        l.plan.clone().into_tensor_arg(),
         t as u32,
         n as u32,
         h as u32,
         dk,
         dv,
         use_qk_l2norm,
+        l.packed,
         dtype,
     );
 
-    let dq = empty_device_contiguous_dtype(
-        client.clone(),
-        q.device.clone(),
-        Shape::new([b, t, h, dk]),
-        q.dtype,
-    );
-    let dk_out = empty_device_contiguous_dtype(
-        client.clone(),
-        q.device.clone(),
-        Shape::new([b, t, h, dk]),
-        q.dtype,
-    );
-    let dg = empty_like(&q, Shape::new([b, t, h]));
-    let dbeta = empty_like(&q, Shape::new([b, t, h]));
+    let dq = empty_with(&q, Shape::new([l.b, t, h, dk]), q.dtype);
+    let dk_out = empty_with(&q, Shape::new([l.b, t, h, dk]), q.dtype);
+    let dg = empty_like(&q, Shape::new([l.b, t, h]));
+    let dbeta = empty_like(&q, Shape::new([l.b, t, h]));
     launched();
     combine_kernel::launch(
         &client,
@@ -2603,12 +2947,14 @@ fn backward_fused(
         dk_out.clone().into_tensor_arg(),
         dg.clone().into_tensor_arg(),
         dbeta.clone().into_tensor_arg(),
+        l.plan.clone().into_tensor_arg(),
         t as u32,
         n as u32,
         h as u32,
         scale,
         dk,
         use_qk_l2norm,
+        l.packed,
         dtype,
     );
     (
@@ -2622,50 +2968,84 @@ fn backward_fused(
 }
 
 /// Bytes of shared memory the kernels of a forward (or backward) pass hold at most, summed from
-/// each kernel's `Shared` arrays: f32 4 bytes, `V2` 8, `V4` 16. The state passings hold the most,
-/// whatever the heads' width: 90 KiB forward, 98 KiB backward.
+/// each kernel's `Shared` arrays: f32 4 bytes, `V2` 8, `V4` 16. Heads up to 128 wide, the state
+/// passings hold the most: 90 KiB forward, 98 KiB backward. Wider, the prep kernel's rows grow
+/// with the width, to 97.5 KiB at `Dk = Dv = 256`, while the wide kernels hold at most 86 KiB.
 fn shared_bytes(dk: usize, dv: usize, backward: bool) -> usize {
     // A chunk's 64 rows padded to `depth + 1` columns, and its 64 x 64 blocks padded likewise.
     let rows = |depth: usize| 64 * (depth + 1);
     let square = 64 * 65;
     let prep = 4 * (rows(dk.max(dv)) + 2 * square + 3 * 64);
-    let state_forward = 16 * (128 * 17 + 64 * 32) + 8 * (128 * 16 + 64 * 16);
-    let output = 4 * (rows(dk) + rows(dk).max(16 * dv) + square + 2 * 64);
-    if !backward {
-        return prep.max(state_forward).max(output);
-    }
-    let dvlocal = output;
-    let state_backward = 16 * (128 * 17 + 64 * 32) + 8 * (128 * 16 + 2 * 64 * 16);
     let dvb = 4 * (square + rows(dv) + 64 + 1024);
-    let dstate = 16 * (3 * 64 * 9 + 2 * dk.div_ceil(16) * 16 * 9) + 4 * 256;
-    let dattn = 4 * (2 * rows(dk) + square + 4224 + 2 * 64);
-    let dwy = 4 * (4224 + 2 * square + rows(dk) + 3 * 64 + 1024);
     let combine = 4 * 3 * 64;
-    [
-        prep,
-        state_forward,
-        dvlocal,
-        state_backward,
-        dvb,
-        dstate,
-        dattn,
-        dwy,
-        combine,
-    ]
-    .into_iter()
-    .fold(0, usize::max)
+    let kernels = if dk > wide::HALF {
+        // The wide kernels: a half of Dk (128 columns) at a time.
+        let half = rows(wide::HALF);
+        let state_forward = 16 * (128 * 17) + 8 * (256 * 16 + 64 * 16);
+        let output = 4 * (half + half.max(16 * dv) + square + 3 * 64);
+        let state_backward = 16 * (128 * 17) + 8 * (256 * 16 + 2 * 64 * 16);
+        let dstate = 16 * (3 * 64 * 9 + 2 * wide::HALF * 9) + 4 * 256;
+        let dattn = 4 * (2 * half + square + 3 * 64);
+        let dwy = 4 * (4224 + 2 * square + half + 3 * 64 + 1024);
+        if backward {
+            vec![
+                prep,
+                state_forward,
+                output,
+                state_backward,
+                dvb,
+                dstate,
+                dattn,
+                dwy,
+                combine,
+            ]
+        } else {
+            vec![prep, state_forward, output]
+        }
+    } else {
+        let state_forward = 16 * (128 * 17 + 64 * 32) + 8 * (128 * 16 + 64 * 16);
+        let output = 4 * (rows(dk) + rows(dk).max(16 * dv) + square + 2 * 64);
+        let state_backward = 16 * (128 * 17 + 64 * 32) + 8 * (128 * 16 + 2 * 64 * 16);
+        let dstate = 16 * (3 * 64 * 9 + 2 * dk.div_ceil(16) * 16 * 9) + 4 * 256;
+        let dattn = 4 * (2 * rows(dk) + square + 4224 + 2 * 64);
+        let dwy = 4 * (4224 + 2 * square + rows(dk) + 3 * 64 + 1024);
+        if backward {
+            vec![
+                prep,
+                state_forward,
+                output,
+                state_backward,
+                dvb,
+                dstate,
+                dattn,
+                dwy,
+                combine,
+            ]
+        } else {
+            vec![prep, state_forward, output]
+        }
+    };
+    kernels.into_iter().fold(0, usize::max)
 }
 
 /// What the kernels of a forward (or backward) pass over `[B, T, H, Dk, Dv]` ask of the device:
 /// 256 units per cube; `B H N` cubes, one per chunk of each batch element and head, and the
-/// state passings' `ceil(Dv / 32)` by `B H`; the shared memory of [`shared_bytes`]; the tensors
-/// of the kernel binding the most (`prep_kernel`'s 10 forward, `combine_kernel`'s 19 backward);
-/// vectors of four f32; and backward, planes of 32 units, which `combine_kernel` sums over with
-/// `plane_sum`, one plane per token, as CUDA's warps.
-pub(super) fn requirements([b, t, h, dk, dv]: [usize; 5], backward: bool) -> Requirements {
-    let n = t.div_ceil(CHUNK);
-    let per_chunk = Requirements::new((THREADS, 1), (b * h * n, 1), if backward { 19 } else { 10 });
-    let state = Requirements::new((THREADS, 1), (dv.div_ceil(BV), b * h), 10);
+/// state passings' `ceil(Dv / 32)` by `B H` (packed: `N` the most chunks the `S` sequences can
+/// need, `S H` state rows; and the plan's one cube); the shared memory of [`shared_bytes`]; the
+/// tensors of the kernel binding the most (`prep_kernel`'s 11 forward, `combine_kernel`'s 20
+/// backward); vectors of four f32; and backward, planes of 32 units, which `combine_kernel` sums
+/// over with `plane_sum`, one plane per token, as CUDA's warps.
+pub(super) fn requirements(
+    [b, t, h, dk, dv]: [usize; 5],
+    packed: Option<usize>,
+    backward: bool,
+) -> Requirements {
+    let (n, rows) = match packed {
+        None => (t.div_ceil(CHUNK), b),
+        Some(seqs) => (max_chunks(t, seqs), seqs),
+    };
+    let per_chunk = Requirements::new((THREADS, 1), (b * h * n, 1), if backward { 20 } else { 11 });
+    let state = Requirements::new((THREADS, 1), (dv.div_ceil(BV), rows * h), 11);
     Requirements {
         shared_bytes: shared_bytes(dk, dv, backward),
         vector_size: 4,
@@ -2675,23 +3055,37 @@ pub(super) fn requirements([b, t, h, dk, dv]: [usize; 5], backward: bool) -> Req
 }
 
 /// Whether the kernels take a forward (or backward) pass over inputs of `dtype` and shape
-/// `[B, T, H, Dk, Dv]` on the device `client` serves; the reference runs otherwise.
+/// `[B, T, H, Dk, Dv]` on the device `client` serves, with `packed` the number of packed
+/// sequences and the dtype of their boundaries; the reference runs otherwise.
 pub(super) fn kernels_take(
     client: &Client,
     dtype: DType,
     dims: [usize; 5],
+    packed: Option<(usize, DType)>,
     backward: bool,
 ) -> bool {
-    let [_, _, _, dk, dv] = dims;
-    dk <= MAX_HEAD_DIM
-        && dv <= MAX_HEAD_DIM
-        && requirements(dims, backward).met_on(client, &[dtype])
+    let [_, t, _, dk, dv] = dims;
+    let mut dtypes = vec![dtype, DType::U32];
+    dtypes.extend(packed.map(|(_, int)| int));
+    dk <= MAX_KERNEL_HEAD_DIM
+        && dv <= MAX_KERNEL_HEAD_DIM
+        && (packed.is_none() || t <= i32::MAX as usize)
+        && requirements(dims, packed.map(|(seqs, _)| seqs), backward).met_on(client, &dtypes)
 }
 
-/// `[B, T, H, Dk, Dv]` of the queries `[B, T, H, Dk]` and the values `[B, T, H, Dv]`.
-fn dims(q: &CubeTensor, v: &CubeTensor) -> [usize; 5] {
+/// `[B, T, H, Dk, Dv]` of the queries `[B, T, H, Dk]` and the values `[B, T, H, Dv]`, and the
+/// packed sequences' count and boundaries' dtype.
+fn dims(
+    q: &CubeTensor,
+    v: &CubeTensor,
+    sequences: &Sequences<CubeBackend>,
+) -> ([usize; 5], Option<(usize, DType)>) {
     let [b, t, h, dk] = q.shape().dims::<4>();
-    [b, t, h, dk, v.shape()[3]]
+    let packed = match sequences {
+        Sequences::Batch => None,
+        Sequences::Packed(cu_seqlens) => Some((cu_seqlens.shape()[0] - 1, cu_seqlens.dtype)),
+    };
+    ([b, t, h, dk, v.shape()[3]], packed)
 }
 
 impl ChunkGatedDeltaBackend for CubeBackend {
@@ -2702,13 +3096,36 @@ impl ChunkGatedDeltaBackend for CubeBackend {
         g: FloatTensor<Self>,
         beta: FloatTensor<Self>,
         initial_state: FloatTensor<Self>,
+        sequences: Sequences<Self>,
         use_qk_l2norm: bool,
+        scale: f32,
         _output_final_state: bool,
     ) -> (FloatTensor<Self>, FloatTensor<Self>) {
-        if !kernels_take(&q.client, q.dtype, dims(&q, &v), false) {
-            return reference::forward::<Self>(q, k, v, g, beta, initial_state, use_qk_l2norm);
+        let (shape, packed) = dims(&q, &v, &sequences);
+        if !kernels_take(&q.client, q.dtype, shape, packed, false) {
+            return super::reference_forward::<Self>(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state,
+                sequences,
+                use_qk_l2norm,
+                scale,
+            );
         }
-        forward_fused(q, k, v, g, beta, initial_state, use_qk_l2norm)
+        forward_fused(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state,
+            sequences,
+            use_qk_l2norm,
+            scale,
+        )
     }
 
     fn chunk_gated_delta_backward(
@@ -2718,9 +3135,11 @@ impl ChunkGatedDeltaBackend for CubeBackend {
         g: FloatTensor<Self>,
         beta: FloatTensor<Self>,
         initial_state: FloatTensor<Self>,
+        sequences: Sequences<Self>,
         d_out: FloatTensor<Self>,
         d_final_state: FloatTensor<Self>,
         use_qk_l2norm: bool,
+        scale: f32,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -2729,17 +3148,20 @@ impl ChunkGatedDeltaBackend for CubeBackend {
         FloatTensor<Self>,
         FloatTensor<Self>,
     ) {
-        if !kernels_take(&q.client, q.dtype, dims(&q, &v), true) {
-            return reference::backward::<Self>(
+        let (shape, packed) = dims(&q, &v, &sequences);
+        if !kernels_take(&q.client, q.dtype, shape, packed, true) {
+            return super::reference_backward::<Self>(
                 q,
                 k,
                 v,
                 g,
                 beta,
                 initial_state,
+                sequences,
                 d_out,
                 d_final_state,
                 use_qk_l2norm,
+                scale,
             );
         }
         backward_fused(
@@ -2749,9 +3171,11 @@ impl ChunkGatedDeltaBackend for CubeBackend {
             g,
             beta,
             initial_state,
+            sequences,
             d_out,
             d_final_state,
             use_qk_l2norm,
+            scale,
         )
     }
 }

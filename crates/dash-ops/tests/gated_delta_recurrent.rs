@@ -31,7 +31,7 @@
 mod common;
 
 use burn::tensor::{DType, Device, Tensor, TensorData, bf16};
-use dash_ops::gated_delta::recurrent::gated_delta_step;
+use dash_ops::gated_delta::recurrent::{GatedDeltaStepOptions, gated_delta_step};
 use safetensors::{Dtype, SafeTensors};
 use std::path::Path;
 
@@ -131,7 +131,8 @@ fn check_f32_step(fixture: &Fixture, case: &str, use_qk_l2norm: bool, device: &D
         fixture.tensor(&name("g"), device),
         fixture.tensor(&name("beta"), device),
         fixture.tensor(&name("state"), device),
-        use_qk_l2norm,
+        None,
+        GatedDeltaStepOptions::default().with_qk_l2norm(use_qk_l2norm),
     );
     assert_eq!(out.dtype(), DType::F32);
     assert_eq!(state.dtype(), DType::F32);
@@ -172,7 +173,8 @@ fn check_prefill_then_decode(device: &Device) {
             g.clone().narrow(1, t, 1).reshape([b, h]),
             beta.clone().narrow(1, t, 1).reshape([b, h]),
             state,
-            true,
+            None,
+            GatedDeltaStepOptions::default().with_qk_l2norm(true),
         );
         outs.push(out);
         state = next;
@@ -206,7 +208,8 @@ fn check_bf16_step(device: &Device) {
         fixture.tensor(&name("g"), device),
         fixture.tensor(&name("beta"), device),
         fixture.tensor(&name("state"), device),
-        true,
+        None,
+        GatedDeltaStepOptions::default().with_qk_l2norm(true),
     );
     assert_eq!(out.dtype(), DType::BF16);
     assert_eq!(state.dtype(), DType::F32);
@@ -246,7 +249,8 @@ fn check_gradients(device: &Device) {
         g.clone(),
         beta.clone(),
         state.clone(),
-        true,
+        None,
+        GatedDeltaStepOptions::default().with_qk_l2norm(true),
     );
     let w_out: Tensor<3> = fixture.tensor(&name("w_out"), device);
     let w_state: Tensor<4> = fixture.tensor(&name("w_state"), device);
@@ -290,7 +294,8 @@ fn check_untracked_autodiff(device: &Device) {
             fixture.tensor(&name("g"), device),
             fixture.tensor(&name("beta"), device),
             fixture.tensor(&name("state"), device),
-            true,
+            None,
+            GatedDeltaStepOptions::default().with_qk_l2norm(true),
         )
     };
     let (out, state) = run(&device.clone().autodiff());
@@ -361,7 +366,7 @@ mod cube {
     /// in `dtype` and `g` in f32 on `device`, rather than the reference. Under CUDA it takes
     /// every head it holds: every card has all it asks.
     fn takes(device: &Device, dtype: DType, dims: [usize; 4]) -> bool {
-        let takes = kernel_takes(device, [dtype, DType::F32, dtype], dims);
+        let takes = kernel_takes(device, [dtype, DType::F32, dtype], dims, None);
         if common::runtime_of(device) == Some("cuda") && dims[2] <= 256 {
             assert!(takes, "CUDA turned the kernel away for {dims:?}");
         }
@@ -530,10 +535,20 @@ mod cube {
             g.clone(),
             beta.clone(),
             state.clone(),
-            use_qk_l2norm,
+            None,
+            GatedDeltaStepOptions::default().with_qk_l2norm(use_qk_l2norm),
         );
         let (out, new_state) = launches_kernel(kernel, 1, || {
-            let (out, new_state) = gated_delta_step(q, k, v, g, beta, state, use_qk_l2norm);
+            let (out, new_state) = gated_delta_step(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state,
+                None,
+                GatedDeltaStepOptions::default().with_qk_l2norm(use_qk_l2norm),
+            );
             (out.into_data(), new_state.into_data())
         });
         let (abs, rel) = errors(&out, &ref_out.into_data());
@@ -611,10 +626,20 @@ mod cube {
             g.clone(),
             beta.clone(),
             state.clone(),
-            true,
+            None,
+            GatedDeltaStepOptions::default().with_qk_l2norm(true),
         );
         let before = probe::kernel_launches();
-        let (out, new_state) = gated_delta_step(q, k, v, g, beta, state, true);
+        let (out, new_state) = gated_delta_step(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state,
+            None,
+            GatedDeltaStepOptions::default().with_qk_l2norm(true),
+        );
         // Under fusion the reference above runs fused and the fallback inside the step does not.
         let (_, rel) = errors(&out.into_data(), &ref_out.into_data());
         assert!(rel <= F32_OUT, "fallback out: relative error {rel:.3e}");
@@ -649,7 +674,8 @@ mod cube {
             g.clone(),
             beta.clone(),
             state.clone(),
-            true,
+            None,
+            GatedDeltaStepOptions::default().with_qk_l2norm(true),
         );
         let qkv = Tensor::cat(vec![q, k, v], 2);
         let g_t = g.swap_dims(0, 1).into_data();
@@ -665,7 +691,8 @@ mod cube {
                 g,
                 beta,
                 state,
-                true,
+                None,
+                GatedDeltaStepOptions::default().with_qk_l2norm(true),
             );
             (out.into_data(), new_state.into_data())
         });
@@ -699,13 +726,23 @@ mod cube {
             g.clone(),
             beta.clone(),
             state.clone(),
-            true,
+            None,
+            GatedDeltaStepOptions::default().with_qk_l2norm(true),
         );
         let poison = Tensor::<4>::full([1, 1, dk, dv], f32::NAN, &device);
         let state = Tensor::cat(vec![state, poison], 1).narrow(1, 0, h);
         let kernel = takes(&device, DType::F32, [1, h, dk, dv]);
         let (out, new_state) = launches_kernel(kernel, 1, || {
-            let (out, new_state) = gated_delta_step(q, k, v, g, beta, state, true);
+            let (out, new_state) = gated_delta_step(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state,
+                None,
+                GatedDeltaStepOptions::default().with_qk_l2norm(true),
+            );
             (out.into_data(), new_state.into_data())
         });
         let (_, rel) = errors(&out, &ref_out.into_data());
@@ -731,9 +768,18 @@ mod cube {
         let before = state.to_data();
         let kernel = takes(&device, DType::F32, [2, 2, 64, 64]);
         let new_state = launches_kernel(kernel, 1, || {
-            gated_delta_step(q, k, v, g, beta, state.clone(), true)
-                .1
-                .into_data()
+            gated_delta_step(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state.clone(),
+                None,
+                GatedDeltaStepOptions::default().with_qk_l2norm(true),
+            )
+            .1
+            .into_data()
         });
         assert_ne!(new_state, before);
         assert_eq!(

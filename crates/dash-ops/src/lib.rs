@@ -10,7 +10,7 @@
 //! each module here follows.
 //!
 //! - [`gated_delta`]: the gated delta rule of Gated DeltaNet, chunked for training and
-//!   recurrent for decoding.
+//!   recurrent for decoding, over a batch or packed variable-length sequences.
 //! - [`attention`]: causal attention whose backward pass does not materialise the T x T scores.
 //! - [`logprob`]: the log-probability of chosen tokens under a large vocabulary, without the
 //!   n x V logits.

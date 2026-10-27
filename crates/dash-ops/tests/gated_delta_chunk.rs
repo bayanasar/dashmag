@@ -16,7 +16,7 @@
 mod common;
 
 use burn::tensor::{DType, Device, Tensor, TensorData};
-use dash_ops::gated_delta::chunk::{chunk_gated_delta_rule, probe};
+use dash_ops::gated_delta::chunk::{ChunkGatedDeltaOptions, chunk_gated_delta_rule, probe};
 use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -105,6 +105,11 @@ fn run(case: &Case, device: &Device, dtype: DType) -> Results {
         .then(|| case.tensor::<4>("h0", device).require_grad());
     let state_grad = case.flag("final_state_grad");
     let runs = probe::backward_runs();
+    let options = ChunkGatedDeltaOptions {
+        qk_l2norm: case.flag("l2norm"),
+        output_final_state: state_grad,
+        ..Default::default()
+    };
     let (out, state) = chunk_gated_delta_rule(
         q.clone(),
         k.clone(),
@@ -112,8 +117,8 @@ fn run(case: &Case, device: &Device, dtype: DType) -> Results {
         g.clone(),
         beta.clone(),
         h0.clone(),
-        state_grad,
-        case.flag("l2norm"),
+        None,
+        options,
     );
     let mut loss = (out.clone().cast(DType::F32) * case.tensor::<4>("d_out", device)).sum();
     if state_grad {
@@ -252,6 +257,9 @@ fn forward_without_gradients_on_flex() {
     for device in [Device::flex(), Device::flex().autodiff()] {
         let t4 = |key: &str| case.tensor::<4>(key, &device);
         let t3 = |key: &str| case.tensor::<3>(key, &device);
+        let options = ChunkGatedDeltaOptions::default()
+            .with_qk_l2norm(true)
+            .with_final_state(true);
         let (out, state) = chunk_gated_delta_rule(
             t4("q"),
             t4("k"),
@@ -259,8 +267,8 @@ fn forward_without_gradients_on_flex() {
             t3("g"),
             t3("beta"),
             Some(t4("h0")),
-            true,
-            true,
+            None,
+            options,
         );
         let (_, rel) = errors(&to_vec(out), case.get("out"));
         assert!(rel <= F32_TOL);
@@ -344,7 +352,7 @@ mod cube {
     /// none for a pass the reference takes. Under CUDA the kernels take both: cards of compute
     /// capability 8.0 and later have all they ask.
     fn expected_launches(device: &Device, dtype: DType, dims: [usize; 5]) -> usize {
-        let [forward, backward] = kernels_take(device, dtype, dims);
+        let [forward, backward] = kernels_take(device, dtype, dims, None);
         if common::runtime_of(device) == Some("cuda") {
             assert!(
                 forward && backward,
@@ -423,6 +431,9 @@ mod cube {
         let (q, k, v, g, beta) = (leaf4(0), leaf4(1), leaf4(2), leaf3(3), leaf3(4));
         let h0 = t4(&x[5], &ad).require_grad();
         let launches = probe::kernel_launches();
+        let options = ChunkGatedDeltaOptions::default()
+            .with_qk_l2norm(l2norm)
+            .with_final_state(true);
         let (out, state) = chunk_gated_delta_rule(
             q.clone(),
             k.clone(),
@@ -430,8 +441,8 @@ mod cube {
             g.clone(),
             beta.clone(),
             Some(h0.clone()),
-            true,
-            l2norm,
+            None,
+            options,
         );
         let state = state.unwrap();
         let loss = (out.clone().cast(DType::F32) * t4(&x[6], &ad)).sum()
@@ -462,8 +473,9 @@ mod cube {
             r4(2),
             r3(3),
             r3(4),
-            t4(&x[5], &device),
-            l2norm,
+            Some(t4(&x[5], &device)),
+            None,
+            options,
         );
         let (dq, dk, dv, dg, dbeta, dh0) = chunk_gated_delta_rule_reference_backward(
             r4(0),
@@ -471,10 +483,11 @@ mod cube {
             r4(2),
             r3(3),
             r3(4),
-            t4(&x[5], &device),
+            Some(t4(&x[5], &device)),
+            None,
             t4(&x[6], &device),
             t4(&x[7], &device),
-            l2norm,
+            options,
         );
         let theirs = [
             to_vec(out),
@@ -551,12 +564,36 @@ mod cube {
         assert!(worst <= F16_VS_REFERENCE, "relative error {worst:.3e}");
     }
 
-    /// Heads larger than the kernels hold run the reference, and agree with Flex.
+    /// Heads 256 wide and between, on the kernels for wide heads (queries and keys taken a half
+    /// at a time): within 1.5e-6 of the reference in fp32, sums twice as long as the narrow
+    /// heads' [measured: 1.19e-6], within a bf16 rounding in bf16 [measured: 3.31e-3].
+    #[test]
+    fn kernels_match_the_reference_for_wide_heads() {
+        let _serial = serial();
+        for (dims, l2norm) in [
+            ([2, 150, 2, 256, 256], true),
+            ([1, 100, 2, 192, 80], true),
+            ([1, 130, 2, 256, 64], false),
+            ([1, 90, 3, 64, 256], true),
+        ] {
+            let label = format!("f32 {dims:?} l2norm={l2norm}");
+            let worst = kernels_against_reference(&label, dims, l2norm, DType::F32);
+            assert!(worst <= 1.5e-6, "{label}: relative error {worst:.3e}");
+        }
+        if has(&common::cube_device(), DType::BF16) {
+            let dims = [1, 200, 2, 256, 256];
+            let worst =
+                kernels_against_reference("bf16 [1, 200, 2, 256, 256]", dims, true, DType::BF16);
+            assert!(worst <= 3.5e-3, "bf16: relative error {worst:.3e}");
+        }
+    }
+
+    /// Heads wider than the kernels hold run the reference, and agree with Flex.
     #[cfg(feature = "flex")]
     #[test]
     fn large_heads_fall_back_to_the_reference() {
         let _serial = serial();
-        let dims = [1, 70, 2, 160, 144];
+        let dims = [1, 70, 2, 272, 48];
         let x = seeded(3, dims, false);
         let run = |device: &Device| {
             let (out, state) = chunk_gated_delta_rule(
@@ -566,8 +603,10 @@ mod cube {
                 t3(&x[3], device),
                 t3(&x[4], device),
                 Some(t4(&x[5], device)),
-                true,
-                true,
+                None,
+                ChunkGatedDeltaOptions::default()
+                    .with_qk_l2norm(true)
+                    .with_final_state(true),
             );
             (to_vec(out), to_vec(state.unwrap()))
         };

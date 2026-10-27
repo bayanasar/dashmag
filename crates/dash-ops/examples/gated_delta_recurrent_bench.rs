@@ -25,8 +25,10 @@
 //!
 //! Without the `cuda` feature it runs on Flex (CPU), as a smoke test.
 
-use burn::tensor::{DType, Device, Tensor, TensorData};
-use dash_ops::gated_delta::recurrent::{gated_delta_step, gated_delta_step_reference, probe};
+use burn::tensor::{DType, Device, Int, Tensor, TensorData};
+use dash_ops::gated_delta::recurrent::{
+    GatedDeltaStepOptions, gated_delta_step, gated_delta_step_reference, probe,
+};
 use std::time::{Duration, Instant};
 
 const B: usize = 8;
@@ -41,7 +43,8 @@ type Step = fn(
     Tensor<2>,
     Tensor<2>,
     Tensor<4>,
-    bool,
+    Option<Tensor<1, Int>>,
+    GatedDeltaStepOptions,
 ) -> (Tensor<3>, Tensor<4>);
 
 /// Deterministic uniform values in [-1, 1).
@@ -102,7 +105,8 @@ impl Inputs {
             self.g.clone(),
             self.beta.clone(),
             state,
-            true,
+            None,
+            GatedDeltaStepOptions::default().with_qk_l2norm(true),
         )
     }
 }

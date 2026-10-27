@@ -1,66 +1,71 @@
 //! The chunked gated delta rule, forward and backward, for training.
 //!
-//! [`chunk_gated_delta_rule`] computes what transformers' `torch_chunk_gated_delta_rule` does
-//! (and fla's `chunk_gated_delta_rule`, which transformers calls when fla is installed): for each
-//! batch element and head, the recurrence
-//!
-//! ```text
-//! S_t = exp(g_t) S_{t-1} + beta_t k_t (v_t - exp(g_t) S_{t-1}^T k_t)^T
-//! o_t = S_t^T q_t / sqrt(Dk)
-//! ```
-//!
-//! computed in chunks of 64 tokens: within a chunk through the WY representation of the
-//! products of Householder-like updates, and the state carried from chunk to chunk. The state
-//! is `[Dk, Dv]` per head and always f32.
+//! [`chunk_gated_delta_rule`] computes the gated delta rule (the [parent module](super) states
+//! it) over sequences of any length, as transformers' `torch_chunk_gated_delta_rule` and fla's
+//! `chunk_gated_delta_rule` do: in chunks of 64 tokens, within a chunk through the WY
+//! representation of the products of its Householder-like updates, and the state carried from
+//! chunk to chunk.
 //!
 //! - Inputs: queries and keys `[B, T, H, Dk]`, values `[B, T, H, Dv]` in one float dtype (f32,
 //!   bf16 or f16); `g`, the log of the decay (`<= 0`), and `beta`, both `[B, T, H]`, each in that
-//!   dtype or in f32 (models compute `g` in f32); both are read as f32, so another float dtype
-//!   works too; an optional initial state `[B, H, Dk, Dv]`, f32.
-//! - Outputs: `o` `[B, T, H, Dv]` in the queries' dtype, and when asked the final state
-//!   `[B, H, Dk, Dv]` in f32, from which [`super::recurrent`] continues decoding.
-//! - Options: `use_qk_l2norm_in_kernel` normalises queries and keys to unit length first (with
-//!   transformers' epsilon, `1e-6` under the square root). The query scale is `1/sqrt(Dk)`; the
-//!   chunk size is 64.
+//!   dtype or in f32 (models compute `g` in f32), read as f32; an optional initial state per
+//!   sequence, f32.
+//! - Sequences: every batch element one sequence, or packed sequences, `B = 1` with
+//!   `cu_seqlens` `[S + 1]` (the [parent module](super) gives the layout); the states are then
+//!   `[S, H, Dk, Dv]`. Each packed sequence is chunked on its own, as fla does: its chunks start at
+//!   its first token, the last one shorter, so no chunk holds two sequences and every chunk's
+//!   arithmetic is what a call on that sequence alone does.
+//! - Outputs: `o` `[B, T, H, Dv]` in the queries' dtype and, when asked, each sequence's final
+//!   state `[B, H, Dk, Dv]` (packed, `[S, H, Dk, Dv]`) in f32, from which [`super::recurrent`]
+//!   continues decoding.
+//! - Options ([`ChunkGatedDeltaOptions`]): the l2 normalisation of queries and keys, the query
+//!   scale (`1 / sqrt(Dk)` by default), and whether to return the final states.
 //! - Everything inside is computed in f32, as transformers does, whatever the inputs' dtype; the
 //!   outputs and gradients are rounded once, to their dtype. (transformers normalises bf16 queries
-//!   and keys in bf16 before casting; here they are normalised in f32.)
-//! - Packed variable-length sequences (fla's `cu_seqlens`) are not supported: every batch element
-//!   is one sequence of length T. Shorter sequences padded at the end are exact for the tokens
-//!   before the padding; the final state is then not the state after the last real token.
+//!   and keys in bf16 before casting; here, as in fla, they are normalised in f32.)
 //!
-//! Gradients flow to the queries, keys, values, `g`, `beta` and the initial state, and from both
-//! the output and the final state. The backward pass is written out: it keeps only the inputs
+//! Gradients flow to the queries, keys, values, `g`, `beta` and the initial states, and from both
+//! the output and the final states. The backward pass is written out: it keeps only the inputs
 //! from the forward pass, recomputes each chunk's quantities, passes the state's gradient back
 //! from chunk to chunk, and forms the input gradients in each chunk.
 //!
-//! Every backend runs the reference built from Burn's tensor operations (`chunk/reference.rs`).
-//! On a CubeCL device (any runtime), heads up to 128 wide (`Dk, Dv <= 128`) run CubeCL kernels
-//! instead (`chunk/cube.rs`), all in f32 without tensor cores: per chunk, one kernel forms
-//! everything that does not depend on the state, one passes the state from chunk to chunk, one
-//! forms the output; the backward pass runs the first two again, passes the state's gradient
-//! back, and forms the gradients in five more per-chunk kernels. The kernels ask of the device
-//! 256 units per cube, up to 90 KiB of shared memory forward and 98 KiB backward, and backward
-//! planes of exactly 32 units: CUDA cards of compute capability 8.0 and later have all of it. On
-//! a device without it, and for wider heads, the reference runs instead (`kernels_take` tells
-//! which): under wgpu on OpenGL over D3D12 and on lavapipe (Vulkan on the CPU), both with 32 KiB
-//! of shared memory and no plane operations, and on CubeCL's CPU runtime (as many units per cube
-//! as cores), for instance.
+//! Every backend runs the reference built from Burn's tensor operations (`chunk/reference.rs`),
+//! packed sequences one at a time. On a CubeCL device (any runtime), heads up to
+//! [`MAX_KERNEL_HEAD_DIM`] = 256 wide (fla's limit) run CubeCL kernels instead (`chunk/cube.rs`),
+//! all in f32 without tensor cores: per chunk, one kernel forms everything that does not depend
+//! on the state, one passes the state from chunk to chunk (each sequence's chunks in turn, the
+//! sequences side by side), one forms the output; the backward pass runs the first two again,
+//! passes the state's gradient back, and forms the gradients in five more per-chunk kernels.
+//! Packed, a small kernel first lays each sequence's chunks out from `cu_seqlens` on the device,
+//! without reading them to the host: the kernels launch for the most chunks `T` tokens in `S`
+//! sequences can make, `ceil(T / 64) + S - 1`, and those past the last chunk return at once.
+//! Queries and keys wider than 128 run kernels of their own (`chunk/cube/wide.rs`) that hold them
+//! and the state's rows a half (128 columns) at a time; the narrower heads' kernels are untouched
+//! by them. The kernels ask of the device 256 units per cube; shared memory up to 90 KiB forward
+//! and 98 KiB backward for heads up to 128 wide, and with wider heads up to 97.5 KiB (the first
+//! kernel's rows of the wider of `Dk` and `Dv`, at 256); and backward, planes of exactly 32 units.
+//! CUDA cards of compute capability 8.0 and later have all of it. On a device without it, and for
+//! heads wider than 256, the reference runs instead (`kernels_take` tells which): under wgpu on
+//! OpenGL over D3D12 and on lavapipe (Vulkan on the CPU), both with 32 KiB of shared memory and no
+//! plane operations, and on CubeCL's CPU runtime (as many units per cube as cores), for instance.
 //!
 //! Measured against transformers' function at f32 (the tests' fixtures), the output, the final
 //! state and every gradient agree to within 1.12e-6 relative to each tensor's largest value; from
-//! bf16 inputs, to within 2.41e-3 of the exact result (torch's own bf16 path: 8.06e-3), and the
-//! CUDA kernels to within 3.17e-3 of the f32 reference at larger shapes. On an
-//! RTX 5070 Ti, one sequence of 6144 tokens with 16 heads of 128 and bf16 inputs takes 2.4 ms
-//! forward and 9.3 ms forward and backward, and grows the memory pool by 687 MiB
-//! (`examples/gated_delta_chunk_bench.rs`); fla 0.5.2, with bf16 tensor cores, takes 0.87 ms and
-//! 3.6 ms and 422 MiB.
+//! bf16 inputs, to within 2.41e-3 of the exact result (torch's own bf16 path: 8.06e-3). Packed,
+//! against transformers in float64 called once per sequence, to within 1.23e-6, and to fla's
+//! packed f32 path within 2.03e-6; packed and per-sequence calls agree to the bit. The CUDA
+//! kernels agree with the f32 reference to within 1.2e-6 (heads up to 256 wide), and 3.31e-3 from
+//! bf16 inputs. On an RTX 5070 Ti, 6144 tokens with 16 heads of 128 and bf16 inputs take 2.1 ms of
+//! device time forward and 8.6 ms forward and backward, as one sequence or as four packed ones
+//! (fla 0.5.2, with bf16 tensor cores: 1.3 and 3.6 ms; 1.2 and 3.3 ms packed); with heads of 256,
+//! 5.4 and 22.2 ms (fla: 2.3 and 8.5 ms) (`examples/gated_delta_chunk_bench.rs`).
 
 mod reference;
 
 #[cfg(feature = "cubecl")]
 mod cube;
 
+use super::{Sequences, query_scale, read_cu_seqlens};
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
 use burn::backend::autodiff::grads::Gradients;
@@ -70,10 +75,51 @@ use burn::backend::tensor::FloatTensor;
 use burn::backend::{
     Autodiff, AutodiffBackend, Backend, Dispatch, TensorMetadata, backend_extension,
 };
-use burn::tensor::{DType, Device, FloatDType, Shape, Slice, Tensor, TensorCreationOptions};
+use burn::tensor::{DType, Device, FloatDType, Int, Shape, Slice, Tensor, TensorCreationOptions};
 use std::sync::atomic::Ordering;
 
 pub use reference::CHUNK as CHUNK_SIZE;
+
+/// The widest heads (`Dk` and `Dv`) the CubeCL kernels take, as fla's; wider heads run the
+/// reference.
+pub const MAX_KERNEL_HEAD_DIM: usize = 256;
+
+/// The options of [`chunk_gated_delta_rule`] that have a usual default; the defaults are fla's
+/// and transformers': no normalisation, the scale `1 / sqrt(Dk)`, no final state.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChunkGatedDeltaOptions {
+    /// Normalise queries and keys to unit length first, `x / sqrt(sum(x^2) + 1e-6)`
+    /// (transformers' and fla's `use_qk_l2norm_in_kernel`).
+    pub qk_l2norm: bool,
+    /// The queries' scale, applied after the normalisation; `None` for `1 / sqrt(Dk)` (fla's
+    /// `scale=None`).
+    pub scale: Option<f32>,
+    /// Return each sequence's state after its last token (fla's `output_final_state`).
+    pub output_final_state: bool,
+}
+
+impl ChunkGatedDeltaOptions {
+    /// The options with the l2 normalisation of queries and keys on or off.
+    pub fn with_qk_l2norm(self, qk_l2norm: bool) -> Self {
+        Self { qk_l2norm, ..self }
+    }
+
+    /// The options with the query scale `scale`.
+    pub fn with_scale(self, scale: f32) -> Self {
+        Self {
+            scale: Some(scale),
+            ..self
+        }
+    }
+
+    /// The options returning the final states, or not.
+    pub fn with_final_state(self, output_final_state: bool) -> Self {
+        Self {
+            output_final_state,
+            ..self
+        }
+    }
+}
 
 /// Counters tests read to tell which path ran. Not part of the API.
 #[doc(hidden)]
@@ -84,7 +130,7 @@ pub mod probe {
     pub(super) static BACKWARD_RUNS: AtomicUsize = AtomicUsize::new(0);
 
     /// Launches of this module's CubeCL kernels: three for a forward pass, nine for a backward
-    /// pass.
+    /// pass, and one more each over packed sequences (the chunks' layout).
     pub fn kernel_launches() -> usize {
         KERNEL_LAUNCHES.load(Ordering::SeqCst)
     }
@@ -96,21 +142,29 @@ pub mod probe {
 }
 
 /// Whether the CubeCL kernels take a forward and a backward pass over inputs of `dtype` and
-/// shape `[B, T, H, Dk, Dv]` on `device`, rather than the reference: heads up to 128 wide, on a
-/// device with what the kernels ask (module documentation). `[false, false]` on any device not
-/// CubeCL's. For tests, as the [`probe`] counters are.
+/// shape `[B, T, H, Dk, Dv]` on `device`, rather than the reference; `packed` gives the number of
+/// packed sequences and the dtype of their `cu_seqlens`. Heads up to [`MAX_KERNEL_HEAD_DIM`] wide,
+/// on a device with what the kernels ask (module documentation). `[false, false]` on any device
+/// not CubeCL's. For tests, as the [`probe`] counters are.
 #[doc(hidden)]
-pub fn kernels_take(device: &Device, dtype: DType, dims: [usize; 5]) -> [bool; 2] {
+pub fn kernels_take(
+    device: &Device,
+    dtype: DType,
+    dims: [usize; 5],
+    packed: Option<(usize, DType)>,
+) -> [bool; 2] {
     #[cfg(feature = "cubecl")]
     if let Some(client) = crate::cube::client(device.as_dispatch()) {
-        return [false, true].map(|backward| cube::kernels_take(&client, dtype, dims, backward));
+        return [false, true]
+            .map(|backward| cube::kernels_take(&client, dtype, dims, packed, backward));
     }
-    let _ = (device, dtype, dims);
+    let _ = (device, dtype, dims, packed);
     [false, false]
 }
 
 #[cfg(feature = "fusion")]
 mod fusion_meta {
+    use crate::gated_delta::SequencesMetadata;
     use burn::backend::fusion::custom::TensorSpec;
     use burn::tensor::{DType, Shape};
 
@@ -122,7 +176,9 @@ mod fusion_meta {
         _g: &TensorSpec,
         _beta: &TensorSpec,
         initial_state: &TensorSpec,
+        _sequences: &SequencesMetadata,
         _use_qk_l2norm: &bool,
+        _scale: &f32,
         _output_final_state: &bool,
     ) -> (TensorSpec, TensorSpec) {
         let [b, t, h, _] = q.shape.dims::<4>();
@@ -141,9 +197,11 @@ mod fusion_meta {
         g: &TensorSpec,
         beta: &TensorSpec,
         initial_state: &TensorSpec,
+        _sequences: &SequencesMetadata,
         _d_out: &TensorSpec,
         _d_final_state: &TensorSpec,
         _use_qk_l2norm: &bool,
+        _scale: &f32,
     ) -> (
         TensorSpec,
         TensorSpec,
@@ -165,7 +223,8 @@ mod fusion_meta {
 
 /// The chunked gated delta rule as a backend extension. Call it through
 /// [`chunk_gated_delta_rule`]; the methods take the layout described in the module docs, with
-/// the initial state always present (zeros when there is none).
+/// an initial state for every sequence always present (zeros when there is none) and the query
+/// scale resolved.
 #[backend_extension(
     Flex: cfg(feature = "flex"),
     Cube: cfg(feature = "cubecl"),
@@ -173,9 +232,9 @@ mod fusion_meta {
     Autodiff
 )]
 pub trait ChunkGatedDeltaBackend: Backend {
-    /// The forward pass: the output `[B, T, H, Dv]` in the queries' dtype and the final state
-    /// `[B, H, Dk, Dv]` in f32. `output_final_state` only tells Autodiff whether the final state
-    /// takes part in the graph; the final state is always computed.
+    /// The forward pass: the output `[B, T, H, Dv]` in the queries' dtype and the final states
+    /// `[B, H, Dk, Dv]` (packed, `[S, H, Dk, Dv]`) in f32. `output_final_state` only tells
+    /// Autodiff whether the final states take part in the graph; they are always computed.
     #[fusion(meta = fusion_meta::forward)]
     #[allow(clippy::too_many_arguments)]
     fn chunk_gated_delta_forward(
@@ -185,16 +244,28 @@ pub trait ChunkGatedDeltaBackend: Backend {
         g: FloatTensor<Self>,
         beta: FloatTensor<Self>,
         initial_state: FloatTensor<Self>,
+        #[extension_type] sequences: Sequences<Self>,
         use_qk_l2norm: bool,
+        scale: f32,
         output_final_state: bool,
     ) -> (FloatTensor<Self>, FloatTensor<Self>) {
         let _ = output_final_state;
-        reference::forward::<Self>(q, k, v, g, beta, initial_state, use_qk_l2norm)
+        reference_forward::<Self>(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state,
+            sequences,
+            use_qk_l2norm,
+            scale,
+        )
     }
 
     /// The backward pass: the gradients of the queries, keys, values, `g`, `beta` (each in its
-    /// input's dtype) and the initial state (f32), given the gradients of the output and of the
-    /// final state (zeros when the final state is not used).
+    /// input's dtype) and the initial states (f32), given the gradients of the output and of the
+    /// final states (zeros when the final states are not used).
     #[fusion(meta = fusion_meta::backward)]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn chunk_gated_delta_backward(
@@ -204,9 +275,11 @@ pub trait ChunkGatedDeltaBackend: Backend {
         g: FloatTensor<Self>,
         beta: FloatTensor<Self>,
         initial_state: FloatTensor<Self>,
+        #[extension_type] sequences: Sequences<Self>,
         d_out: FloatTensor<Self>,
         d_final_state: FloatTensor<Self>,
         use_qk_l2norm: bool,
+        scale: f32,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -215,7 +288,84 @@ pub trait ChunkGatedDeltaBackend: Backend {
         FloatTensor<Self>,
         FloatTensor<Self>,
     ) {
-        reference::backward::<Self>(
+        reference_backward::<Self>(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state,
+            sequences,
+            d_out,
+            d_final_state,
+            use_qk_l2norm,
+            scale,
+        )
+    }
+}
+
+#[cfg(feature = "flex")]
+impl ChunkGatedDeltaBackend for burn::backend::Flex {}
+
+/// The reference forward on any backend: batched, or packed sequences one at a time (their
+/// boundaries read to the host).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reference_forward<B: Backend>(
+    q: FloatTensor<B>,
+    k: FloatTensor<B>,
+    v: FloatTensor<B>,
+    g: FloatTensor<B>,
+    beta: FloatTensor<B>,
+    initial_state: FloatTensor<B>,
+    sequences: Sequences<B>,
+    use_qk_l2norm: bool,
+    scale: f32,
+) -> (FloatTensor<B>, FloatTensor<B>) {
+    match sequences {
+        Sequences::Batch => {
+            reference::forward::<B>(q, k, v, g, beta, initial_state, use_qk_l2norm, scale)
+        }
+        Sequences::Packed(cu_seqlens) => {
+            let cu = read_cu_seqlens::<B>(cu_seqlens, initial_state.shape()[0], q.shape()[1]);
+            reference::forward_packed::<B>(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state,
+                &cu,
+                use_qk_l2norm,
+                scale,
+            )
+        }
+    }
+}
+
+/// The reference's written-out backward on any backend, as [`reference_forward`].
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn reference_backward<B: Backend>(
+    q: FloatTensor<B>,
+    k: FloatTensor<B>,
+    v: FloatTensor<B>,
+    g: FloatTensor<B>,
+    beta: FloatTensor<B>,
+    initial_state: FloatTensor<B>,
+    sequences: Sequences<B>,
+    d_out: FloatTensor<B>,
+    d_final_state: FloatTensor<B>,
+    use_qk_l2norm: bool,
+    scale: f32,
+) -> (
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+    FloatTensor<B>,
+) {
+    match sequences {
+        Sequences::Batch => reference::backward::<B>(
             q,
             k,
             v,
@@ -225,12 +375,26 @@ pub trait ChunkGatedDeltaBackend: Backend {
             d_out,
             d_final_state,
             use_qk_l2norm,
-        )
+            scale,
+        ),
+        Sequences::Packed(cu_seqlens) => {
+            let cu = read_cu_seqlens::<B>(cu_seqlens, initial_state.shape()[0], q.shape()[1]);
+            reference::backward_packed::<B>(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state,
+                &cu,
+                d_out,
+                d_final_state,
+                use_qk_l2norm,
+                scale,
+            )
+        }
     }
 }
-
-#[cfg(feature = "flex")]
-impl ChunkGatedDeltaBackend for burn::backend::Flex {}
 
 /// What the backward pass keeps from the forward: the inputs, nothing computed from them.
 #[derive(Clone, Debug)]
@@ -241,10 +405,12 @@ struct Saved<B: Backend> {
     g: FloatTensor<B>,
     beta: FloatTensor<B>,
     initial_state: FloatTensor<B>,
+    sequences: Sequences<B>,
     use_qk_l2norm: bool,
-    /// When the final state takes part in the graph, the node's output is the output (as f32)
-    /// and the final state flattened into one tensor, since an autodiff node has one output; this
-    /// is the output's shape, for splitting the gradient.
+    scale: f32,
+    /// When the final states take part in the graph, the node's output is the output (as f32)
+    /// and the final states flattened into one tensor, since an autodiff node has one output;
+    /// this is the output's shape, for splitting the gradient.
     packed: Option<Shape>,
 }
 
@@ -283,9 +449,11 @@ impl<B: ChunkGatedDeltaBackend> Backward<B, 6> for ChunkBackward {
             s.g,
             s.beta,
             s.initial_state,
+            s.sequences,
             d_out,
             d_final_state,
             s.use_qk_l2norm,
+            s.scale,
         );
         for (parent, grad) in ops
             .parents
@@ -299,6 +467,16 @@ impl<B: ChunkGatedDeltaBackend> Backward<B, 6> for ChunkBackward {
     }
 }
 
+/// The sequences of an `Autodiff` call on its inner backend: int tensors are not tracked.
+fn inner_sequences<B: Backend, C: CheckpointStrategy>(
+    sequences: Sequences<Autodiff<B, C>>,
+) -> Sequences<B> {
+    match sequences {
+        Sequences::Batch => Sequences::Batch,
+        Sequences::Packed(cu_seqlens) => Sequences::Packed(cu_seqlens),
+    }
+}
+
 impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend for Autodiff<B, C> {
     fn chunk_gated_delta_forward(
         q: FloatTensor<Self>,
@@ -307,7 +485,9 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
         g: FloatTensor<Self>,
         beta: FloatTensor<Self>,
         initial_state: FloatTensor<Self>,
+        sequences: Sequences<Self>,
         use_qk_l2norm: bool,
+        scale: f32,
         output_final_state: bool,
     ) -> (FloatTensor<Self>, FloatTensor<Self>) {
         let nodes = [
@@ -321,6 +501,7 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
         let (q, k, v) = (q.into_primitive(), k.into_primitive(), v.into_primitive());
         let (g, beta) = (g.into_primitive(), beta.into_primitive());
         let initial_state = initial_state.into_primitive();
+        let sequences = inner_sequences(sequences);
         match ChunkBackward.prepare::<C>(nodes).compute_bound().stateful() {
             OpsKind::UnTracked(prep) => {
                 let (out, state) = B::chunk_gated_delta_forward(
@@ -330,7 +511,9 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
                     g,
                     beta,
                     initial_state,
+                    sequences,
                     use_qk_l2norm,
+                    scale,
                     output_final_state,
                 );
                 (prep.finish(out), Self::from_inner(state))
@@ -343,7 +526,9 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
                     g: g.clone(),
                     beta: beta.clone(),
                     initial_state: initial_state.clone(),
+                    sequences: sequences.clone(),
                     use_qk_l2norm,
+                    scale,
                     packed: None,
                 };
                 let (out, state) = B::chunk_gated_delta_forward(
@@ -353,7 +538,9 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
                     g,
                     beta,
                     initial_state,
+                    sequences,
                     use_qk_l2norm,
+                    scale,
                     output_final_state,
                 );
                 if !output_final_state {
@@ -397,9 +584,11 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
         g: FloatTensor<Self>,
         beta: FloatTensor<Self>,
         initial_state: FloatTensor<Self>,
+        sequences: Sequences<Self>,
         d_out: FloatTensor<Self>,
         d_final_state: FloatTensor<Self>,
         use_qk_l2norm: bool,
+        scale: f32,
     ) -> (
         FloatTensor<Self>,
         FloatTensor<Self>,
@@ -415,9 +604,11 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
             Self::inner(g),
             Self::inner(beta),
             Self::inner(initial_state),
+            inner_sequences(sequences),
             Self::inner(d_out),
             Self::inner(d_final_state),
             use_qk_l2norm,
+            scale,
         );
         (
             Self::from_inner(dq),
@@ -430,36 +621,14 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
     }
 }
 
-/// The chunked gated delta rule, transformers' `torch_chunk_gated_delta_rule` (chunk size 64,
-/// query scale `1/sqrt(Dk)`).
-///
-/// - `q`, `k`: `[B, T, H, Dk]`; `v`: `[B, T, H, Dv]`, one float dtype for the three.
-/// - `g`: `[B, T, H]`, the log of the decay, `<= 0`; `beta`: `[B, T, H]`; each in the queries'
-///   dtype or f32 (read as f32 whatever their dtype).
-/// - `initial_state`: `[B, H, Dk, Dv]`, f32 (other dtypes are cast); zeros when `None`.
-/// - `output_final_state`: return the state after the last token, `[B, H, Dk, Dv]` in f32.
-/// - `use_qk_l2norm_in_kernel`: normalise queries and keys to unit length first.
-///
-/// Returns the output `[B, T, H, Dv]` in the queries' dtype and, if asked, the final state.
-/// Packed variable-length sequences (`cu_seqlens`) are not supported.
-///
-/// # Panics
-///
-/// If the shapes do not agree, or `q`, `k`, `v` differ in dtype.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "mirrors transformers' torch_chunk_gated_delta_rule, argument for argument"
-)]
-pub fn chunk_gated_delta_rule(
-    q: Tensor<4>,
-    k: Tensor<4>,
-    v: Tensor<4>,
-    g: Tensor<3>,
-    beta: Tensor<3>,
+/// Checks the inputs of one call against each other and returns the initial states, f32 (zeros
+/// where none are given), `[S, H, Dk, Dv]` with `S` the number of sequences.
+fn check_inputs(
+    [q, k, v]: [&Tensor<4>; 3],
+    [g, beta]: [&Tensor<3>; 2],
     initial_state: Option<Tensor<4>>,
-    output_final_state: bool,
-    use_qk_l2norm_in_kernel: bool,
-) -> (Tensor<4>, Option<Tensor<4>>) {
+    cu_seqlens: Option<&Tensor<1, Int>>,
+) -> Tensor<4> {
     let [b, t, h, dk] = q.dims();
     let dv = v.dims()[3];
     assert_eq!(
@@ -482,12 +651,24 @@ pub fn chunk_gated_delta_rule(
         v.dtype()
     );
     assert!(t > 0, "the sequence must not be empty");
-    let initial_state = match initial_state {
+    let sequences = match cu_seqlens {
+        None => b,
+        Some(cu_seqlens) => {
+            assert_eq!(
+                b, 1,
+                "packed sequences lie along T of a batch of one, got B = {b}"
+            );
+            let [n] = cu_seqlens.dims();
+            assert!(n >= 2, "cu_seqlens must hold S + 1 >= 2 offsets, got {n}");
+            n - 1
+        }
+    };
+    match initial_state {
         Some(state) => {
             assert_eq!(
                 state.dims(),
-                [b, h, dk, dv],
-                "the initial state must be [B, H, Dk, Dv]"
+                [sequences, h, dk, dv],
+                "the initial state must be [S, H, Dk, Dv], one per sequence"
             );
             if state.dtype() == DType::F32 {
                 state
@@ -496,10 +677,54 @@ pub fn chunk_gated_delta_rule(
             }
         }
         None => Tensor::zeros(
-            [b, h, dk, dv],
+            [sequences, h, dk, dv],
             TensorCreationOptions::new(q.device()).with_dtype(DType::F32),
         ),
-    };
+    }
+}
+
+/// The chunked gated delta rule over `B` sequences, or over `S` packed ones (chunk size 64; the
+/// [module](self) and its [parent](super) give the definition).
+///
+/// - `q`, `k`: `[B, T, H, Dk]`; `v`: `[B, T, H, Dv]`, one float dtype for the three.
+/// - `g`: `[B, T, H]`, the log of the decay, `<= 0`; `beta`: `[B, T, H]`; each in the queries'
+///   dtype or f32 (read as f32 whatever their dtype).
+/// - `initial_state`: `[B, H, Dk, Dv]` (packed, `[S, H, Dk, Dv]`), f32 (other dtypes are cast);
+///   zeros when `None`.
+/// - `cu_seqlens`: `None` for one sequence per batch element; else `[S + 1]`, the boundaries of
+///   `S` sequences packed along `T` of a batch of one (`B = 1`), from 0 to `T` without
+///   decreasing. On a device running the kernels they are not read back to check them.
+/// - `options`: the l2 normalisation of queries and keys, the query scale, the final states.
+///
+/// Returns the output `[B, T, H, Dv]` in the queries' dtype and, if asked, the final states,
+/// shaped as the initial states, in f32.
+///
+/// # Panics
+///
+/// If the shapes do not agree, `q`, `k`, `v` differ in dtype, `T` is 0, or packed sequences
+/// come with `B > 1`; where the reference runs, if `cu_seqlens` does not go from 0 to `T`
+/// without decreasing.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the five inputs, the two that may be absent, the options: fla's arguments"
+)]
+pub fn chunk_gated_delta_rule(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    g: Tensor<3>,
+    beta: Tensor<3>,
+    initial_state: Option<Tensor<4>>,
+    cu_seqlens: Option<Tensor<1, Int>>,
+    options: ChunkGatedDeltaOptions,
+) -> (Tensor<4>, Option<Tensor<4>>) {
+    let initial_state = check_inputs(
+        [&q, &k, &v],
+        [&g, &beta],
+        initial_state,
+        cu_seqlens.as_ref(),
+    );
+    let scale = query_scale(options.scale, q.dims()[3]);
     let (out, state) = <Dispatch as ChunkGatedDeltaBackend>::chunk_gated_delta_forward(
         q.into_dispatch(),
         k.into_dispatch(),
@@ -507,17 +732,21 @@ pub fn chunk_gated_delta_rule(
         g.into_dispatch(),
         beta.into_dispatch(),
         initial_state.into_dispatch(),
-        use_qk_l2norm_in_kernel,
-        output_final_state,
+        Sequences::from(cu_seqlens.map(Tensor::into_dispatch)),
+        options.qk_l2norm,
+        scale,
+        options.output_final_state,
     );
     (
         Tensor::from_dispatch(out),
-        output_final_state.then(|| Tensor::from_dispatch(state)),
+        options
+            .output_final_state
+            .then(|| Tensor::from_dispatch(state)),
     )
 }
 
 /// The reference built from Burn's tensor operations, on any device, without autodiff: the
-/// output and the final state. For tests and benchmarks that hold the kernels to it.
+/// output and the final states. For tests and benchmarks that hold the kernels to it.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn chunk_gated_delta_rule_reference(
@@ -526,23 +755,34 @@ pub fn chunk_gated_delta_rule_reference(
     v: Tensor<4>,
     g: Tensor<3>,
     beta: Tensor<3>,
-    initial_state: Tensor<4>,
-    use_qk_l2norm_in_kernel: bool,
+    initial_state: Option<Tensor<4>>,
+    cu_seqlens: Option<Tensor<1, Int>>,
+    options: ChunkGatedDeltaOptions,
 ) -> (Tensor<4>, Tensor<4>) {
-    let (out, state) = reference::forward::<Dispatch>(
+    let initial_state = check_inputs(
+        [&q, &k, &v],
+        [&g, &beta],
+        initial_state,
+        cu_seqlens.as_ref(),
+    );
+    let scale = query_scale(options.scale, q.dims()[3]);
+    let (out, state) = reference_forward::<Dispatch>(
         q.into_dispatch(),
         k.into_dispatch(),
         v.into_dispatch(),
         g.into_dispatch(),
         beta.into_dispatch(),
         initial_state.into_dispatch(),
-        use_qk_l2norm_in_kernel,
+        Sequences::from(cu_seqlens.map(Tensor::into_dispatch)),
+        options.qk_l2norm,
+        scale,
     );
     (Tensor::from_dispatch(out), Tensor::from_dispatch(state))
 }
 
 /// The reference's written-out backward pass, as [`chunk_gated_delta_rule_reference`]: the
-/// gradients of the queries, keys, values, `g`, `beta` and the initial state.
+/// gradients of the queries, keys, values, `g`, `beta` and the initial states, given those of
+/// the output and the final states.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn chunk_gated_delta_rule_reference_backward(
@@ -551,10 +791,11 @@ pub fn chunk_gated_delta_rule_reference_backward(
     v: Tensor<4>,
     g: Tensor<3>,
     beta: Tensor<3>,
-    initial_state: Tensor<4>,
+    initial_state: Option<Tensor<4>>,
+    cu_seqlens: Option<Tensor<1, Int>>,
     d_out: Tensor<4>,
     d_final_state: Tensor<4>,
-    use_qk_l2norm_in_kernel: bool,
+    options: ChunkGatedDeltaOptions,
 ) -> (
     Tensor<4>,
     Tensor<4>,
@@ -563,16 +804,25 @@ pub fn chunk_gated_delta_rule_reference_backward(
     Tensor<3>,
     Tensor<4>,
 ) {
-    let (dq, dk, dv, dg, d_beta, d_initial) = reference::backward::<Dispatch>(
+    let initial_state = check_inputs(
+        [&q, &k, &v],
+        [&g, &beta],
+        initial_state,
+        cu_seqlens.as_ref(),
+    );
+    let scale = query_scale(options.scale, q.dims()[3]);
+    let (dq, dk, dv, dg, d_beta, d_initial) = reference_backward::<Dispatch>(
         q.into_dispatch(),
         k.into_dispatch(),
         v.into_dispatch(),
         g.into_dispatch(),
         beta.into_dispatch(),
         initial_state.into_dispatch(),
+        Sequences::from(cu_seqlens.map(Tensor::into_dispatch)),
         d_out.into_dispatch(),
         d_final_state.into_dispatch(),
-        use_qk_l2norm_in_kernel,
+        options.qk_l2norm,
+        scale,
     );
     (
         Tensor::from_dispatch(dq),

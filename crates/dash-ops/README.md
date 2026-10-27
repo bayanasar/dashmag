@@ -5,8 +5,8 @@ backward pass:
 
 | module | operation | kernels |
 |---|---|---|
-| `gated_delta::chunk` | the gated delta rule, chunked, forward and backward | f32 kernels, no tensor cores yet |
-| `gated_delta::recurrent` | the gated delta rule one token at a time, for decoding | one kernel a step |
+| `gated_delta::chunk` | the gated delta rule, chunked, forward and backward, over a batch or packed variable-length sequences (`cu_seqlens`), heads up to 256 wide, with the l2 normalisation of queries and keys and the query scale as options | f32 kernels, no tensor cores yet |
+| `gated_delta::recurrent` | the gated delta rule a token at a time, for decoding: one token per sequence, or packed sequences' tokens in turn | one kernel a step |
 | `attention` | causal attention with grouped key-value heads, a backward pass that keeps no T x T scores, and decoding against a key-value cache | FlashAttention-2 style kernels on the tensor cores |
 | `logprob` | the log-probability of chosen tokens under a large vocabulary, with the entropy, without the n x V logits | chunked matmuls and a fused log-sum-exp kernel, on devices with plane operations on planes of 8 or more units (CUDA; not lavapipe, OpenGL or the CPU runtime) |
 | `loss` | cross-entropy fused with the output layer over a large vocabulary (mean, sum or none; ignore index, label smoothing, z-loss, masked ids), with each row's log-probability and entropy, gradients for the hidden states and the output weight, without the n x V logits | `logprob`'s pass, and a second pass for the weight's gradient whose kernel takes cubes of 256 units and 64-bit integers (CUDA, lavapipe; not OpenGL or the CPU runtime) |
@@ -67,8 +67,9 @@ with `cuda` only unless a row says otherwise:
 
 | operation | shape | dash-ops | PyTorch |
 |---|---|---|---|
-| gated delta rule, chunked, forward + backward | 6144 tokens, 16 heads of 128 | 9.2 ms, +687 MiB | 3.6 ms, +422 MiB (fla 0.5.2) |
-| gated delta rule, one decoding step | batch 8, 16 heads of 128, 18 layers in turn | 22 us a layer | 34 us (fla 0.5.2) |
+| gated delta rule, chunked, forward + backward | 6144 tokens, 16 heads of 128: one sequence / four packed of 1536 / four calls of 1536 | 8.9 / 9.1 / 9.2 ms (on the device 8.5 / 8.7 / 8.6), +687 / +700 / +225 MiB | 3.6 / 3.3 / 8.1 ms, +398 / +398 / +154 MiB (fla 0.5.2) |
+| gated delta rule, chunked, forward + backward | the same with 16 heads of 256 | 22.7 / 23.1 / 23.2 ms (on the device 22.2 / 22.5 / 22.5), +1548 / +1985 / +485 MiB | 8.6 / 13.4 / 8.4 ms, +974 / +974 / +352 MiB (fla 0.5.2) |
+| gated delta rule, one decoding step | batch 8, 16 heads of 128, 18 layers in turn | 21 us a layer | 34 us (fla 0.5.2) |
 | attention, forward + backward | 6144 tokens, 8 query and 2 key-value heads of 256 | 9.2 ms, +60 MiB | 7.4 ms, +204 MiB (flash) |
 | attention, decoding | batch 8, 6144 cached keys | 200 us a layer, synchronised after each call (144 us over 24 calls; 454 us each with `fusion`) | 201 us |
 | log-probability, forward + backward | 3072 tokens, 248320 classes, width 1024 | 78.9 ms, +216 MiB (70.4 ms with `fusion` and `autotune`) | 86.4 ms, +8730 MiB |
@@ -76,8 +77,11 @@ with `cuda` only unless a row says otherwise:
 | conv1d, forward + backward | 6144 steps, 6144 channels, width 4, SiLU (widths 2 to 4, with or without a bias: 0.54 to 0.57 ms) | 0.56 ms | 2.63 ms (conv1d, then SiLU) |
 
 The chunked gated delta rule's kernels compute in f32 without tensor cores, which is most of its
-distance from fla; attention's backward does seven T x T x D products to FlashAttention-2's five,
-to avoid atomics. Each example in `examples/` reproduces its row (`--features cuda`).
+distance from fla. Packed sequences cost what one sequence of their length does: the state
+passing takes each sequence's chunks in turn, and its shared memory fits one cube per
+multiprocessor, so sequences side by side do not shorten it. Attention's backward does seven
+T x T x D products to FlashAttention-2's five, to avoid atomics. Each example in `examples/`
+reproduces its row (`--features cuda`).
 `matmul_bench` and `dispatch_bench` measure Burn itself: bf16 matmul against cuBLAS, and the
 host-side cost of each unfused operation.
 
