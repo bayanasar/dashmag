@@ -2,7 +2,7 @@
 //! paired against `dash-tract`'s "interpret-a-graph-file" extreme so the
 //! `dash-core` trait is forced honest across two maximally-different backends.
 //!
-//! ## Phase-0 spike — read this
+//! ## A spike — read this
 //!
 //! This implementation drives the `iree-run-module` **command-line tool as a
 //! subprocess** and round-trips tensors through files in a private temporary
@@ -11,7 +11,7 @@
 //! on both CPU and CUDA.
 //!
 //! It is **not** the production shape. The design calls for a thin FFI shim over
-//! IREE's C runtime with device-resident, zero-copy tensors (Phase 2). This stub
+//! IREE's C runtime with device-resident, zero-copy tensors. This stub
 //! pays a process launch and a host round-trip per call.
 //!
 //! Output shape is recovered from [`dash_core::ArtifactMeta`]: `iree-run-module`

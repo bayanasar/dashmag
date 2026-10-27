@@ -1,6 +1,6 @@
 [package]
 name = "dash-iree"
-description = "IREE backend for Dashmag. Phase-0 spike: drives iree-run-module as a subprocess."
+description = "IREE backend for Dashmag. Spike: drives iree-run-module as a subprocess."
 readme = "README.md"
 keywords = ["inference", "edge", "machine-learning", "iree", "gpu"]
 categories = ["science", "hardware-support"]

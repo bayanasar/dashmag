@@ -1,8 +1,8 @@
-//! Train a multi-head classifier on any Burn device, to the recipe a PyTorch run used.
+//! The modules training uses, on any Burn device, written to the recipe a PyTorch run used.
 //!
 //! Each part of the recipe is reproduced as PyTorch computes it and checked against values
-//! recorded from PyTorch, so that a model trained here differs from one trained there by
-//! the noise of training and not by a different recipe:
+//! recorded from PyTorch, so that a model trained with these modules differs from one trained
+//! by PyTorch by the noise of training and not by a different recipe:
 //! - [`loss`]: cross-entropy per head, class-weighted, masked targets dropped, reduced as
 //!   PyTorch's weighted mean; the heads with a target in the batch averaged.
 //! - [`optim`]: AdamW as `torch.optim.AdamW` computes it, with beta1 set per step; with
@@ -12,6 +12,12 @@
 //!   it picks the best epoch.
 //! - [`calibrate`]: one class's logit shifted by the value best on validation, folded
 //!   into its head's bias.
+//!
+//! The crate still also holds a training loop for multi-head classifiers built on these
+//! modules: [`train`], with [`train::predict`]; [`data`] and [`cache`], which read and write
+//! the decoded frames it trains on; [`calibrate::calibrate`], which calibrates a trained run
+//! on a cache; and the `dash-train` command line. A training loop is the application's, not
+//! the library's: these parts are moving to the application that uses them.
 //!
 //! Not reproduced, and stated:
 //! - Random streams. Shuffles, crops, flips, dropout masks and the heads' initial weights

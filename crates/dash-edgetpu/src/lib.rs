@@ -1,7 +1,7 @@
 //! `dash-edgetpu` — Coral Edge TPU backend: a vendor-delegate leaf for the
 //! closed Edge TPU appliance (`/dev/apex_0` via `libedgetpu`).
 //!
-//! ## STATUS: Phase-0.5 spike — NOT YET PROVEN ON HARDWARE
+//! ## STATUS: spike — NOT YET PROVEN ON HARDWARE
 //!
 //! The crate compiles and implements the `dash-core` trait, but it has **not**
 //! been executed on a real Edge TPU. Two things gate that proof:

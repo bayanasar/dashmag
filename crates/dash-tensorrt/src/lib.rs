@@ -2,7 +2,7 @@
 //! GPUs (Nano, TX2, Orin). One SDK, so this single crate covers every TensorRT
 //! board — the correct axis of sharing, versus fusing unrelated vendor SDKs.
 //!
-//! ## Phase-0.5 spike — read this
+//! ## A spike — read this
 //!
 //! Drives the **`trtexec`** tool as a subprocess and round-trips tensors through
 //! a private temporary directory. It proves the closed-SDK path spans the

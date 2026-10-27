@@ -1,6 +1,6 @@
 [package]
 name = "dash-edgetpu"
-description = "Coral Edge TPU backend for Dashmag. Phase-0.5 spike (UNPROVEN on hardware): drives a tflite+libedgetpu runner."
+description = "Coral Edge TPU backend for Dashmag. Spike, not yet run on hardware: drives a tflite+libedgetpu runner as a subprocess."
 readme = "README.md"
 keywords = ["inference", "edge", "coral", "edgetpu", "npu"]
 categories = ["science", "hardware-support"]

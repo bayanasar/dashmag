@@ -1,4 +1,4 @@
-//! Training operations Burn does not have built in.
+//! Operations Burn does not have built in, for training and decoding.
 //!
 //! Each operation is a backend extension (`burn::backend::backend_extension`): a trait whose
 //! default body builds the operation from Burn's own tensor operations, which is the reference

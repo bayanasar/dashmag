@@ -1,6 +1,6 @@
 [package]
 name = "dash-train"
-description = "Train multi-head classifiers in Rust on any Burn device, to the recipe a PyTorch run used."
+description = "Training modules for Burn, reproduced as PyTorch computes them: a masked, class-weighted multi-head cross-entropy, AdamW with beta1 set per step, OneCycleLR, macro-F1, logit calibration. The training loop and command line the crate still holds are moving to the application that uses them."
 readme = "README.md"
 keywords = ["burn", "training", "classification", "machine-learning"]
 categories = ["science"]

@@ -3,23 +3,34 @@
 <!-- progress -->
 updated: 2026-10-27
 owner: bayanasar
-stage: one model, correct on every target tried; models run on Burn and train in Rust (`dash-train`), held to PyTorch's arithmetic and, on data this repository does not hold, no more than 3 standard errors below its results, one cell of ten unresolved
+stage: one model, correct on every target tried; models run on Burn and train in Rust with `dash-train`'s modules, held to PyTorch's arithmetic and, on data this repository does not hold, no more than 3 standard errors below its results, one cell of ten unresolved
 <!-- /progress -->
 
 ## What this is
-A general machine-learning library in Rust on Burn: model architectures, training, the
-operations training needs that Burn lacks, inference across runtimes, and exits to
-accelerator compilers. With Burn beneath it, it is meant to do for Rust what PyTorch does for
-Python, and to grow more general, not narrower. Each part is held to values recorded from the
-implementation it replaces.
+A general machine-learning library in Rust on Burn: the compute layer applications build on
+(operations Burn lacks, in forward, backward and decoding-step forms with kernels for Burn's
+backends; layers such as LoRA; autodiff utilities such as activation checkpointing; the modules
+training uses, such as losses, optimisers and learning-rate schedules), each part built for a
+family of models rather than shaped to one; and inference, a whole trained model in one forward
+call, tensors in and tensors out, on Burn and across runtimes, with exits to accelerator
+compilers. With Burn beneath it, it is meant to do for Rust what PyTorch does for Python, and
+to grow more general, not narrower. Each part is held to values recorded from the
+implementation it replaces, and each operation is benchmarked on its own, at the shapes its
+workload gives it. The application writes the rest on top of it: modules and training code
+shaped to its own model, training loops and training algorithms, the generation loop, a task's
+harness.
 
 Built so far: one model family, MobileNetV3-Small with any number of heads (`dash-models`),
-trained by `dash-train` and run by Burn or by other runtimes behind one `dash-core` trait
-(tract, IREE, TensorRT, Edge TPU), with a cross-backend conformance test that holds them to
-each other and a pure-Rust CPU floor; and operations for training that Burn 0.22 does not have: `dash-ops` (attention with grouped key-value heads and the masks models train with, whose backward pass keeps no T x T scores; the gated delta rule, chunked and recurrent; causal depthwise conv1d of any small width, from a given state; the log-probability of chosen tokens and cross-entropy fused with the output layer over a large vocabulary; the low-rank product of LoRA's layers; activation checkpointing — over packed variable-length sequences wherever an operation takes sequences, each with a reference every device runs and CubeCL kernels on every CubeCL runtime whose device offers what they ask) and `dash-lora` (a frozen bf16 base, f32 adapters, several over one base, PEFT's format), which depend on Burn alone.
+trained with `dash-train`'s loss, optimiser and schedule and run by Burn or by other runtimes
+behind one `dash-core` trait (tract, IREE, TensorRT, Edge TPU), with a cross-backend
+conformance test that holds them to each other and a pure-Rust CPU floor; and operations for
+training and decoding that Burn 0.22 does not have: `dash-ops` (attention with grouped key-value heads and the masks models train with, whose backward pass keeps no T x T scores; the gated delta rule, chunked and recurrent; causal depthwise conv1d of any small width, from a given state; the log-probability of chosen tokens and cross-entropy fused with the output layer over a large vocabulary; the low-rank product of LoRA's layers; activation checkpointing — over packed variable-length sequences wherever an operation takes sequences, each with a reference every device runs and CubeCL kernels on every CubeCL runtime whose device offers what they ask) and `dash-lora` (a frozen bf16 base, f32 adapters, several over one base, PEFT's format), which depend on Burn alone.
 
-Where it is going: models defined once in Rust on Burn, trained and run by dashmag, with
-ONNX and int8 tflite written from Rust only as exits to NPU vendors' compilers.
+Where it is going: models defined once in Rust on Burn, trained by the applications that use
+them, on dashmag's operations and training modules, and run by dashmag, with ONNX and int8
+tflite written from Rust only as exits to NPU vendors' compilers. `dash-train` keeps its
+modules; its training loop, data and cache handling, `predict` and command line move to the
+application that uses them.
 
 ## Sealed
 On `main`, and re-runnable by anyone who checks it out.
@@ -70,10 +81,10 @@ On `main`, and re-runnable by anyone who checks it out.
 - 2026-10-21 Training runs on Flex, the CPU device, until a GPU is free — because a full run takes about 95 minutes on ten cores, and the one other GPU in reach, an RDNA2 card under WSL2, has no ROCm: AMD's WSL support starts at RDNA3.
 - 2026-10-24 `dash-models` names no Flex features; `dash-burn` and `dash-train` turn on its SIMD kernels and threads — because the crate that defines the model stays device-agnostic, and which kernels run is decided where the device is chosen.
 - 2026-10-25 Training operations Burn lacks live in `dash-ops` and `dash-lora`, which depend on Burn alone — because they extend Burn's backends and share this workspace's Burn pin, its patched cubecl-cuda and its way of holding results to recorded references, while nothing else here depends on them, so they can move out or upstream unchanged.
-- 2026-10-26 Dashmag is a general machine-learning library in Rust on Burn, not an inference framework for one model family — because what it holds is general (architectures, a trainer, training operations, runtimes, exits), and with Burn it is to serve Rust as PyTorch serves Python; the model it was first built for uses it and does not define it.
+- 2026-10-26 Dashmag is a general machine-learning library in Rust on Burn, not an inference framework for one model family — because what it holds is general (architectures, training modules, operations, runtimes, exits), and with Burn it is to serve Rust as PyTorch serves Python; the model it was first built for uses it and does not define it.
 - 2026-10-26 An operation enters the library for its whole family, not shaped to the model that asked for it: attention for the masks models train with, a causal convolution of any small width — because a library grows by its own logic (one convention across operations, a reference for each, kernels on every CubeCL backend), and a requesting model is one test case among others.
 - 2026-10-26 A kernel holds what it asks of the device (units per cube, shared memory, a plane width, the tensor cores' instructions, 64-bit integers, its dtypes) against the device's properties before it launches, and a device that falls short runs the operation's reference — because one CubeCL source compiles for every runtime while devices differ in what they offer, and the reference is what every device has.
-- 2026-10-26 What an application asks of the library is met with operations and layers: the application writes its model, its training algorithms (PPO, GRPO and their kind), its generation loop and the orchestration of a backward pass taken in segments, on top of them — because those are the application's own and change with it, while operations generalise; the library's part is that its operations support such uses (states and their gradients, attention against a cache, decoding steps) and run fast.
+- 2026-10-27 Dashmag's scope is the compute layer applications build on, and inference. The compute layer is operations in forward, backward and decoding-step forms with a kernel per backend, layers (LoRA), autodiff utilities (activation checkpointing) and the modules training uses (losses, optimisers, learning-rate schedules), each built for a family of models (transformers for language, convolutional networks), never shaped to one, held to its reference and benchmarked one operation at a time at its workload's shapes. Inference runs trained models, whole models among them (`dash-models` and the runtimes), and whole-model inference is one forward call, tensors in and tensors out. The application writes the rest on top of these: modules, training code and stacks of layers shaped to its one model, its training loop, its training algorithms and their objectives (PPO, GRPO and their kind), the orchestration of a backward pass taken in segments, the generation loop that calls the model step by step, samples, keeps each sequence's state and decides when to stop, the scheduler around that loop, and its task harness. `dash-train` keeps its loss, optimiser and schedule and what is general in its calibration and metrics; its training loop, data and cache handling, `predict` and command line move to the application that uses them — because those are the application's own and change with it, and there are too many training algorithms for a library to hold, while operations generalise; the library's part is that its operations support such uses (states and their gradients, attention against a key-value cache, the gated delta rule's recurrent step, and later sampling on the device) and run fast.
 - 2026-10-27 Attention's backward sums the query gradient over the key blocks with f32 atomics, as FlashAttention-2 and PyTorch do by default, so that gradient's last bits vary from run to run (the output and the key and value gradients do not) — because a fixed-order sum, seven products to five, measured 28% slower.
 - 2026-10-25 `fusion` and `autotune` are opt-in features — because they change which kernels every Burn crate in a build runs, and with autotune the kernel depends on timing, so results stop repeating bit for bit between runs; the agreements and the determinism recorded here are made without them.
 

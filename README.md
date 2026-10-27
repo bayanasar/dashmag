@@ -3,12 +3,24 @@
 **A machine-learning library in Rust, on [Burn](https://burn.dev).**
 
 Dashmag is a general machine-learning library in Rust. Burn beneath it supplies tensors, autodiff
-and devices; Dashmag adds what a model's life needs around them — architectures, training, the
-operations training needs that Burn does not have, inference on whatever hardware is at hand, and
-exits to the compilers of accelerators Burn cannot drive. Together they are meant to do for Rust
-what PyTorch does for Python. Each part is held to values recorded from the implementation it
-replaces (PyTorch, torchvision, Pillow, transformers, PEFT), and each test says where its
-recording comes from.
+and devices; Dashmag adds the compute layer that applications build on, and inference. Together
+they are meant to do for Rust what PyTorch does for Python.
+
+The compute layer is the operations Burn does not have, in forward, backward and decoding-step
+forms with kernels for Burn's backends; layers, such as LoRA; autodiff utilities, such as
+activation checkpointing; and the modules training uses (losses, optimisers, learning-rate
+schedules). Each is built for a family of models (transformers for language, convolutional
+networks), not shaped to one, and each operation is benchmarked on its own, at the shapes its
+workload gives it. Inference runs trained models, a whole model in one forward call, tensors in
+and tensors out, on whatever hardware is at hand, with exits to the compilers of accelerators Burn
+cannot drive. Each part is held to values recorded from the implementation it replaces (PyTorch,
+torchvision, Pillow, transformers, PEFT), and each test says where its recording comes from.
+
+What sits above both is the application's, written on top of Dashmag: modules and training code
+shaped to its own model, its training loop and training algorithms (PPO, GRPO and their kind), the
+generation loop that calls a model step by step, samples, keeps each sequence's state and decides
+when to stop, and its task harness. For a generation loop Dashmag gives the decoding-step
+operations, such as attention against a key-value cache and the gated delta rule's recurrent step.
 
 > **Status:** pre-alpha, moving fast. APIs will change.
 
@@ -17,8 +29,8 @@ recording comes from.
 | Crate | What it is | Status |
 |---|---|---|
 | [`dash-models`](https://crates.io/crates/dash-models) | model architectures as Burn modules, named so that published PyTorch weights load unchanged; MobileNetV3-Small with any number of heads | torchvision's weights give torch's answer on Burn's CPU backend and on CUDA |
-| [`dash-train`](https://crates.io/crates/dash-train) | training: masked, class-weighted multi-head cross-entropy, AdamW under a one-cycle schedule, calibration, prediction | reproduces a PyTorch recipe's arithmetic; trains on the CPU and on CUDA |
-| [`dash-ops`](https://crates.io/crates/dash-ops) | training operations Burn lacks, each with a reference, a written-out backward pass and CubeCL kernels for any runtime whose device offers what they ask: attention with the masks models train with, keeping no T x T scores; the gated delta rule and causal depthwise conv1d, over packed sequences and from given states; chosen-token log-probabilities and cross-entropy fused with the output layer over a large vocabulary; the low-rank product LoRA's layers use; activation checkpointing | agrees with PyTorch, transformers and fla on the CPU, on CUDA, through wgpu and on CubeCL's CPU runtime |
+| [`dash-train`](https://crates.io/crates/dash-train) | the modules training uses: masked, class-weighted multi-head cross-entropy, AdamW under a one-cycle schedule, calibration; the training loop, data handling, prediction and command line it still holds are moving to the application that uses them | reproduces a PyTorch recipe's arithmetic; trains on the CPU and on CUDA |
+| [`dash-ops`](https://crates.io/crates/dash-ops) | operations Burn lacks, for training and decoding, each with a reference, a written-out backward pass and CubeCL kernels for any runtime whose device offers what they ask: attention with the masks models train with, keeping no T x T scores; the gated delta rule and causal depthwise conv1d, over packed sequences and from given states; chosen-token log-probabilities and cross-entropy fused with the output layer over a large vocabulary; the low-rank product LoRA's layers use; activation checkpointing | agrees with PyTorch, transformers and fla on the CPU, on CUDA, through wgpu and on CubeCL's CPU runtime |
 | [`dash-lora`](https://crates.io/crates/dash-lora) | LoRA with a frozen low-precision base and f32 adapters, several over one base, one chosen per forward for a whole model, read and written in PEFT's format | one layer bit-identical to PEFT; two adapters over one base held to PEFT's `set_adapter` |
 | [`dash-image`](https://crates.io/crates/dash-image) | image preprocessing: JPEG decode, Pillow-exact bilinear resize, normalisation | byte-exact with Pillow's resize |
 | [`dash-core`](https://crates.io/crates/dash-core) | the inference trait: tensors, capability negotiation, dispatch across runtimes | — |
@@ -33,8 +45,9 @@ recording comes from.
 
 ## How a model gets here
 
-- **As code.** A model is a Burn module (`dash-models`), trained by `dash-train` and run by
-  `dash-burn`, or by `dash --backend burn`, on any Burn device. Published PyTorch weights for a
+- **As code.** A model is a Burn module (`dash-models`), trained by the application that uses it,
+  with Dashmag's operations and training modules, and run by `dash-burn`, or by
+  `dash --backend burn`, on any Burn device. Published PyTorch weights for a
   `dash-models` architecture load directly, and `dash-import` converts a PyTorch checkpoint into
   the safetensors file `dash-burn` reads.
 - **As an artifact.** tract and TensorRT run an ONNX file, IREE a module compiled from one

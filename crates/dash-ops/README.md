@@ -1,7 +1,7 @@
 # dash-ops
 
-Training operations Burn 0.22 does not have built in. Each is a backend extension with its own
-backward pass:
+Operations Burn 0.22 does not have built in, for training and decoding. Each is a backend
+extension with its own backward pass:
 
 | module | operation | kernels |
 |---|---|---|

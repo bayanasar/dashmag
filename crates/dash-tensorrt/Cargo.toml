@@ -1,6 +1,6 @@
 [package]
 name = "dash-tensorrt"
-description = "NVIDIA TensorRT backend for Dashmag (Jetson GPUs). Phase-0.5 spike: drives trtexec."
+description = "NVIDIA TensorRT backend for Dashmag (Jetson GPUs). Spike: drives trtexec as a subprocess."
 readme = "README.md"
 keywords = ["inference", "edge", "tensorrt", "jetson", "cuda"]
 categories = ["science", "hardware-support"]
