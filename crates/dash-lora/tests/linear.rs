@@ -48,7 +48,7 @@ fn run(device_name: &str, device: &Device, tag: &str) {
     let gy: Tensor<2> = tensor(key("gy"), device);
     let grads = y.clone().mul(gy).sum().backward();
 
-    let lora = layer.lora.as_ref().unwrap();
+    let lora = layer.lora().unwrap();
     // Gradients reach A and B only: the base weight requires none and gets none.
     assert!(!layer.weight.is_require_grad());
     assert!(layer.weight.val().grad(&grads).is_none());

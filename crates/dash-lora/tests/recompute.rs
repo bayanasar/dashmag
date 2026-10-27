@@ -65,7 +65,7 @@ impl Block {
     /// The same block with its base weights upcast to f32 (exactly) and the same adapters.
     fn to_f32(&self) -> Self {
         let f32 = |l: &LoraLinear| {
-            let lora = l.lora.as_ref().unwrap();
+            let lora = l.lora().unwrap();
             LoraLinear::frozen(l.weight.val().cast(DType::F32)).with_lora(Lora::new(
                 lora.a.val(),
                 lora.b.val(),
@@ -89,7 +89,7 @@ impl Block {
     }
 
     fn loras(&self) -> [&Lora; 3] {
-        [&self.gate, &self.up, &self.down].map(|l| l.lora.as_ref().unwrap())
+        [&self.gate, &self.up, &self.down].map(|l| l.lora().unwrap())
     }
 }
 

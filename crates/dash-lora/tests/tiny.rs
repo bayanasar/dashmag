@@ -92,7 +92,7 @@ impl Tiny {
             "v_proj" => &self.layers[i].v_proj,
             other => panic!("{other}"),
         };
-        layer.lora.as_ref().unwrap()
+        layer.lora().unwrap()
     }
 }
 
@@ -134,7 +134,7 @@ fn model(f: &HashMap<String, TensorData>, prec: &str, device: &Device) -> Tiny {
         }
         _ => {
             for (path, layer) in model.adapted_mut() {
-                layer.lora = Some(Lora::from_data(
+                layer.set_lora(Lora::from_data(
                     get(f, &format!("{prec}.init.{path}.lora_A")),
                     get(f, &format!("{prec}.init.{path}.lora_B")),
                     SCALE,
@@ -358,7 +358,7 @@ fn teacher_forced(device_name: &str, device: &Device, prec: &str) {
     for (step, torch_loss) in losses.iter().copied().enumerate() {
         if step > 0 {
             for (path, layer) in model.adapted_mut() {
-                layer.lora = Some(Lora::from_data(
+                layer.set_lora(Lora::from_data(
                     get(&f, &format!("{prec}.step{step}.{path}.lora_A")),
                     get(&f, &format!("{prec}.step{step}.{path}.lora_B")),
                     SCALE,

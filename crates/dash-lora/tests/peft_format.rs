@@ -1,6 +1,7 @@
 //! PEFT's adapter format: files written by PEFT 0.20's `save_pretrained` read and written back
-//! byte for byte, through the caller's layers too; per-module scales as PEFT computes them;
-//! a new configuration as PEFT writes one; variants this crate does not implement refused.
+//! byte for byte, through the caller's layers too, and two adapters through one set of layers;
+//! per-module scales as PEFT computes them; a new configuration as PEFT writes one; variants this
+//! crate does not implement refused.
 //!
 //!   cargo test -p dash-lora --test peft_format -- --nocapture
 
@@ -9,7 +10,9 @@ mod common;
 use burn::tensor::{DType, Device, Tensor};
 use common::*;
 use dash_lora::peft::{CONFIG_FILE, WEIGHTS_FILE};
-use dash_lora::{LoraLinear, PeftAdapter, PeftConfig, PeftError};
+use dash_lora::{
+    AdapterChoice, ApplyOptions, DEFAULT_ADAPTER, LoraLinear, PeftAdapter, PeftConfig, PeftError,
+};
 use serde_json::Value;
 
 fn files(dir: &str) -> (String, Vec<u8>) {
@@ -22,19 +25,35 @@ fn files(dir: &str) -> (String, Vec<u8>) {
 
 /// Frozen layers shaped like the fixture's adapted modules, under their PEFT paths.
 fn layers(adapter: &PeftAdapter, device: &Device) -> Vec<(String, LoraLinear)> {
-    adapter
-        .modules()
-        .map(|(path, w)| {
-            let (out, inp) = (w.b.shape().as_slice()[0], w.a.shape().as_slice()[1]);
+    layers_for(&[adapter], device)
+}
+
+/// Frozen layers shaped like the modules any of `adapters` adapts, under their PEFT paths.
+fn layers_for(adapters: &[&PeftAdapter], device: &Device) -> Vec<(String, LoraLinear)> {
+    let mut shapes = std::collections::BTreeMap::new();
+    for adapter in adapters {
+        for (path, w) in adapter.modules() {
+            let shape = (w.b.shape().as_slice()[0], w.a.shape().as_slice()[1]);
+            assert_eq!(*shapes.entry(path.to_string()).or_insert(shape), shape);
+        }
+    }
+    shapes
+        .into_iter()
+        .map(|(path, (out, inp))| {
             let weight = Tensor::<2>::zeros([out, inp], (device, DType::BF16));
-            (path.to_string(), LoraLinear::frozen(weight))
+            (path, LoraLinear::frozen(weight))
         })
         .collect()
 }
 
 #[test]
 fn read_then_written_back_is_byte_identical() {
-    for dir in ["peft_tiny", "peft_patterns"] {
+    for dir in [
+        "peft_tiny",
+        "peft_patterns",
+        "peft_multi",
+        "peft_multi/reference",
+    ] {
         let (config, weights) = files(dir);
         let adapter = PeftAdapter::read(fixture(dir)).unwrap();
         assert_eq!(adapter.modules().count(), 4);
@@ -46,8 +65,11 @@ fn read_then_written_back_is_byte_identical() {
         assert_eq!(config2, config, "{dir}: {CONFIG_FILE} differs from PEFT's");
 
         // Through the file system as well.
-        let out =
-            std::env::temp_dir().join(format!("dash-lora-round-trip-{dir}-{}", std::process::id()));
+        let out = std::env::temp_dir().join(format!(
+            "dash-lora-round-trip-{}-{}",
+            dir.replace('/', "-"),
+            std::process::id()
+        ));
         adapter.write(&out).unwrap();
         assert!(std::fs::read(out.join(WEIGHTS_FILE)).unwrap() == weights);
         assert_eq!(
@@ -74,7 +96,7 @@ fn through_the_layers_and_back_is_byte_identical() {
         .apply(layers.iter_mut().map(|(p, l)| (p.as_str(), l)), &device)
         .unwrap();
     for (path, layer) in &layers {
-        let lora = layer.lora.as_ref().unwrap();
+        let lora = layer.lora().unwrap();
         assert_eq!(lora.a.val().dtype(), DType::F32);
         assert!(lora.a.is_require_grad() && lora.b.is_require_grad());
         assert!(!layer.weight.is_require_grad());
@@ -91,6 +113,102 @@ fn through_the_layers_and_back_is_byte_identical() {
         "{WEIGHTS_FILE} differs after the layers"
     );
     assert_eq!(config2, config);
+}
+
+/// Two adapters PEFT saved from one model ("default" at the top of the directory, "reference"
+/// in its subdirectory), read into one set of layers under their names, one trainable and one
+/// frozen, and written back the way PEFT lays them out: each adapter's two files as PEFT wrote
+/// them, byte for byte.
+#[test]
+fn two_adapters_through_one_set_of_layers_are_written_back_as_peft_wrote_them() {
+    let device = Device::flex().autodiff();
+    let dirs = [
+        (DEFAULT_ADAPTER, "peft_multi"),
+        ("reference", "peft_multi/reference"),
+    ];
+    let adapters: Vec<PeftAdapter> = dirs
+        .iter()
+        .map(|(_, dir)| PeftAdapter::read(fixture(dir)).unwrap())
+        .collect();
+    let mut layers = layers_for(&adapters.iter().collect::<Vec<_>>(), &device);
+    adapters[0]
+        .apply(layers.iter_mut().map(|(p, l)| (p.as_str(), l)), &device)
+        .unwrap();
+    let frozen = ApplyOptions {
+        name: "reference".into(),
+        trainable: false,
+    };
+    adapters[1]
+        .apply_with(
+            layers.iter_mut().map(|(p, l)| (p.as_str(), l)),
+            &device,
+            &frozen,
+        )
+        .unwrap();
+    // One base per layer; q_proj holds both adapters, v_proj and o_proj one each.
+    assert_eq!(layers.len(), 6);
+    for (path, layer) in &layers {
+        let names: Vec<&str> = layer.adapters().map(|(n, _)| n).collect();
+        let expect: &[&str] = match path.rsplit('.').next().unwrap() {
+            "q_proj" => &[DEFAULT_ADAPTER, "reference"],
+            "v_proj" => &[DEFAULT_ADAPTER],
+            _ => &["reference"],
+        };
+        assert_eq!(names, expect, "{path}");
+        if let Some(lora) = layer.adapter("reference") {
+            assert!(!lora.a.is_require_grad() && !lora.b.is_require_grad());
+        }
+        if let Some(lora) = layer.adapter(DEFAULT_ADAPTER) {
+            assert!(lora.a.is_require_grad() && lora.b.is_require_grad());
+        }
+    }
+    let all: Vec<LoraLinear> = layers.iter().map(|(_, l)| l.clone()).collect();
+    assert_eq!(all.adapter_names(), [DEFAULT_ADAPTER, "reference"]);
+
+    let out = std::env::temp_dir().join(format!("dash-lora-two-adapters-{}", std::process::id()));
+    for ((name, dir), read) in dirs.iter().zip(&adapters) {
+        let named = layers.iter().map(|(p, l)| (p.as_str(), l));
+        let back = PeftAdapter::from_layers_named(read.config.clone(), name, named).unwrap();
+        // PEFT's layout: the default adapter at the top, every other in a subdirectory.
+        let sub = match *name {
+            DEFAULT_ADAPTER => out.clone(),
+            other => out.join(other),
+        };
+        back.write(&sub).unwrap();
+        let (config, weights) = files(dir);
+        assert!(
+            std::fs::read(sub.join(WEIGHTS_FILE)).unwrap() == weights,
+            "{name}: {WEIGHTS_FILE} differs from PEFT's"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sub.join(CONFIG_FILE)).unwrap(),
+            config,
+            "{name}: {CONFIG_FILE} differs from PEFT's"
+        );
+        println!(
+            "{name}: {} + {} bytes written back identical",
+            weights.len(),
+            config.len()
+        );
+    }
+    std::fs::remove_dir_all(&out).unwrap();
+
+    // Applying an adapter again under a name replaces it whole: a layer it does not cover loses
+    // its adapter of that name.
+    adapters[0]
+        .apply_with(
+            layers.iter_mut().map(|(p, l)| (p.as_str(), l)),
+            &device,
+            &ApplyOptions {
+                name: "reference".into(),
+                trainable: true,
+            },
+        )
+        .unwrap();
+    for (path, layer) in &layers {
+        let held = layer.adapter("reference").is_some();
+        assert_eq!(held, !path.ends_with("o_proj"), "{path}");
+    }
 }
 
 #[test]
@@ -199,7 +317,7 @@ fn apply_refuses_to_drop_weights() {
         layers.iter_mut().map(|(p, l)| (p.as_str(), l)).collect();
     named.push(("layers.0.o_proj", &mut extra));
     adapter.apply(named, &device).unwrap();
-    assert!(extra.lora.is_none());
+    assert!(extra.adapters().next().is_none());
 }
 
 /// The adapter a layer gets carries PEFT's scale and `lora_dropout`, which acts only while

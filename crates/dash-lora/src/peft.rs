@@ -12,6 +12,12 @@
 //! path names is the caller's to say, since the model lives outside this crate:
 //! [`PeftAdapter::apply`] and [`PeftAdapter::from_layers`] take `(path, layer)` pairs.
 //!
+//! One directory holds one adapter. A model holding several reads each from its own directory
+//! under its own name ([`PeftAdapter::apply_with`], PEFT's `load_adapter(path, adapter_name)`)
+//! and writes each back to its own ([`PeftAdapter::from_layers_named`]); PEFT's `save_pretrained`
+//! puts [`DEFAULT_ADAPTER`] at the top of its directory and every other adapter in a
+//! subdirectory named after it.
+//!
 //! Reading and writing back changes nothing: tensors keep their dtype and bytes, tensors that
 //! are not LoRA factors (`modules_to_save`, trainable tokens) are carried through untouched,
 //! configuration fields this crate does not interpret are kept, and both files are written as
@@ -23,10 +29,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
 
+use burn::module::Module;
 use burn::tensor::{DType, Device, TensorData};
 use safetensors::tensor::{Dtype, SafeTensors, TensorView};
 use serde_json::{Map, Value};
 
+use crate::adapters::DEFAULT_ADAPTER;
 use crate::linear::{Lora, LoraLinear};
 
 /// The weights file in an adapter directory.
@@ -576,15 +584,30 @@ impl PeftAdapter {
         ))
     }
 
-    /// Gives each of the caller's layers its adapter: `layers` pairs PEFT module paths with
-    /// the layers they name. A named layer the adapter does not cover is left without one.
-    /// Errs, before changing any layer, if a module's shapes do not fit its layer, or if the
-    /// adapter holds weights no named layer takes: a LoRA module nobody named, or tensors
-    /// such as `modules_to_save` (place those with [`lora`](Self::lora) and your own code).
+    /// Gives each of the caller's layers its adapter, as [`DEFAULT_ADAPTER`], trainable:
+    /// [`apply_with`](Self::apply_with) with the default [`ApplyOptions`].
     pub fn apply<'a, S: AsRef<str>>(
         &self,
         layers: impl IntoIterator<Item = (S, &'a mut LoraLinear)>,
         device: &Device,
+    ) -> Result<(), PeftError> {
+        self.apply_with(layers, device, &ApplyOptions::default())
+    }
+
+    /// Gives each of the caller's layers its adapter, under the name and with the trainability
+    /// `options` give, beside the adapters the layer holds by other names: `layers` pairs PEFT
+    /// module paths with the layers they name. A named layer the adapter does not cover is left
+    /// without an adapter of that name (one it held is removed), so that the adapter of that name
+    /// is this one in every layer. The layers' choice of adapter is left as it is: as with
+    /// PEFT's `load_adapter`, the new adapter runs once chosen. Errs, before changing any layer,
+    /// if a module's shapes do not fit its layer, or if the adapter holds weights no named layer
+    /// takes: a LoRA module nobody named, or tensors such as `modules_to_save` (place those with
+    /// [`lora`](Self::lora) and your own code).
+    pub fn apply_with<'a, S: AsRef<str>>(
+        &self,
+        layers: impl IntoIterator<Item = (S, &'a mut LoraLinear)>,
+        device: &Device,
+        options: &ApplyOptions,
     ) -> Result<(), PeftError> {
         let layers: Vec<(S, &'a mut LoraLinear)> = layers.into_iter().collect();
         let mut unclaimed: BTreeSet<&str> = self.modules.keys().map(String::as_str).collect();
@@ -609,25 +632,51 @@ impl PeftAdapter {
                 names.join(", ")
             )));
         }
-        for (path, layer) in layers {
-            layer.lora = self.lora(path.as_ref(), device)?;
+        let mut loras = Vec::with_capacity(layers.len());
+        for (path, _) in &layers {
+            loras.push(self.lora(path.as_ref(), device)?);
+        }
+        for ((_, layer), lora) in layers.into_iter().zip(loras) {
+            match lora {
+                Some(lora) if options.trainable => {
+                    layer.insert_adapter(&options.name, lora);
+                }
+                Some(lora) => {
+                    layer.insert_adapter(&options.name, lora.no_grad());
+                }
+                None => {
+                    layer.remove_adapter(&options.name);
+                }
+            }
         }
         Ok(())
     }
 
-    /// An adapter holding the adapters of the caller's layers under the PEFT module paths
-    /// given, as f32, with `config`. Layers without an adapter are skipped. Errs if a layer's
-    /// scale is not the one `config` gives its path and rank, since PEFT would load it with
-    /// that one.
+    /// An adapter holding the caller's layers' [`DEFAULT_ADAPTER`]:
+    /// [`from_layers_named`](Self::from_layers_named) with that name.
     pub fn from_layers<'a, S: AsRef<str>>(
         config: PeftConfig,
+        layers: impl IntoIterator<Item = (S, &'a LoraLinear)>,
+    ) -> Result<Self, PeftError> {
+        Self::from_layers_named(config, DEFAULT_ADAPTER, layers)
+    }
+
+    /// An adapter holding the caller's layers' adapter named `name` under the PEFT module paths
+    /// given, as f32, with `config`. Layers without an adapter of that name are skipped. Errs if
+    /// a layer's scale is not the one `config` gives its path and rank, since PEFT would load it
+    /// with that one.
+    pub fn from_layers_named<'a, S: AsRef<str>>(
+        config: PeftConfig,
+        name: &str,
         layers: impl IntoIterator<Item = (S, &'a LoraLinear)>,
     ) -> Result<Self, PeftError> {
         config.check_supported()?;
         let mut adapter = Self::new(config);
         for (path, layer) in layers {
             let path = path.as_ref();
-            let Some(lora) = &layer.lora else { continue };
+            let Some(lora) = layer.adapter(name) else {
+                continue;
+            };
             let r = lora.rank();
             let expected = adapter.config.scale(path, r)?;
             if (expected - lora.scale).abs() > 1e-12 * expected.abs() {
@@ -652,6 +701,27 @@ impl PeftAdapter {
             adapter.insert(path, weights);
         }
         Ok(adapter)
+    }
+}
+
+/// How [`PeftAdapter::apply_with`] gives the caller's layers an adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyOptions {
+    /// The name the adapter takes in each layer, PEFT's `adapter_name`: [`DEFAULT_ADAPTER`] by
+    /// default.
+    pub name: String,
+    /// Whether its factors train (require a gradient), PEFT's `is_trainable`: true by default.
+    /// A frozen adapter records nothing for autodiff, gets no gradient and so no optimizer state;
+    /// its dropout, if it has any, still acts in training, as PEFT's does.
+    pub trainable: bool,
+}
+
+impl Default for ApplyOptions {
+    fn default() -> Self {
+        Self {
+            name: DEFAULT_ADAPTER.to_string(),
+            trainable: true,
+        }
     }
 }
 

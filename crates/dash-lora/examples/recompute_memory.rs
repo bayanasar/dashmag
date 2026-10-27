@@ -236,7 +236,7 @@ fn checksum(blocks: &[Block], params: &GradientsParams) -> f64 {
     let mut sum = 0.0;
     for b in blocks {
         for layer in [&b.gate, &b.up, &b.down] {
-            let lora = layer.lora.as_ref().unwrap();
+            let lora = layer.lora().unwrap();
             for id in [lora.a.id, lora.b.id] {
                 let g = params.get::<2>(id).expect("every adapter has a gradient");
                 sum += g.powi_scalar(2).sum().into_scalar::<f32>() as f64;

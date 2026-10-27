@@ -1,9 +1,11 @@
-//! A linear layer whose frozen base weight keeps its own precision and whose LoRA adapter is
+//! A linear layer whose frozen base weight keeps its own precision and whose LoRA adapters are
 //! applied beside it, never folded into it.
 //!
 //! `y = x Wᵀ + scale · (x Aᵀ) Bᵀ`, with `W` `[out, in]` frozen (bf16, or f32), `A` `[r, in]` and
 //! `B` `[out, r]` in f32, and `scale = lora_alpha / r` (`lora_alpha / √r` with rsLoRA): PEFT's
-//! layout, names and arithmetic. The precision of each part:
+//! layout, names and arithmetic. A layer holds any number of adapters by name over its one `W`,
+//! and each forward pass adds the term of one of them, or of none ([`crate::adapters`]). The
+//! precision of each part:
 //!
 //! - **Base product** `x Wᵀ`, at the weight's dtype: `x` is cast to it if it differs (it does
 //!   not when `x` and `W` are both bf16, PEFT's case). For bf16, Flex converts both operands to
@@ -16,7 +18,8 @@
 //!   compute capability 8.0 and later, while PyTorch's default is IEEE f32.
 //! - **Sum**, in f32: the base product upcast (exact) plus the low-rank term, one f32 addition,
 //!   then rounded once to `x`'s dtype. With bf16 `x` this is PEFT's
-//!   `(result + lora).to(torch_result_dtype)`.
+//!   `(result + lora).to(torch_result_dtype)`. With no adapter chosen, the base product alone,
+//!   at `x`'s dtype, as PEFT's layer returns it with its adapters disabled.
 //!
 //! Against PEFT 0.20's `lora.Linear` on PyTorch 2.13 (`tests/linear.rs`), the output and the
 //! gradients of `x`, `A` and `B` are bit-identical, for a bf16 and for an f32 base, on Flex and
@@ -31,29 +34,32 @@
 //! of its elements round to zero and what is left has a cosine of 0.575 with it). Kept apart,
 //! the update reaches the output at f32 precision.
 //!
-//! Gradients reach `A` and `B` only. `W` is a [`Param`] that does not require a gradient, so
-//! Burn's autodiff never computes one for it: its matrix product records `W` as a constant,
-//! keeps only what the input's gradient needs (`W` itself, not `x`), and its backward computes
-//! `∂L/∂x = ∂L/∂y · W` alone.
+//! Gradients reach the factors of the chosen adapter, if they require one, and nothing else.
+//! `W` is a [`Param`] that does not require a gradient, so Burn's autodiff never computes one
+//! for it: its matrix product records `W` as a constant, keeps only what the input's gradient
+//! needs (`W` itself, not `x`), and its backward computes `∂L/∂x = ∂L/∂y · W` alone. A frozen
+//! adapter's factors are constants the same way.
 //!
 //! Burn 0.22.1 has a LoRA of its own, `burn::module::LoraAdapter`, a reparameterization of a
 //! `Param` that materializes `W + scale · (a b)` on every read. It does not fit here: it is the
 //! merged form, computed at the factors' precision, so each forward makes an f32 copy of every
 //! adapted weight and multiplies by it instead of by the bf16 weight; its backward computes the
 //! gradient of that whole effective weight, `xᵀ ∂L/∂y`, `[in, out]` and as costly as the frozen
-//! weight's own gradient, before projecting it onto the factors; and its factors are laid out
-//! `[in, r]` and `[r, out]`, the transposes of PEFT's.
+//! weight's own gradient, before projecting it onto the factors; its factors are laid out
+//! `[in, r]` and `[r, out]`, the transposes of PEFT's; and a parameter carries one at most.
 
 use burn::module::{Module, Param, ParamId};
 use burn::nn::{Dropout, DropoutConfig};
 use burn::tensor::{DType, Device, Tensor, TensorData};
 
-/// The low-rank adapter of a [`LoraLinear`], in PEFT's layout.
+use crate::adapters::{Adapters, DEFAULT_ADAPTER};
+
+/// A low-rank adapter of a [`LoraLinear`], in PEFT's layout.
 #[derive(Module, Debug)]
 pub struct Lora {
-    /// `lora_A`: `[r, in]`, f32, trainable.
+    /// `lora_A`: `[r, in]`, f32; trainable unless frozen (Burn's `Module::no_grad`).
     pub a: Param<Tensor<2>>,
-    /// `lora_B`: `[out, r]`, f32, trainable.
+    /// `lora_B`: `[out, r]`, f32; trainable unless frozen.
     pub b: Param<Tensor<2>>,
     /// The factor on the low-rank product: `lora_alpha / r`, or `lora_alpha / √r` with rsLoRA.
     pub scale: f64,
@@ -65,7 +71,8 @@ pub struct Lora {
 
 impl Lora {
     /// An adapter from its factors, `a` `[r, in]` and `b` `[out, r]`, stored as f32 trainable
-    /// parameters whatever their dtype, and the factor on their product.
+    /// parameters whatever their dtype, and the factor on their product. `.no_grad()` (Burn's
+    /// `Module::no_grad`) freezes it: its factors then record nothing and get no gradient.
     pub fn new(a: Tensor<2>, b: Tensor<2>, scale: f64) -> Self {
         let [r, _] = a.dims();
         let [_, rb] = b.dims();
@@ -110,15 +117,21 @@ impl Lora {
     }
 }
 
-/// A linear layer with a frozen base weight and, optionally, a LoRA adapter. No bias: the
-/// projections LoRA targets in today's language models have none.
+/// A linear layer with a frozen base weight and any number of LoRA adapters by name, of which
+/// each forward pass uses the chosen one, or none. No bias: the projections LoRA targets in
+/// today's language models have none.
+///
+/// The layer uses [`DEFAULT_ADAPTER`] until [`AdapterChoice::set_adapter`] chooses another for
+/// it, or for the whole module tree it is part of; a layer that does not hold the chosen
+/// adapter runs its base alone.
+///
+/// [`AdapterChoice::set_adapter`]: crate::AdapterChoice::set_adapter
 #[derive(Module, Debug)]
 pub struct LoraLinear {
     /// The base weight, `[out, in]` (PyTorch's layout), kept at the dtype it was given in
     /// (bf16 or f32). It never requires a gradient.
     pub weight: Param<Tensor<2>>,
-    /// The adapter, if this layer has one.
-    pub lora: Option<Lora>,
+    adapters: Adapters,
 }
 
 impl LoraLinear {
@@ -127,7 +140,7 @@ impl LoraLinear {
     pub fn frozen(weight: Tensor<2>) -> Self {
         Self {
             weight: Param::initialized(ParamId::new(), weight.detach()),
-            lora: None,
+            adapters: Adapters::new(),
         }
     }
 
@@ -137,8 +150,29 @@ impl LoraLinear {
         Self::frozen(Tensor::from_data(weight, (device, dtype)))
     }
 
-    /// The same layer with `lora` as its adapter. Panics if the shapes do not fit the weight.
-    pub fn with_lora(mut self, lora: Lora) -> Self {
+    /// The same layer with `lora` as its adapter [`DEFAULT_ADAPTER`], the one it uses unless
+    /// another is chosen: a layer's single adapter. Panics if the shapes do not fit the weight.
+    pub fn with_lora(self, lora: Lora) -> Self {
+        self.with_adapter(DEFAULT_ADAPTER, lora)
+    }
+
+    /// Makes `lora` the layer's adapter [`DEFAULT_ADAPTER`], in the place of the one it held:
+    /// [`with_lora`](Self::with_lora) in place.
+    pub fn set_lora(&mut self, lora: Lora) {
+        self.insert_adapter(DEFAULT_ADAPTER, lora);
+    }
+
+    /// The same layer with `lora` as its adapter named `name`, added beside the others or in the
+    /// place of the one of that name. Panics if the shapes do not fit the weight, or if `name` is
+    /// empty or has a `.`.
+    pub fn with_adapter(mut self, name: &str, lora: Lora) -> Self {
+        self.insert_adapter(name, lora);
+        self
+    }
+
+    /// Adds `lora` as the adapter named `name`, or puts it in the place of the one of that name,
+    /// which it returns. Panics as [`with_adapter`](Self::with_adapter) does.
+    pub fn insert_adapter(&mut self, name: &str, lora: Lora) -> Option<Lora> {
         let [out, inp] = self.weight.val().dims();
         let [_, a_in] = lora.a.val().dims();
         let [b_out, _] = lora.b.val().dims();
@@ -147,8 +181,34 @@ impl LoraLinear {
             (out, inp),
             "the adapter is [out, r] x [r, in] = [{b_out}, {a_in}], the weight [{out}, {inp}]"
         );
-        self.lora = Some(lora);
-        self
+        self.adapters.insert(name, lora)
+    }
+
+    /// Removes the adapter named `name` and returns it. If it was the chosen one, the layer runs
+    /// its base alone until it holds one of that name again or another is chosen.
+    pub fn remove_adapter(&mut self, name: &str) -> Option<Lora> {
+        self.adapters.remove(name)
+    }
+
+    /// The adapter named `name`, if the layer holds one.
+    pub fn adapter(&self, name: &str) -> Option<&Lora> {
+        self.adapters.get(name)
+    }
+
+    /// The layer's adapters by name, in the order they were added.
+    pub fn adapters(&self) -> impl Iterator<Item = (&str, &Lora)> {
+        self.adapters.iter()
+    }
+
+    /// The name of the adapter the layer's forward pass uses where it holds it:
+    /// [`DEFAULT_ADAPTER`] unless another was chosen; `None` if the layer runs its base alone.
+    pub fn active_adapter(&self) -> Option<&str> {
+        self.adapters.active_name()
+    }
+
+    /// The adapter the forward pass uses: the chosen one, if the layer holds it.
+    pub fn lora(&self) -> Option<&Lora> {
+        self.adapters.active()
     }
 
     /// Input features.
@@ -161,7 +221,8 @@ impl LoraLinear {
         self.weight.val().dims()[0]
     }
 
-    /// `x Wᵀ + scale · (x Aᵀ) Bᵀ` for `x` `[.., in]`, returned at `x`'s dtype; the precision of
+    /// `x Wᵀ + scale · (x Aᵀ) Bᵀ` with the chosen adapter's factors, or `x Wᵀ` if the layer
+    /// holds none of that name, for `x` `[.., in]`, returned at `x`'s dtype; the precision of
     /// each part is in the [module documentation](self).
     pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
         let dtype = x.dtype();
@@ -170,7 +231,7 @@ impl LoraLinear {
             x.cast(weight.dtype())
                 .matmul(weight.clone().transpose().unsqueeze())
         };
-        match &self.lora {
+        match self.lora() {
             None => base(x).cast(dtype),
             Some(lora) => base(x.clone())
                 .cast(DType::F32)
