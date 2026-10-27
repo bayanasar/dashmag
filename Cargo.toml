@@ -19,7 +19,7 @@ dash-tract = { path = "crates/dash-tract", version = "0.0.1" }
 dash-iree = { path = "crates/dash-iree", version = "0.0.1" }
 dash-tensorrt = { path = "crates/dash-tensorrt", version = "0.0.1" }
 dash-edgetpu = { path = "crates/dash-edgetpu", version = "0.0.1" }
-dash-ops = { path = "crates/dash-ops", version = "0.0.1" }
+dash-ops = { path = "crates/dash-ops", version = "0.0.1", default-features = false }
 dash-lora = { path = "crates/dash-lora", version = "0.0.1" }
 # Pinned exactly: Burn changes its API and its record format between minor releases, and an
 # upgrade is its own change, checked against the same references.

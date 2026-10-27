@@ -11,7 +11,8 @@
 //!
 //! - [`gated_delta`]: the gated delta rule of Gated DeltaNet, chunked for training and
 //!   recurrent for decoding, over a batch or packed variable-length sequences.
-//! - [`attention`]: causal attention whose backward pass does not materialise the T x T scores.
+//! - [`attention`]: attention with grouped key-value heads and the masks models train with,
+//!   whose backward pass keeps no T x T scores, and decoding against a key-value cache.
 //! - [`logprob`]: the log-probability of chosen tokens under a large vocabulary, without the
 //!   n x V logits.
 //! - [`loss`]: cross-entropy fused with the output layer over a large vocabulary, with label

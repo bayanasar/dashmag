@@ -1,10 +1,16 @@
 //! Causal attention with grouped key-value heads (`dash_ops::attention`): the reference and its
-//! written-out backward pass against torch's math SDPA in fp32, the CUDA kernels against the
+//! written-out backward pass against torch's math SDPA in fp32, the CubeCL kernels against the
 //! same records in bf16 and f16 and against the reference at shapes with several blocks, and
-//! decoding against the reference.
+//! decoding against the reference. `tests/attention_masks.rs` covers the other masks.
+//!
+//! With a CubeCL runtime's feature the kernel tests run on that runtime's device
+//! (`tests/common`): the kernels where the device has what they ask, the reference elsewhere,
+//! each test asserting which ran.
 //!
 //!   cargo test -p dash-ops --test attention
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test attention
+//!   DASH_OPS_DEVICE=wgpu:vulkan cargo test --release -p dash-ops --features wgpu --test attention
+//!   DASH_OPS_DEVICE=cpu cargo test --release -p dash-ops --features cpu --test attention
 //!
 //! The records (`tests/fixtures/attention/*.safetensors`) hold inputs drawn from a normal
 //! distribution and rounded to bf16, so that the same inputs feed f32 and bf16 runs, and
@@ -13,11 +19,15 @@
 //! the module's `[B, T, H, D]` and `[B, T, H]`. Errors are reported as the largest absolute
 //! difference and that difference over the largest reference magnitude.
 
+mod common;
+
 use burn::backend::{DType, FloatDType, bf16};
 use burn::tensor::{Device, Tensor, TensorData};
 #[cfg(feature = "cuda")]
 use dash_ops::attention::causal_attention_backward;
-use dash_ops::attention::{attention_decode, causal_attention, causal_attention_with_lse, probe};
+use dash_ops::attention::{
+    AttentionOptions, attention_decode, causal_attention, causal_attention_with_lse, probe,
+};
 use safetensors::{Dtype, SafeTensors};
 use std::sync::Mutex;
 
@@ -211,28 +221,31 @@ fn check(label: &str, actual: &Results, expected: &Results, tolerance: [f32; 5])
 
 /// Tolerances on the error relative to the largest reference magnitude, in the order o, lse,
 /// dq, dk, dv, each just above the largest error measured over every case and every build that
-/// uses it (an RTX 5070 Ti, CUDA 13). In f32 the reference agrees with torch to rounding. In
-/// bf16 the error is the output's own rounding (8 significant bits) plus the probabilities'
-/// rounding to bf16 before the value product; the log-sum-exp is accumulated in f32
-/// throughout.
-const F32_TOLERANCE: [f32; 5] = [4e-7, 2e-7, 6e-7, 5e-7, 5e-7];
-/// The reference run on CUDA in f32, against torch: just above the largest error over the four
-/// CUDA builds (`cuda`, with `fusion`, each with and without Burn's `autotune`). Its products
-/// and reductions are Burn's CubeCL kernels, which autotune picks differently: dq is 4.2e-7
-/// relative without it and 7.1e-7 with it, dk 3.3e-7 and 3.7e-7; the rest moves less. Flex
-/// takes no part in those features, so `F32_TOLERANCE` holds for every build.
-#[cfg(feature = "cuda")]
-const CUDA_F32_TOLERANCE: [f32; 5] = [3e-7, 2e-7, 9e-7, 5e-7, 3e-7];
-#[cfg(feature = "cuda")]
-const BF16_TOLERANCE: [f32; 5] = [4e-3, 5e-7, 5.5e-3, 4.5e-3, 5e-3];
-#[cfg(feature = "cuda")]
-const F16_TOLERANCE: [f32; 5] = [5.5e-4, 5e-7, 5.5e-4, 4.5e-4, 5e-4];
+/// uses it: Flex; `cuda`, with `fusion`, `autotune` or both (an RTX 5070 Ti, CUDA 13); `wgpu` on
+/// lavapipe and `cpu`, where the reference runs. In f32 the reference agrees with torch to
+/// rounding. In bf16 the error is the output's own rounding (8 significant bits) plus the
+/// probabilities' rounding to bf16 before the value product; the log-sum-exp is accumulated in
+/// f32 throughout.
+const F32_TOLERANCE: [f32; 5] = [3e-7, 1.1e-7, 4.5e-7, 3.5e-7, 3.5e-7];
+/// The reference run on a CubeCL device in f32, against torch: just above the largest error
+/// over the four CUDA builds (`cuda`, with `fusion`, each with and without Burn's `autotune`),
+/// lavapipe and CubeCL's CPU runtime. Its products and reductions are Burn's CubeCL kernels,
+/// which autotune and the runtime pick differently: dq is 4.2e-7 relative on CUDA and 8.1e-7 on
+/// lavapipe, dk 3.3e-7 and 4.4e-7; the rest moves less. Flex takes no part in those features, so
+/// `F32_TOLERANCE` holds for every build.
+#[cfg(feature = "cubecl")]
+const CUBE_F32_TOLERANCE: [f32; 5] = [3.2e-7, 1.1e-7, 8.5e-7, 4.6e-7, 3.8e-7];
+#[cfg(feature = "cubecl")]
+const BF16_TOLERANCE: [f32; 5] = [3.4e-3, 2.5e-7, 4.7e-3, 4e-3, 4.2e-3];
+#[cfg(feature = "cubecl")]
+const F16_TOLERANCE: [f32; 5] = [4.6e-4, 1.7e-7, 4.7e-4, 3.6e-4, 4e-4];
 /// Decoding in bf16 against the f32 reference.
-#[cfg(feature = "cuda")]
-const DECODE_BF16_TOLERANCE: f32 = 3.5e-3;
+#[cfg(feature = "cubecl")]
+const DECODE_BF16_TOLERANCE: f32 = 2.9e-3;
 
 const RECORDS: [&str; 2] = ["gqa8x2_d256_t40", "gqa6x2_d64_tq24_tk56"];
 
+#[cfg(feature = "flex")]
 #[test]
 fn reference_and_its_backward_match_torch_on_flex() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -293,11 +306,17 @@ fn step_query(q: &Host) -> Host {
     q.reshaped(&[b, hq, d])
 }
 
+/// Decoding with the whole cache and the scale given: no lengths, no window.
+fn decode(q: Tensor<3>, k: Tensor<4>, v: Tensor<4>, scale: f32) -> Tensor<3> {
+    attention_decode(q, k, v, None, AttentionOptions::default().with_scale(scale))
+}
+
+#[cfg(feature = "flex")]
 #[test]
 fn decode_is_attention_with_one_query_on_flex() {
     let device = Device::flex();
     let (q, k, v, _, scale) = inputs([2, 4, 2, 1, 37, 64], 7);
-    let decoded = attention_decode(
+    let decoded = decode(
         step_query(&q).on::<3>(&device, DType::F32),
         k.on::<4>(&device, DType::F32),
         v.on::<4>(&device, DType::F32),
@@ -321,6 +340,7 @@ fn decode_is_attention_with_one_query_on_flex() {
 
 /// A decoding step that requires gradients takes the training path: its query's gradient is
 /// that of attention with one query.
+#[cfg(feature = "flex")]
 #[test]
 fn decode_with_gradients_is_attention_with_one_query_on_flex() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -335,7 +355,7 @@ fn decode_with_gradients_is_attention_with_one_query_on_flex() {
     let step_q = step_query(&q).on::<3>(&device, DType::F32).require_grad();
     let (step_k, step_v) = (leaf(&k), leaf(&v));
     let runs = probe::backward_runs();
-    let step = attention_decode(step_q.clone(), step_k.clone(), step_v.clone(), scale);
+    let step = decode(step_q.clone(), step_k.clone(), step_v.clone(), scale);
     let step_grads = (step * step_query(&grad).on::<3>(&device, DType::F32))
         .sum()
         .backward();
@@ -363,34 +383,83 @@ fn decode_with_gradients_is_attention_with_one_query_on_flex() {
     }
 }
 
-#[cfg(feature = "cuda")]
-mod cuda {
+/// The same checks on a CubeCL device, any runtime: the one `DASH_OPS_DEVICE` names. Where the
+/// device lacks what the kernels ask, the reference runs, and the tests assert that too.
+#[cfg(all(feature = "cubecl", feature = "flex"))]
+mod cube {
     use super::*;
+    use dash_ops::attention::{decode_kernels_take, kernels_take};
 
-    fn cuda() -> Device {
-        Device::cuda(0).autodiff()
+    fn device() -> Device {
+        common::cube_device().autodiff()
+    }
+
+    /// The `[B, Tq, Tk, Hq, Hkv, D]` of inputs from [`inputs`] for `dims` `[B, Hq, Hkv, Tq, Tk, D]`.
+    fn call_dims([b, hq, hkv, tq, tk, d]: [usize; 6]) -> [usize; 6] {
+        [b, tq, tk, hq, hkv, d]
+    }
+
+    /// The kernel launches a forward and backward pass over `dims` (`[B, Tq, Tk, Hq, Hkv, D]`) in
+    /// `dtype` makes on `device`: one forward and three backward kernels where the kernels take
+    /// them, none where the reference runs. Under CUDA the kernels take every bf16 and f16 call
+    /// with a head dimension of 64, 128 or 256: cards of compute capability 8.0 and later have
+    /// all they ask.
+    fn expected_launches(device: &Device, dtype: DType, dims: [usize; 6]) -> usize {
+        let [forward, backward] = kernels_take(device, dtype, dims);
+        let takes = matches!(dtype, DType::BF16 | DType::F16) && matches!(dims[5], 64 | 128 | 256);
+        if common::runtime_of(device) == Some("cuda") {
+            assert_eq!(
+                [forward, backward],
+                [takes, takes],
+                "CUDA turned the kernels away for {dims:?} {dtype:?}"
+            );
+        }
+        usize::from(forward) + 3 * usize::from(backward)
+    }
+
+    /// Whether `device` stores `dtype`; the tests in a dtype it does not skip, saying so.
+    fn has(device: &Device, dtype: DType) -> bool {
+        let has = device.supports_dtype(dtype);
+        if !has {
+            println!("skipped: {} has no {dtype:?}", common::describe(device));
+        }
+        has
+    }
+
+    /// Asserts that `f` launched exactly `expected` kernels: under fusion the kernels run when
+    /// their results are read, so `f` reads them.
+    fn launches_kernels<R>(expected: usize, f: impl FnOnce() -> R) -> R {
+        let before = probe::kernel_launches();
+        let result = f();
+        let launched = probe::kernel_launches() - before;
+        assert_eq!(
+            launched, expected,
+            "the kernels made {launched} launches, expected {expected}"
+        );
+        result
     }
 
     #[test]
     fn kernels_match_torch_in_bf16_and_f16() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let device = device();
+        println!("{}", common::describe(&device));
         for name in RECORDS {
             let r = record(name);
+            let [_, tq, hq, d] = [r.q.shape[0], r.q.shape[1], r.q.shape[2], r.q.shape[3]];
+            let [b, tk, hkv, _] = [r.k.shape[0], r.k.shape[1], r.k.shape[2], r.k.shape[3]];
             for (dtype, label, tolerance) in [
                 (DType::BF16, "bf16", BF16_TOLERANCE),
                 (DType::F16, "f16", F16_TOLERANCE),
             ] {
-                let (launches, runs, copies) = (
-                    probe::kernel_launches(),
-                    probe::backward_runs(),
-                    probe::input_copies(),
-                );
-                let actual = run(&cuda(), &r.q, &r.k, &r.v, &r.grad, r.scale, dtype);
-                // The forward, then delta, dQ, and dK with dV.
-                assert!(
-                    probe::kernel_launches() >= launches + 4,
-                    "the CUDA kernels did not run"
-                );
+                if !has(&device, dtype) {
+                    continue;
+                }
+                let expected = expected_launches(&device, dtype, [b, tq, tk, hq, hkv, d]);
+                let (runs, copies) = (probe::backward_runs(), probe::input_copies());
+                let actual = launches_kernels(expected, || {
+                    run(&device, &r.q, &r.k, &r.v, &r.grad, r.scale, dtype)
+                });
                 assert!(
                     probe::backward_runs() > runs,
                     "the written-out backward did not run"
@@ -401,7 +470,7 @@ mod cuda {
                     "contiguous inputs were copied"
                 );
                 check(
-                    &format!("cuda {label} {}", r.name),
+                    &format!("cube {label} {}", r.name),
                     &actual,
                     &r.expected,
                     tolerance,
@@ -411,22 +480,30 @@ mod cuda {
     }
 
     #[test]
-    fn f32_runs_the_reference_on_cuda() {
+    fn f32_runs_the_reference() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let r = record(RECORDS[0]);
-        let launches = probe::kernel_launches();
-        let actual = run(&cuda(), &r.q, &r.k, &r.v, &r.grad, r.scale, DType::F32);
-        assert_eq!(
-            probe::kernel_launches(),
-            launches,
-            "f32 should take the reference"
-        );
-        check(
-            &format!("cuda f32 {}", r.name),
-            &actual,
-            &r.expected,
-            CUDA_F32_TOLERANCE,
-        );
+        let device = device();
+        for name in RECORDS {
+            let r = record(name);
+            let dims = [
+                r.q.shape[0],
+                r.q.shape[1],
+                r.k.shape[1],
+                r.q.shape[2],
+                r.k.shape[2],
+                r.q.shape[3],
+            ];
+            assert_eq!(expected_launches(&device, DType::F32, dims), 0);
+            let actual = launches_kernels(0, || {
+                run(&device, &r.q, &r.k, &r.v, &r.grad, r.scale, DType::F32)
+            });
+            check(
+                &format!("cube f32 {}", r.name),
+                &actual,
+                &r.expected,
+                CUBE_F32_TOLERANCE,
+            );
+        }
     }
 
     /// Shapes with several query and key blocks, partial last blocks, groups of 1, 3 and 4,
@@ -434,6 +511,10 @@ mod cuda {
     #[test]
     fn kernels_match_the_reference_across_blocks() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let device = device();
+        if !has(&device, DType::BF16) {
+            return;
+        }
         let shapes = [
             [2, 8, 2, 200, 200, 256],
             [1, 4, 4, 130, 130, 128],
@@ -451,12 +532,14 @@ mod cuda {
                 scale,
                 DType::F32,
             );
-            let (launches, copies) = (probe::kernel_launches(), probe::input_copies());
-            let actual = run(&cuda(), &q, &k, &v, &grad, scale, DType::BF16);
-            assert!(probe::kernel_launches() >= launches + 4);
+            let launches = expected_launches(&device, DType::BF16, call_dims(dims));
+            let copies = probe::input_copies();
+            let actual = launches_kernels(launches, || {
+                run(&device, &q, &k, &v, &grad, scale, DType::BF16)
+            });
             assert_eq!(probe::input_copies(), copies);
             check(
-                &format!("cuda bf16 {dims:?}"),
+                &format!("cube bf16 {dims:?}"),
                 &actual,
                 &expected,
                 BF16_TOLERANCE,
@@ -466,12 +549,12 @@ mod cuda {
 
     /// The forward and backward through autodiff, every input given as a view of other storage
     /// through `layout`, against the reference on Flex from contiguous inputs. Returns the
-    /// inputs the kernels copied.
+    /// inputs the kernels copied, and whether they ran.
     fn run_with_layout(
         dims: [usize; 6],
         seed: u64,
         layout: impl Fn(&Host, &Device) -> Tensor<4>,
-    ) -> usize {
+    ) -> (usize, bool) {
         let (q, k, v, grad, scale) = inputs(dims, seed);
         let expected = run(
             &Device::flex().autodiff(),
@@ -482,29 +565,31 @@ mod cuda {
             scale,
             DType::F32,
         );
-        let device = cuda();
+        let device = device();
         let leaf = |h: &Host| layout(h, &device).detach().require_grad();
         let (qt, kt, vt) = (leaf(&q), leaf(&k), leaf(&v));
-        let (launches, copies) = (probe::kernel_launches(), probe::input_copies());
-        let (o, lse) = causal_attention_with_lse(qt.clone(), kt.clone(), vt.clone(), scale);
-        let grads = (o.clone() * grad.on::<4>(&device, DType::BF16))
-            .sum()
-            .backward();
-        let actual = Results {
-            o: Host::from_tensor(o),
-            lse: Host::from_tensor(lse),
-            dq: Host::from_tensor(qt.grad(&grads).unwrap()),
-            dk: Host::from_tensor(kt.grad(&grads).unwrap()),
-            dv: Host::from_tensor(vt.grad(&grads).unwrap()),
-        };
-        assert!(probe::kernel_launches() >= launches + 4);
+        let launches = expected_launches(&device, DType::BF16, call_dims(dims));
+        let copies = probe::input_copies();
+        let actual = launches_kernels(launches, || {
+            let (o, lse) = causal_attention_with_lse(qt.clone(), kt.clone(), vt.clone(), scale);
+            let grads = (o.clone() * grad.on::<4>(&device, DType::BF16))
+                .sum()
+                .backward();
+            Results {
+                o: Host::from_tensor(o),
+                lse: Host::from_tensor(lse),
+                dq: Host::from_tensor(qt.grad(&grads).unwrap()),
+                dk: Host::from_tensor(kt.grad(&grads).unwrap()),
+                dv: Host::from_tensor(vt.grad(&grads).unwrap()),
+            }
+        });
         check(
-            &format!("cuda bf16 strided {dims:?}"),
+            &format!("cube bf16 strided {dims:?}"),
             &actual,
             &expected,
             BF16_TOLERANCE,
         );
-        probe::input_copies() - copies
+        (probe::input_copies() - copies, launches > 0)
     }
 
     /// Inputs stored in torch's order, `[B, H, T, D]`, and seen as `[B, T, H, D]` through
@@ -513,6 +598,9 @@ mod cuda {
     #[test]
     fn kernels_read_head_major_inputs_in_place() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !has(&device(), DType::BF16) {
+            return;
+        }
         let dims = [2, 8, 2, 96, 96, 256];
         let head_major = |h: &Host, device: &Device| {
             let t = h.on::<4>(device, DType::BF16).swap_dims(1, 2);
@@ -520,7 +608,7 @@ mod cuda {
                 .cast(DType::BF16)
                 .swap_dims(1, 2)
         };
-        let copies = run_with_layout(dims, 5, head_major);
+        let (copies, _) = run_with_layout(dims, 5, head_major);
         assert_eq!(copies, 0, "inputs the kernels read in place were copied");
 
         let features_first = |h: &Host, device: &Device| {
@@ -529,9 +617,9 @@ mod cuda {
                 .cast(DType::BF16)
                 .swap_dims(2, 3)
         };
-        let copies = run_with_layout(dims, 6, features_first);
+        let (copies, kernels) = run_with_layout(dims, 6, features_first);
         assert!(
-            copies >= 3,
+            copies >= 3 || !kernels,
             "inputs with a strided last dimension were not copied"
         );
     }
@@ -540,7 +628,17 @@ mod cuda {
     #[test]
     fn decode_matches_the_reference() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let device = Device::cuda(0);
+        let device = common::cube_device();
+        if !has(&device, DType::BF16) {
+            return;
+        }
+        let launches = |[b, hq, hkv, _, s, d]: [usize; 6]| {
+            let takes = decode_kernels_take(&device, DType::BF16, [b, s, hq, hkv, d]);
+            if common::runtime_of(&device) == Some("cuda") {
+                assert!(takes, "CUDA turned the decoding kernels away");
+            }
+            2 * usize::from(takes)
+        };
         for (i, dims) in [
             [3, 8, 2, 1, 1000, 256],
             [2, 4, 1, 1, 77, 128],
@@ -553,20 +651,21 @@ mod cuda {
             let (q, k, v, _, scale) = inputs(dims, 200 + 10 * i as u64);
             let q = step_query(&q);
             let flex = Device::flex();
-            let expected = Host::from_tensor(attention_decode(
+            let expected = Host::from_tensor(decode(
                 q.on::<3>(&flex, DType::F32),
                 k.on::<4>(&flex, DType::F32),
                 v.on::<4>(&flex, DType::F32),
                 scale,
             ));
-            let (launches, copies) = (probe::kernel_launches(), probe::input_copies());
-            let actual = Host::from_tensor(attention_decode(
-                q.on::<3>(&device, DType::BF16),
-                k.on::<4>(&device, DType::BF16),
-                v.on::<4>(&device, DType::BF16),
-                scale,
-            ));
-            assert!(probe::kernel_launches() >= launches + 2);
+            let copies = probe::input_copies();
+            let actual = launches_kernels(launches(dims), || {
+                Host::from_tensor(decode(
+                    q.on::<3>(&device, DType::BF16),
+                    k.on::<4>(&device, DType::BF16),
+                    v.on::<4>(&device, DType::BF16),
+                    scale,
+                ))
+            });
             assert_eq!(probe::input_copies(), copies);
             let (abs, rel) = errors(&actual, &expected);
             println!("decode bf16 {dims:?}: max abs {abs:.3e}, relative {rel:.3e}");
@@ -577,10 +676,11 @@ mod cuda {
         }
 
         // On an autodiff device, a step that takes no gradient runs the same kernels.
-        let (q, k, v, _, scale) = inputs([3, 8, 2, 1, 1000, 256], 200);
+        let dims = [3, 8, 2, 1, 1000, 256];
+        let (q, k, v, _, scale) = inputs(dims, 200);
         let q = step_query(&q);
         let step = |device: &Device| {
-            Host::from_tensor(attention_decode(
+            Host::from_tensor(decode(
                 q.on::<3>(device, DType::BF16),
                 k.on::<4>(device, DType::BF16),
                 v.on::<4>(device, DType::BF16),
@@ -588,12 +688,7 @@ mod cuda {
             ))
         };
         let plain = step(&device);
-        let launches = probe::kernel_launches();
-        let autodiff = step(&device.clone().autodiff());
-        assert!(
-            probe::kernel_launches() >= launches + 2,
-            "the autodiff device did not run the decoding kernels"
-        );
+        let autodiff = launches_kernels(launches(dims), || step(&device.clone().autodiff()));
         let (abs, _) = errors(&autodiff, &plain);
         assert!(
             abs == 0.0,
@@ -601,25 +696,28 @@ mod cuda {
         );
 
         // A cache of 512 positions of which the first 300 are filled: read as a slice, in place.
-        let (q, k, v, _, scale) = inputs([2, 8, 2, 1, 512, 256], 300);
+        let dims = [2, 8, 2, 1, 512, 256];
+        let (q, k, v, _, scale) = inputs(dims, 300);
         let q = step_query(&q);
         let flex = Device::flex();
         let slice = |h: &Host, device: &Device, dtype| {
             h.on::<4>(device, dtype).slice([0..2, 0..300, 0..2, 0..256])
         };
-        let expected = Host::from_tensor(attention_decode(
+        let expected = Host::from_tensor(decode(
             q.on::<3>(&flex, DType::F32),
             slice(&k, &flex, DType::F32),
             slice(&v, &flex, DType::F32),
             scale,
         ));
         let copies = probe::input_copies();
-        let actual = Host::from_tensor(attention_decode(
-            q.on::<3>(&device, DType::BF16),
-            slice(&k, &device, DType::BF16),
-            slice(&v, &device, DType::BF16),
-            scale,
-        ));
+        let actual = launches_kernels(launches([2, 8, 2, 1, 300, 256]), || {
+            Host::from_tensor(decode(
+                q.on::<3>(&device, DType::BF16),
+                slice(&k, &device, DType::BF16),
+                slice(&v, &device, DType::BF16),
+                scale,
+            ))
+        });
         assert_eq!(probe::input_copies(), copies, "the sliced cache was copied");
         let (abs, rel) = errors(&actual, &expected);
         println!("decode bf16 sliced cache: max abs {abs:.3e}, relative {rel:.3e}");
@@ -628,6 +726,12 @@ mod cuda {
             "sliced cache: relative error {rel:.3e}"
         );
     }
+}
+
+/// Memory on CUDA, where CubeCL's pools report what they hold.
+#[cfg(feature = "cuda")]
+mod cuda {
+    use super::*;
 
     /// What CubeCL's pools on device 0 hold.
     struct Memory {
@@ -668,7 +772,7 @@ mod cuda {
     /// The two are called directly on the CUDA device rather than through autodiff, so that
     /// what runs between the measurements is this module's kernels alone (no loss, no
     /// autotuned Burn operation), and each step is synchronised before memory is read, which
-    /// Burn's fusion needs for it to have run at all.
+    /// Burn's fusion needs for it to have run at all. On CUDA only: it reads CUDA's pools.
     #[test]
     fn forward_and_backward_keep_no_t_by_t() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

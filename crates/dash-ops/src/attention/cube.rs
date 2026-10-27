@@ -1,6 +1,7 @@
-//! The CUDA backend: launches the kernels of `kernels.rs` for the inputs they take (bf16 or
-//! f16, head dimension 64, 128 or 256, a device with `mma.sync` and `ldmatrix` for that dtype)
-//! and runs the reference for the rest.
+//! The CubeCL backend, for every CubeCL runtime: launches the kernels of `kernels.rs` for the
+//! inputs they take (bf16 or f16, head dimension 64, 128 or 256) on a device with what they ask
+//! (the [`Requirements`] of each pass, `mma.sync` m16n8k16 and `ldmatrix` for the dtype), and
+//! runs the reference for the rest.
 //!
 //! Inputs are read through their strides, in place where the kernels can (see [`readable`]).
 //! Every tensor the kernels write is allocated contiguous, in the layout the module
@@ -11,22 +12,31 @@ use super::kernels::{
     BLOCK_KV, BLOCK_Q, FORWARD_BLOCK_Q, decode_merge_kernel, decode_split_kernel, delta_kernel,
     dkdv_kernel, dq_kernel, forward_kernel,
 };
-use super::{CausalAttentionBackend, probe, reference};
+use super::{
+    AttentionBackend, AttentionMaskPrimitive, AttentionOptions, CacheLengths, MaskShape,
+    check_decode_shapes, check_shapes, probe, reference,
+};
+use crate::cube::Requirements;
 use burn::backend::cubecl::{dtype_to_elem_type, dtype_to_storage_type};
-use burn::backend::ops::FloatTensorOps;
+use burn::backend::ops::{BoolTensorOps, FloatTensorOps, IntTensorOps};
 use burn::backend::tensor::FloatTensor;
-use burn::backend::{DType, FloatDType, Shape};
+use burn::backend::{DType, FloatDType, IntDType, Shape};
 use burn_cubecl::CubeBackend;
 use burn_cubecl::kernel::{into_contiguous, untile};
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
+use cubecl::client::Client;
 use cubecl::ir::features::MmaConfig;
-use cubecl::ir::{ElemType, FloatKind};
+use cubecl::ir::{AddressType, DeviceProperties, ElemType, FloatKind};
 use cubecl::prelude::*;
 use std::sync::atomic::Ordering;
 
 /// Elements per 16-byte vector: the kernels' unit of every load, so strides count in it.
 const VECTOR: usize = 8;
+
+/// The plane width the kernels are written for: the tensor-core fragments give each of 32
+/// lanes its rows and columns, and the reductions shuffle across those lanes.
+const PLANE: u32 = 32;
 
 /// The key block of the forward and `dQ` kernels for head dimension `d`: 32 keys at 256, so that
 /// queries (128 rows in the forward, 64 with the output gradients in `dQ`), keys and values fit
@@ -35,28 +45,68 @@ fn block_kv(d: usize) -> u32 {
     if d > 128 { 32 } else { 64 }
 }
 
-/// Bytes of shared memory the `dQ` kernel, the largest, takes at head dimension `d`.
-fn shared_bytes(d: usize) -> usize {
-    (2 * BLOCK_Q as usize + 2 * block_kv(d) as usize) * d * 2
+/// `[B, Tq, Tk, Hq, Hkv, D]` of queries `[B, Tq, Hq, D]` and keys `[B, Tk, Hkv, D]`.
+fn dims(query: &CubeTensor, key: &CubeTensor) -> [usize; 6] {
+    let [b, tq, hq, d] = query.meta.shape().dims::<4>();
+    let [_, tk, hkv, _] = key.meta.shape().dims::<4>();
+    [b, tq, tk, hq, hkv, d]
 }
 
-/// Whether the kernels take these inputs (`key` and `value` `[B, Tk, Hkv, D]`, `query` with `D`
-/// last).
-fn supported(query: &CubeTensor, key: &CubeTensor, value: &CubeTensor) -> bool {
-    let dtype = query.dtype;
-    if !matches!(dtype, DType::BF16 | DType::F16) || key.dtype != dtype || value.dtype != dtype {
-        return false;
+/// Bytes of shared memory a block of `rows` queries keeps its rows' key intervals and its warp
+/// groups' spans in, beside the padding flags of a tile of `keys` keys.
+fn bounds_bytes(rows: usize, groups: usize, keys: usize) -> usize {
+    4 * (2 * rows + 4 * groups + keys)
+}
+
+/// What the forward kernel asks: 256 units per cube, a cube per 128 queries of each query head
+/// (and batch element), the query, key and value tiles, the rows' key intervals, the warps'
+/// spans and the padding flags in shared memory, eight tensors, 16-byte vectors and planes of
+/// 32.
+fn forward_requirements([_, tq, _, hq, _, d]: [usize; 6]) -> Requirements {
+    let bkv = block_kv(d) as usize;
+    let rows = FORWARD_BLOCK_Q as usize;
+    let tiles = (rows + 2 * bkv) * d * 2;
+    Requirements {
+        shared_bytes: tiles + bounds_bytes(rows, rows / 16, bkv),
+        vector_size: VECTOR,
+        plane_width: Some(PLANE),
+        ..Requirements::new(
+            (2 * FORWARD_BLOCK_Q, 1),
+            (tq.div_ceil(FORWARD_BLOCK_Q as usize), hq),
+            8,
+        )
     }
-    let d = key.meta.shape()[3];
-    if !matches!(d, 64 | 128 | 256) {
-        return false;
+}
+
+/// What the backward kernels ask, the most of each: 256 units per cube; `delta`'s cube per
+/// `256 / (D / 8)` rows, `dQ`'s per 64 queries of each query head, `dK`/`dV`'s per 32 keys of
+/// each key-value head; `dQ`'s query, output-gradient, key and value tiles in shared memory (the
+/// most, beside `dK`/`dV`'s four 32-row tiles and its 32 x 32 tiles of `P` and `dS`); the twelve
+/// tensors of `dK`/`dV`; 16-byte vectors and planes of 32.
+fn backward_requirements([b, tq, tk, hq, hkv, d]: [usize; 6]) -> Requirements {
+    let bkv = block_kv(d) as usize;
+    let rows_per_cube = 256 / (d / VECTOR);
+    let delta = Requirements::new((256, 1), ((b * tq * hq).div_ceil(rows_per_cube), 1), 8);
+    let rows = BLOCK_Q as usize;
+    let dq = Requirements {
+        shared_bytes: (2 * rows + 2 * bkv) * d * 2 + bounds_bytes(rows, rows / 16, bkv),
+        ..Requirements::new((256, 1), (tq.div_ceil(BLOCK_Q as usize), hq), 10)
+    };
+    let block = BLOCK_KV as usize;
+    let dkdv = Requirements {
+        shared_bytes: 4 * block * d * 2 + 2 * block * block * 2 + 4 * 4 * block,
+        ..Requirements::new((256, 1), (tk.div_ceil(block), hkv), 12)
+    };
+    Requirements {
+        vector_size: VECTOR,
+        plane_width: Some(PLANE),
+        ..delta.max(dq).max(dkdv)
     }
-    // Empty inputs launch nothing: the reference returns their empty results.
-    if query.meta.shape().num_elements() == 0 || key.meta.shape().num_elements() == 0 {
-        return false;
-    }
+}
+
+/// Whether the device has `mma.sync` m16n8k16 from `dtype` into f32, and `ldmatrix` for it.
+fn tensor_cores(properties: &DeviceProperties, dtype: DType) -> bool {
     let elem = dtype_to_elem_type(dtype);
-    let properties = query.client.properties();
     let mma = MmaConfig {
         a_type: elem,
         b_type: elem,
@@ -67,7 +117,93 @@ fn supported(query: &CubeTensor, key: &CubeTensor, value: &CubeTensor) -> bool {
     };
     properties.features.matmul.mma.contains(&mma)
         && properties.features.matmul.ldmatrix.contains(&elem)
-        && properties.hardware.max_shared_memory_size >= shared_bytes(d)
+}
+
+/// Whether the kernels take a forward (or backward) pass over inputs of `dtype` and dimensions
+/// `[B, Tq, Tk, Hq, Hkv, D]` on the device `client` serves: bf16 or f16, a head dimension of 64,
+/// 128 or 256, something to compute, positions and elements that `i32` and `u32` index, and a
+/// device with what the kernels ask. The reference runs otherwise.
+pub(super) fn kernels_take(
+    client: &Client,
+    dtype: DType,
+    dims: [usize; 6],
+    backward: bool,
+) -> bool {
+    let [b, tq, tk, hq, hkv, d] = dims;
+    let properties = client.properties();
+    let requirements = if backward {
+        backward_requirements(dims)
+    } else {
+        forward_requirements(dims)
+    };
+    matches!(dtype, DType::BF16 | DType::F16)
+        && matches!(d, 64 | 128 | 256)
+        && b * tq * hq > 0
+        && tk > 0
+        && tq + tk < 1 << 29
+        && (b * tq.max(tk) * hq.max(hkv) * d) < 1 << 32
+        && b <= properties.hardware.max_cube_count.2 as usize
+        && tensor_cores(properties, dtype)
+        && requirements.met_on(client, &[dtype, DType::F32, DType::I32])
+}
+
+/// What the decoding kernels ask for `[B, S, Hq, Hkv, D]` in `splits` splits: 128 units per
+/// cube for the splits (four planes of 32, sharing their partial results through shared memory)
+/// and `D` for the merge; six tensors; 16-byte vectors.
+fn decode_requirements([b, _, hq, hkv, d]: [usize; 5], splits: usize) -> Requirements {
+    let group = hq / hkv;
+    let chunks = d / VECTOR;
+    let slots = 4 * (32 / chunks);
+    let split = Requirements {
+        shared_bytes: slots * group * (2 * 4 + chunks * 32),
+        vector_size: VECTOR,
+        plane_width: Some(PLANE),
+        ..Requirements::new((128, 1), (splits, hkv), 6)
+    };
+    let merge = Requirements::new((d as u32, 1), (b * hq, 1), 3);
+    split.max(merge)
+}
+
+/// How decoding splits the cache, for `[B, S, Hq, Hkv, D]` and a window reaching `left` keys
+/// before the query: about eight cubes per multiprocessor, each split a whole number of the first
+/// pass's key slots long, over the keys a query can see at most. Returns `(split_len, splits)`.
+fn decode_splits(client: &Client, [b, s, _, hkv, d]: [usize; 5], left: usize) -> (usize, usize) {
+    let slots = 4 * (32 / (d / VECTOR));
+    let span = s.min(left.saturating_add(1)).max(1);
+    let processors = client
+        .properties()
+        .hardware
+        .num_streaming_multiprocessors
+        .unwrap_or(64) as usize;
+    let wanted = (8 * processors).div_ceil(b * hkv).max(1);
+    let split_len = span.div_ceil(wanted).max(slots).next_multiple_of(slots);
+    (split_len, span.div_ceil(split_len))
+}
+
+/// Whether the decoding kernels take a step over inputs of `dtype` and dimensions
+/// `[B, S, Hq, Hkv, D]` on the device `client` serves: as [`kernels_take`], with at most 16
+/// query heads per key-value head (the first pass keeps a group's query rows in registers and
+/// their partial sums in shared memory).
+pub(super) fn decode_kernels_take(client: &Client, dtype: DType, dims: [usize; 5]) -> bool {
+    let [b, s, hq, hkv, d] = dims;
+    let properties = client.properties();
+    let (_, splits) = decode_splits(client, dims, usize::MAX);
+    matches!(dtype, DType::BF16 | DType::F16)
+        && matches!(d, 64 | 128 | 256)
+        && b * hq > 0
+        && s > 0
+        && s < 1 << 29
+        && hq / hkv <= 16
+        && (b * s * hkv * d).max(b * hq * splits * d) < 1 << 32
+        && b <= properties.hardware.max_cube_count.2 as usize
+        && decode_requirements(dims, splits).met_on(client, &[dtype, DType::F32, DType::I32])
+}
+
+/// Whether the kernels index every one of `tensors` with `u32`.
+fn indexable(tensors: &[&CubeTensor]) -> bool {
+    tensors
+        .iter()
+        .all(|tensor| tensor.required_address_type() == AddressType::U32)
 }
 
 /// Whether the kernels read `tensor` as it is: rows (not a matmul's storage tiles), the last
@@ -117,9 +253,86 @@ fn sequence_strides(tensor: &CubeTensor) -> [u32; 3] {
     vector_strides(tensor, [0, 2, 1])
 }
 
-fn dims(tensor: &CubeTensor) -> [usize; 4] {
-    let shape = tensor.meta.shape();
-    [shape[0], shape[1], shape[2], shape[3]]
+/// An Int tensor as the kernels read it: `i32`, untiled.
+fn int32(tensor: CubeTensor) -> CubeTensor {
+    let tensor = if tensor.dtype == DType::I32 {
+        tensor
+    } else {
+        CubeBackend::int_cast(tensor, IntDType::I32)
+    };
+    untile(tensor)
+}
+
+/// A one-element `i32` tensor bound where a kernel's mask argument goes unread.
+fn unread(like: &CubeTensor) -> CubeTensor {
+    empty_device_contiguous_dtype(
+        like.client.clone(),
+        like.device.clone(),
+        Shape::new([1]),
+        DType::I32,
+    )
+}
+
+/// The mask and the options as the training kernels take them.
+struct Mask {
+    /// `[B, Tk]` `i32`, nonzero where a key is left out, or unread.
+    keys: CubeTensor,
+    /// Its batch and key strides, in elements.
+    key_strides: [u32; 2],
+    /// The offsets of packed sequences, contiguous `i32` `[S + 1]`, or unread.
+    cu_q: CubeTensor,
+    cu_k: CubeTensor,
+    /// `S`.
+    seqs: u32,
+    padded: bool,
+    packed: bool,
+    /// How far a query sees before and after its position, at most `Tq + Tk + 1` (unbounded).
+    left: i32,
+    right: i32,
+}
+
+impl Mask {
+    fn new(
+        mask: AttentionMaskPrimitive<CubeBackend>,
+        options: &AttentionOptions,
+        [_, tq, tk, ..]: [usize; 6],
+        like: &CubeTensor,
+    ) -> Self {
+        let unbounded = tq + tk + 1;
+        let (left, right) = options.reach();
+        let mut out = Self {
+            keys: unread(like),
+            key_strides: [0, 0],
+            cu_q: unread(like),
+            cu_k: unread(like),
+            seqs: 0,
+            padded: false,
+            packed: false,
+            left: left.min(unbounded) as i32,
+            right: right.min(unbounded) as i32,
+        };
+        match mask {
+            AttentionMaskPrimitive::None => {}
+            AttentionMaskPrimitive::KeyPadding(keys) => {
+                let keys = untile(CubeBackend::bool_into_int(keys, IntDType::I32));
+                let strides = keys.meta.strides();
+                out.key_strides = [strides[0], strides[1]]
+                    .map(|stride| u32::try_from(stride).expect("strides fit in u32"));
+                out.keys = keys;
+                out.padded = true;
+            }
+            AttentionMaskPrimitive::Packed {
+                cu_seqlens_q,
+                cu_seqlens_k,
+            } => {
+                out.seqs = (cu_seqlens_q.meta.shape()[0] - 1) as u32;
+                out.cu_q = into_contiguous(int32(cu_seqlens_q));
+                out.cu_k = into_contiguous(int32(cu_seqlens_k));
+                out.packed = true;
+            }
+        }
+        out
+    }
 }
 
 fn launched() {
@@ -131,11 +344,11 @@ fn forward(
     query: CubeTensor,
     key: CubeTensor,
     value: CubeTensor,
+    mask: &Mask,
     scale: f32,
 ) -> (CubeTensor, CubeTensor) {
     let (query, key, value) = (readable(query), readable(key), readable(value));
-    let [b, tq, hq, d] = dims(&query);
-    let [_, tk, hkv, _] = dims(&key);
+    let [b, tq, tk, hq, hkv, d] = dims(&query, &key);
     let client = query.client.clone();
     let device = query.device.clone();
     let output = empty_device_contiguous_dtype(
@@ -149,10 +362,14 @@ fn forward(
     let [q_sb, q_sh, q_st] = sequence_strides(&query);
     let [k_sb, k_sh, k_st] = sequence_strides(&key);
     let [v_sb, v_sh, v_st] = sequence_strides(&value);
+    let [m_sb, m_st] = mask.key_strides;
     let q_blocks = tq.div_ceil(FORWARD_BLOCK_Q as usize);
     let cube_count = CubeCount::Static(q_blocks as u32, hq as u32, b as u32);
     let dtype = dtype_to_storage_type(query.dtype);
     launched();
+    // SAFETY: the shapes were checked against each other, and the kernel bounds every index it
+    // forms by them: rows below Tq, keys below Tk (whatever the offsets say), heads and batch
+    // elements from the cube count.
     unsafe {
         forward_kernel::launch_unchecked(
             &client,
@@ -163,6 +380,9 @@ fn forward(
             value.into_tensor_arg(),
             output.clone().into_tensor_arg(),
             lse.clone().into_tensor_arg(),
+            mask.keys.clone().into_tensor_arg(),
+            mask.cu_q.clone().into_tensor_arg(),
+            mask.cu_k.clone().into_tensor_arg(),
             q_blocks as u32,
             tq as u32,
             tk as u32,
@@ -176,10 +396,17 @@ fn forward(
             v_sb,
             v_sh,
             v_st,
+            m_sb,
+            m_st,
+            mask.seqs,
+            mask.left,
+            mask.right,
             scale,
             d as u32,
             FORWARD_BLOCK_Q,
             block_kv(d),
+            mask.padded,
+            mask.packed,
             dtype,
         );
     }
@@ -210,13 +437,13 @@ fn backward(
     output: CubeTensor,
     lse: CubeTensor,
     grad_output: CubeTensor,
+    mask: &Mask,
     scale: f32,
 ) -> (CubeTensor, CubeTensor, CubeTensor) {
     let (query, key, value) = (readable(query), readable(key), readable(value));
     let (output, grad_output) = (readable(output), readable(grad_output));
     let lse = lse_readable(lse);
-    let [b, tq, hq, d] = dims(&query);
-    let [_, tk, hkv, _] = dims(&key);
+    let [b, tq, tk, hq, hkv, d] = dims(&query, &key);
     let client = query.client.clone();
     let device = query.device.clone();
     let dtype = dtype_to_storage_type(query.dtype);
@@ -225,6 +452,7 @@ fn backward(
     let [v_sb, v_sh, v_st] = sequence_strides(&value);
     let [o_sb, o_sh, o_st] = sequence_strides(&output);
     let [do_sb, do_sh, do_st] = sequence_strides(&grad_output);
+    let [m_sb, m_st] = mask.key_strides;
     let group = (hq / hkv) as u32;
 
     let rows = b * tq * hq;
@@ -234,8 +462,27 @@ fn backward(
         Shape::new([b, tq, hq]),
         DType::F32,
     );
+    // The log-sum-exp as `dQ` and `dK`/`dV` read it: `+inf` for a query that sees no key.
+    let lse_bwd = empty_device_contiguous_dtype(
+        client.clone(),
+        device.clone(),
+        Shape::new([b, tq, hq]),
+        DType::F32,
+    );
+    // Packed, each query's interval of keys, for `dK`/`dV`.
+    let bounds = if mask.packed {
+        empty_device_contiguous_dtype(
+            client.clone(),
+            device.clone(),
+            Shape::new([tq, 2]),
+            DType::I32,
+        )
+    } else {
+        unread(&query)
+    };
     let rows_per_cube = 256 / (d / VECTOR);
     launched();
+    // SAFETY: as for the forward; `delta` reads the output and its gradient row by row.
     unsafe {
         delta_kernel::launch_unchecked(
             &client,
@@ -244,16 +491,26 @@ fn backward(
             output.into_tensor_arg(),
             grad_output.clone().into_tensor_arg(),
             delta.clone().into_tensor_arg(),
+            lse.into_tensor_arg(),
+            lse_bwd.clone().into_tensor_arg(),
+            bounds.clone().into_tensor_arg(),
+            mask.cu_q.clone().into_tensor_arg(),
+            mask.cu_k.clone().into_tensor_arg(),
             rows as u32,
             hq as u32,
             tq as u32,
+            tk as u32,
             o_sb,
             o_sh,
             o_st,
             do_sb,
             do_sh,
             do_st,
+            mask.seqs,
+            mask.left,
+            mask.right,
             d as u32,
+            mask.packed,
             dtype,
         );
     }
@@ -265,6 +522,7 @@ fn backward(
         query.dtype,
     );
     launched();
+    // SAFETY: as for the forward.
     unsafe {
         dq_kernel::launch_unchecked(
             &client,
@@ -274,9 +532,12 @@ fn backward(
             key.clone().into_tensor_arg(),
             value.clone().into_tensor_arg(),
             grad_output.clone().into_tensor_arg(),
-            lse.clone().into_tensor_arg(),
+            lse_bwd.clone().into_tensor_arg(),
             delta.clone().into_tensor_arg(),
             grad_query.clone().into_tensor_arg(),
+            mask.keys.clone().into_tensor_arg(),
+            mask.cu_q.clone().into_tensor_arg(),
+            mask.cu_k.clone().into_tensor_arg(),
             tq.div_ceil(BLOCK_Q as usize) as u32,
             tq as u32,
             tk as u32,
@@ -294,8 +555,15 @@ fn backward(
             do_sh,
             do_st,
             scale,
+            m_sb,
+            m_st,
+            mask.seqs,
+            mask.left,
+            mask.right,
             d as u32,
             block_kv(d),
+            mask.padded,
+            mask.packed,
             dtype,
         );
     }
@@ -313,6 +581,7 @@ fn backward(
         value.dtype,
     );
     launched();
+    // SAFETY: as for the forward.
     unsafe {
         dkdv_kernel::launch_unchecked(
             &client,
@@ -322,10 +591,14 @@ fn backward(
             key.into_tensor_arg(),
             value.into_tensor_arg(),
             grad_output.into_tensor_arg(),
-            lse.into_tensor_arg(),
+            lse_bwd.into_tensor_arg(),
             delta.into_tensor_arg(),
             grad_key.clone().into_tensor_arg(),
             grad_value.clone().into_tensor_arg(),
+            mask.keys.clone().into_tensor_arg(),
+            bounds.into_tensor_arg(),
+            mask.cu_q.clone().into_tensor_arg(),
+            mask.cu_k.clone().into_tensor_arg(),
             tq as u32,
             tk as u32,
             group,
@@ -341,35 +614,47 @@ fn backward(
             do_sb,
             do_sh,
             do_st,
+            m_sb,
+            m_st,
+            mask.seqs,
+            mask.left,
+            mask.right,
             scale,
             d as u32,
+            mask.padded,
+            mask.packed,
             dtype,
         );
     }
     (grad_query, grad_key, grad_value)
 }
 
-/// Decoding, `query` `[B, Hq, D]` against `key` and `value` `[B, S, Hkv, D]`: the cache split so
-/// that there are about eight cubes per multiprocessor, each split a whole number of the first
-/// pass's key slots long.
-fn decode(query: CubeTensor, key: CubeTensor, value: CubeTensor, scale: f32) -> CubeTensor {
+/// Decoding, `query` `[B, Hq, D]` against `key` and `value` `[B, S, Hkv, D]`, sequence `b`
+/// holding `lengths[b]` keys (all `S` without lengths) and its query the last `left + 1` of
+/// them: the cache split by [`decode_splits`], each split counted back from the sequence's last
+/// key, then the splits merged.
+fn decode(
+    query: CubeTensor,
+    key: CubeTensor,
+    value: CubeTensor,
+    lengths: Option<CubeTensor>,
+    left: usize,
+    scale: f32,
+) -> CubeTensor {
     let (query, key, value) = (readable(query), readable(key), readable(value));
-    let [b, len, hkv, d] = dims(&key);
+    let [b, len, hkv, d] = key.meta.shape().dims::<4>();
     let hq = query.meta.shape()[1];
     let client = query.client.clone();
     let device = query.device.clone();
     let dtype = dtype_to_storage_type(query.dtype);
     let group = hq / hkv;
-
-    let slots = 4 * (32 / (d / VECTOR));
-    let processors = client
-        .properties()
-        .hardware
-        .num_streaming_multiprocessors
-        .unwrap_or(64) as usize;
-    let wanted = (8 * processors).div_ceil(b * hkv).max(1);
-    let split_len = len.div_ceil(wanted).max(slots).next_multiple_of(slots);
-    let splits = len.div_ceil(split_len);
+    let (split_len, splits) = decode_splits(&client, [b, len, hq, hkv, d], left);
+    let has_lengths = lengths.is_some();
+    let lengths = match lengths {
+        Some(lengths) => int32(lengths),
+        None => unread(&query),
+    };
+    let l_st = u32::try_from(lengths.meta.strides()[0]).expect("strides fit in u32");
 
     let part_o = empty_device_contiguous_dtype(
         client.clone(),
@@ -387,6 +672,8 @@ fn decode(query: CubeTensor, key: CubeTensor, value: CubeTensor, scale: f32) -> 
     let [k_sb, k_sh, k_st] = sequence_strides(&key);
     let [v_sb, v_sh, v_st] = sequence_strides(&value);
     launched();
+    // SAFETY: the shapes were checked against each other, and the kernel keeps every key it
+    // reads below the cache's length, whatever the lengths say.
     unsafe {
         decode_split_kernel::launch_unchecked(
             &client,
@@ -397,6 +684,7 @@ fn decode(query: CubeTensor, key: CubeTensor, value: CubeTensor, scale: f32) -> 
             value.into_tensor_arg(),
             part_o.clone().into_tensor_arg(),
             part_lse.clone().into_tensor_arg(),
+            lengths.into_tensor_arg(),
             len as u32,
             split_len as u32,
             q_sb,
@@ -407,9 +695,12 @@ fn decode(query: CubeTensor, key: CubeTensor, value: CubeTensor, scale: f32) -> 
             v_sb,
             v_sh,
             v_st,
+            l_st,
+            left.min(len + 1) as i32,
             scale,
             d as u32,
             group as u32,
+            has_lengths,
             dtype,
         );
     }
@@ -417,6 +708,7 @@ fn decode(query: CubeTensor, key: CubeTensor, value: CubeTensor, scale: f32) -> 
     let output =
         empty_device_contiguous_dtype(client.clone(), device, Shape::new([b, hq, d]), query.dtype);
     launched();
+    // SAFETY: one cube per output row, one unit per element.
     unsafe {
         decode_merge_kernel::launch_unchecked(
             &client,
@@ -433,59 +725,122 @@ fn decode(query: CubeTensor, key: CubeTensor, value: CubeTensor, scale: f32) -> 
     output
 }
 
-impl CausalAttentionBackend for CubeBackend {
-    fn causal_attention(
-        query: FloatTensor<Self>,
-        key: FloatTensor<Self>,
-        value: FloatTensor<Self>,
-        scale: f32,
-    ) -> FloatTensor<Self> {
-        Self::causal_attention_with_lse(query, key, value, scale).0
-    }
+/// Whether the kernels take this call's inputs: those of one dtype, on a device and at
+/// dimensions they take ([`kernels_take`]), every tensor indexable with `u32`.
+fn takes(inputs: &[&CubeTensor], dims: [usize; 6], backward: bool) -> bool {
+    let dtype = inputs[0].dtype;
+    inputs.iter().all(|input| input.dtype == dtype)
+        && kernels_take(&inputs[0].client, dtype, dims, backward)
+        && indexable(inputs)
+}
 
-    fn causal_attention_with_lse(
+/// The shape of a tensor as a slice, for the checks.
+fn shape(tensor: &CubeTensor) -> Vec<usize> {
+    tensor.meta.shape().as_slice().to_vec()
+}
+
+impl AttentionBackend for CubeBackend {
+    fn attention_forward(
         query: FloatTensor<Self>,
         key: FloatTensor<Self>,
         value: FloatTensor<Self>,
-        scale: f32,
+        mask: AttentionMaskPrimitive<Self>,
+        options: AttentionOptions,
     ) -> (FloatTensor<Self>, FloatTensor<Self>) {
-        if supported(&query, &key, &value) {
-            forward(query, key, value, scale)
-        } else {
-            reference::forward::<Self>(query, key, value, scale)
+        // The kernels index without bounds checks: hold the shapes to each other first.
+        let dims = check_shapes(
+            &shape(&query),
+            &shape(&key),
+            &shape(&value),
+            MaskShape::of(&mask),
+        );
+        if !takes(&[&query, &key, &value], dims, false) {
+            return reference::forward::<Self>(query, key, value, mask, options);
         }
+        let mask = Mask::new(mask, &options, dims, &query);
+        forward(query, key, value, &mask, options.scale_for(dims[5]))
     }
 
-    fn causal_attention_backward(
+    fn attention_backward(
         query: FloatTensor<Self>,
         key: FloatTensor<Self>,
         value: FloatTensor<Self>,
         output: FloatTensor<Self>,
         lse: FloatTensor<Self>,
         grad_output: FloatTensor<Self>,
-        scale: f32,
+        mask: AttentionMaskPrimitive<Self>,
+        options: AttentionOptions,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
-        let same_dtype = output.dtype == query.dtype && grad_output.dtype == query.dtype;
-        if same_dtype && supported(&query, &key, &value) {
-            backward(query, key, value, output, lse, grad_output, scale)
-        } else {
-            reference::backward::<Self>(query, key, value, output, lse, grad_output, scale)
+        let dims = check_shapes(
+            &shape(&query),
+            &shape(&key),
+            &shape(&value),
+            MaskShape::of(&mask),
+        );
+        let [b, tq, _, hq, _, _] = dims;
+        assert_eq!(shape(&output), shape(&query), "attention_backward: output");
+        assert_eq!(
+            shape(&grad_output),
+            shape(&query),
+            "attention_backward: grad"
+        );
+        assert_eq!(shape(&lse), [b, tq, hq], "attention_backward: lse");
+        let inputs = [&query, &key, &value, &output, &grad_output];
+        if !takes(&inputs, dims, true) || !indexable(&[&lse]) {
+            return reference::backward::<Self>(
+                query,
+                key,
+                value,
+                output,
+                lse,
+                grad_output,
+                mask,
+                options,
+            );
         }
+        let mask = Mask::new(mask, &options, dims, &query);
+        backward(
+            query,
+            key,
+            value,
+            output,
+            lse,
+            grad_output,
+            &mask,
+            options.scale_for(dims[5]),
+        )
     }
 
     fn attention_decode(
         query: FloatTensor<Self>,
         key: FloatTensor<Self>,
         value: FloatTensor<Self>,
-        scale: f32,
+        lengths: CacheLengths<Self>,
+        options: AttentionOptions,
     ) -> FloatTensor<Self> {
-        let group = query.meta.shape()[1] / key.meta.shape()[2];
-        // The first pass keeps `group` query rows of eight f32 per lane in registers and their
-        // partial sums in shared memory; past 16 heads per group the reference is the safer path.
-        if supported(&query, &key, &value) && group <= 16 {
-            decode(query, key, value, scale)
-        } else {
-            reference::decode::<Self>(query, key, value, scale)
+        let lengths_shape = match &lengths {
+            CacheLengths::Full => None,
+            CacheLengths::Lengths(lengths) => Some(shape(lengths)),
+        };
+        let dims = check_decode_shapes(
+            &shape(&query),
+            &shape(&key),
+            &shape(&value),
+            lengths_shape.as_deref(),
+        );
+        let dtype = query.dtype;
+        let inputs = [&query, &key, &value];
+        let takes = inputs.iter().all(|input| input.dtype == dtype)
+            && decode_kernels_take(&query.client, dtype, dims)
+            && indexable(&inputs);
+        if !takes {
+            return reference::decode::<Self>(query, key, value, lengths, options);
         }
+        let lengths = match lengths {
+            CacheLengths::Full => None,
+            CacheLengths::Lengths(lengths) => Some(lengths),
+        };
+        let left = options.reach().0;
+        decode(query, key, value, lengths, left, options.scale_for(dims[4]))
     }
 }

@@ -14,16 +14,17 @@ rust-version.workspace = true
 
 [features]
 default = ["flex"]
-flex = ["burn/flex", "burn/simd", "burn/rayon"]
-# The CubeCL runtimes, as in dash-ops. LoRA is built from Burn's own operations, so each only makes
-# its devices available.
-cuda = ["burn/cuda", "cubecl"]
-rocm = ["burn/rocm", "cubecl"]
-wgpu = ["burn/wgpu", "cubecl"]
-vulkan = ["burn/vulkan", "wgpu"]
-metal = ["burn/metal", "wgpu"]
-webgpu = ["burn/webgpu", "wgpu"]
-cpu = ["burn/cpu", "cubecl"]
+# Flex and the CubeCL runtimes, as in dash-ops, each turning on dash-ops' feature of the same name.
+# LoRA is built from Burn's own operations and dash-ops' activation checkpointing, so each only
+# makes its devices available.
+flex = ["burn/flex", "burn/simd", "burn/rayon", "dash-ops/flex"]
+cuda = ["burn/cuda", "cubecl", "dash-ops/cuda"]
+rocm = ["burn/rocm", "cubecl", "dash-ops/rocm"]
+wgpu = ["burn/wgpu", "cubecl", "dash-ops/wgpu"]
+vulkan = ["burn/vulkan", "wgpu", "dash-ops/vulkan"]
+metal = ["burn/metal", "wgpu", "dash-ops/metal"]
+webgpu = ["burn/webgpu", "wgpu", "dash-ops/webgpu"]
+cpu = ["burn/cpu", "cubecl", "dash-ops/cpu"]
 # What every runtime above turns on, for tests and examples to ask whether a CubeCL device is
 # there. Not a runtime itself.
 cubecl = []
