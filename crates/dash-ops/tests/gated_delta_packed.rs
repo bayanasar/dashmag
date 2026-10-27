@@ -48,10 +48,14 @@ const F32_VS_F64: f32 = 1.5e-6;
 /// The chunked rule, f32, against fla's packed f32 path [measured: 2.03e-6]. fla computes its
 /// gates in base 2 and in its own order, a few f32 roundings from the exact result itself.
 const F32_VS_FLA: f32 = 2.5e-6;
-/// bf16 inputs against float64 from the same values: one bf16 rounding of each output and
-/// gradient, at most 2^-9 relative to its largest value [measured: 2.58e-3]; fla's own bf16 path
-/// is further off (6.4e-3, printed beside it).
+/// bf16 inputs against float64 from the same values, where the reference or the f32 kernels run:
+/// one bf16 rounding of each output and gradient, at most 2^-9 relative to its largest value
+/// [measured: 2.58e-3]; fla's own bf16 path is further off (6.4e-3, printed beside it).
 const BF16_VS_F64: f32 = 3e-3;
+/// The same where the kernels on tensor cores run, with bf16 operands as fla's [measured: 5.58e-3,
+/// the queries' gradient; fla's 6.36e-3].
+#[cfg(feature = "cubecl")]
+const BF16_TC_VS_F64: f32 = 6e-3;
 /// The step, f32, its output and new states against transformers in float64 and fla [measured:
 /// 2.3e-7].
 const STEP_VS_REF: f32 = 3e-7;
@@ -389,10 +393,10 @@ fn check_chunk_f32(device: &Device, label: &str) {
     }
 }
 
-fn check_chunk_bf16(device: &Device, label: &str) {
+fn check_chunk_bf16(device: &Device, label: &str, tol: f32) {
     let case = Fixture::load("chunk_bf16");
     let res = run_chunk(&case, device, DType::BF16);
-    check(&case, label, &res, "_f64", BF16_VS_F64);
+    check(&case, label, &res, "_f64", tol);
     // For the record: fla's own bf16 path against the same float64 reference.
     let mut keys: Vec<_> = res.keys().copied().collect();
     keys.sort();
@@ -532,7 +536,7 @@ mod flex {
     #[test]
     fn packed_bf16_chunks_on_flex() {
         let _serial = serial();
-        check_chunk_bf16(&Device::flex().autodiff(), "flex-bf16");
+        check_chunk_bf16(&Device::flex().autodiff(), "flex-bf16", BF16_VS_F64);
     }
 
     #[test]
@@ -608,13 +612,14 @@ mod cube {
     use super::*;
     use dash_ops::gated_delta::chunk::{
         chunk_gated_delta_rule_reference, chunk_gated_delta_rule_reference_backward, kernels_take,
+        tensor_cores_take,
     };
     use dash_ops::gated_delta::recurrent::{self, gated_delta_step_reference, kernel_takes};
 
     /// The kernel launches a packed forward and backward pass over `[1, T, H, Dk, Dv]` in
-    /// `dtype` make on `device`: four forward and ten backward where the kernels take them (the
-    /// chunks' layout first in each), none where the reference does. Under CUDA the kernels
-    /// take heads up to their width.
+    /// `dtype` make on `device`: four forward and, backward, seven on tensor cores or ten on the
+    /// f32 kernels where the kernels take them (the chunks' layout first in each), none where the
+    /// reference does. Under CUDA the kernels take heads up to their width.
     fn expected_launches(device: &Device, dtype: DType, dims: [usize; 5], seqs: usize) -> usize {
         let int = cu_seqlens(&[0, 1], device).dtype();
         let [forward, backward] = kernels_take(device, dtype, dims, Some((seqs, int)));
@@ -626,7 +631,29 @@ mod cube {
                 "CUDA turned the kernels away for {dims:?}"
             );
         }
-        4 * usize::from(forward) + 10 * usize::from(backward)
+        let [_, tc_backward] = tensor_cores_take(device, dtype, dims, Some((seqs, int)));
+        let backward_launches = if tc_backward { 7 } else { 10 };
+        4 * usize::from(forward) + backward_launches * usize::from(backward)
+    }
+
+    /// How many of those run on tensor cores: three forward and six backward (all but the
+    /// chunks' layout) where the kernels on tensor cores take them, which under CUDA they do for
+    /// bf16 inputs with heads of 32, 64 or 128.
+    fn expected_tc_launches(device: &Device, dtype: DType, dims: [usize; 5], seqs: usize) -> usize {
+        let int = cu_seqlens(&[0, 1], device).dtype();
+        let [forward, backward] = tensor_cores_take(device, dtype, dims, Some((seqs, int)));
+        let narrow = |d: usize| matches!(d, 32 | 64 | 128);
+        if common::runtime_of(device) == Some("cuda")
+            && matches!(dtype, DType::BF16 | DType::F16)
+            && narrow(dims[3])
+            && narrow(dims[4])
+        {
+            assert!(
+                forward && backward,
+                "CUDA turned the tensor cores away for {dims:?}"
+            );
+        }
+        3 * usize::from(forward) + 6 * usize::from(backward)
     }
 
     fn has(device: &Device, dtype: DType) -> bool {
@@ -637,13 +664,18 @@ mod cube {
         has
     }
 
-    fn launches<R>(expected: usize, f: impl FnOnce() -> R) -> R {
+    /// Asserts that `f` launched exactly `expected` kernels, `tc` of them on tensor cores.
+    fn launches<R>(expected: usize, tc: usize, f: impl FnOnce() -> R) -> R {
         let before = chunk::probe::kernel_launches();
+        let before_tc = chunk::probe::tensor_core_launches();
         let result = f();
         let launched = chunk::probe::kernel_launches() - before;
+        let launched_tc = chunk::probe::tensor_core_launches() - before_tc;
         assert_eq!(
-            launched, expected,
-            "the kernels made {launched} launches, expected {expected}"
+            (launched, launched_tc),
+            (expected, tc),
+            "the kernels made {launched} launches ({launched_tc} on tensor cores), expected \
+             {expected} ({tc})"
         );
         result
     }
@@ -663,8 +695,8 @@ mod cube {
             let case = Fixture::load(name);
             let (dims, seqs) = dims_of(&case);
             let expected = expected_launches(&device, DType::F32, dims, seqs);
-            println!("{name}: {dims:?}, {seqs} sequences, {expected} kernel launches of 14");
-            let res = launches(expected, || {
+            println!("{name}: {dims:?}, {seqs} sequences, {expected} kernel launches");
+            let res = launches(expected, 0, || {
                 run_chunk(&case, &device.clone().autodiff(), DType::F32)
             });
             check(&case, "cubecl", &res, "_f64", F32_VS_F64);
@@ -684,8 +716,10 @@ mod cube {
         let case = Fixture::load("chunk_bf16");
         let (dims, seqs) = dims_of(&case);
         let expected = expected_launches(&device, DType::BF16, dims, seqs);
-        launches(expected, || {
-            check_chunk_bf16(&device.clone().autodiff(), "cubecl-bf16")
+        let tc = expected_tc_launches(&device, DType::BF16, dims, seqs);
+        let tol = if tc > 0 { BF16_TC_VS_F64 } else { BF16_VS_F64 };
+        launches(expected, tc, || {
+            check_chunk_bf16(&device.clone().autodiff(), "cubecl-bf16", tol)
         });
     }
 
@@ -711,9 +745,22 @@ mod cube {
     /// through Autodiff) against the reference (packed, its sequences one at a time) on the same
     /// device, from the same inputs rounded to `dtype`. Returns the largest relative error over the
     /// outputs and gradients, printing each.
-    fn kernels_against_reference(lens: &[usize], h: usize, d: usize, dtype: DType) -> f32 {
+    fn kernels_against_reference(lens: &[usize], h: usize, d: usize, dtype: DType) -> (f32, bool) {
         let device = common::cube_device();
         let ad = device.clone().autodiff();
+        // Where no kernel takes the shape the reference runs (lavapipe, OpenGL, CubeCL's CPU
+        // runtime): sequences of at most 48 tokens, boundaries still inside chunks, do there.
+        let full: usize = lens.iter().sum();
+        let int = cu_seqlens(&[0, 1], &device).dtype();
+        let shorter: Vec<usize>;
+        let lens = if kernels_take(&device, dtype, [1, full, h, d, d], Some((lens.len(), int)))
+            == [false, false]
+        {
+            shorter = lens.iter().map(|&n| n.min(48)).collect();
+            &shorter[..]
+        } else {
+            lens
+        };
         let t: usize = lens.iter().sum();
         let seqs = lens.len();
         let mut offsets = vec![0i64];
@@ -721,6 +768,7 @@ mod cube {
             offsets.push(offsets.last().unwrap() + n as i64);
         }
         let expected = expected_launches(&device, dtype, [1, t, h, d, d], seqs);
+        let tc = expected_tc_launches(&device, dtype, [1, t, h, d, d], seqs);
         let x = |seed: u64, len: usize| normal(seed, len);
         let unit = |v: Vec<f32>| -> Vec<f32> {
             v.chunks(d)
@@ -756,7 +804,7 @@ mod cube {
         let (lq, lk, lv) = (leaf4(&q), leaf4(&k), leaf4(&v));
         let (lg, lb) = (leaf3(&g), leaf3(&beta));
         let lh0 = t4(&h0, st4, &ad).require_grad();
-        let ours = launches(expected, || {
+        let ours = launches(expected, tc, || {
             let (out, state) = chunk_gated_delta_rule(
                 lq.clone(),
                 lk.clone(),
@@ -824,7 +872,7 @@ mod cube {
             println!("{label:32} {name:6} vs reference  max abs {abs:.3e} rel {rel:.3e}");
             worst = worst.max(rel);
         }
-        worst
+        (worst, tc > 0)
     }
 
     /// Qwen3.5-0.8B's head width, sequences ending inside chunks and one shorter than a chunk:
@@ -832,19 +880,22 @@ mod cube {
     #[test]
     fn packed_kernels_match_the_reference() {
         let _serial = serial();
-        let worst = kernels_against_reference(&[100, 37, 163], 3, 128, DType::F32);
+        let (worst, _) = kernels_against_reference(&[100, 37, 163], 3, 128, DType::F32);
         assert!(worst <= 8e-7, "relative error {worst:.3e}");
     }
 
-    /// The same in bf16, within a bf16 rounding of the f32 reference [measured: 3.07e-3].
+    /// The same in bf16: the f32 kernels within a bf16 rounding of the f32 reference [measured:
+    /// 3.07e-3], those on tensor cores, with bf16 operands, within 5e-3 [measured: 4.70e-3, the
+    /// final states].
     #[test]
     fn packed_kernels_match_the_reference_in_bf16() {
         let _serial = serial();
         if !has(&common::cube_device(), DType::BF16) {
             return;
         }
-        let worst = kernels_against_reference(&[90, 110], 2, 128, DType::BF16);
-        assert!(worst <= 3.5e-3, "relative error {worst:.3e}");
+        let (worst, tc) = kernels_against_reference(&[90, 110], 2, 128, DType::BF16);
+        let tol = if tc { 5e-3 } else { 3.5e-3 };
+        assert!(worst <= tol, "relative error {worst:.3e}");
     }
 
     /// Heads 256 wide, packed: the kernels where they take them, else the reference, against the
@@ -852,7 +903,7 @@ mod cube {
     #[test]
     fn wide_heads_match_the_reference() {
         let _serial = serial();
-        let worst = kernels_against_reference(&[70, 30, 64], 2, 256, DType::F32);
+        let (worst, _) = kernels_against_reference(&[70, 30, 64], 2, 256, DType::F32);
         assert!(worst <= 8e-7, "relative error {worst:.3e}");
     }
 

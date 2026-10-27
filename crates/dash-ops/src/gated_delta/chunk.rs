@@ -20,45 +20,78 @@
 //!   continues decoding.
 //! - Options ([`ChunkGatedDeltaOptions`]): the l2 normalisation of queries and keys, the query
 //!   scale (`1 / sqrt(Dk)` by default), and whether to return the final states.
-//! - Everything inside is computed in f32, as transformers does, whatever the inputs' dtype; the
-//!   outputs and gradients are rounded once, to their dtype. (transformers normalises bf16 queries
-//!   and keys in bf16 before casting; here, as in fla, they are normalised in f32.)
+//! - Arithmetic accumulates in f32 whatever the inputs' dtype; the outputs and gradients are
+//!   rounded once, to their dtype. From f32 inputs everything is computed in IEEE f32, as
+//!   transformers does. From bf16 and f16 inputs the kernels on tensor cores (below) take the
+//!   products' operands in the input dtype, as fla does: the intermediates that only feed
+//!   products are rounded to it. (transformers normalises bf16 queries and keys in bf16 before
+//!   casting; here, as in fla, they are normalised in f32.)
 //!
 //! Gradients flow to the queries, keys, values, `g`, `beta` and the initial states, and from both
-//! the output and the final states. The backward pass is written out: it keeps only the inputs
-//! from the forward pass, recomputes each chunk's quantities, passes the state's gradient back
-//! from chunk to chunk, and forms the input gradients in each chunk.
+//! the output and the final states. The backward pass is written out: it keeps the inputs from
+//! the forward pass and, where the kernels on tensor cores run, the per-chunk `T = (I + A)^-1` (in
+//! the inputs' dtype, 8 KiB a chunk of each head, as fla keeps it); it recomputes each chunk's
+//! other quantities, passes the state's gradient back from chunk to chunk, and forms the input
+//! gradients in each chunk.
 //!
 //! Every backend runs the reference built from Burn's tensor operations (`chunk/reference.rs`),
 //! packed sequences one at a time. On a CubeCL device (any runtime), heads up to
-//! [`MAX_KERNEL_HEAD_DIM`] = 256 wide (fla's limit) run CubeCL kernels instead (`chunk/cube.rs`),
-//! all in f32 without tensor cores: per chunk, one kernel forms everything that does not depend
-//! on the state, one passes the state from chunk to chunk (each sequence's chunks in turn, the
-//! sequences side by side), one forms the output; the backward pass runs the first two again,
-//! passes the state's gradient back, and forms the gradients in five more per-chunk kernels.
-//! Packed, a small kernel first lays each sequence's chunks out from `cu_seqlens` on the device,
-//! without reading them to the host: the kernels launch for the most chunks `T` tokens in `S`
-//! sequences can make, `ceil(T / 64) + S - 1`, and those past the last chunk return at once.
-//! Queries and keys wider than 128 run kernels of their own (`chunk/cube/wide.rs`) that hold them
-//! and the state's rows a half (128 columns) at a time; the narrower heads' kernels are untouched
-//! by them. The kernels ask of the device 256 units per cube; shared memory up to 90 KiB forward
-//! and 98 KiB backward for heads up to 128 wide, and with wider heads up to 97.5 KiB (the first
-//! kernel's rows of the wider of `Dk` and `Dv`, at 256); and backward, planes of exactly 32 units.
-//! CUDA cards of compute capability 8.0 and later have all of it. On a device without it, and for
-//! heads wider than 256, the reference runs instead (`kernels_take` tells which): under wgpu on
+//! [`MAX_KERNEL_HEAD_DIM`] = 256 wide (fla's limit) run CubeCL kernels instead (`chunk/cube.rs`):
+//! per chunk, one kernel forms everything that does not depend on the state, one passes the state
+//! from chunk to chunk (each sequence's chunks in turn, the sequences side by side), one forms
+//! the output; the backward pass forms the first kernel's quantities again, passes the state
+//! forward again and its gradient back, and forms the gradients in per-chunk kernels. Packed, a
+//! small kernel first lays each sequence's chunks out from `cu_seqlens` on the device, without
+//! reading them to the host: the kernels launch for the most chunks `T` tokens in `S` sequences
+//! can make, `ceil(T / 64) + S - 1`, and those past the last chunk return at once.
+//!
+//! Two sets of kernels take that shape. From bf16 and f16 inputs with `Dk` and `Dv` of 32, 64 or
+//! 128, on a device with `mma.sync` m16n8k16 from the dtype into f32 and `ldmatrix` (CUDA cards of
+//! compute capability 8.0 and later), every product runs on tensor cores (`chunk/cube/tc.rs`),
+//! with f32 accumulation. Their intermediates that only feed products are kept in the input
+//! dtype, as fla keeps them: `W`, `U`, the normalised keys, `T`, the state entering each chunk and
+//! `V'`, and backward `gamma Q`, the output's gradient, the state's gradient leaving each chunk,
+//! `dV'`, `dV_b` and `dKbg`. The decays, `A` and its inversion, the state carried from chunk to
+//! chunk and its gradient (in registers), the partial gradients summed within a kernel, the keys'
+//! gradient passed between the last two kernels, and the final states and the initial states'
+//! gradient stay f32. Backward they take six kernels: `W`, `U` and the keys from the kept `T`, the
+//! state passed forward, `P^T dO`, the state's gradient passed back, then one kernel for all but
+//! the WY part (the queries' and values' gradients whole) and one for the WY part (the keys', the
+//! gate's and `beta`'s). They ask of the device 256 units per cube (128 for the state passings, so
+//! that each cube holds a block of 32 state columns in four warps), planes of exactly 32 units
+//! (the warps the fragments are laid out over), 16-byte vectors, and shared memory up to 76.5 KiB
+//! (the backward's kernel for all but the WY part, at `Dk = Dv = 128`; the first kernel's 73.3
+//! KiB); the state passings hold 44 KiB forward and 48 KiB backward at `Dk = 128`, so that two of
+//! them fit on a multiprocessor of 100 KiB. Otherwise (f32 inputs, other widths, or a device without the instructions) the f32
+//! kernels run, in IEEE f32 without tensor cores, nine of them backward. Queries and keys wider
+//! than 128 run f32 kernels of their own (`chunk/cube/wide.rs`) that hold them and the state's
+//! rows a half (128 columns) at a time. The f32 kernels ask 256 units per cube; shared memory up
+//! to 90 KiB forward and 98 KiB backward for heads up to 128 wide, and with wider heads up to 97.5
+//! KiB (the first kernel's rows of the wider of `Dk` and `Dv`, at 256); and backward, planes of
+//! exactly 32 units; their state passings fit one cube per multiprocessor. CUDA cards of compute
+//! capability 8.0 and later have all of it. On a device without it, and for heads wider than 256,
+//! the reference runs instead (`kernels_take` and `tensor_cores_take` tell which): under wgpu on
 //! OpenGL over D3D12 and on lavapipe (Vulkan on the CPU), both with 32 KiB of shared memory and no
 //! plane operations, and on CubeCL's CPU runtime (as many units per cube as cores), for instance.
 //!
 //! Measured against transformers' function at f32 (the tests' fixtures), the output, the final
 //! state and every gradient agree to within 1.12e-6 relative to each tensor's largest value; from
-//! bf16 inputs, to within 2.41e-3 of the exact result (torch's own bf16 path: 8.06e-3). Packed,
-//! against transformers in float64 called once per sequence, to within 1.23e-6, and to fla's
-//! packed f32 path within 2.03e-6; packed and per-sequence calls agree to the bit. The CUDA
-//! kernels agree with the f32 reference to within 1.2e-6 (heads up to 256 wide), and 3.31e-3 from
-//! bf16 inputs. On an RTX 5070 Ti, 6144 tokens with 16 heads of 128 and bf16 inputs take 2.1 ms of
-//! device time forward and 8.6 ms forward and backward, as one sequence or as four packed ones
-//! (fla 0.5.2, with bf16 tensor cores: 1.3 and 3.6 ms; 1.2 and 3.3 ms packed); with heads of 256,
-//! 5.4 and 22.2 ms (fla: 2.3 and 8.5 ms) (`examples/gated_delta_chunk_bench.rs`).
+//! bf16 inputs, through the reference and the f32 kernels, to within 2.41e-3 of the exact result
+//! (torch's own bf16 path: 8.06e-3). Packed, against transformers in float64 called once per
+//! sequence, to within 1.23e-6, and to fla's packed f32 path within 2.03e-6; packed and
+//! per-sequence calls agree to the bit. The f32 kernels agree with the f32 reference to within
+//! 1.2e-6 (heads up to 256 wide), and 3.31e-3 from bf16 inputs. On tensor cores, from bf16 inputs,
+//! the errors grow to those of fla's own bf16 path: against float64 to within 6.12e-3 (packed,
+//! 5.58e-3 where fla's is 6.36e-3, the output and final states agreeing with fla's errors to three
+//! digits), and against the f32 reference to within 7.01e-3 (the final states), and 1.12e-2 for
+//! the gate's gradient without the l2 normalisation, a difference of sums within each chunk; from
+//! f16 inputs, to within 7.5e-4 of the f32 reference. On an RTX 5070 Ti, 6144 tokens with 16 heads
+//! of 128 and bf16 inputs take 2.87 ms of device time forward and backward in this operation's
+//! kernels as one sequence, 2.72 ms as four packed ones (fla 0.5.2, measured beside them: 2.67
+//! and 2.50 ms), and 0.89 and 0.86 ms forward (fla: 0.73 and 0.71 ms); the loss around it in the
+//! benchmark adds 1.0 ms of Burn's kernels (PyTorch's: 0.6). With heads of 256, on the f32
+//! kernels, 21.8 and 6.1 ms (fla: 7.5 and 2.2 ms) (`examples/gated_delta_chunk_bench.rs`, device
+//! times summed from `nsys`).
 
 mod reference;
 
@@ -127,12 +160,20 @@ pub mod probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub(super) static KERNEL_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static TENSOR_CORE_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static BACKWARD_RUNS: AtomicUsize = AtomicUsize::new(0);
 
-    /// Launches of this module's CubeCL kernels: three for a forward pass, nine for a backward
-    /// pass, and one more each over packed sequences (the chunks' layout).
+    /// Launches of this module's CubeCL kernels: three for a forward pass; for a backward pass
+    /// nine on the f32 kernels, six on tensor cores; one more each over packed sequences (the
+    /// chunks' layout).
     pub fn kernel_launches() -> usize {
         KERNEL_LAUNCHES.load(Ordering::SeqCst)
+    }
+
+    /// Those of [`kernel_launches`] that ran the kernels on tensor cores (all but the chunks'
+    /// layout).
+    pub fn tensor_core_launches() -> usize {
+        TENSOR_CORE_LAUNCHES.load(Ordering::SeqCst)
     }
 
     /// Runs of the written-out backward pass on `Autodiff`.
@@ -162,11 +203,76 @@ pub fn kernels_take(
     [false, false]
 }
 
+/// Whether the kernels on tensor cores take a forward and a backward pass, as
+/// [`kernels_take`]: bf16 or f16 inputs, `Dk` and `Dv` of 32, 64 or 128, on a device with
+/// `mma.sync` m16n8k16 and `ldmatrix` for the dtype and what the kernels ask (module
+/// documentation). Where they do not, the f32 kernels or the reference run. For tests.
+#[doc(hidden)]
+pub fn tensor_cores_take(
+    device: &Device,
+    dtype: DType,
+    dims: [usize; 5],
+    packed: Option<(usize, DType)>,
+) -> [bool; 2] {
+    #[cfg(feature = "cubecl")]
+    if let Some(client) = crate::cube::client(device.as_dispatch()) {
+        return [false, true]
+            .map(|backward| cube::tensor_cores_take(&client, dtype, dims, packed, backward));
+    }
+    let _ = (device, dtype, dims, packed);
+    [false, false]
+}
+
+/// The shape of what a forward pass over `[B, T, H, Dk, Dv]` in `dtype` keeps for its backward
+/// pass when asked to (`save`), with `packed` the number of packed sequences: the per-chunk
+/// `T = (I + A)^-1`, `[B, H, N, C, C]` in the inputs' dtype (8 KiB a chunk of each head), where
+/// the kernels on tensor cores may take the call (bf16 or f16, `Dk` and `Dv` of 32, 64 or 128),
+/// `N` the chunks of each head as they lay them out (packed, the most `S` sequences can need);
+/// `None` otherwise, where a placeholder of one f32 stands in. A rule of shapes and dtypes alone,
+/// as Burn's fusion asks of an output: on a device without tensor cores the forward keeps an
+/// unwritten tensor of that shape, which the backward does not read.
+#[cfg(any(feature = "cubecl", feature = "fusion"))]
+pub(crate) fn saved_shape(
+    dtype: DType,
+    [b, t, h, dk, dv]: [usize; 5],
+    packed: Option<usize>,
+    save: bool,
+) -> Option<Shape> {
+    let narrow = |d: usize| matches!(d, 32 | 64 | 128);
+    let n = t.div_ceil(CHUNK_SIZE) + packed.map_or(0, |seqs| seqs.saturating_sub(1));
+    (save && matches!(dtype, DType::BF16 | DType::F16) && narrow(dk) && narrow(dv))
+        .then(|| Shape::new([b, h, n, CHUNK_SIZE, CHUNK_SIZE]))
+}
+
+/// The one-element f32 tensor a forward pass returns where it keeps nothing for the backward.
+pub(crate) fn nothing_saved<B: Backend>(device: &B::Device) -> FloatTensor<B> {
+    B::float_zeros(Shape::new([1]), device, FloatDType::F32)
+}
+
 #[cfg(feature = "fusion")]
 mod fusion_meta {
     use crate::sequences::SequencesMetadata;
     use burn::backend::fusion::custom::TensorSpec;
     use burn::tensor::{DType, Shape};
+
+    /// [`super::saved_shape`] of a call's specs.
+    fn saved(
+        q: &TensorSpec,
+        v: &TensorSpec,
+        sequences: &SequencesMetadata,
+        save: bool,
+    ) -> TensorSpec {
+        let [b, t, h, dk] = q.shape.dims::<4>();
+        let dv = v.shape.dims::<4>()[3];
+        let packed = match sequences {
+            SequencesMetadata::Batch => None,
+            SequencesMetadata::Packed(cu_seqlens) => Some(cu_seqlens.shape[0] - 1),
+        };
+        match super::saved_shape(q.dtype, [b, t, h, dk, dv], packed, save) {
+            Some(shape) => TensorSpec::new(shape, q.dtype),
+            None => TensorSpec::new(Shape::new([1]), DType::F32),
+        }
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward(
@@ -176,16 +282,18 @@ mod fusion_meta {
         _g: &TensorSpec,
         _beta: &TensorSpec,
         initial_state: &TensorSpec,
-        _sequences: &SequencesMetadata,
+        sequences: &SequencesMetadata,
         _use_qk_l2norm: &bool,
         _scale: &f32,
         _output_final_state: &bool,
-    ) -> (TensorSpec, TensorSpec) {
+        save_for_backward: &bool,
+    ) -> (TensorSpec, TensorSpec, TensorSpec) {
         let [b, t, h, _] = q.shape.dims::<4>();
         let dv = v.shape.dims::<4>()[3];
         (
             TensorSpec::new(Shape::new([b, t, h, dv]), q.dtype),
             TensorSpec::new(initial_state.shape.clone(), DType::F32),
+            saved(q, v, sequences, *save_for_backward),
         )
     }
 
@@ -198,6 +306,7 @@ mod fusion_meta {
         beta: &TensorSpec,
         initial_state: &TensorSpec,
         _sequences: &SequencesMetadata,
+        _saved: &TensorSpec,
         _d_out: &TensorSpec,
         _d_final_state: &TensorSpec,
         _use_qk_l2norm: &bool,
@@ -232,11 +341,13 @@ mod fusion_meta {
     Autodiff
 )]
 pub trait ChunkGatedDeltaBackend: Backend {
-    /// The forward pass: the output `[B, T, H, Dv]` in the queries' dtype and the final states
-    /// `[B, H, Dk, Dv]` (packed, `[S, H, Dk, Dv]`) in f32. `output_final_state` only tells
-    /// Autodiff whether the final states take part in the graph; they are always computed.
+    /// The forward pass: the output `[B, T, H, Dv]` in the queries' dtype, the final states
+    /// `[B, H, Dk, Dv]` (packed, `[S, H, Dk, Dv]`) in f32, and what it keeps for the backward
+    /// pass when `save_for_backward` (shaped by [`saved_shape`]; the kernels on tensor cores keep
+    /// the per-chunk `T`, the reference nothing). `output_final_state` only tells Autodiff whether
+    /// the final states take part in the graph; they are always computed.
     #[fusion(meta = fusion_meta::forward)]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn chunk_gated_delta_forward(
         q: FloatTensor<Self>,
         k: FloatTensor<Self>,
@@ -248,9 +359,11 @@ pub trait ChunkGatedDeltaBackend: Backend {
         use_qk_l2norm: bool,
         scale: f32,
         output_final_state: bool,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
-        let _ = output_final_state;
-        reference_forward::<Self>(
+        save_for_backward: bool,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+        let _ = (output_final_state, save_for_backward);
+        let device = q.device();
+        let (out, state) = reference_forward::<Self>(
             q,
             k,
             v,
@@ -260,12 +373,14 @@ pub trait ChunkGatedDeltaBackend: Backend {
             sequences,
             use_qk_l2norm,
             scale,
-        )
+        );
+        (out, state, nothing_saved::<Self>(&device))
     }
 
     /// The backward pass: the gradients of the queries, keys, values, `g`, `beta` (each in its
-    /// input's dtype) and the initial states (f32), given the gradients of the output and of the
-    /// final states (zeros when the final states are not used).
+    /// input's dtype) and the initial states (f32), given what the forward pass kept (`saved`;
+    /// what it does not find there it computes again) and the gradients of the output and of
+    /// the final states (zeros when the final states are not used).
     #[fusion(meta = fusion_meta::backward)]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn chunk_gated_delta_backward(
@@ -276,6 +391,7 @@ pub trait ChunkGatedDeltaBackend: Backend {
         beta: FloatTensor<Self>,
         initial_state: FloatTensor<Self>,
         #[extension_type] sequences: Sequences<Self>,
+        saved: FloatTensor<Self>,
         d_out: FloatTensor<Self>,
         d_final_state: FloatTensor<Self>,
         use_qk_l2norm: bool,
@@ -288,6 +404,7 @@ pub trait ChunkGatedDeltaBackend: Backend {
         FloatTensor<Self>,
         FloatTensor<Self>,
     ) {
+        let _ = saved;
         reference_backward::<Self>(
             q,
             k,
@@ -406,6 +523,8 @@ struct Saved<B: Backend> {
     beta: FloatTensor<B>,
     initial_state: FloatTensor<B>,
     sequences: Sequences<B>,
+    /// What the forward pass kept for the backward (the per-chunk `T` on tensor cores).
+    kept: FloatTensor<B>,
     use_qk_l2norm: bool,
     scale: f32,
     /// When the final states take part in the graph, the node's output is the output (as f32)
@@ -450,6 +569,7 @@ impl<B: ChunkGatedDeltaBackend> Backward<B, 6> for ChunkBackward {
             s.beta,
             s.initial_state,
             s.sequences,
+            s.kept,
             d_out,
             d_final_state,
             s.use_qk_l2norm,
@@ -489,7 +609,10 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
         use_qk_l2norm: bool,
         scale: f32,
         output_final_state: bool,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        save_for_backward: bool,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+        // Autodiff keeps what the backward pass wants exactly when it records the node.
+        let _ = save_for_backward;
         let nodes = [
             q.node(),
             k.node(),
@@ -504,7 +627,7 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
         let sequences = inner_sequences(sequences);
         match ChunkBackward.prepare::<C>(nodes).compute_bound().stateful() {
             OpsKind::UnTracked(prep) => {
-                let (out, state) = B::chunk_gated_delta_forward(
+                let (out, state, kept) = B::chunk_gated_delta_forward(
                     q,
                     k,
                     v,
@@ -515,36 +638,53 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
                     use_qk_l2norm,
                     scale,
                     output_final_state,
+                    false,
                 );
-                (prep.finish(out), Self::from_inner(state))
+                (
+                    prep.finish(out),
+                    Self::from_inner(state),
+                    Self::from_inner(kept),
+                )
             }
             OpsKind::Tracked(prep) => {
+                let inputs = (
+                    q.clone(),
+                    k.clone(),
+                    v.clone(),
+                    g.clone(),
+                    beta.clone(),
+                    initial_state.clone(),
+                    sequences.clone(),
+                );
+                let (out, state, kept) = B::chunk_gated_delta_forward(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    initial_state,
+                    sequences,
+                    use_qk_l2norm,
+                    scale,
+                    output_final_state,
+                    true,
+                );
+                let nothing = nothing_saved::<Self>(&out.device());
                 let mut saved = Saved {
-                    q: q.clone(),
-                    k: k.clone(),
-                    v: v.clone(),
-                    g: g.clone(),
-                    beta: beta.clone(),
-                    initial_state: initial_state.clone(),
-                    sequences: sequences.clone(),
+                    q: inputs.0,
+                    k: inputs.1,
+                    v: inputs.2,
+                    g: inputs.3,
+                    beta: inputs.4,
+                    initial_state: inputs.5,
+                    sequences: inputs.6,
+                    kept,
                     use_qk_l2norm,
                     scale,
                     packed: None,
                 };
-                let (out, state) = B::chunk_gated_delta_forward(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    initial_state,
-                    sequences,
-                    use_qk_l2norm,
-                    scale,
-                    output_final_state,
-                );
                 if !output_final_state {
-                    return (prep.finish(saved, out), Self::from_inner(state));
+                    return (prep.finish(saved, out), Self::from_inner(state), nothing);
                 }
                 let (out_shape, out_dtype) = (out.shape(), out.dtype());
                 let state_shape = state.shape();
@@ -571,7 +711,7 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
                     Self::float_slice(packed, &[Slice::from(n..n + m)]),
                     state_shape,
                 );
-                (out, state)
+                (out, state, nothing)
             }
         }
     }
@@ -585,6 +725,7 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
         beta: FloatTensor<Self>,
         initial_state: FloatTensor<Self>,
         sequences: Sequences<Self>,
+        saved: FloatTensor<Self>,
         d_out: FloatTensor<Self>,
         d_final_state: FloatTensor<Self>,
         use_qk_l2norm: bool,
@@ -605,6 +746,7 @@ impl<B: ChunkGatedDeltaBackend, C: CheckpointStrategy> ChunkGatedDeltaBackend fo
             Self::inner(beta),
             Self::inner(initial_state),
             inner_sequences(sequences),
+            Self::inner(saved),
             Self::inner(d_out),
             Self::inner(d_final_state),
             use_qk_l2norm,
@@ -725,7 +867,7 @@ pub fn chunk_gated_delta_rule(
         cu_seqlens.as_ref(),
     );
     let scale = query_scale(options.scale, q.dims()[3]);
-    let (out, state) = <Dispatch as ChunkGatedDeltaBackend>::chunk_gated_delta_forward(
+    let (out, state, _) = <Dispatch as ChunkGatedDeltaBackend>::chunk_gated_delta_forward(
         q.into_dispatch(),
         k.into_dispatch(),
         v.into_dispatch(),
@@ -736,6 +878,7 @@ pub fn chunk_gated_delta_rule(
         options.qk_l2norm,
         scale,
         options.output_final_state,
+        false,
     );
     (
         Tensor::from_dispatch(out),

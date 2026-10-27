@@ -5,7 +5,7 @@ backward pass:
 
 | module | operation | kernels |
 |---|---|---|
-| `gated_delta::chunk` | the gated delta rule, chunked, forward and backward, over a batch or packed variable-length sequences (`cu_seqlens`), heads up to 256 wide, with the l2 normalisation of queries and keys and the query scale as options | f32 kernels, no tensor cores yet |
+| `gated_delta::chunk` | the gated delta rule, chunked, forward and backward, over a batch or packed variable-length sequences (`cu_seqlens`), heads up to 256 wide, with the l2 normalisation of queries and keys and the query scale as options | kernels on the tensor cores from bf16 and f16 inputs (heads of 32, 64 and 128; the products' operands in the input dtype, as fla's), f32 kernels otherwise (heads up to 256), on devices with what they ask (CUDA; not lavapipe, OpenGL or the CPU runtime) |
 | `gated_delta::recurrent` | the gated delta rule a token at a time, for decoding: one token per sequence, or packed sequences' tokens in turn | one kernel a step |
 | `attention` | attention with grouped key-value heads and the masks models train with (none, causal, key padding, packed variable-length sequences, a sliding window), a backward pass that keeps no T x T scores, and decoding against a key-value cache with per-sequence lengths | FlashAttention-2 style kernels on the tensor cores (bf16, f16; heads of 64, 128, 256) that skip the tiles a mask leaves out, on devices with the tensor cores' mma and ldmatrix (CUDA; not lavapipe, OpenGL or the CPU runtime) |
 | `logprob` | the log-probability of chosen tokens under a large vocabulary, with the entropy, without the n x V logits | chunked matmuls and a fused log-sum-exp kernel, on devices with plane operations on planes of 8 or more units (CUDA; not lavapipe, OpenGL or the CPU runtime) |
@@ -67,8 +67,8 @@ with `cuda` only unless a row says otherwise:
 
 | operation | shape | dash-ops | PyTorch |
 |---|---|---|---|
-| gated delta rule, chunked, forward + backward | 6144 tokens, 16 heads of 128: one sequence / four packed of 1536 / four calls of 1536 | 8.9 / 9.1 / 9.2 ms (on the device 8.5 / 8.7 / 8.6), +687 / +700 / +225 MiB | 3.6 / 3.3 / 8.1 ms, +398 / +398 / +154 MiB (fla 0.5.2) |
-| gated delta rule, chunked, forward + backward | the same with 16 heads of 256 | 22.7 / 23.1 / 23.2 ms (on the device 22.2 / 22.5 / 22.5), +1548 / +1985 / +485 MiB | 8.6 / 13.4 / 8.4 ms, +974 / +974 / +352 MiB (fla 0.5.2) |
+| gated delta rule, chunked, forward + backward | 6144 tokens, 16 heads of 128: one sequence / four packed of 1536 | this operation's kernels 2.87 / 2.72 ms on the device (with the benchmark's loss 3.90 / 3.75; 4.4 / 4.6 ms on the host), +400 / +408 MiB; forward alone 0.89 / 0.86 ms on the device | fla's kernels 2.67 / 2.50 ms (with the loss 3.25 / 3.10), +398 / +398 MiB; forward 0.73 / 0.71 ms (fla 0.5.2) |
+| gated delta rule, chunked, forward + backward | the same with 16 heads of 256 (the f32 kernels) | 21.8 / 22.5 ms on the device, +1548 / +1985 MiB; forward 6.1 / 6.4 ms | 7.5 / 6.8 ms; forward 2.2 / 1.8 ms (fla 0.5.2) |
 | gated delta rule, one decoding step | batch 8, 16 heads of 128, 18 layers in turn | 21 us a layer | 34 us (fla 0.5.2) |
 | attention, forward + backward | 6144 tokens, 8 query and 2 key-value heads of 256: causal; no mask; 4 packed sequences of 1536; causal within a window of 1024 | 9.5 ms, +60 MiB (kernels 9.0 ms); 18.4 ms; 2.9 ms; 3.4 ms | flash: 7.6 ms, +204 MiB; 15.0 ms; 2.5 ms as a padded batch of 4; the window through flex_attention 12.9 ms |
 | attention, decoding | batch 8, 6144 cached keys: the whole cache; lengths from 100 to 6144; a window of 1024 | 147 us; 52 us; 42 us a layer, over 24 calls between synchronisations | 140 us; 3729 us (a padding mask); 37 us (the last 1025 keys) |
@@ -76,10 +76,23 @@ with `cuda` only unless a row says otherwise:
 | linear + cross-entropy, forward + backward with the weight's gradient | 3072 / 8192 tokens, 248320 classes, width 1024 | 102 / 293 ms, +641 / +731 MiB (94 / 261 ms with `autotune`) | logits in f32: 95 / 1179 ms, +11672 / +31072 MiB; in bf16: 64 / 1241 ms, +5824 / +15520 MiB (at 8192 both spill past the card's 16 GB into host memory) |
 | conv1d, forward + backward | 6144 steps, 6144 channels, width 4, SiLU (widths 2 to 4, with or without a bias: 0.54 to 0.57 ms); from initial states / with final states too; as 4 packed sequences of 1536 / 4 calls on 1536 / a batch of 4 | 0.56 ms; 0.57 / 0.57 ms; 0.56 / 0.55 / 0.57 ms (on the device 0.55; 0.55 / 0.56; 0.55 / 0.51 / 0.55 ms) | 2.63 ms (conv1d, then SiLU); 2.76 / 3.14 ms (`torch.cat` of the state first); 4 calls 2.46 ms |
 
-The chunked gated delta rule's kernels compute in f32 without tensor cores, which is most of its
-distance from fla. Packed sequences cost what one sequence of their length does: the state
-passing takes each sequence's chunks in turn, and its shared memory fits one cube per
-multiprocessor, so sequences side by side do not shorten it. Attention's backward does seven
+The chunked gated delta rule's device times are sums over `nsys`'s kernels, fla's measured
+beside them under the same load on the card's host (the wall-clock times rise with it). At heads
+of 128, forward and backward, its kernels on tensor cores take 1.07 times fla's time (1.09
+packed): the state passings and the WY part are faster than fla's (0.26 ms forward, twice, and
+0.40 backward, against 0.23 and 0.54; 0.28 against 0.37 with the keys' l2 normalisation), the
+other per-chunk kernels slower. Its first kernel inverts `I + A` with 64 units in f32, on CUDA
+cores (0.37 ms with the forward's other work, fla's 0.28 in three kernels, its inversion on
+tensor cores in TF32), and the backward's kernel for all but the WY part holds 77 KiB of shared
+memory, so that one cube fits on a multiprocessor and waits on memory between its phases more
+than fla's pipelined kernels do (0.64 ms, against 0.49 for fla's and the queries' l2
+normalisation, `dv` going to fla's WY kernel). The backward keeps the forward's `T` (8 KiB a
+chunk of each head) as fla does. The loss around
+it in the benchmark (a cast, a product and a sum over the output) takes 1.0 ms in Burn's kernels
+and 0.6 in PyTorch's. Heads of 256 run the f32 kernels, three times fla's time. Packed sequences
+cost about what one sequence of their length does: the state passings take each sequence's
+chunks in turn, two of their cubes fitting on a multiprocessor on tensor cores (44 and 48 KiB of
+shared memory), one in f32. Attention's backward does seven
 T x T x D products to FlashAttention-2's five, to avoid atomics. Each example in `examples/`
 reproduces its row (`--features cuda`).
 `matmul_bench` and `dispatch_bench` measure Burn itself: bf16 matmul against cuBLAS, and the

@@ -1,7 +1,10 @@
-//! The chunked gated delta rule on the CubeCL backend, in CubeCL kernels, all in f32 (no tensor
-//! cores), for heads up to [`MAX_KERNEL_HEAD_DIM`] wide (queries and keys wider than 128 in the
-//! kernels of [`wide`]), on devices with what [`requirements`] lists. Notation as in
-//! `reference.rs`.
+//! The chunked gated delta rule on the CubeCL backend, in CubeCL kernels. From bf16 and f16
+//! inputs with `Dk` and `Dv` of 32, 64 or 128, on devices with the tensor cores' `mma` and
+//! `ldmatrix` and what [`tc_requirements`] lists, the kernels of [`tc`] run, their products on
+//! tensor cores; otherwise, for heads up to [`MAX_KERNEL_HEAD_DIM`] wide (queries and keys wider
+//! than 128 in the kernels of [`wide`]), on devices with what [`requirements`] lists, the f32
+//! kernels below, all in f32 without tensor cores; elsewhere the reference. Both sets share the
+//! layout and the per-chunk quantities described here. Notation as in `reference.rs`.
 //!
 //! The per-chunk kernels run one cube per chunk of each head, `cube = (b H + h) N + c`. Batch
 //! element `b` is a sequence of `T` tokens in `N = ceil(T / 64)` chunks. Packed sequences (`B =
@@ -34,7 +37,7 @@ use super::{ChunkGatedDeltaBackend, MAX_KERNEL_HEAD_DIM, probe};
 use crate::cube::Requirements;
 use crate::gated_delta::Sequences;
 use burn::backend::TensorMetadata;
-use burn::backend::cubecl::dtype_to_storage_type;
+use burn::backend::cubecl::{dtype_to_elem_type, dtype_to_storage_type};
 use burn::backend::ops::FloatTensorOps;
 use burn::backend::tensor::FloatTensor;
 use burn::tensor::{DType, Shape, Slice};
@@ -43,9 +46,12 @@ use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::client::Client;
+use cubecl::ir::features::MmaConfig;
+use cubecl::ir::{DeviceProperties, ElemType, FloatKind};
 use cubecl::prelude::*;
 use std::sync::atomic::Ordering;
 
+mod tc;
 mod wide;
 
 /// Launches `$narrow`, or `$wide` when `$is_wide` (heads wider than [`wide::HALF`]), with the
@@ -2381,6 +2387,13 @@ fn launched() {
     probe::KERNEL_LAUNCHES.fetch_add(1, Ordering::SeqCst);
 }
 
+/// Counts one launch of a kernel on tensor cores, in `probe::kernel_launches` and
+/// `probe::tensor_core_launches`.
+fn launched_tc() {
+    launched();
+    probe::TENSOR_CORE_LAUNCHES.fetch_add(1, Ordering::SeqCst);
+}
+
 fn empty_like(reference: &CubeTensor, shape: Shape) -> CubeTensor {
     empty_with(reference, shape, DType::F32)
 }
@@ -2967,6 +2980,208 @@ fn backward_fused(
     )
 }
 
+/// The backward pass on tensor cores, six kernels: `W`, `U` and the keys again from the `T` the
+/// forward pass kept (or the forward's prep again, where it kept none), the forward's state
+/// passing again, `dv_local`, the state's gradient passed back, then `tc_dqk_kernel` (all but the
+/// WY part, the queries' and the values' gradients whole) and `tc_wy_kernel` (the WY part, the
+/// keys', the gate's and `beta`'s gradients).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn tc_backward(
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    g: CubeTensor,
+    beta: CubeTensor,
+    initial_state: CubeTensor,
+    sequences: Sequences<CubeBackend>,
+    saved: CubeTensor,
+    d_out: CubeTensor,
+    d_final_state: CubeTensor,
+    use_qk_l2norm: bool,
+    scale: f32,
+) -> (
+    CubeTensor,
+    CubeTensor,
+    CubeTensor,
+    CubeTensor,
+    CubeTensor,
+    CubeTensor,
+) {
+    type B = CubeBackend;
+    let (g_dtype, beta_dtype) = (g.dtype, beta.dtype);
+    let (q, k, v) = (aligned(q), aligned(k), aligned(v));
+    let l = layout(&q, &v, sequences);
+    let (t, h, dk, dv, n) = (l.t, l.h, l.dk, l.dv, l.n);
+    let g = into_contiguous(reference::to_f32::<B>(g));
+    let beta = into_contiguous(reference::to_f32::<B>(beta));
+    // The forward pass's T where it kept it; else T and the rest formed again.
+    let p = if saved.shape() == l.chunked(CHUNK) && saved.dtype == q.dtype {
+        tc_wu(&l, &k, &v, g, beta.clone(), aligned(saved), use_qk_l2norm)
+    } else {
+        tc_prep(&l, &k, &v, g, beta.clone(), use_qk_l2norm, true)
+    };
+    let h0 = aligned(reference::to_f32::<B>(initial_state));
+    let (states, v_new, _) = tc_state_forward(&l, &p, h0);
+
+    let client = q.client.clone();
+    let dtype = q.dtype;
+    let elem = dtype_to_storage_type(dtype);
+    let (count, dim) = l.per_chunk();
+    let d_out = aligned(reference::to_dtype::<B>(d_out, dtype));
+    let dv_local = empty_with(&q, l.chunked(dv), dtype);
+    let qg = empty_with(&q, l.chunked(dk), dtype);
+    let d_o = empty_with(&q, l.chunked(dv), dtype);
+    launched_tc();
+    // SAFETY (this and the per-chunk launches below): each cube reads its chunk's rows below the
+    // chunk's count of tokens from the `[B, T, H, D]` tensors and its chunk of the chunked ones,
+    // all allocated for the layout's chunks, and writes its chunk's rows.
+    unsafe {
+        tc::tc_dvlocal_kernel::launch_unchecked(
+            &client,
+            count.clone(),
+            dim,
+            q.clone().into_tensor_arg(),
+            k.clone().into_tensor_arg(),
+            p.gcum.clone().into_tensor_arg(),
+            d_out.clone().into_tensor_arg(),
+            dv_local.clone().into_tensor_arg(),
+            qg.clone().into_tensor_arg(),
+            d_o.clone().into_tensor_arg(),
+            l.plan.clone().into_tensor_arg(),
+            t as u32,
+            n as u32,
+            h as u32,
+            scale,
+            dk as u32,
+            dv as u32,
+            use_qk_l2norm,
+            l.packed,
+            elem,
+        );
+    }
+
+    let d_last = aligned(reference::to_f32::<B>(d_final_state));
+    let ds_next = empty_with(&q, Shape::new([l.b, h, n, dk, dv]), dtype);
+    let dvn = empty_with(&q, l.chunked(dv), dtype);
+    let d_initial = empty_like(&q, Shape::new([l.seqs, h, dk, dv]));
+    let state_count = CubeCount::Static(dv.div_ceil(tc::STATE_COLS) as u32, (l.seqs * h) as u32, 1);
+    launched_tc();
+    // SAFETY: as the forward state passing's.
+    unsafe {
+        tc::tc_state_backward_kernel::launch_unchecked(
+            &client,
+            state_count,
+            CubeDim::new_1d(tc::STATE_UNITS),
+            p.kn.clone().into_tensor_arg(),
+            p.w.clone().into_tensor_arg(),
+            qg.into_tensor_arg(),
+            d_o.clone().into_tensor_arg(),
+            dv_local.into_tensor_arg(),
+            p.gcum.clone().into_tensor_arg(),
+            d_last.into_tensor_arg(),
+            l.offsets.clone().into_tensor_arg(),
+            ds_next.clone().into_tensor_arg(),
+            dvn.clone().into_tensor_arg(),
+            d_initial.clone().into_tensor_arg(),
+            n as u32,
+            h as u32,
+            dk as u32,
+            dv as u32,
+            l.packed,
+            elem,
+        );
+    }
+
+    let dq = empty_with(&q, Shape::new([l.b, t, h, dk]), dtype);
+    let dv_out = empty_with(&q, Shape::new([l.b, t, h, dv]), dtype);
+    let dvb = empty_with(&q, l.chunked(dv), dtype);
+    let dkbg = empty_with(&q, l.chunked(dk), dtype);
+    let dk_part = empty_like(&q, l.chunked(dk));
+    let rg_part = empty_like(&q, l.per_token());
+    let rb_part = empty_like(&q, l.per_token());
+    let tail = empty_like(&q, Shape::new([l.b, h, n]));
+    launched_tc();
+    unsafe {
+        tc::tc_dqk_kernel::launch_unchecked(
+            &client,
+            count.clone(),
+            dim,
+            q.into_tensor_arg(),
+            k.clone().into_tensor_arg(),
+            v.into_tensor_arg(),
+            beta.clone().into_tensor_arg(),
+            p.gcum.clone().into_tensor_arg(),
+            p.t.into_tensor_arg(),
+            dvn.into_tensor_arg(),
+            d_o.into_tensor_arg(),
+            v_new.into_tensor_arg(),
+            states.into_tensor_arg(),
+            ds_next.into_tensor_arg(),
+            dq.clone().into_tensor_arg(),
+            dv_out.clone().into_tensor_arg(),
+            dvb.clone().into_tensor_arg(),
+            dkbg.clone().into_tensor_arg(),
+            dk_part.clone().into_tensor_arg(),
+            rg_part.clone().into_tensor_arg(),
+            rb_part.clone().into_tensor_arg(),
+            tail.clone().into_tensor_arg(),
+            l.plan.clone().into_tensor_arg(),
+            t as u32,
+            n as u32,
+            h as u32,
+            scale,
+            dk as u32,
+            dv as u32,
+            use_qk_l2norm,
+            l.packed,
+            elem,
+        );
+    }
+
+    let dk_out = empty_with(&k, Shape::new([l.b, t, h, dk]), dtype);
+    let dg = empty_like(&k, Shape::new([l.b, t, h]));
+    let dbeta = empty_like(&k, Shape::new([l.b, t, h]));
+    launched_tc();
+    unsafe {
+        tc::tc_wy_kernel::launch_unchecked(
+            &client,
+            count,
+            dim,
+            k.into_tensor_arg(),
+            p.gcum.into_tensor_arg(),
+            beta.into_tensor_arg(),
+            dvb.into_tensor_arg(),
+            p.u.into_tensor_arg(),
+            dkbg.into_tensor_arg(),
+            p.w.into_tensor_arg(),
+            dk_part.into_tensor_arg(),
+            rg_part.into_tensor_arg(),
+            rb_part.into_tensor_arg(),
+            tail.into_tensor_arg(),
+            dk_out.clone().into_tensor_arg(),
+            dg.clone().into_tensor_arg(),
+            dbeta.clone().into_tensor_arg(),
+            l.plan.clone().into_tensor_arg(),
+            t as u32,
+            n as u32,
+            h as u32,
+            dk as u32,
+            dv as u32,
+            use_qk_l2norm,
+            l.packed,
+            elem,
+        );
+    }
+    (
+        dq,
+        dk_out,
+        dv_out,
+        reference::to_dtype::<B>(dg, g_dtype),
+        reference::to_dtype::<B>(dbeta, beta_dtype),
+        d_initial,
+    )
+}
+
 /// Bytes of shared memory the kernels of a forward (or backward) pass hold at most, summed from
 /// each kernel's `Shared` arrays: f32 4 bytes, `V2` 8, `V4` 16. Heads up to 128 wide, the state
 /// passings hold the most: 90 KiB forward, 98 KiB backward. Wider, the prep kernel's rows grow
@@ -3054,10 +3269,10 @@ pub(super) fn requirements(
     }
 }
 
-/// Whether the kernels take a forward (or backward) pass over inputs of `dtype` and shape
+/// Whether the f32 kernels take a forward (or backward) pass over inputs of `dtype` and shape
 /// `[B, T, H, Dk, Dv]` on the device `client` serves, with `packed` the number of packed
-/// sequences and the dtype of their boundaries; the reference runs otherwise.
-pub(super) fn kernels_take(
+/// sequences and the dtype of their boundaries.
+fn f32_kernels_take(
     client: &Client,
     dtype: DType,
     dims: [usize; 5],
@@ -3071,6 +3286,345 @@ pub(super) fn kernels_take(
         && dv <= MAX_KERNEL_HEAD_DIM
         && (packed.is_none() || t <= i32::MAX as usize)
         && requirements(dims, packed.map(|(seqs, _)| seqs), backward).met_on(client, &dtypes)
+}
+
+/// Whether some kernels take a forward (or backward) pass, those on tensor cores or the f32
+/// ones; the reference runs otherwise.
+pub(super) fn kernels_take(
+    client: &Client,
+    dtype: DType,
+    dims: [usize; 5],
+    packed: Option<(usize, DType)>,
+    backward: bool,
+) -> bool {
+    tensor_cores_take(client, dtype, dims, packed, backward)
+        || f32_kernels_take(client, dtype, dims, packed, backward)
+}
+
+/// The head widths (`Dk` and `Dv`) the tensor-core kernels take.
+fn tc_width(d: usize) -> bool {
+    matches!(d, 32 | 64 | 128)
+}
+
+/// Whether the device has `mma.sync` m16n8k16 from `dtype` into f32, and `ldmatrix` for it.
+fn tensor_cores(properties: &DeviceProperties, dtype: DType) -> bool {
+    let elem = dtype_to_elem_type(dtype);
+    let mma = MmaConfig {
+        a_type: elem,
+        b_type: elem,
+        cd_type: ElemType::Float(FloatKind::F32),
+        m: 16,
+        n: 8,
+        k: 16,
+    };
+    properties.features.matmul.mma.contains(&mma)
+        && properties.features.matmul.ldmatrix.contains(&elem)
+}
+
+/// Bytes of shared memory the tensor-core kernels of a forward (or backward) pass hold at most,
+/// from each kernel's `Shared` arrays: tiles of 16-bit values, `64 x 65` f32 blocks.
+fn tc_shared_bytes(dk: usize, dv: usize, backward: bool) -> usize {
+    let tile = |rows: usize, cols: usize| 2 * rows * cols;
+    let square = 4 * 64 * 65;
+    let prep = tile(64, dk) + tile(64, dk.max(dv)) + tile(64, 64) + 2 * square + 4 * 3 * 64;
+    let state_forward = 2 * tile(64, dk) + tile(dk, tc::STATE_COLS) + tile(64, tc::STATE_COLS);
+    let output = 2 * tile(64, dk) + tile(dk, dv) + tile(64, dv) + 4 * 64;
+    if !backward {
+        return [prep, state_forward, output]
+            .into_iter()
+            .fold(0, usize::max);
+    }
+    // The backward kernels stage the products over `Dv` (and the WY kernel those over `Dk`) 64
+    // columns at a time.
+    let (vb, kb) = (dv.min(64), dk.min(64));
+    let small = |count: usize| 4 * 64 * count;
+    let wu = tile(64, dk) + tile(64, dk.max(dv)) + tile(64, 64) + small(3);
+    let dvlocal = 2 * tile(64, dk) + tile(64, dv) + tile(64, 64) + 4 * 64;
+    let state_backward = 2 * tile(64, dk) + tile(dk, tc::STATE_COLS) + 2 * tile(64, tc::STATE_COLS);
+    let dqk = 2 * tile(64, dk.max(dv))
+        + 2 * tile(64, vb)
+        + tile(64, dv)
+        + tile(64, 64)
+        + small(10)
+        + 4 * (128 + 384);
+    let wy =
+        2 * tile(64, vb.max(kb)) + 2 * tile(64, dk) + tile(64, 64) + small(7) + 4 * (128 + 256);
+    [prep, wu, state_forward, dvlocal, state_backward, dqk, wy]
+        .into_iter()
+        .fold(0, usize::max)
+}
+
+/// What the tensor-core kernels of a forward (or backward) pass over `[B, T, H, Dk, Dv]` ask
+/// of the device: 256 units per cube for the per-chunk kernels and 128 for the state passings,
+/// their cube counts (as [`requirements`] counts them), the shared memory of
+/// [`tc_shared_bytes`], the tensors of the kernel binding the most, 16-byte vectors, and planes
+/// of exactly 32 units, the warps whose lanes the tensor-core fragments are laid out over.
+fn tc_requirements(
+    [b, t, h, dk, dv]: [usize; 5],
+    packed: Option<usize>,
+    backward: bool,
+) -> Requirements {
+    let (n, rows) = match packed {
+        None => (t.div_ceil(CHUNK), b),
+        Some(seqs) => (max_chunks(t, seqs), seqs),
+    };
+    let per_chunk = Requirements::new(
+        (tc::CHUNK_UNITS, 1),
+        (b * h * n, 1),
+        if backward { 20 } else { 10 },
+    );
+    let state = Requirements::new(
+        (tc::STATE_UNITS, 1),
+        (dv.div_ceil(tc::STATE_COLS), rows * h),
+        9,
+    );
+    Requirements {
+        shared_bytes: tc_shared_bytes(dk, dv, backward),
+        vector_size: 8,
+        plane_width: Some(32),
+        ..per_chunk.max(state)
+    }
+}
+
+/// Whether the tensor-core kernels take a forward (or backward) pass: bf16 or f16 inputs,
+/// `Dk` and `Dv` of 32, 64 or 128, on a device with `mma` and `ldmatrix` for the dtype and what
+/// [`tc_requirements`] lists.
+pub(super) fn tensor_cores_take(
+    client: &Client,
+    dtype: DType,
+    dims: [usize; 5],
+    packed: Option<(usize, DType)>,
+    backward: bool,
+) -> bool {
+    let [_, t, _, dk, dv] = dims;
+    let mut dtypes = vec![dtype, DType::F32, DType::U32];
+    dtypes.extend(packed.map(|(_, int)| int));
+    matches!(dtype, DType::BF16 | DType::F16)
+        && tc_width(dk)
+        && tc_width(dv)
+        && (packed.is_none() || t <= i32::MAX as usize)
+        && tensor_cores(client.properties(), dtype)
+        && tc_requirements(dims, packed.map(|(seqs, _)| seqs), backward).met_on(client, &dtypes)
+}
+
+/// `tensor` contiguous with its first element 16-byte aligned, as the tensor-core kernels read
+/// it 16 bytes at a time: itself when it is, else a fresh copy.
+fn aligned(tensor: CubeTensor) -> CubeTensor {
+    let tensor = into_contiguous(tensor);
+    if tensor.handle.offset_start.unwrap_or(0).is_multiple_of(16) {
+        return tensor;
+    }
+    let (client, device, dtype) = (tensor.client.clone(), tensor.device.clone(), tensor.dtype);
+    let copy = burn_cubecl::cubecl::std::tensor::into_contiguous(
+        &client,
+        tensor.binding(),
+        dtype_to_storage_type(dtype),
+    );
+    CubeTensor::new(client, copy.handle, *copy.metadata, device, dtype)
+}
+
+/// What the tensor-core prep kernel forms, per chunk: `W`, `U`, the keys `K` `[B, H, N, C, D]`
+/// and `T` `[B, H, N, C, C]` (for the backward pass) in the input dtype, `G` `[B, H, N, C]` f32.
+struct TcPrep {
+    w: CubeTensor,
+    u: CubeTensor,
+    kn: CubeTensor,
+    gcum: CubeTensor,
+    t: CubeTensor,
+}
+
+fn tc_prep(
+    l: &Layout,
+    k: &CubeTensor,
+    v: &CubeTensor,
+    g: CubeTensor,
+    beta: CubeTensor,
+    use_qk_l2norm: bool,
+    store_t: bool,
+) -> TcPrep {
+    let g = into_contiguous(reference::to_f32::<CubeBackend>(g));
+    let beta = into_contiguous(reference::to_f32::<CubeBackend>(beta));
+    let dtype = k.dtype;
+    let w = empty_with(k, l.chunked(l.dk), dtype);
+    let u = empty_with(k, l.chunked(l.dv), dtype);
+    let kn = empty_with(k, l.chunked(l.dk), dtype);
+    let gcum = empty_like(k, l.per_token());
+    let t = if store_t {
+        empty_with(k, l.chunked(CHUNK), dtype)
+    } else {
+        empty_with(k, Shape::new([8]), dtype)
+    };
+    let (count, dim) = l.per_chunk();
+    launched_tc();
+    // SAFETY: the kernel reads chunk rows below each chunk's count of tokens from the inputs and
+    // writes the chunk's rows of the chunked tensors, all allocated for the layout's chunks.
+    unsafe {
+        tc::tc_prep_kernel::launch_unchecked(
+            &k.client.clone(),
+            count,
+            dim,
+            k.clone().into_tensor_arg(),
+            v.clone().into_tensor_arg(),
+            g.into_tensor_arg(),
+            beta.into_tensor_arg(),
+            w.clone().into_tensor_arg(),
+            u.clone().into_tensor_arg(),
+            kn.clone().into_tensor_arg(),
+            gcum.clone().into_tensor_arg(),
+            t.clone().into_tensor_arg(),
+            l.plan.clone().into_tensor_arg(),
+            l.t as u32,
+            l.n as u32,
+            l.h as u32,
+            l.dk as u32,
+            l.dv as u32,
+            use_qk_l2norm,
+            store_t,
+            l.packed,
+            dtype_to_storage_type(dtype),
+        );
+    }
+    TcPrep { w, u, kn, gcum, t }
+}
+
+/// What [`tc_prep`] forms for the backward pass, from the `T` the forward pass kept.
+fn tc_wu(
+    l: &Layout,
+    k: &CubeTensor,
+    v: &CubeTensor,
+    g: CubeTensor,
+    beta: CubeTensor,
+    t: CubeTensor,
+    use_qk_l2norm: bool,
+) -> TcPrep {
+    let dtype = k.dtype;
+    let w = empty_with(k, l.chunked(l.dk), dtype);
+    let u = empty_with(k, l.chunked(l.dv), dtype);
+    let kn = empty_with(k, l.chunked(l.dk), dtype);
+    let gcum = empty_like(k, l.per_token());
+    let (count, dim) = l.per_chunk();
+    launched_tc();
+    // SAFETY: as the prep kernel's; `t` holds the layout's chunks.
+    unsafe {
+        tc::tc_wu_kernel::launch_unchecked(
+            &k.client.clone(),
+            count,
+            dim,
+            k.clone().into_tensor_arg(),
+            v.clone().into_tensor_arg(),
+            g.into_tensor_arg(),
+            beta.into_tensor_arg(),
+            t.clone().into_tensor_arg(),
+            w.clone().into_tensor_arg(),
+            u.clone().into_tensor_arg(),
+            kn.clone().into_tensor_arg(),
+            gcum.clone().into_tensor_arg(),
+            l.plan.clone().into_tensor_arg(),
+            l.t as u32,
+            l.n as u32,
+            l.h as u32,
+            l.dk as u32,
+            l.dv as u32,
+            use_qk_l2norm,
+            l.packed,
+            dtype_to_storage_type(dtype),
+        );
+    }
+    TcPrep { w, u, kn, gcum, t }
+}
+
+/// The tensor-core state passing, forward: the state entering each chunk `[B, H, N, Dk, Dv]`
+/// and `V'` `[B, H, N, C, Dv]` in the input dtype, and the final states, f32.
+fn tc_state_forward(
+    l: &Layout,
+    p: &TcPrep,
+    h0: CubeTensor,
+) -> (CubeTensor, CubeTensor, CubeTensor) {
+    let dtype = p.w.dtype;
+    let states = empty_with(&p.w, Shape::new([l.b, l.h, l.n, l.dk, l.dv]), dtype);
+    let v_new = empty_with(&p.w, l.chunked(l.dv), dtype);
+    let last = empty_like(&p.w, Shape::new([l.seqs, l.h, l.dk, l.dv]));
+    let count = CubeCount::Static(
+        l.dv.div_ceil(tc::STATE_COLS) as u32,
+        (l.seqs * l.h) as u32,
+        1,
+    );
+    launched_tc();
+    // SAFETY: each cube walks the chunks `state_chunks` gives it, within the layout's chunks, and
+    // its block of state columns, within `Dv` (a multiple of 32).
+    unsafe {
+        tc::tc_state_forward_kernel::launch_unchecked(
+            &p.w.client.clone(),
+            count,
+            CubeDim::new_1d(tc::STATE_UNITS),
+            p.kn.clone().into_tensor_arg(),
+            p.w.clone().into_tensor_arg(),
+            p.u.clone().into_tensor_arg(),
+            p.gcum.clone().into_tensor_arg(),
+            h0.into_tensor_arg(),
+            l.offsets.clone().into_tensor_arg(),
+            states.clone().into_tensor_arg(),
+            v_new.clone().into_tensor_arg(),
+            last.clone().into_tensor_arg(),
+            l.n as u32,
+            l.h as u32,
+            l.dk as u32,
+            l.dv as u32,
+            l.packed,
+            dtype_to_storage_type(dtype),
+        );
+    }
+    (states, v_new, last)
+}
+
+/// The forward pass on tensor cores: the prep kernel, the state passing, the output kernel.
+#[allow(clippy::too_many_arguments)]
+fn tc_forward(
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    g: CubeTensor,
+    beta: CubeTensor,
+    initial_state: CubeTensor,
+    sequences: Sequences<CubeBackend>,
+    use_qk_l2norm: bool,
+    scale: f32,
+    keep: bool,
+) -> (CubeTensor, CubeTensor, Option<CubeTensor>) {
+    let (q, k, v) = (aligned(q), aligned(k), aligned(v));
+    let l = layout(&q, &v, sequences);
+    let p = tc_prep(&l, &k, &v, g, beta, use_qk_l2norm, keep);
+    let h0 = aligned(reference::to_f32::<CubeBackend>(initial_state));
+    let (states, v_new, last) = tc_state_forward(&l, &p, h0);
+    let out = empty_with(&q, Shape::new([l.b, l.t, l.h, l.dv]), q.dtype);
+    let (count, dim) = l.per_chunk();
+    launched_tc();
+    // SAFETY: as the prep kernel's; rows of the output at or past a chunk's count are not
+    // written.
+    unsafe {
+        tc::tc_output_kernel::launch_unchecked(
+            &q.client.clone(),
+            count,
+            dim,
+            q.clone().into_tensor_arg(),
+            k.into_tensor_arg(),
+            p.gcum.into_tensor_arg(),
+            states.into_tensor_arg(),
+            v_new.into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            l.plan.clone().into_tensor_arg(),
+            l.t as u32,
+            l.n as u32,
+            l.h as u32,
+            scale,
+            l.dk as u32,
+            l.dv as u32,
+            use_qk_l2norm,
+            l.packed,
+            dtype_to_storage_type(q.dtype),
+        );
+    }
+    (out, last, keep.then_some(p.t))
 }
 
 /// `[B, T, H, Dk, Dv]` of the queries `[B, T, H, Dk]` and the values `[B, T, H, Dv]`, and the
@@ -3100,10 +3654,24 @@ impl ChunkGatedDeltaBackend for CubeBackend {
         use_qk_l2norm: bool,
         scale: f32,
         _output_final_state: bool,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        save_for_backward: bool,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         let (shape, packed) = dims(&q, &v, &sequences);
-        if !kernels_take(&q.client, q.dtype, shape, packed, false) {
-            return super::reference_forward::<Self>(
+        let keep = super::saved_shape(
+            q.dtype,
+            shape,
+            packed.map(|(seqs, _)| seqs),
+            save_for_backward,
+        );
+        // What the forward keeps, shaped by the rule whichever path runs (Burn's fusion takes
+        // the shape from the rule): an unwritten tensor where the tensor cores do not run.
+        let unkept = |q: &CubeTensor| match &keep {
+            Some(shape) => empty_with(q, shape.clone(), q.dtype),
+            None => empty_like(q, Shape::new([1])),
+        };
+        if tensor_cores_take(&q.client, q.dtype, shape, packed, false) {
+            let placeholder = keep.is_none().then(|| unkept(&q));
+            let (out, last, t) = tc_forward(
                 q,
                 k,
                 v,
@@ -3113,19 +3681,37 @@ impl ChunkGatedDeltaBackend for CubeBackend {
                 sequences,
                 use_qk_l2norm,
                 scale,
+                keep.is_some(),
             );
+            return (out, last, t.or(placeholder).expect("kept or a placeholder"));
         }
-        forward_fused(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state,
-            sequences,
-            use_qk_l2norm,
-            scale,
-        )
+        let placeholder = unkept(&q);
+        let (out, last) = if !f32_kernels_take(&q.client, q.dtype, shape, packed, false) {
+            super::reference_forward::<Self>(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state,
+                sequences,
+                use_qk_l2norm,
+                scale,
+            )
+        } else {
+            forward_fused(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state,
+                sequences,
+                use_qk_l2norm,
+                scale,
+            )
+        };
+        (out, last, placeholder)
     }
 
     fn chunk_gated_delta_backward(
@@ -3136,6 +3722,7 @@ impl ChunkGatedDeltaBackend for CubeBackend {
         beta: FloatTensor<Self>,
         initial_state: FloatTensor<Self>,
         sequences: Sequences<Self>,
+        saved: FloatTensor<Self>,
         d_out: FloatTensor<Self>,
         d_final_state: FloatTensor<Self>,
         use_qk_l2norm: bool,
@@ -3149,7 +3736,23 @@ impl ChunkGatedDeltaBackend for CubeBackend {
         FloatTensor<Self>,
     ) {
         let (shape, packed) = dims(&q, &v, &sequences);
-        if !kernels_take(&q.client, q.dtype, shape, packed, true) {
+        if tensor_cores_take(&q.client, q.dtype, shape, packed, true) {
+            return tc_backward(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state,
+                sequences,
+                saved,
+                d_out,
+                d_final_state,
+                use_qk_l2norm,
+                scale,
+            );
+        }
+        if !f32_kernels_take(&q.client, q.dtype, shape, packed, true) {
             return super::reference_backward::<Self>(
                 q,
                 k,
