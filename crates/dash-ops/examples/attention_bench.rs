@@ -11,17 +11,23 @@
 //! Training: T tokens, queries `[1, T, 8, 256]`, keys and values `[1, T, 2, 256]`, with each mask
 //! in turn: causal; none (every query sees every key); four packed sequences of `T / 4`
 //! tokens, causal within each; causal within a sliding window of 1024 keys. For each, the forward
-//! (with its log-sum-exp), the backward (`delta`, `dQ`, `dK`/`dV`) and both; for causal also both
-//! through `Autodiff` with `sum(o * dO)` as the loss, and the memory. Decoding: batch 8, one query
-//! each (`[8, 8, 256]`), against a 6144-token cache (`[8, 6144, 2, 256]`), per layer: the whole
-//! cache, mixed cache lengths, and a window of 1024. Beside them, Burn's own `attention`, on
-//! inputs of its own in its layout, `[B, H, T, D]`, which takes no grouped heads (the key-value
-//! heads are expanded for it), and, for decoding, its flash kernel asked for by name. Each time is
-//! the median of 20 runs after 3 warm-ups, with the device synchronised around each run, so a
-//! time includes one launch and synchronisation; decoding is also timed over 24 calls between
-//! synchronisations, as a step over the layers runs. Memory is the growth of the bytes CubeCL's
-//! pools hold in use, read after synchronising (under Burn's fusion nothing has run before), and
-//! the largest single allocation the pools that hold tensors served.
+//! (with its log-sum-exp), the backward (`delta`, the five products, the gradients rounded from
+//! their f32 accumulators) and both; for causal also both through `Autodiff` with `sum(o * dO)`
+//! as the loss, and the memory. Decoding: batch 8, one query each (`[8, 8, 256]`), against a
+//! 6144-token cache (`[8, 6144, 2, 256]`), per layer: the whole cache, mixed cache lengths, and a
+//! window of 1024. Beside them, Burn's own `attention`, on inputs of its own in its layout,
+//! `[B, H, T, D]`, which takes no grouped heads (the key-value heads are expanded for it), and,
+//! for decoding, its flash kernel asked for by name. Each time is the median of 20 runs after 3
+//! warm-ups, with the device synchronised around each run, so a time includes one launch and
+//! synchronisation; decoding is also timed over 24 calls between synchronisations, as a step over
+//! the layers runs. Memory is the growth of the bytes CubeCL's pools hold in use, read after
+//! synchronising (under Burn's fusion nothing has run before), and the largest single allocation
+//! the pools that hold tensors served.
+//!
+//! The times are wall clock; on a card other work shares, compare device times instead: run the
+//! benchmark under `nsys profile -t cuda` and take each kernel's median from
+//! `nsys stats -r cuda_gpu_kern_sum` (the forward is `forward_kernel`; the backward
+//! `delta_kernel`, `backward_kernel` and `finish_kernel`).
 
 #[cfg(not(feature = "cuda"))]
 fn main() {

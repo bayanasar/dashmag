@@ -414,30 +414,38 @@ fn format_errors(errors: [f32; 5]) -> String {
 /// CPU runtime). In f32 the reference agrees with torch's float64 to f32 rounding.
 const F32_TOLERANCE: [f32; 5] = [3.2e-7, 1.2e-7, 3.2e-7, 4.1e-7, 3.5e-7];
 /// The reference run on a CubeCL device in f32, against torch: its products and reductions are
-/// Burn's CubeCL kernels, which autotune picks differently; on OpenGL its log-sum-exp reaches
-/// 1.33e-7.
+/// Burn's CubeCL kernels; on OpenGL its log-sum-exp reaches 1.33e-7. With autotune those kernels
+/// change from run to run (the value gradient reached 4.0e-7 in one of two runs), so the bounds are
+/// then a few roundings, as for checkpointing.
 #[cfg(feature = "cubecl")]
-const CUBE_F32_TOLERANCE: [f32; 5] = [5.5e-7, 1.4e-7, 4.3e-7, 4.1e-7, 3.4e-7];
+const CUBE_F32_TOLERANCE: [f32; 5] = if cfg!(feature = "autotune") {
+    [1e-6, 2e-7, 1e-6, 1e-6, 1e-6]
+} else {
+    [5.5e-7, 1.4e-7, 4.3e-7, 4.1e-7, 3.4e-7]
+};
 /// In bf16 the error is the output's own rounding (8 significant bits) plus the probabilities'
 /// rounding to bf16 before the value product; the log-sum-exp is accumulated in f32 throughout.
+/// The query gradient is summed over the key blocks with atomics, in whatever order the kernels
+/// run: its bounds here and below are just above the largest over six to eight runs of each
+/// CUDA build, where the largest errors came out the same in every run.
 #[cfg(feature = "cubecl")]
-const BF16_TOLERANCE: [f32; 5] = [3.2e-3, 1.2e-7, 4.3e-3, 4.4e-3, 3.6e-3];
+const BF16_TOLERANCE: [f32; 5] = [3.2e-3, 1.2e-7, 4.2e-3, 4.4e-3, 3.6e-3];
 #[cfg(feature = "cubecl")]
-const F16_TOLERANCE: [f32; 5] = [3.9e-4, 1.2e-7, 7.4e-4, 6.9e-4, 6.4e-4];
+const F16_TOLERANCE: [f32; 5] = [3.9e-4, 1.2e-7, 7.3e-4, 6.9e-4, 6.4e-4];
 /// Decoding in bf16 and in f16 against the f32 reference.
 #[cfg(feature = "cubecl")]
 const DECODE_BF16_TOLERANCE: f32 = 2.2e-3;
 #[cfg(feature = "cubecl")]
 const DECODE_F16_TOLERANCE: f32 = 2.6e-4;
-/// The kernels against the f32 reference at shapes of several tiles, in bf16 and in f16: in
-/// bf16, dq reaches 7.3e-3 at the queries that see few keys (the start of a causal sequence),
-/// whose `delta = rowsum(dO * O)` is formed from the output rounded to bf16, as in
-/// FlashAttention-2; the same queries run alone through the plain causal kernels give the same
-/// bits.
+/// The kernels against the f32 reference at shapes of several tiles, in bf16 and in f16, the
+/// backward's products split and whole: in bf16, dq reaches 7.31e-3 at the queries that see few
+/// keys (the start of a causal sequence), whose `delta = rowsum(dO * O)` is formed from the output
+/// rounded to bf16, as in FlashAttention-2; the same queries run alone through the plain causal
+/// kernels give the same bits.
 #[cfg(feature = "cubecl")]
-const TILED_BF16_TOLERANCE: [f32; 5] = [3.3e-3, 4.4e-7, 7.7e-3, 4.6e-3, 3.9e-3];
+const TILED_BF16_TOLERANCE: [f32; 5] = [3.3e-3, 4.4e-7, 7.5e-3, 4.6e-3, 3.9e-3];
 #[cfg(feature = "cubecl")]
-const TILED_F16_TOLERANCE: [f32; 5] = [4.1e-4, 4.4e-7, 7.3e-4, 6.8e-4, 4.9e-4];
+const TILED_F16_TOLERANCE: [f32; 5] = [4.1e-4, 4.4e-7, 7.1e-4, 6.8e-4, 4.9e-4];
 /// A head dimension the kernels do not take: the reference on the device in bf16 and in f16
 /// against the f32 reference, the error the outputs' and gradients' rounding.
 #[cfg(feature = "cubecl")]
@@ -447,9 +455,9 @@ const REFERENCE_F16_TOLERANCE: [f32; 5] = [2.6e-4, 1e-7, 3.6e-4, 3.7e-4, 3.2e-4]
 /// Two causal segments composed by the kernels against the whole sequence, by the kernels and by
 /// the f32 reference: each segment's gradients are rounded to the dtype before they are added.
 #[cfg(feature = "cubecl")]
-const SEGMENTS_BF16_TOLERANCE: [f32; 5] = [3.2e-3, 2.3e-7, 4.7e-3, 4.7e-3, 4.9e-3];
+const SEGMENTS_BF16_TOLERANCE: [f32; 5] = [3.2e-3, 2.3e-7, 4.6e-3, 4.7e-3, 4.9e-3];
 #[cfg(feature = "cubecl")]
-const SEGMENTS_F16_TOLERANCE: [f32; 5] = [5.2e-4, 2.3e-7, 5.3e-4, 7.1e-4, 6.4e-4];
+const SEGMENTS_F16_TOLERANCE: [f32; 5] = [5.2e-4, 2.3e-7, 5.2e-4, 7.1e-4, 6.4e-4];
 /// Two causal segments composed against the whole sequence, both in f32 on Flex.
 #[cfg(feature = "flex")]
 const SEGMENTS_F32_TOLERANCE: [f32; 5] = [1.9e-7, 9e-8, 2.6e-7, 6.1e-7, 7.6e-7];
@@ -850,8 +858,26 @@ mod cube {
         }
     }
 
+    /// Makes the backward's products split each key block's sweep between two cubes, or keep it
+    /// whole, while it lives; then the call's size decides again.
+    struct ForcedSplit;
+
+    impl ForcedSplit {
+        fn new(split: bool) -> Self {
+            probe::force_split(Some(split));
+            Self
+        }
+    }
+
+    impl Drop for ForcedSplit {
+        fn drop(&mut self) {
+            probe::force_split(None);
+        }
+    }
+
     /// The kernels against the reference on Flex from the same inputs (rounded to bf16, so that
-    /// f16 holds them too), over [`tiled_cases`], in bf16 and in f16.
+    /// f16 holds them too), over [`tiled_cases`], in bf16 and in f16, the backward's products
+    /// both split between two cubes per key block and whole.
     #[test]
     fn kernels_match_the_reference_across_tiles_and_sequences() {
         let _serial = serial();
@@ -861,26 +887,89 @@ mod cube {
             .iter()
             .map(|case| run(&Device::flex().autodiff(), case, DType::F32))
             .collect();
-        for (dtype, label, tolerance) in [
-            (DType::BF16, "bf16", TILED_BF16_TOLERANCE),
-            (DType::F16, "f16", TILED_F16_TOLERANCE),
-        ] {
-            if !has(&device, dtype) {
-                continue;
+        for split in [false, true] {
+            let _forced = ForcedSplit::new(split);
+            let products = if split { "split" } else { "whole" };
+            for (dtype, label, tolerance) in [
+                (DType::BF16, "bf16", TILED_BF16_TOLERANCE),
+                (DType::F16, "f16", TILED_F16_TOLERANCE),
+            ] {
+                if !has(&device, dtype) {
+                    continue;
+                }
+                let mut worst = [0.0f32; 5];
+                for (case, expected) in cases.iter().zip(&expected) {
+                    let launches = expected_launches(&device, dtype, case.dims());
+                    let backward = kernels_take(&device, dtype, case.dims())[1];
+                    let splits = probe::split_runs();
+                    let actual = launches_kernels(launches, || run(&device, case, dtype));
+                    assert_eq!(
+                        probe::split_runs() - splits,
+                        usize::from(split && backward),
+                        "the products did not run {products}"
+                    );
+                    let name = format!("cube {label} {products} {} {:?}", case.name, case.dims());
+                    let errors = check(&name, &actual, expected, tolerance);
+                    for (w, e) in worst.iter_mut().zip(errors) {
+                        *w = w.max(e);
+                    }
+                }
+                println!(
+                    "{label} {products}, largest over the cases (o, lse, dq, dk, dv): {}",
+                    format_errors(worst)
+                );
             }
-            let mut worst = [0.0f32; 5];
-            for (case, expected) in cases.iter().zip(&expected) {
-                let launches = expected_launches(&device, dtype, case.dims());
-                let actual = launches_kernels(launches, || run(&device, case, dtype));
-                let name = format!("cube {label} {} {:?}", case.name, case.dims());
-                let errors = check(&name, &actual, expected, tolerance);
-                for (w, e) in worst.iter_mut().zip(errors) {
-                    *w = w.max(e);
+        }
+    }
+
+    /// The key and value gradients are the same bits from run to run, the products split or not:
+    /// whole, each key block's sums run in one cube in a fixed order; split, each element is the
+    /// sum of two halves' sums added to zero, whose order does not show. The query gradient is
+    /// summed over the key blocks in whatever order the cubes run, so its bits may differ from
+    /// run to run: by a unit in the dtype's last place where its value is large, and by the f32
+    /// sum's reordering, a few millionths of the largest value, where terms cancel.
+    #[test]
+    fn key_and_value_gradients_are_the_same_bits_from_run_to_run() {
+        let _serial = serial();
+        let device = device();
+        if !has(&device, DType::BF16) {
+            return;
+        }
+        let case = seeded(
+            "causal",
+            [1, 8, 2, 1000, 1000, 128],
+            Mask::None,
+            AttentionOptions::causal(),
+            600,
+        );
+        let bits = |h: &Host| h.values.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for split in [false, true] {
+            let _forced = ForcedSplit::new(split);
+            let first = run(&device, &case, DType::BF16);
+            let largest = first.dq.values.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let (mut differing, mut compared, mut worst) = (0, 0, 0.0f32);
+            for _ in 0..4 {
+                let again = run(&device, &case, DType::BF16);
+                assert_eq!(bits(&again.dk), bits(&first.dk), "dk differs between runs");
+                assert_eq!(bits(&again.dv), bits(&first.dv), "dv differs between runs");
+                assert_eq!(bits(&again.o), bits(&first.o), "o differs between runs");
+                for (a, b) in again.dq.values.iter().zip(&first.dq.values) {
+                    compared += 1;
+                    if a.to_bits() != b.to_bits() {
+                        differing += 1;
+                        let diff = (a - b).abs();
+                        worst = worst.max(diff / largest);
+                        assert!(
+                            diff <= a.abs().max(b.abs()) / 128.0 + 1e-5 * largest,
+                            "dq: {a} and {b} in two runs"
+                        );
+                    }
                 }
             }
             println!(
-                "{label}, largest over the cases (o, lse, dq, dk, dv): {}",
-                format_errors(worst)
+                "split {split}: dk, dv and o the same bits over 5 runs; dq differs from the \
+                 first run in {differing} of {compared} elements, by at most {worst:.2e} of its \
+                 largest value"
             );
         }
     }

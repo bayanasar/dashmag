@@ -232,13 +232,22 @@ const F32_TOLERANCE: [f32; 5] = [3e-7, 1.1e-7, 4.5e-7, 3.5e-7, 3.5e-7];
 /// lavapipe and CubeCL's CPU runtime. Its products and reductions are Burn's CubeCL kernels,
 /// which autotune and the runtime pick differently: dq is 4.2e-7 relative on CUDA and 8.1e-7 on
 /// lavapipe, dk 3.3e-7 and 4.4e-7; the rest moves less. Flex takes no part in those features, so
-/// `F32_TOLERANCE` holds for every build.
+/// `F32_TOLERANCE` holds for every build. With autotune Burn's kernels change from run to run, so
+/// the bounds are then a few roundings, as in `attention_masks.rs`.
 #[cfg(feature = "cubecl")]
-const CUBE_F32_TOLERANCE: [f32; 5] = [3.2e-7, 1.1e-7, 8.5e-7, 4.6e-7, 3.8e-7];
+const CUBE_F32_TOLERANCE: [f32; 5] = if cfg!(feature = "autotune") {
+    [1e-6, 2e-7, 1e-6, 1e-6, 1e-6]
+} else {
+    [3.2e-7, 1.1e-7, 8.5e-7, 4.6e-7, 3.8e-7]
+};
+/// The kernels in bf16 and f16. The query gradient is summed over the key blocks with atomics, in
+/// whatever order the kernels run: its bounds are just above the largest over eight runs of each
+/// CUDA build (4.48e-3 in bf16, 4.46e-4 in f16; the largest are where few key blocks add up, and
+/// the same in every run).
 #[cfg(feature = "cubecl")]
-const BF16_TOLERANCE: [f32; 5] = [3.4e-3, 2.5e-7, 4.7e-3, 4e-3, 4.2e-3];
+const BF16_TOLERANCE: [f32; 5] = [3.4e-3, 2.5e-7, 4.6e-3, 4e-3, 4.2e-3];
 #[cfg(feature = "cubecl")]
-const F16_TOLERANCE: [f32; 5] = [4.6e-4, 1.7e-7, 4.7e-4, 3.6e-4, 4e-4];
+const F16_TOLERANCE: [f32; 5] = [4.6e-4, 1.7e-7, 4.6e-4, 3.6e-4, 4e-4];
 /// Decoding in bf16 against the f32 reference.
 #[cfg(feature = "cubecl")]
 const DECODE_BF16_TOLERANCE: f32 = 2.9e-3;
@@ -506,8 +515,26 @@ mod cube {
         }
     }
 
+    /// Makes the backward's products split each key block's sweep between two cubes, or keep it
+    /// whole, while it lives; then the call's size decides again.
+    struct ForcedSplit;
+
+    impl ForcedSplit {
+        fn new(split: bool) -> Self {
+            probe::force_split(Some(split));
+            Self
+        }
+    }
+
+    impl Drop for ForcedSplit {
+        fn drop(&mut self) {
+            probe::force_split(None);
+        }
+    }
+
     /// Shapes with several query and key blocks, partial last blocks, groups of 1, 3 and 4,
-    /// Tk > Tq and a single query, against the reference on Flex from the same bf16 inputs.
+    /// Tk > Tq and a single query, against the reference on Flex from the same bf16 inputs, the
+    /// backward's products both split between two cubes per key block and whole.
     #[test]
     fn kernels_match_the_reference_across_blocks() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -521,29 +548,34 @@ mod cube {
             [1, 6, 2, 70, 150, 64],
             [1, 8, 2, 1, 33, 256],
         ];
-        for (i, dims) in shapes.into_iter().enumerate() {
-            let (q, k, v, grad, scale) = inputs(dims, 100 + 10 * i as u64);
-            let expected = run(
-                &Device::flex().autodiff(),
-                &q,
-                &k,
-                &v,
-                &grad,
-                scale,
-                DType::F32,
-            );
-            let launches = expected_launches(&device, DType::BF16, call_dims(dims));
-            let copies = probe::input_copies();
-            let actual = launches_kernels(launches, || {
-                run(&device, &q, &k, &v, &grad, scale, DType::BF16)
-            });
-            assert_eq!(probe::input_copies(), copies);
-            check(
-                &format!("cube bf16 {dims:?}"),
-                &actual,
-                &expected,
-                BF16_TOLERANCE,
-            );
+        for split in [false, true] {
+            let _forced = ForcedSplit::new(split);
+            for (i, dims) in shapes.into_iter().enumerate() {
+                let (q, k, v, grad, scale) = inputs(dims, 100 + 10 * i as u64);
+                let expected = run(
+                    &Device::flex().autodiff(),
+                    &q,
+                    &k,
+                    &v,
+                    &grad,
+                    scale,
+                    DType::F32,
+                );
+                let launches = expected_launches(&device, DType::BF16, call_dims(dims));
+                let backward = kernels_take(&device, DType::BF16, call_dims(dims))[1];
+                let (copies, splits) = (probe::input_copies(), probe::split_runs());
+                let actual = launches_kernels(launches, || {
+                    run(&device, &q, &k, &v, &grad, scale, DType::BF16)
+                });
+                assert_eq!(probe::input_copies(), copies);
+                assert_eq!(probe::split_runs() - splits, usize::from(split && backward));
+                check(
+                    &format!("cube bf16 split {split} {dims:?}"),
+                    &actual,
+                    &expected,
+                    BF16_TOLERANCE,
+                );
+            }
         }
     }
 

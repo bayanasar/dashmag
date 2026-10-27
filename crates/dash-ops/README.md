@@ -64,14 +64,15 @@ then leaves it no room.
 ## Measured
 
 On one RTX 5070 Ti (sm_120) under WSL2, bf16, against PyTorch 2.13 on the same card, built
-with `cuda` only unless a row says otherwise:
+with `cuda` only unless a row says otherwise (attention's training row measured run in turn
+with PyTorch's while the card ran about a fifth slower than for the other rows):
 
 | operation | shape | dash-ops | PyTorch |
 |---|---|---|---|
 | gated delta rule, chunked, forward + backward | 6144 tokens, 16 heads of 128: one sequence / four packed of 1536 | this operation's kernels 2.87 / 2.72 ms on the device (with the benchmark's loss 3.90 / 3.75; 4.4 / 4.6 ms on the host), +400 / +408 MiB; forward alone 0.89 / 0.86 ms on the device | fla's kernels 2.67 / 2.50 ms (with the loss 3.25 / 3.10), +398 / +398 MiB; forward 0.73 / 0.71 ms (fla 0.5.2) |
 | gated delta rule, chunked, forward + backward | the same with 16 heads of 256 (the f32 kernels) | 21.8 / 22.5 ms on the device, +1548 / +1985 MiB; forward 6.1 / 6.4 ms | 7.5 / 6.8 ms; forward 2.2 / 1.8 ms (fla 0.5.2) |
 | gated delta rule, one decoding step | batch 8, 16 heads of 128, 18 layers in turn | 21 us a layer | 34 us (fla 0.5.2) |
-| attention, forward + backward | 6144 tokens, 8 query and 2 key-value heads of 256: causal; no mask; 4 packed sequences of 1536; causal within a window of 1024 | 9.5 ms, +60 MiB (kernels 9.0 ms); 18.4 ms; 2.9 ms; 3.4 ms | flash: 7.6 ms, +204 MiB; 15.0 ms; 2.5 ms as a padded batch of 4; the window through flex_attention 12.9 ms |
+| attention, forward + backward | 6144 tokens, 8 query and 2 key-value heads of 256: causal; no mask; 4 packed sequences of 1536; causal within a window of 1024 | on the device 8.7 ms, +60 MiB (+132 MiB at the backward's peak); 17.6 ms; 2.6 ms; 3.0 ms (wall clock 10.0; 17.9; 3.0; 3.3 ms) | flash on the device: 8.9 ms, +204 MiB; 17.8 ms; 2.8 ms as a padded batch of 4; the window through flex_attention 7.3 ms |
 | attention, decoding | batch 8, 6144 cached keys: the whole cache; lengths from 100 to 6144; a window of 1024 | 147 us; 52 us; 42 us a layer, over 24 calls between synchronisations | 140 us; 3729 us (a padding mask); 37 us (the last 1025 keys) |
 | log-probability, forward + backward | 3072 tokens, 248320 classes, width 1024 | 78.9 ms, +216 MiB (70.4 ms with `fusion` and `autotune`) | 86.4 ms, +8730 MiB |
 | linear + cross-entropy, forward + backward with the weight's gradient | 3072 / 8192 tokens, 248320 classes, width 1024 | 102 / 293 ms, +641 / +731 MiB (94 / 261 ms with `autotune`) | logits in f32: 95 / 1179 ms, +11672 / +31072 MiB; in bf16: 64 / 1241 ms, +5824 / +15520 MiB (at 8192 both spill past the card's 16 GB into host memory) |
@@ -93,10 +94,13 @@ the benchmark (a cast, a product and a sum over the output) takes 1.0 ms in Burn
 in PyTorch's. Heads of 256 run the f32 kernels, three times fla's time. Packed sequences cost about
 what one sequence of their length does: the state passings take each sequence's chunks in turn, two
 of their cubes fitting on a multiprocessor on tensor cores (44 and 48 KiB of shared memory), one in
-f32. Attention's backward does seven T x T x D products to FlashAttention-2's five, to avoid
-atomics. The low-rank product's row is by device time under Nsight Systems, from `dash-lora`'s
-`examples/lora_layer.rs`, PEFT's term the same way; `lowrank_bench` times it against Burn's own
-matmuls by wall clock. Each example in `examples/` reproduces its row (`--features cuda`).
+f32. Attention's backward does FlashAttention-2's five T x T x D products in one kernel and sums the
+query gradient over the key blocks with f32 atomics, as FlashAttention-2 does, so that gradient's
+last bits vary from run to run (the output and the key and value gradients do not); a fixed-order
+query gradient, seven products, measured 28% slower. The low-rank product's row is by device time
+under Nsight Systems, from `dash-lora`'s `examples/lora_layer.rs`, PEFT's term the same way;
+`lowrank_bench` times it against Burn's own matmuls by wall clock. Each example in `examples/`
+reproduces its row (`--features cuda`).
 `matmul_bench` and `dispatch_bench` measure Burn itself: bf16 matmul against cuBLAS, and the
 host-side cost of each unfused operation.
 

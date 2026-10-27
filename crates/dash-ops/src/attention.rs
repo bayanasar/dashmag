@@ -78,22 +78,37 @@
 //! The CubeCL kernels take bf16 and f16 with a head dimension of 64, 128 or 256, every mask
 //! above, on a device with `mma.sync` m16n8k16 and `ldmatrix` for that dtype, planes of exactly
 //! 32 units (the tensor-core fragments and the plane shuffles are laid out for them), 256 units
-//! per cube and up to 97 KiB of shared memory per cube: CUDA cards of compute capability 8.0 and
-//! later, where they always run; elsewhere the reference runs (`kernels_take` tells which).
+//! per cube, up to 97 KiB of shared memory per cube and, for the backward, atomic f32 additions
+//! in global memory: CUDA cards of compute capability 8.0 and later, where they always run;
+//! elsewhere the reference runs (`kernels_take` tells which).
 //!
 //! - Training: a FlashAttention-2 style forward that also writes each query's log-sum-exp, and a
-//!   backward of three kernels: `delta = rowsum(dO * O)`, `dQ` sweeping the key blocks of each
-//!   query block, and `dK`, `dV` sweeping the query blocks, and the query heads of the group, of
-//!   each key block. Both passes recompute the scores tile by tile from the log-sum-exp, so
-//!   neither holds T x T, and grouped heads are handled inside the kernels: nothing is
-//!   expanded. Each query's visible keys are one interval (the mask kinds above all give one,
-//!   apart from padding), so every block of queries sweeps only the key blocks some of its
-//!   queries see, every block of keys only the query blocks that see some of its keys, and
-//!   per-element masking runs only on tiles that cut an interval or carry padding: tiles wholly
-//!   outside the causal triangle, the window or a sequence cost nothing. A padding mask is
-//!   applied per element. Tiles go through the tensor cores (`mma.sync` m16n8k16, f32 accumulation,
-//!   operands staged through swizzled shared memory with `ldmatrix`). No kernel uses atomics, so
-//!   the gradients are the same bits from run to run.
+//!   backward in FlashAttention-2's five products, in three kernels: `delta = rowsum(dO * O)`;
+//!   the products, sweeping the query blocks, and the query heads of the group, of each key
+//!   block, computing the scores, the probabilities, their gradient `dP = dO V^T` and
+//!   `dS = P (dP - delta)` once per tile, accumulating `dK` and `dV` in registers and adding
+//!   each tile's `dQ = dS K` to an f32 accumulator with atomic additions; then the gradients
+//!   rounded once from f32 to their inputs' dtype. Both passes recompute the scores tile by tile
+//!   from the log-sum-exp, so neither holds T x T, and grouped heads are handled inside the
+//!   kernels: nothing is expanded. Each query's visible keys are one interval (the mask kinds
+//!   above all give one, apart from padding), so every block of queries sweeps only the key
+//!   blocks some of its queries see, every block of keys only the query blocks that see some of
+//!   its keys, and per-element masking runs only on tiles that cut an interval or carry
+//!   padding: tiles wholly outside the causal triangle, the window or a sequence cost nothing.
+//!   A padding mask is applied per element. Tiles go through the tensor cores (`mma.sync`
+//!   m16n8k16, f32 accumulation, operands staged through swizzled shared memory with
+//!   `ldmatrix`). When the key blocks would fill the multiprocessors unevenly, two cubes share
+//!   each key block, each sweeping half its query blocks, and add their `dK` and `dV` to f32
+//!   accumulators too.
+//!
+//!   The query gradient's sum over the key blocks comes in whatever order the cubes run, so its
+//!   last bits vary from run to run: by a unit in the dtype's last place where it is large, and
+//!   where its terms cancel by the f32 sum's reordering, a few millionths of its largest value.
+//!   The output, the log-sum-exp and the key and value gradients are the same bits from run to
+//!   run (split, each key and value gradient is two addends added to zero, in either order the
+//!   same). PyTorch's and flash-attn's flash backward sum the query gradient the same way. A
+//!   fixed-order query gradient, a kernel of its own sweeping the key blocks of each query block
+//!   (seven products in all), costs 28% more backward time on an RTX 5070 Ti and is not kept.
 //! - Decoding: the cache is split (flash-decoding), counted back from each sequence's last key so
 //!   that splits past its length or before its window cost nothing; each key and value row is
 //!   loaded once for all the query heads of its group; then the splits are merged by their
@@ -106,27 +121,32 @@
 //! projection) and for a permutation of those dimensions (`[B, H, T, D]` storage seen through
 //! `swap_dims(1, 2)`); the kernels copy any other input. They write the output, the log-sum-exp
 //! and the gradients contiguous. `probe` counts the kernel launches, the runs of the written-out
-//! backward, and the inputs the kernels copied.
+//! backward, the inputs the kernels copied and the backward passes whose products split.
 //!
 //! # Measured
 //!
 //! Against PyTorch 2.13's `scaled_dot_product_attention` in float64 with an explicit boolean
 //! mask (the tests' records: every mask above, grouped heads, `Tq != Tk`, queries that see no
 //! key; packed sequences one call per sequence), the reference in f32 agrees to within 4.1e-7 of
-//! each output's and gradient's largest value, and the kernels to within 4.4e-3 in bf16 and
-//! 7.4e-4 in f16. Against the f32 reference at shapes of several tiles and sequences, the bf16
-//! kernels agree to within 4.6e-3, but for the query gradient's 7.7e-3 at the queries that see
+//! each output's and gradient's largest value, and the kernels to within 4.2e-3 in bf16 and
+//! 7.1e-4 in f16. Against the f32 reference at shapes of several tiles and sequences, the bf16
+//! kernels agree to within 4.6e-3, but for the query gradient's 7.3e-3 at the queries that see
 //! few keys (the start of a causal sequence), whose `delta = rowsum(dO * O)` comes from the
-//! output rounded to bf16, as in FlashAttention-2; f16 to within 7.3e-4. A causal sequence run in
+//! output rounded to bf16, as in FlashAttention-2; f16 to within 7.0e-4. These are the largest
+//! over repeated runs: where the query gradient's atomic sums change its bits, by up to 5.2e-4
+//! of its largest value from one run to the next, its error moves less. A causal sequence run in
 //! two segments, the second's queries against both segments' keys, composes into the whole
 //! sequence's outputs and gradients to f32 rounding (7.6e-7).
 //!
 //! On an RTX 5070 Ti with 6144 tokens, 8 query and 2 key-value heads of 256 in bf16
-//! (`examples/attention_bench.rs`, PyTorch 2.13 beside it), forward and backward take 9.5 ms
-//! causal (flash attention 7.6 ms; the four kernels alone 9.0 ms) and grow the memory pool by
-//! 60 MiB (204 MiB); 18.4 ms with no mask (15.0 ms); 2.9 ms for four packed sequences of 1536
-//! (2.5 ms as a padded batch of four); 3.4 ms causal within a window of 1024 (PyTorch has no
-//! fused window at this head width: flex_attention 12.9 ms, an explicit mask 49.4 ms). Decoding
+//! (`examples/attention_bench.rs`, PyTorch 2.13 beside it, the two run in turn on a card other
+//! work shared), forward and backward kernels take 8.7 ms of device time causal (flash attention
+//! 8.9 ms): the forward 2.8 ms (2.4), the backward 5.9 ms (6.5, with grouped heads expanded and
+//! summed), of which the products 5.6 ms. They grow the memory pool by 60 MiB (flash 204 MiB at
+//! its peak), and the backward holds 72 MiB more meanwhile, its f32 accumulators. With no mask
+//! they take 17.6 ms (17.8 ms); four packed sequences of 1536, 2.6 ms (2.8 ms as a padded batch
+//! of four); causal within a window of 1024, 3.0 ms (PyTorch has no fused window at this head
+//! width: flex_attention 7.3 ms, an explicit mask 49.4 ms of wall clock). Decoding
 //! a batch of 8 against 6144 cached keys takes 147 us a layer (140 us), 52 us with cache lengths
 //! from 100 to 6144 (3729 us through a padding mask) and 42 us within a window of 1024 (37 us on
 //! the last 1025 keys).
@@ -153,18 +173,22 @@ mod cube;
 mod kernels;
 mod reference;
 
-/// Counters tests read to tell which path ran. Not part of the API.
+/// Counters tests read to tell which path ran, and a switch they set to run each. Not part of
+/// the API.
 #[doc(hidden)]
 pub mod probe {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
     pub(super) static KERNEL_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static BACKWARD_RUNS: AtomicUsize = AtomicUsize::new(0);
     pub(super) static INPUT_COPIES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static SPLIT_RUNS: AtomicUsize = AtomicUsize::new(0);
+    /// 0: the backward's products split by the call's size; 1: never; 2: always.
+    static SPLIT: AtomicU8 = AtomicU8::new(0);
 
     /// Launches of this module's CubeCL kernels: the forward adds one, the backward three
-    /// (`delta`, `dQ`, `dK` with `dV`), decoding two (the splits, then their merge). Zero
-    /// without a CubeCL runtime's feature.
+    /// (`delta`, the products, the gradients' rounding from their accumulators), decoding two
+    /// (the splits, then their merge). Zero without a CubeCL runtime's feature.
     pub fn kernel_launches() -> usize {
         KERNEL_LAUNCHES.load(Ordering::SeqCst)
     }
@@ -178,6 +202,33 @@ pub mod probe {
     /// documentation says which they read in place).
     pub fn input_copies() -> usize {
         INPUT_COPIES.load(Ordering::SeqCst)
+    }
+
+    /// Backward passes whose products split each key block's sweep between two cubes.
+    pub fn split_runs() -> usize {
+        SPLIT_RUNS.load(Ordering::SeqCst)
+    }
+
+    /// Makes the backward's products split each key block's sweep (`Some(true)`), keep it whole
+    /// (`Some(false)`), or choose by the call's size (`None`, the default), so that tests run
+    /// both paths whatever the device.
+    pub fn force_split(split: Option<bool>) {
+        let mode = match split {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        };
+        SPLIT.store(mode, Ordering::SeqCst);
+    }
+
+    /// What [`force_split`] asked for.
+    #[cfg(feature = "cubecl")]
+    pub(super) fn forced_split() -> Option<bool> {
+        match SPLIT.load(Ordering::SeqCst) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
     }
 }
 

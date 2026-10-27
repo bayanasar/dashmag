@@ -9,8 +9,8 @@
 //! kernels index their outputs and the per-row statistics densely.
 
 use super::kernels::{
-    BLOCK_KV, BLOCK_Q, FORWARD_BLOCK_Q, decode_merge_kernel, decode_split_kernel, delta_kernel,
-    dkdv_kernel, dq_kernel, forward_kernel,
+    BLOCK_KV, FORWARD_BLOCK_Q, backward_kernel, decode_merge_kernel, decode_split_kernel,
+    delta_kernel, finish_kernel, forward_kernel,
 };
 use super::{
     AttentionBackend, AttentionMaskPrimitive, AttentionOptions, CacheLengths, MaskShape,
@@ -26,8 +26,9 @@ use burn_cubecl::kernel::{into_contiguous, untile};
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::client::Client;
+use cubecl::ir::features::AtomicUsage;
 use cubecl::ir::features::MmaConfig;
-use cubecl::ir::{AddressType, DeviceProperties, ElemType, FloatKind};
+use cubecl::ir::{AddressType, DeviceProperties, ElemType, FloatKind, Type};
 use cubecl::prelude::*;
 use std::sync::atomic::Ordering;
 
@@ -38,9 +39,8 @@ const VECTOR: usize = 8;
 /// lanes its rows and columns, and the reductions shuffle across those lanes.
 const PLANE: u32 = 32;
 
-/// The key block of the forward and `dQ` kernels for head dimension `d`: 32 keys at 256, so that
-/// queries (128 rows in the forward, 64 with the output gradients in `dQ`), keys and values fit
-/// in 99 KB of shared memory; 64 below.
+/// The forward's key block for head dimension `d`: 32 keys at 256, so that 128 queries, the keys
+/// and the values fit in 99 KB of shared memory; 64 below.
 fn block_kv(d: usize) -> u32 {
     if d > 128 { 32 } else { 64 }
 }
@@ -79,29 +79,62 @@ fn forward_requirements([_, tq, _, hq, _, d]: [usize; 6]) -> Requirements {
 }
 
 /// What the backward kernels ask, the most of each: 256 units per cube; `delta`'s cube per
-/// `256 / (D / 8)` rows, `dQ`'s per 64 queries of each query head, `dK`/`dV`'s per 32 keys of
-/// each key-value head; `dQ`'s query, output-gradient, key and value tiles in shared memory (the
-/// most, beside `dK`/`dV`'s four 32-row tiles and its 32 x 32 tiles of `P` and `dS`); the twelve
-/// tensors of `dK`/`dV`; 16-byte vectors and planes of 32.
-fn backward_requirements([b, tq, tk, hq, hkv, d]: [usize; 6]) -> Requirements {
-    let bkv = block_kv(d) as usize;
+/// `256 / (D / 8)` rows of the `dQ` accumulator (whole 32-query blocks) or per 2048 elements of
+/// the key and value gradients' accumulators, split; the products' per 32 keys of each key-value
+/// head (two, split); the conversion's per 32 queries of each query head, beside those per 2048
+/// elements of the key and value gradients, split; the products' four 32-row tiles and their
+/// 32 x 32 tiles of `P` and `dS` in shared memory; the products' fifteen tensors; f32 atomic
+/// additions; 16-byte vectors and planes of 32.
+fn backward_requirements(dims: [usize; 6], split: bool) -> Requirements {
+    let [b, tq, tk, hq, hkv, d] = dims;
     let rows_per_cube = 256 / (d / VECTOR);
-    let delta = Requirements::new((256, 1), ((b * tq * hq).div_ceil(rows_per_cube), 1), 8);
-    let rows = BLOCK_Q as usize;
-    let dq = Requirements {
-        shared_bytes: (2 * rows + 2 * bkv) * d * 2 + bounds_bytes(rows, rows / 16, bkv),
-        ..Requirements::new((256, 1), (tq.div_ceil(BLOCK_Q as usize), hq), 10)
-    };
     let block = BLOCK_KV as usize;
-    let dkdv = Requirements {
-        shared_bytes: 4 * block * d * 2 + 2 * block * block * 2 + 4 * 4 * block,
-        ..Requirements::new((256, 1), (tk.div_ceil(block), hkv), 12)
+    let q_blocks = tq.div_ceil(block);
+    let kv_cubes = if split {
+        (b * tk * hkv * d / VECTOR).div_ceil(256)
+    } else {
+        0
     };
+    let rows = b * q_blocks * block * hq;
+    let delta = Requirements::new(
+        (256, 1),
+        (rows.div_ceil(rows_per_cube).max(kv_cubes), 1),
+        11,
+    );
+    let products = Requirements {
+        shared_bytes: 4 * block * d * 2 + 2 * block * block * 2 + 4 * 4 * block,
+        ..Requirements::new(
+            (256, 1),
+            (tk.div_ceil(block) * (1 + usize::from(split)), hkv),
+            15,
+        )
+    };
+    let finish = Requirements::new((256, 1), (b * q_blocks * hq + kv_cubes, 1), 6);
     Requirements {
         vector_size: VECTOR,
         plane_width: Some(PLANE),
-        ..delta.max(dq).max(dkdv)
+        ..delta.max(products).max(finish)
     }
+}
+
+/// Whether the products split each key block's sweep between two cubes: when that fills the
+/// device's multiprocessors more evenly, one cube each at a time. The products' cubes are
+/// `ceil(Tk / 32) Hkv B`; `n` equal ones on `P` multiprocessors run in `ceil(n / P)` rounds, and
+/// their halves in `ceil(2 n / P)` rounds of half the length. Split, the key and value gradients
+/// go through f32 accumulators, which costs a pass over them, hence the margin.
+fn splits(client: &Client, [b, _, tk, _, hkv, _]: [usize; 6]) -> bool {
+    if let Some(split) = probe::forced_split() {
+        return split;
+    }
+    let processors = client
+        .properties()
+        .hardware
+        .num_streaming_multiprocessors
+        .unwrap_or(64) as usize;
+    let cubes = tk.div_ceil(BLOCK_KV as usize) * hkv * b;
+    let rounds = cubes.div_ceil(processors);
+    let halves = (2 * cubes).div_ceil(processors);
+    20 * halves < 19 * 2 * rounds
 }
 
 /// Whether the device has `mma.sync` m16n8k16 from `dtype` into f32, and `ldmatrix` for it.
@@ -119,6 +152,13 @@ fn tensor_cores(properties: &DeviceProperties, dtype: DType) -> bool {
         && properties.features.matmul.ldmatrix.contains(&elem)
 }
 
+/// Whether the device adds to f32 in global memory atomically, as the backward sums `dQ`.
+fn float_atomics(properties: &DeviceProperties) -> bool {
+    properties
+        .atomic_type_usage(Type::atomic(ElemType::Float(FloatKind::F32)))
+        .contains(AtomicUsage::Add)
+}
+
 /// Whether the kernels take a forward (or backward) pass over inputs of `dtype` and dimensions
 /// `[B, Tq, Tk, Hq, Hkv, D]` on the device `client` serves: bf16 or f16, a head dimension of 64,
 /// 128 or 256, something to compute, positions and elements that `i32` and `u32` index, and a
@@ -132,16 +172,17 @@ pub(super) fn kernels_take(
     let [b, tq, tk, hq, hkv, d] = dims;
     let properties = client.properties();
     let requirements = if backward {
-        backward_requirements(dims)
+        backward_requirements(dims, splits(client, dims))
     } else {
         forward_requirements(dims)
     };
-    matches!(dtype, DType::BF16 | DType::F16)
+    (!backward || float_atomics(properties))
+        && matches!(dtype, DType::BF16 | DType::F16)
         && matches!(d, 64 | 128 | 256)
         && b * tq * hq > 0
         && tk > 0
         && tq + tk < 1 << 29
-        && (b * tq.max(tk) * hq.max(hkv) * d) < 1 << 32
+        && (b * tq.next_multiple_of(BLOCK_KV as usize).max(tk) * hq.max(hkv) * d) < 1 << 32
         && b <= properties.hardware.max_cube_count.2 as usize
         && tensor_cores(properties, dtype)
         && requirements.met_on(client, &[dtype, DType::F32, DType::I32])
@@ -427,8 +468,19 @@ fn lse_readable(lse: CubeTensor) -> CubeTensor {
     into_contiguous(lse)
 }
 
-/// The backward: `delta`, then `dQ`, then `dK` and `dV`, each gradient contiguous in its input's
-/// layout.
+/// A one-element f32 tensor bound where a kernel's accumulator goes unused.
+fn unused_f32(like: &CubeTensor) -> CubeTensor {
+    empty_device_contiguous_dtype(
+        like.client.clone(),
+        like.device.clone(),
+        Shape::new([1]),
+        DType::F32,
+    )
+}
+
+/// The backward, each gradient contiguous in its input's layout: `delta` (zeroing the f32
+/// accumulators), the five products (`dQ` added to its accumulator with atomics, and, split, `dK`
+/// and `dV` to theirs), and the gradients rounded from the accumulators.
 #[allow(clippy::too_many_arguments)]
 fn backward(
     query: CubeTensor,
@@ -454,49 +506,69 @@ fn backward(
     let [do_sb, do_sh, do_st] = sequence_strides(&grad_output);
     let [m_sb, m_st] = mask.key_strides;
     let group = (hq / hkv) as u32;
+    let contiguous = |shape: Vec<usize>, dtype: DType| {
+        empty_device_contiguous_dtype(client.clone(), device.clone(), Shape::from(shape), dtype)
+    };
 
     let rows = b * tq * hq;
-    let delta = empty_device_contiguous_dtype(
-        client.clone(),
-        device.clone(),
-        Shape::new([b, tq, hq]),
-        DType::F32,
-    );
-    // The log-sum-exp as `dQ` and `dK`/`dV` read it: `+inf` for a query that sees no key.
-    let lse_bwd = empty_device_contiguous_dtype(
-        client.clone(),
-        device.clone(),
-        Shape::new([b, tq, hq]),
-        DType::F32,
-    );
-    // Packed, each query's interval of keys, for `dK`/`dV`.
-    let bounds = if mask.packed {
-        empty_device_contiguous_dtype(
-            client.clone(),
-            device.clone(),
-            Shape::new([tq, 2]),
-            DType::I32,
+    let delta = contiguous(vec![b, tq, hq], DType::F32);
+    // The log-sum-exp as the other kernels read it: `+inf` for a query that sees no key.
+    let lse_bwd = contiguous(vec![b, tq, hq], DType::F32);
+    // `dQ` in f32, summed over the key blocks by the products' atomics: a tile of 32 x D values per
+    // 32-query block and query head, in the products' register order (`dq_tile()`).
+    let split = splits(&client, [b, tq, tk, hq, hkv, d]);
+    if split {
+        probe::SPLIT_RUNS.fetch_add(1, Ordering::SeqCst);
+    }
+    let q_blocks = tq.div_ceil(BLOCK_KV as usize);
+    let zero_rows = b * q_blocks * BLOCK_KV as usize * hq;
+    let dq_acc = contiguous(vec![b, q_blocks, hq, BLOCK_KV as usize * d], DType::F32);
+    // Split, `dK` and `dV` in f32, each the sum of the two halves of its key block's sweep.
+    let kv_chunks = if split { b * tk * hkv * d / VECTOR } else { 0 };
+    let (dk_acc, dv_acc) = if split {
+        let shape = vec![b, tk, hkv, d];
+        (
+            contiguous(shape.clone(), DType::F32),
+            contiguous(shape, DType::F32),
         )
+    } else {
+        (unused_f32(&query), unused_f32(&query))
+    };
+    // Packed, each query's interval of keys, for the products.
+    let bounds = if mask.packed {
+        contiguous(vec![tq, 2], DType::I32)
     } else {
         unread(&query)
     };
     let rows_per_cube = 256 / (d / VECTOR);
     launched();
-    // SAFETY: as for the forward; `delta` reads the output and its gradient row by row.
+    // SAFETY: as for the forward; `delta` reads the output and its gradient row by row, and
+    // zeroes the accumulators, whose sizes bound the units that write them.
     unsafe {
         delta_kernel::launch_unchecked(
             &client,
-            CubeCount::Static(rows.div_ceil(rows_per_cube) as u32, 1, 1),
+            CubeCount::Static(
+                zero_rows
+                    .div_ceil(rows_per_cube)
+                    .max(kv_chunks.div_ceil(256)) as u32,
+                1,
+                1,
+            ),
             CubeDim::new_1d(256),
             output.into_tensor_arg(),
             grad_output.clone().into_tensor_arg(),
             delta.clone().into_tensor_arg(),
             lse.into_tensor_arg(),
             lse_bwd.clone().into_tensor_arg(),
+            dq_acc.clone().into_tensor_arg(),
+            dk_acc.clone().into_tensor_arg(),
+            dv_acc.clone().into_tensor_arg(),
             bounds.clone().into_tensor_arg(),
             mask.cu_q.clone().into_tensor_arg(),
             mask.cu_k.clone().into_tensor_arg(),
             rows as u32,
+            zero_rows as u32,
+            kv_chunks as u32,
             hq as u32,
             tq as u32,
             tk as u32,
@@ -515,77 +587,19 @@ fn backward(
         );
     }
 
-    let grad_query = empty_device_contiguous_dtype(
-        client.clone(),
-        device.clone(),
-        Shape::new([b, tq, hq, d]),
-        query.dtype,
-    );
+    let grad_query = contiguous(vec![b, tq, hq, d], query.dtype);
+    let grad_key = contiguous(vec![b, tk, hkv, d], key.dtype);
+    let grad_value = contiguous(vec![b, tk, hkv, d], value.dtype);
     launched();
-    // SAFETY: as for the forward.
+    // SAFETY: as for the forward; the accumulator's rows are those of the queries, below Tq.
     unsafe {
-        dq_kernel::launch_unchecked(
+        backward_kernel::launch_unchecked(
             &client,
-            CubeCount::Static(tq.div_ceil(BLOCK_Q as usize) as u32, hq as u32, b as u32),
-            CubeDim::new_1d(256),
-            query.clone().into_tensor_arg(),
-            key.clone().into_tensor_arg(),
-            value.clone().into_tensor_arg(),
-            grad_output.clone().into_tensor_arg(),
-            lse_bwd.clone().into_tensor_arg(),
-            delta.clone().into_tensor_arg(),
-            grad_query.clone().into_tensor_arg(),
-            mask.keys.clone().into_tensor_arg(),
-            mask.cu_q.clone().into_tensor_arg(),
-            mask.cu_k.clone().into_tensor_arg(),
-            tq.div_ceil(BLOCK_Q as usize) as u32,
-            tq as u32,
-            tk as u32,
-            group,
-            q_sb,
-            q_sh,
-            q_st,
-            k_sb,
-            k_sh,
-            k_st,
-            v_sb,
-            v_sh,
-            v_st,
-            do_sb,
-            do_sh,
-            do_st,
-            scale,
-            m_sb,
-            m_st,
-            mask.seqs,
-            mask.left,
-            mask.right,
-            d as u32,
-            block_kv(d),
-            mask.padded,
-            mask.packed,
-            dtype,
-        );
-    }
-
-    let grad_key = empty_device_contiguous_dtype(
-        client.clone(),
-        device.clone(),
-        Shape::new([b, tk, hkv, d]),
-        key.dtype,
-    );
-    let grad_value = empty_device_contiguous_dtype(
-        client.clone(),
-        device,
-        Shape::new([b, tk, hkv, d]),
-        value.dtype,
-    );
-    launched();
-    // SAFETY: as for the forward.
-    unsafe {
-        dkdv_kernel::launch_unchecked(
-            &client,
-            CubeCount::Static(tk.div_ceil(BLOCK_KV as usize) as u32, hkv as u32, b as u32),
+            CubeCount::Static(
+                (tk.div_ceil(BLOCK_KV as usize) * (1 + usize::from(split))) as u32,
+                hkv as u32,
+                b as u32,
+            ),
             CubeDim::new_1d(256),
             query.into_tensor_arg(),
             key.into_tensor_arg(),
@@ -593,8 +607,11 @@ fn backward(
             grad_output.into_tensor_arg(),
             lse_bwd.into_tensor_arg(),
             delta.into_tensor_arg(),
+            dq_acc.clone().into_tensor_arg(),
             grad_key.clone().into_tensor_arg(),
             grad_value.clone().into_tensor_arg(),
+            dk_acc.clone().into_tensor_arg(),
+            dv_acc.clone().into_tensor_arg(),
             mask.keys.clone().into_tensor_arg(),
             bounds.into_tensor_arg(),
             mask.cu_q.clone().into_tensor_arg(),
@@ -623,6 +640,34 @@ fn backward(
             d as u32,
             mask.padded,
             mask.packed,
+            split,
+            dtype,
+        );
+    }
+
+    let tiles = b * q_blocks * hq;
+    launched();
+    // SAFETY: one cube per tile of the `dQ` accumulator, rows past the queries not written; then,
+    // split, one unit per eight elements of `dK` and `dV`.
+    unsafe {
+        finish_kernel::launch_unchecked(
+            &client,
+            CubeCount::Static((tiles + kv_chunks.div_ceil(256)) as u32, 1, 1),
+            CubeDim::new_1d(256),
+            dq_acc.into_tensor_arg(),
+            grad_query.clone().into_tensor_arg(),
+            dk_acc.into_tensor_arg(),
+            dv_acc.into_tensor_arg(),
+            grad_key.clone().into_tensor_arg(),
+            grad_value.clone().into_tensor_arg(),
+            q_blocks as u32,
+            hq as u32,
+            tiles as u32,
+            tq as u32,
+            kv_chunks as u32,
+            scale,
+            d as u32,
+            split,
             dtype,
         );
     }
