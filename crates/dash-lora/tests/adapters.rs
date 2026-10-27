@@ -863,10 +863,12 @@ fn a_recomputed_stack_runs_the_adapter_chosen() {
         // passes may settle on other fused kernels than the whole stack's (`tests/recompute.rs`):
         // up to 3.98e-7 of the largest value (the reference's gradients; dx 2.3e-7), the same in
         // three runs, with the low-rank products as `dash_ops::lowrank`'s kernels (up to 1.7e-7
-        // over four runs when they were Burn's matrix products); 0 with autotune alone.
+        // over four runs when they were Burn's matrix products); 0 with autotune alone. Autotune
+        // picks Burn's kernels by timing, so the next run can go further: the bound is a few
+        // roundings, as in `tests/recompute.rs`, not the largest measured.
         let (abs, rel) = match name {
             "flex" => (0.0, 0.0),
-            _ if cfg!(feature = "autotune") => (f64::INFINITY, 4.5e-7),
+            _ if cfg!(feature = "autotune") => (f64::INFINITY, 1e-6),
             _ => (0.0, 0.0),
         };
         check(
