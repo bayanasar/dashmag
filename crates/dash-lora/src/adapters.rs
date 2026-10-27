@@ -69,9 +69,9 @@
 //! changes no parameter, while each layer's adapters take the choice as the traversal passes
 //! them (the choice waits in a thread-local for the length of the traversal, a plain recursive
 //! call on the calling thread); any other walk of the tree (an optimizer's step, `no_grad`,
-//! loading a record) leaves the choice as it is. No tensor is touched or copied: cloning a stack
-//! of 72 LoRA'd layers and choosing for it takes 22 µs on the host
-//! (`examples/adapters_memory.rs`; PEFT's `set_adapter` on the same stack, 1.3 ms).
+//! loading a record) leaves the choice as it is. No tensor is touched or copied: cloning a layer
+//! holding two adapters and choosing for it takes 0.2 to 0.3 µs on the host
+//! (`examples/lora_layer.rs`; PEFT's `set_adapter` on the same layer, 18 to 21 µs).
 //!
 //! **Paths.** Each adapter's factors sit under its name in the module's parameter paths,
 //! `<layer>.adapters.<name>.a` and `.b`, so that Burn's own records and parameter groups name

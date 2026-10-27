@@ -19,6 +19,8 @@
 //!   smoothing, z-loss, an ignore index and masked ids, training the output weight too.
 //! - [`conv1d`]: causal depthwise 1-D convolution, from a given state and over a batch or packed
 //!   variable-length sequences, with the state a decoder carries.
+//! - [`lowrank`]: low-rank products `base + scale · (x Aᵀ) Bᵀ` of small rank, as LoRA and the
+//!   adapters built on it add to a frozen layer, with f32 factors over inputs of any float dtype.
 //! - [`checkpoint`]: activation checkpointing, not an operation but built on Burn's tensor API:
 //!   a stack of layers run outside autodiff, each layer run again in the backward pass.
 //! - [`sequences`]: packed variable-length sequences, as the operations that take them share
@@ -107,5 +109,6 @@ pub(crate) mod cube;
 pub mod gated_delta;
 pub mod logprob;
 pub mod loss;
+pub mod lowrank;
 mod reference;
 pub mod sequences;

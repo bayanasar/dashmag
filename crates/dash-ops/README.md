@@ -11,6 +11,7 @@ backward pass:
 | `logprob` | the log-probability of chosen tokens under a large vocabulary, with the entropy, without the n x V logits | chunked matmuls and a fused log-sum-exp kernel, on devices with plane operations on planes of 8 or more units (CUDA; not lavapipe, OpenGL or the CPU runtime) |
 | `loss` | cross-entropy fused with the output layer over a large vocabulary (mean, sum or none; ignore index, label smoothing, z-loss, masked ids), with each row's log-probability and entropy, gradients for the hidden states and the output weight, without the n x V logits | `logprob`'s pass, and a second pass for the weight's gradient whose kernel takes cubes of 256 units and 64-bit integers (CUDA, lavapipe; not OpenGL or the CPU runtime) |
 | `conv1d` | causal depthwise conv1d of any kernel width, with an optional bias and activation (none or SiLU), from given initial states (their gradients too) and returning final states, over a batch or packed variable-length sequences (`cu_seqlens`), and its decoding step | forward, backward and step kernels for widths 1 to 8, reading `cu_seqlens` on the device, on devices with cubes of 256 units (CUDA, lavapipe, OpenGL; 64-bit `cu_seqlens` also need 64-bit integers, which OpenGL lacks; not the CPU runtime) |
+| `lowrank` | low-rank products `base + scale · (x U) V` of ranks 1 to 64, as LoRA and the adapters built on it add to a frozen layer: f32 factors over f32, bf16 or f16 inputs, the sum with the base rounded once, gradients of the input, the factors and the base | four kernels (`x U`, `h V` with the base added, the factors' gradients over the rows, a sum of partial runs) that read the wide operand once and sum each element in order, on devices with cubes of 256 units and 17 KiB of shared memory (CUDA, lavapipe; not the CPU runtime) |
 | `checkpoint` | activation checkpointing: a stack of layers run outside autodiff, each layer run again in the backward pass (built on Burn's tensor API, not an extension) | the layers' own |
 
 Each operation has three parts: a reference built from Burn's tensor operations, which runs on
@@ -74,27 +75,28 @@ with `cuda` only unless a row says otherwise:
 | attention, decoding | batch 8, 6144 cached keys: the whole cache; lengths from 100 to 6144; a window of 1024 | 147 us; 52 us; 42 us a layer, over 24 calls between synchronisations | 140 us; 3729 us (a padding mask); 37 us (the last 1025 keys) |
 | log-probability, forward + backward | 3072 tokens, 248320 classes, width 1024 | 78.9 ms, +216 MiB (70.4 ms with `fusion` and `autotune`) | 86.4 ms, +8730 MiB |
 | linear + cross-entropy, forward + backward with the weight's gradient | 3072 / 8192 tokens, 248320 classes, width 1024 | 102 / 293 ms, +641 / +731 MiB (94 / 261 ms with `autotune`) | logits in f32: 95 / 1179 ms, +11672 / +31072 MiB; in bf16: 64 / 1241 ms, +5824 / +15520 MiB (at 8192 both spill past the card's 16 GB into host memory) |
+| low-rank product `scale · (x U) V`, r 16, bf16 x, f32 factors | 2048 tokens, `in -> out` 1024 -> 3584 / 3584 -> 1024 / 1024 -> 2048 / 1024 -> 256: forward; forward + backward | on the device 0.043 / 0.052 / 0.032 / 0.018 ms; 0.19 / 0.17 / 0.14 / 0.069 ms (Burn's own matmuls: 0.32 / 0.89 / 0.29 / 0.26; 1.6 / 1.7 / 1.2 / 0.84 ms) | PEFT's LoRA term: 0.087 / 0.107 / 0.048 / 0.027; 0.27 / 0.23 / 0.14 / 0.063 ms |
 | conv1d, forward + backward | 6144 steps, 6144 channels, width 4, SiLU (widths 2 to 4, with or without a bias: 0.54 to 0.57 ms); from initial states / with final states too; as 4 packed sequences of 1536 / 4 calls on 1536 / a batch of 4 | 0.56 ms; 0.57 / 0.57 ms; 0.56 / 0.55 / 0.57 ms (on the device 0.55; 0.55 / 0.56; 0.55 / 0.51 / 0.55 ms) | 2.63 ms (conv1d, then SiLU); 2.76 / 3.14 ms (`torch.cat` of the state first); 4 calls 2.46 ms |
 
-The chunked gated delta rule's device times are sums over `nsys`'s kernels, fla's measured
-beside them under the same load on the card's host (the wall-clock times rise with it). At heads
-of 128, forward and backward, its kernels on tensor cores take 1.07 times fla's time (1.09
-packed): the state passings and the WY part are faster than fla's (0.26 ms forward, twice, and
-0.40 backward, against 0.23 and 0.54; 0.28 against 0.37 with the keys' l2 normalisation), the
-other per-chunk kernels slower. Its first kernel inverts `I + A` with 64 units in f32, on CUDA
-cores (0.37 ms with the forward's other work, fla's 0.28 in three kernels, its inversion on
-tensor cores in TF32), and the backward's kernel for all but the WY part holds 77 KiB of shared
-memory, so that one cube fits on a multiprocessor and waits on memory between its phases more
-than fla's pipelined kernels do (0.64 ms, against 0.49 for fla's and the queries' l2
-normalisation, `dv` going to fla's WY kernel). The backward keeps the forward's `T` (8 KiB a
-chunk of each head) as fla does. The loss around
-it in the benchmark (a cast, a product and a sum over the output) takes 1.0 ms in Burn's kernels
-and 0.6 in PyTorch's. Heads of 256 run the f32 kernels, three times fla's time. Packed sequences
-cost about what one sequence of their length does: the state passings take each sequence's
-chunks in turn, two of their cubes fitting on a multiprocessor on tensor cores (44 and 48 KiB of
-shared memory), one in f32. Attention's backward does seven
-T x T x D products to FlashAttention-2's five, to avoid atomics. Each example in `examples/`
-reproduces its row (`--features cuda`).
+The chunked gated delta rule's device times are sums over `nsys`'s kernels, fla's measured beside
+them under the same load on the card's host (the wall-clock times rise with it). At heads of 128,
+forward and backward, its kernels on tensor cores take 1.07 times fla's time (1.09 packed): the
+state passings and the WY part are faster than fla's (0.26 ms forward, twice, and 0.40 backward,
+against 0.23 and 0.54; 0.28 against 0.37 with the keys' l2 normalisation), the other per-chunk
+kernels slower. Its first kernel inverts `I + A` with 64 units in f32, on CUDA cores (0.37 ms with
+the forward's other work, fla's 0.28 in three kernels, its inversion on tensor cores in TF32), and
+the backward's kernel for all but the WY part holds 77 KiB of shared memory, so that one cube fits
+on a multiprocessor and waits on memory between its phases more than fla's pipelined kernels do
+(0.64 ms, against 0.49 for fla's and the queries' l2 normalisation, `dv` going to fla's WY kernel).
+The backward keeps the forward's `T` (8 KiB a chunk of each head) as fla does. The loss around it in
+the benchmark (a cast, a product and a sum over the output) takes 1.0 ms in Burn's kernels and 0.6
+in PyTorch's. Heads of 256 run the f32 kernels, three times fla's time. Packed sequences cost about
+what one sequence of their length does: the state passings take each sequence's chunks in turn, two
+of their cubes fitting on a multiprocessor on tensor cores (44 and 48 KiB of shared memory), one in
+f32. Attention's backward does seven T x T x D products to FlashAttention-2's five, to avoid
+atomics. The low-rank product's row is by device time under Nsight Systems, from `dash-lora`'s
+`examples/lora_layer.rs`, PEFT's term the same way; `lowrank_bench` times it against Burn's own
+matmuls by wall clock. Each example in `examples/` reproduces its row (`--features cuda`).
 `matmul_bench` and `dispatch_bench` measure Burn itself: bf16 matmul against cuBLAS, and the
 host-side cost of each unfused operation.
 

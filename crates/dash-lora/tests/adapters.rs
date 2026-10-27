@@ -861,10 +861,12 @@ fn a_recomputed_stack_runs_the_adapter_chosen() {
 
         // Bit-identical, but on CUDA with autotune and fusion together, where the per-block
         // passes may settle on other fused kernels than the whole stack's (`tests/recompute.rs`):
-        // up to 1.7e-7 of the largest value over four runs.
+        // up to 3.98e-7 of the largest value (the reference's gradients; dx 2.3e-7), the same in
+        // three runs, with the low-rank products as `dash_ops::lowrank`'s kernels (up to 1.7e-7
+        // over four runs when they were Burn's matrix products); 0 with autotune alone.
         let (abs, rel) = match name {
             "flex" => (0.0, 0.0),
-            _ if cfg!(feature = "autotune") => (f64::INFINITY, 3e-7),
+            _ if cfg!(feature = "autotune") => (f64::INFINITY, 4.5e-7),
             _ => (0.0, 0.0),
         };
         check(

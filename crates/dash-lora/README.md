@@ -9,7 +9,14 @@ PEFT's format (`adapter_model.safetensors` and `adapter_config.json`, a director
 the mapping from PEFT's module paths to the caller's layers is the caller's.
 
 - `LoraLinear`, `Lora`: the layer; the base product at the weight's dtype, the low-rank product in
-  f32, their sum rounded once, as PEFT computes it.
+  f32, their sum rounded once, as PEFT computes it. On a CubeCL device the low-rank products are
+  `dash_ops::lowrank`'s kernels, which add the base and round in the same pass. Per layer at a
+  language model's projection shapes (r 16, 2048 and 6144 tokens, `examples/lora_layer.rs`), on an
+  RTX 5070 Ti against PEFT by device time: the low-rank products within 1.1x of PEFT's and mostly
+  ahead in every build; a training step with Burn's `fusion` and `autotune` 0.75x to 1.08x of
+  PEFT's; with Burn's default kernels 0.91x to 1.09x where Burn's default bf16 matrix product is
+  near cuBLAS, and 2x to 10x where it is not (the base product of a 1024 -> 256 projection, and of
+  every projection over 6144 tokens), which autotune fixes.
 - `AdapterChoice`: `model.set_adapter(Some(name))` makes every layer of any Burn module use its
   adapter `name` from then on, and `set_adapter(None)` the base alone (PEFT's `set_adapter` and
   `disable_adapter()`), without the model's code passing anything through its forward pass. The
@@ -22,10 +29,9 @@ the mapping from PEFT's module paths to the caller's layers is the caller's.
   `disable_adapter()` on a two-block model holding two adapters, and a step of cross-entropy plus
   a KL penalty against the frozen one: in f32, logits within 3.5e-7 of their largest value and
   the trained adapter's gradients within 6.1e-7; with a bf16 base, logits bit-identical on Flex
-  and one bf16 unit apart at most on CUDA, gradients within 2.9e-6 and 1.1e-3. Over 24 LoRA'd MLP
-  blocks at Qwen3.5-0.8B's shapes, two adapters take 548.5 MiB of an RTX 5070 Ti (the base once,
-  both adapters) where two module trees take 1052.5 MiB, as with PEFT, and a step costs the same
-  device time either way (`examples/adapters_memory.rs`).
+  and one bf16 unit apart at most on CUDA, gradients within 2.9e-6 and 1.1e-3. A layer holding
+  two adapters keeps its base once: at a 1024 -> 3584 projection with r 16, 7.56 MiB of an RTX
+  5070 Ti where two layers take 14.56 MiB, as with PEFT (`examples/lora_layer.rs`).
 - `PeftAdapter`, `PeftConfig`: PEFT's files, read and written back byte for byte;
   `apply_with` gives the caller's layers an adapter under a name, trainable or frozen (PEFT's
   `adapter_name` and `is_trainable`), and `from_layers_named` takes it back.

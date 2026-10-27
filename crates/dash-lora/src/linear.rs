@@ -11,20 +11,25 @@
 //!   not when `x` and `W` are both bf16, PEFT's case). For bf16, Flex converts both operands to
 //!   f32, multiplies in f32 and rounds each output once to bf16; CUDA (cubek) accumulates in f32
 //!   and writes bf16. cuBLAS, under PyTorch, does the same.
-//! - **Low-rank product**, f32 throughout: `x` upcast to f32 (exact from bf16), `x Aᵀ` `[.., r]`
-//!   and then `· Bᵀ` `[.., out]` as f32 matrix products, then `· scale` in f32, in that order, as
-//!   PEFT computes `lora_B(lora_A(x)) * scaling`. On CUDA, f32 products are IEEE f32 only with
-//!   TF32 off (`CUBECL_CUDA_TF32=0` in this workspace); Burn 0.22 otherwise runs them in TF32 on
-//!   compute capability 8.0 and later, while PyTorch's default is IEEE f32.
+//! - **Low-rank product**, f32 throughout ([`dash_ops::lowrank`]): `x` read exactly into f32,
+//!   `x Aᵀ` `[.., r]` and then `· Bᵀ` `[.., out]` as f32 products, then `· scale` in f32, in that
+//!   order, as PEFT computes `lora_B(lora_A(x)) * scaling`. On a CubeCL device these are kernels
+//!   of their own, which read `x` in its own dtype and sum each element in order (Burn's default
+//!   matrix-product kernels run these skinny shapes several times slower than cuBLAS); elsewhere,
+//!   Burn's matrix products. On CUDA, f32 products are IEEE f32 only with TF32 off
+//!   (`CUBECL_CUDA_TF32=0` in this workspace); Burn 0.22 otherwise runs its own in TF32 on compute
+//!   capability 8.0 and later, while PyTorch's default is IEEE f32.
 //! - **Sum**, in f32: the base product upcast (exact) plus the low-rank term, one f32 addition,
 //!   then rounded once to `x`'s dtype. With bf16 `x` this is PEFT's
-//!   `(result + lora).to(torch_result_dtype)`. With no adapter chosen, the base product alone,
-//!   at `x`'s dtype, as PEFT's layer returns it with its adapters disabled.
+//!   `(result + lora).to(torch_result_dtype)`. On a CubeCL device the kernel computing `· Bᵀ`
+//!   adds the base and rounds, so the f32 `[.., out]` term is never held. With no adapter chosen,
+//!   the base product alone, at `x`'s dtype, as PEFT's layer returns it with its adapters
+//!   disabled.
 //!
 //! Against PEFT 0.20's `lora.Linear` on PyTorch 2.13 (`tests/linear.rs`), the output and the
 //! gradients of `x`, `A` and `B` are bit-identical, for a bf16 and for an f32 base, on Flex and
 //! on an RTX 5070 Ti with Burn's default kernels or with `burn/fusion`. With `burn/autotune`,
-//! CUDA may choose a matrix-product kernel that sums in another order, and then f32 results
+//! CUDA may choose a base matrix-product kernel that sums in another order, and then f32 results
 //! move by a few roundings and a bf16 output element by one unit.
 //!
 //! The adapter is never merged into `W`, in training or in inference. A merged bf16 weight
@@ -51,6 +56,7 @@
 use burn::module::{Module, Param, ParamId};
 use burn::nn::{Dropout, DropoutConfig};
 use burn::tensor::{DType, Device, Tensor, TensorData};
+use dash_ops::lowrank::{LowRankOptions, low_rank};
 
 use crate::adapters::{Adapters, DEFAULT_ADAPTER};
 
@@ -110,10 +116,24 @@ impl Lora {
 
     /// `scale · (x Aᵀ) Bᵀ`, in f32, for `x` `[.., in]` of any float dtype.
     pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
-        let x = self.dropout.forward(x.cast(DType::F32));
-        let h = x.matmul(self.a.val().transpose().unsqueeze());
-        h.matmul(self.b.val().transpose().unsqueeze())
-            .mul_scalar(self.scale)
+        self.low_rank(x, None)
+    }
+
+    /// `base + scale · (x Aᵀ) Bᵀ` ([`dash_ops::lowrank::low_rank`]): the sum in f32, rounded once
+    /// to the base's dtype; without a base, the low-rank term in f32.
+    fn low_rank<const D: usize>(&self, x: Tensor<D>, base: Option<Tensor<D>>) -> Tensor<D> {
+        // The products read `x` in its own dtype, exactly; dropout, where there is one, acts on
+        // the f32 input PEFT's acts on.
+        let x = match self.dropout.prob {
+            0.0 => x,
+            _ => self.dropout.forward(x.cast(DType::F32)),
+        };
+        // The factors as matrix products take them, `x Aᵀ` then `· Bᵀ`: views, as Burn's own
+        // `x.matmul(a.transpose())` takes them, and so recorded where its product would be.
+        let u = self.a.val().transpose().unsqueeze();
+        let v = self.b.val().transpose().unsqueeze();
+        let options = LowRankOptions::default().with_scale(self.scale);
+        low_rank(x, u, v, base, options)
     }
 }
 
@@ -231,12 +251,24 @@ impl LoraLinear {
             x.cast(weight.dtype())
                 .matmul(weight.clone().transpose().unsqueeze())
         };
-        match self.lora() {
-            None => base(x).cast(dtype),
-            Some(lora) => base(x.clone())
-                .cast(DType::F32)
-                .add(lora.forward(x))
-                .cast(dtype),
+        let Some(lora) = self.lora() else {
+            return base(x).cast(dtype);
+        };
+        if D != 2 {
+            // As rows, so that the base product and the low-rank one read the same tensor.
+            let dims = x.dims();
+            let rows = dims[..D - 1].iter().product();
+            let y: Tensor<2> = self.forward(x.reshape([rows, dims[D - 1]]));
+            let mut out = dims;
+            out[D - 1] = self.out_features();
+            return y.reshape(out);
         }
+        // The sum is rounded once, to x's dtype: a base in another dtype is added in f32.
+        let base = base(x.clone());
+        let base = match base.dtype() == dtype {
+            true => base,
+            false => base.cast(DType::F32),
+        };
+        lora.low_rank(x, Some(base)).cast(dtype)
     }
 }
