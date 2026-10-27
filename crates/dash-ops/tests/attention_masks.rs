@@ -164,6 +164,7 @@ impl Mask {
 }
 
 /// One call: inputs, the mask and options, and (for a record) torch's results.
+#[derive(Clone)]
 struct Case {
     name: String,
     q: Host,
@@ -425,13 +426,13 @@ const CUBE_F32_TOLERANCE: [f32; 5] = if cfg!(feature = "autotune") {
 };
 /// In bf16 the error is the output's own rounding (8 significant bits) plus the probabilities'
 /// rounding to bf16 before the value product; the log-sum-exp is accumulated in f32 throughout.
-/// The query gradient is summed over the key blocks with atomics, in whatever order the kernels
-/// run: its bounds here and below are just above the largest over six to eight runs of each
-/// CUDA build, where the largest errors came out the same in every run.
+/// The query gradient is summed over the key blocks in a fixed order, or with atomics in whatever
+/// order the kernels run: its bounds here and below are just above the largest of both over
+/// repeated runs of each CUDA build, where the largest errors came out the same in every run.
 #[cfg(feature = "cubecl")]
-const BF16_TOLERANCE: [f32; 5] = [3.2e-3, 1.2e-7, 4.2e-3, 4.4e-3, 3.6e-3];
+const BF16_TOLERANCE: [f32; 5] = [3.2e-3, 1.2e-7, 4.3e-3, 4.4e-3, 3.6e-3];
 #[cfg(feature = "cubecl")]
-const F16_TOLERANCE: [f32; 5] = [3.9e-4, 1.2e-7, 7.3e-4, 6.9e-4, 6.4e-4];
+const F16_TOLERANCE: [f32; 5] = [3.9e-4, 1.2e-7, 7.4e-4, 6.9e-4, 6.4e-4];
 /// Decoding in bf16 and in f16 against the f32 reference.
 #[cfg(feature = "cubecl")]
 const DECODE_BF16_TOLERANCE: f32 = 2.2e-3;
@@ -443,9 +444,9 @@ const DECODE_F16_TOLERANCE: f32 = 2.6e-4;
 /// rounded to bf16, as in FlashAttention-2; the same queries run alone through the plain causal
 /// kernels give the same bits.
 #[cfg(feature = "cubecl")]
-const TILED_BF16_TOLERANCE: [f32; 5] = [3.3e-3, 4.4e-7, 7.5e-3, 4.6e-3, 3.9e-3];
+const TILED_BF16_TOLERANCE: [f32; 5] = [3.3e-3, 4.4e-7, 7.7e-3, 4.6e-3, 3.9e-3];
 #[cfg(feature = "cubecl")]
-const TILED_F16_TOLERANCE: [f32; 5] = [4.1e-4, 4.4e-7, 7.1e-4, 6.8e-4, 4.9e-4];
+const TILED_F16_TOLERANCE: [f32; 5] = [4.1e-4, 4.4e-7, 7.3e-4, 6.8e-4, 4.9e-4];
 /// A head dimension the kernels do not take: the reference on the device in bf16 and in f16
 /// against the f32 reference, the error the outputs' and gradients' rounding.
 #[cfg(feature = "cubecl")]
@@ -455,9 +456,9 @@ const REFERENCE_F16_TOLERANCE: [f32; 5] = [2.6e-4, 1e-7, 3.6e-4, 3.7e-4, 3.2e-4]
 /// Two causal segments composed by the kernels against the whole sequence, by the kernels and by
 /// the f32 reference: each segment's gradients are rounded to the dtype before they are added.
 #[cfg(feature = "cubecl")]
-const SEGMENTS_BF16_TOLERANCE: [f32; 5] = [3.2e-3, 2.3e-7, 4.6e-3, 4.7e-3, 4.9e-3];
+const SEGMENTS_BF16_TOLERANCE: [f32; 5] = [3.2e-3, 2.3e-7, 4.7e-3, 4.7e-3, 4.9e-3];
 #[cfg(feature = "cubecl")]
-const SEGMENTS_F16_TOLERANCE: [f32; 5] = [5.2e-4, 2.3e-7, 5.2e-4, 7.1e-4, 6.4e-4];
+const SEGMENTS_F16_TOLERANCE: [f32; 5] = [5.2e-4, 2.3e-7, 5.3e-4, 7.1e-4, 6.4e-4];
 /// Two causal segments composed against the whole sequence, both in f32 on Flex.
 #[cfg(feature = "flex")]
 const SEGMENTS_F32_TOLERANCE: [f32; 5] = [1.9e-7, 9e-8, 2.6e-7, 6.1e-7, 7.6e-7];
@@ -765,8 +766,9 @@ mod cube {
 
     /// The kernel launches a forward and backward pass over `dims` (`[B, Tq, Tk, Hq, Hkv, D]`)
     /// in `dtype` makes on `device`: one forward and three backward kernels where the kernels
-    /// take them, none where the reference runs. Under CUDA the kernels take every bf16 and f16
-    /// call with a head dimension of 64, 128 or 256, whatever the mask.
+    /// take them, none where the reference runs; [`launches_kernels`] adds the fourth of a
+    /// deterministic backward whose products split. Under CUDA the kernels take every bf16 and
+    /// f16 call with a head dimension of 64, 128 or 256, whatever the mask.
     fn expected_launches(device: &Device, dtype: DType, dims: [usize; 6]) -> usize {
         let [forward, backward] = kernels_take(device, dtype, dims);
         let takes = matches!(dtype, DType::BF16 | DType::F16) && matches!(dims[5], 64 | 128 | 256);
@@ -789,12 +791,23 @@ mod cube {
         has
     }
 
-    /// Asserts that `f` launched exactly `expected` kernels: under fusion the kernels run when
-    /// their results are read, so `f` reads them.
+    /// Asserts that `f` launched exactly `expected` kernels, and one more for each backward pass
+    /// whose products split and whose query gradient is the fixed-order one (its key and value
+    /// gradients are rounded from accumulators by a kernel the atomic way runs anyway): under
+    /// fusion the kernels run when their results are read, so `f` reads them. The passes in one
+    /// `f` take their query gradient the same way.
     fn launches_kernels<R>(expected: usize, f: impl FnOnce() -> R) -> R {
         let before = probe::kernel_launches();
+        let (splits, atomics) = (probe::split_runs(), probe::atomic_runs());
         let result = f();
         let launched = probe::kernel_launches() - before;
+        let split = probe::split_runs() - splits;
+        let expected = expected
+            + if probe::atomic_runs() == atomics {
+                split
+            } else {
+                0
+            };
         assert_eq!(
             launched, expected,
             "the kernels made {launched} launches, expected {expected}"
@@ -816,22 +829,31 @@ mod cube {
             }
             let mut worst = [0.0f32; 5];
             for name in RECORDS {
-                let (case, expected) = record(name);
-                let launches = expected_launches(&device, dtype, case.dims());
-                let runs = probe::backward_runs();
-                let actual = launches_kernels(launches, || run(&device, &case, dtype));
-                assert!(
-                    probe::backward_runs() > runs,
-                    "the written-out backward did not run"
-                );
-                let errors = check(
-                    &format!("cube {label} {name}"),
-                    &actual,
-                    &expected,
-                    tolerance,
-                );
-                for (w, e) in worst.iter_mut().zip(errors) {
-                    *w = w.max(e);
+                let (mut case, expected) = record(name);
+                for deterministic in [true, false] {
+                    case.options = case.options.with_deterministic(deterministic);
+                    let launches = expected_launches(&device, dtype, case.dims());
+                    let backward = kernels_take(&device, dtype, case.dims())[1];
+                    let (runs, atomics) = (probe::backward_runs(), probe::atomic_runs());
+                    let actual = launches_kernels(launches, || run(&device, &case, dtype));
+                    assert!(
+                        probe::backward_runs() > runs,
+                        "the written-out backward did not run"
+                    );
+                    assert_eq!(
+                        probe::atomic_runs() - atomics,
+                        usize::from(backward && !deterministic),
+                        "the query gradient was not summed the way asked"
+                    );
+                    let errors = check(
+                        &format!("cube {label} deterministic {deterministic} {name}"),
+                        &actual,
+                        &expected,
+                        tolerance,
+                    );
+                    for (w, e) in worst.iter_mut().zip(errors) {
+                        *w = w.max(e);
+                    }
                 }
             }
             println!(
@@ -877,7 +899,8 @@ mod cube {
 
     /// The kernels against the reference on Flex from the same inputs (rounded to bf16, so that
     /// f16 holds them too), over [`tiled_cases`], in bf16 and in f16, the backward's products
-    /// both split between two cubes per key block and whole.
+    /// both split between two cubes per key block and whole, its query gradient both in a fixed
+    /// order and with atomics.
     #[test]
     fn kernels_match_the_reference_across_tiles_and_sequences() {
         let _serial = serial();
@@ -887,9 +910,14 @@ mod cube {
             .iter()
             .map(|case| run(&Device::flex().autodiff(), case, DType::F32))
             .collect();
-        for split in [false, true] {
+        for (split, deterministic) in [(false, true), (true, true), (false, false), (true, false)] {
             let _forced = ForcedSplit::new(split);
-            let products = if split { "split" } else { "whole" };
+            let products = match (split, deterministic) {
+                (false, true) => "whole",
+                (true, true) => "split",
+                (false, false) => "whole atomic",
+                (true, false) => "split atomic",
+            };
             for (dtype, label, tolerance) in [
                 (DType::BF16, "bf16", TILED_BF16_TOLERANCE),
                 (DType::F16, "f16", TILED_F16_TOLERANCE),
@@ -899,6 +927,10 @@ mod cube {
                 }
                 let mut worst = [0.0f32; 5];
                 for (case, expected) in cases.iter().zip(&expected) {
+                    let case = &Case {
+                        options: case.options.with_deterministic(deterministic),
+                        ..case.clone()
+                    };
                     let launches = expected_launches(&device, dtype, case.dims());
                     let backward = kernels_take(&device, dtype, case.dims())[1];
                     let splits = probe::split_runs();
@@ -922,37 +954,71 @@ mod cube {
         }
     }
 
-    /// The key and value gradients are the same bits from run to run, the products split or not:
-    /// whole, each key block's sums run in one cube in a fixed order; split, each element is the
-    /// sum of two halves' sums added to zero, whose order does not show. The query gradient is
-    /// summed over the key blocks in whatever order the cubes run, so its bits may differ from
-    /// run to run: by a unit in the dtype's last place where its value is large, and by the f32
-    /// sum's reordering, a few millionths of the largest value, where terms cancel.
+    /// By default the backward gives the same bits from run to run, at a size where 32 key blocks
+    /// add to the last queries' gradient, the products split or not: the query gradient is summed
+    /// over the key blocks in a fixed order; whole, each key block's sums run in one cube in a
+    /// fixed order; split, each key and value gradient is the sum of two halves' sums added to
+    /// zero, whose order does not show. With atomics the output and the key and value gradients
+    /// are still those bits; the query gradient is summed in whatever order the cubes run, so it
+    /// may differ from run to run and from the fixed order's: by a unit in the dtype's last place
+    /// where its value is large, and by the f32 sum's reordering, a few millionths of the largest
+    /// value, where terms cancel.
     #[test]
-    fn key_and_value_gradients_are_the_same_bits_from_run_to_run() {
+    fn the_backward_repeats_bit_for_bit_unless_atomic() {
         let _serial = serial();
         let device = device();
         if !has(&device, DType::BF16) {
             return;
         }
-        let case = seeded(
+        let causal = AttentionOptions::causal();
+        let fixed = seeded(
             "causal",
             [1, 8, 2, 1000, 1000, 128],
             Mask::None,
-            AttentionOptions::causal(),
+            causal,
             600,
         );
+        let atomic = Case {
+            options: causal.with_deterministic(false),
+            ..fixed.clone()
+        };
         let bits = |h: &Host| h.values.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         for split in [false, true] {
             let _forced = ForcedSplit::new(split);
-            let first = run(&device, &case, DType::BF16);
+            let first = run(&device, &fixed, DType::BF16);
+            for _ in 0..4 {
+                let again = run(&device, &fixed, DType::BF16);
+                for (name, a, b) in [
+                    ("o", &again.o, &first.o),
+                    ("lse", &again.lse, &first.lse),
+                    ("dq", &again.dq, &first.dq),
+                    ("dk", &again.dk, &first.dk),
+                    ("dv", &again.dv, &first.dv),
+                ] {
+                    assert_eq!(bits(a), bits(b), "{name} differs between runs");
+                }
+            }
             let largest = first.dq.values.iter().fold(0.0f32, |m, x| m.max(x.abs()));
             let (mut differing, mut compared, mut worst) = (0, 0, 0.0f32);
-            for _ in 0..4 {
-                let again = run(&device, &case, DType::BF16);
-                assert_eq!(bits(&again.dk), bits(&first.dk), "dk differs between runs");
-                assert_eq!(bits(&again.dv), bits(&first.dv), "dv differs between runs");
-                assert_eq!(bits(&again.o), bits(&first.o), "o differs between runs");
+            let mut first_atomic: Option<Vec<u32>> = None;
+            let mut moved = false;
+            for _ in 0..5 {
+                let again = run(&device, &atomic, DType::BF16);
+                assert_eq!(
+                    bits(&again.dk),
+                    bits(&first.dk),
+                    "atomic dk is not the fixed order's"
+                );
+                assert_eq!(
+                    bits(&again.dv),
+                    bits(&first.dv),
+                    "atomic dv is not the fixed order's"
+                );
+                assert_eq!(
+                    bits(&again.o),
+                    bits(&first.o),
+                    "atomic o is not the fixed order's"
+                );
                 for (a, b) in again.dq.values.iter().zip(&first.dq.values) {
                     compared += 1;
                     if a.to_bits() != b.to_bits() {
@@ -961,15 +1027,21 @@ mod cube {
                         worst = worst.max(diff / largest);
                         assert!(
                             diff <= a.abs().max(b.abs()) / 128.0 + 1e-5 * largest,
-                            "dq: {a} and {b} in two runs"
+                            "dq: {a} atomic and {b} in a fixed order"
                         );
                     }
                 }
+                let now = bits(&again.dq);
+                match &first_atomic {
+                    None => first_atomic = Some(now),
+                    Some(earlier) => moved |= *earlier != now,
+                }
             }
             println!(
-                "split {split}: dk, dv and o the same bits over 5 runs; dq differs from the \
-                 first run in {differing} of {compared} elements, by at most {worst:.2e} of its \
-                 largest value"
+                "split {split}: o, lse, dq, dk and dv the same bits over 5 runs; with atomics o, \
+                 dk and dv those bits again, and dq differs from the fixed order's in {differing} \
+                 of {compared} elements over 5 runs, by at most {worst:.2e} of its largest value \
+                 (moved between atomic runs: {moved})"
             );
         }
     }

@@ -7,7 +7,9 @@
 //! loss, the stack input's gradient and every parameter's gradient are compared, in f32 and in
 //! bf16, on Flex and on a CubeCL device (`DASH_OPS_DEVICE`; the bf16 cases where it has bf16):
 //! bit for bit, but for what `same_computation` and the layer norm test state. The layer function
-//! counts its calls: each unit runs once in each pass.
+//! counts its calls: each unit runs once in each pass. On a device where `dash_ops::attention`'s
+//! kernels run, a stack of attention blocks built on them is held to the same at a length where
+//! many key blocks add to each query's gradient.
 //!
 //! The stacks are drawn on the host from a seeded generator, not from Burn's process-wide one,
 //! so they do not depend on which other tests run at the same time.
@@ -28,6 +30,7 @@ use std::sync::{Mutex, MutexGuard};
 use burn::module::{Module, ModuleVisitor, Param};
 use burn::nn::{LayerNorm, LayerNormConfig, Linear, RmsNorm};
 use burn::tensor::{Bool, DType, Device, Gradients, Int, Tensor, TensorData, activation};
+use dash_ops::attention::{AttentionMask, AttentionOptions, attention};
 use dash_ops::checkpoint;
 
 /// The tests take turns. With Burn's `autotune`, a thread that asks for a shape another thread
@@ -77,11 +80,24 @@ struct Attention {
     out: Linear,
 }
 
+/// `x + out(attention(qkv(norm(x))))` through `dash_ops::attention`: causal self-attention over
+/// `T`, `C / 128` heads of 128, its backward pass the module's written-out one.
+#[derive(Module, Debug)]
+struct KernelAttention {
+    norm: RmsNorm,
+    qkv: Linear,
+    out: Linear,
+}
+
 /// One layer of a stack of mixed layers.
 #[derive(Module, Debug)]
 enum Layer {
     Mlp(Mlp),
     Attention(Attention),
+    /// Attention through `dash_ops::attention`, its backward pass deterministic (the default).
+    Kernel(KernelAttention),
+    /// The same with the backward's query gradient summed with atomics.
+    KernelAtomic(KernelAttention),
 }
 
 impl Mlp {
@@ -121,11 +137,30 @@ impl Attention {
     }
 }
 
+impl KernelAttention {
+    fn forward(&self, x: Tensor<3>, deterministic: bool) -> Tensor<3> {
+        let [b, t, c] = x.dims();
+        let qkv = self.qkv.forward(self.norm.forward(x.clone()));
+        let heads = |i: usize| {
+            qkv.clone()
+                .narrow(2, i * c, c)
+                .reshape([b, t, c / 128, 128])
+        };
+        let options = AttentionOptions::causal().with_deterministic(deterministic);
+        let o = attention(heads(0), heads(1), heads(2), AttentionMask::None, options);
+        x.add(self.out.forward(o.reshape([b, t, c])))
+    }
+}
+
 impl Layer {
+    /// `mask` is the causal mask of [`Attention`]; the kernels' blocks take causality as an
+    /// option.
     fn forward(&self, x: Tensor<3>, mask: &Tensor<2, Bool>) -> Tensor<3> {
         match self {
             Layer::Mlp(m) => m.forward(x),
             Layer::Attention(a) => a.forward(x, mask),
+            Layer::Kernel(a) => a.forward(x, true),
+            Layer::KernelAtomic(a) => a.forward(x, false),
         }
     }
 }
@@ -455,6 +490,64 @@ fn checkpointed_stack_gives_plain_autodiff_s_gradients() {
                     max_rel,
                 );
             }
+        }
+    }
+}
+
+/// Two attention blocks on `dash_ops::attention`'s kernels, heads of 128 in bf16 over a sequence
+/// of 1000, where 32 key blocks add to the last queries' gradients: with the default
+/// deterministic backward, checkpointed one block at a time, the loss and every gradient are
+/// plain autodiff's bit for bit, as `same_computation` allows for bf16. With the query gradient
+/// summed with atomics they are not: its last bits move from one backward pass to the next, and
+/// the gradients below it with them (printed; within a bf16 unit of the largest value). Where the
+/// kernels do not run, the reference runs, which is deterministic either way.
+#[cfg(feature = "cubecl")]
+#[test]
+fn a_stack_on_the_attention_kernels_gives_plain_autodiff_s_gradients() {
+    let _serial = serial();
+    let device = common::cube_device().autodiff();
+    let (b, t, c) = (1, 1000, 256);
+    if !common::has(&device, DType::BF16)
+        || !dash_ops::attention::kernels_take(&device, DType::BF16, [b, t, t, 2, 2, 128])[1]
+    {
+        println!("skipped: the attention kernels do not run here");
+        return;
+    }
+    let mask = causal_mask(&device);
+    let max_rel = same_computation("cubecl").1;
+    for atomic in [false, true] {
+        let mut rng = Rng(11);
+        let layers: Vec<Layer> = (0..2)
+            .map(|_| {
+                let block = KernelAttention {
+                    norm: rms_norm(&mut rng, c, BF16, &device),
+                    qkv: linear(&mut rng, c, 3 * c, BF16, &device),
+                    out: linear(&mut rng, c, c, BF16, &device),
+                };
+                if atomic {
+                    Layer::KernelAtomic(block)
+                } else {
+                    Layer::Kernel(block)
+                }
+            })
+            .collect();
+        let x = rng.tensor([b, t, c], BF16, &device, Rng::normal);
+        let p = plain(&layers, &x, &mask);
+        let r = checkpointed(&layers, &x, &mask, 1);
+        if atomic {
+            let mut worst = err(&r.dx, &p.dx).1;
+            for ((_, r), (_, p)) in r.params.iter().zip(&p.params) {
+                worst = worst.max(err(r, p).1);
+            }
+            println!(
+                "attention kernels with atomics: checkpointed against plain, largest {worst:.3e}"
+            );
+            assert!(
+                worst <= 1.0 / 128.0,
+                "{worst:.3e}: more than a bf16 unit of the largest value"
+            );
+        } else {
+            check_run("attention kernels, deterministic,", &r, &p, max_rel);
         }
     }
 }

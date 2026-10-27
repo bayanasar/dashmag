@@ -7,13 +7,17 @@
 //!   ... --example attention_bench -- 6144 burn   # also time Burn's own attention (needs ~5 GB)
 //!   ... --example attention_bench -- 6144 packed # only what starts with "packed" (or
 //!                                                # "causal", "window", "no mask", "decoding")
+//!   ... --example attention_bench -- 6144 atomic # the backward with atomics only ("fixed":
+//!                                                # the deterministic one only)
 //!
 //! Training: T tokens, queries `[1, T, 8, 256]`, keys and values `[1, T, 2, 256]`, with each mask
 //! in turn: causal; none (every query sees every key); four packed sequences of `T / 4`
 //! tokens, causal within each; causal within a sliding window of 1024 keys. For each, the forward
-//! (with its log-sum-exp), the backward (`delta`, the five products, the gradients rounded from
-//! their f32 accumulators) and both; for causal also both through `Autodiff` with `sum(o * dO)`
-//! as the loss, and the memory. Decoding: batch 8, one query each (`[8, 8, 256]`), against a
+//! (with its log-sum-exp), the backward and both, the backward in both ways: deterministic, the
+//! default (`delta`, the fixed-order query gradient, the other four products, and where the
+//! products split the key and value gradients rounded from their f32 accumulators), and with
+//! atomics (`delta`, the five products, the gradients rounded from their f32 accumulators); for
+//! causal also both through `Autodiff` with `sum(o * dO)` as the loss, and the memory, each way. Decoding: batch 8, one query each (`[8, 8, 256]`), against a
 //! 6144-token cache (`[8, 6144, 2, 256]`), per layer: the whole cache, mixed cache lengths, and a
 //! window of 1024. Beside them, Burn's own `attention`, on inputs of its own in its layout,
 //! `[B, H, T, D]`, which takes no grouped heads (the key-value heads are expanded for it), and,
@@ -27,7 +31,7 @@
 //! The times are wall clock; on a card other work shares, compare device times instead: run the
 //! benchmark under `nsys profile -t cuda` and take each kernel's median from
 //! `nsys stats -r cuda_gpu_kern_sum` (the forward is `forward_kernel`; the backward
-//! `delta_kernel`, `backward_kernel` and `finish_kernel`).
+//! `delta_kernel`, `dq_kernel` (deterministic only), `backward_kernel` and `finish_kernel`).
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -111,11 +115,20 @@ mod bench {
             .get(1)
             .map_or(6144, |a| a.parse().expect("sequence length"));
         let burn_too = args.iter().any(|a| a == "burn");
+        // Which ways of summing the backward's query gradient run: deterministic, atomic.
+        let ways: Vec<bool> = match (
+            args.iter().any(|a| a == "fixed"),
+            args.iter().any(|a| a == "atomic"),
+        ) {
+            (true, false) => vec![true],
+            (false, true) => vec![false],
+            _ => vec![true, false],
+        };
         // The other arguments pick what runs: what names start with one of them.
         let filters: Vec<&str> = args[1..]
             .iter()
             .map(String::as_str)
-            .filter(|a| a.parse::<usize>().is_err() && *a != "burn")
+            .filter(|a| a.parse::<usize>().is_err() && !["burn", "fixed", "atomic"].contains(a))
             .collect();
         let picked = |name: &str| filters.is_empty() || filters.iter().any(|f| name.starts_with(f));
         let device = Device::cuda(0);
@@ -155,8 +168,14 @@ mod bench {
                 options: AttentionOptions::causal().with_window(1024, 0),
             },
         ];
-        for kind in kinds.iter().filter(|kind| picked(kind.name)) {
-            let (mask, options) = (|| kind.mask.clone(), kind.options);
+        for (kind, deterministic) in kinds
+            .iter()
+            .filter(|kind| picked(kind.name))
+            .flat_map(|kind| ways.iter().map(move |&way| (kind, way)))
+        {
+            let mask = || kind.mask.clone();
+            let options = kind.options.with_deterministic(deterministic);
+            let way = if deterministic { "" } else { ", atomic dQ" };
             let forward = median_ms(&device, || {
                 let _ = attention(q.clone(), k.clone(), v.clone(), mask(), options);
             });
@@ -188,8 +207,8 @@ mod bench {
             });
             drop((o, lse));
             println!(
-                "  {}: forward {forward:.2} ms, backward {backward:.2} ms, forward + backward \
-                 {both:.2} ms",
+                "  {}{way}: forward {forward:.2} ms, backward {backward:.2} ms, forward + \
+                 backward {both:.2} ms",
                 kind.name
             );
         }
@@ -202,78 +221,97 @@ mod bench {
             return;
         }
 
-        // Memory of one causal forward and backward, everything they return kept alive.
-        device.sync().unwrap();
-        let (before, _) = memory();
-        let (o, lse) =
-            attention_with_lse(q.clone(), k.clone(), v.clone(), AttentionMask::None, causal);
-        device.sync().unwrap();
-        let (after_forward, _) = memory();
-        let grads = attention_backward(
-            q.clone(),
-            k.clone(),
-            v.clone(),
-            o.clone(),
-            lse.clone(),
-            grad.clone(),
-            AttentionMask::None,
-            causal,
-        );
-        device.sync().unwrap();
-        let (after_backward, largest) = memory();
-        println!(
-            "  causal, memory over the inputs: +{:.1} MiB after the forward (output, \
-             log-sum-exp), +{:.1} MiB after the backward (and dQ, dK, dV); largest allocation so \
-             far {:.1} MiB",
-            mib(after_forward - before),
-            mib(after_backward - before),
-            mib(largest)
-        );
-        drop((o, lse, grads));
+        // Memory of one causal forward and backward, everything they return kept alive, each way.
+        for &deterministic in &ways {
+            let options = causal.with_deterministic(deterministic);
+            let way = if deterministic { "" } else { ", atomic dQ" };
+            device.sync().unwrap();
+            let (before, _) = memory();
+            let (o, lse) = attention_with_lse(
+                q.clone(),
+                k.clone(),
+                v.clone(),
+                AttentionMask::None,
+                options,
+            );
+            device.sync().unwrap();
+            let (after_forward, _) = memory();
+            let grads = attention_backward(
+                q.clone(),
+                k.clone(),
+                v.clone(),
+                o.clone(),
+                lse.clone(),
+                grad.clone(),
+                AttentionMask::None,
+                options,
+            );
+            device.sync().unwrap();
+            let (after_backward, largest) = memory();
+            println!(
+                "  causal{way}, memory over the inputs: +{:.1} MiB after the forward (output, \
+                 log-sum-exp), +{:.1} MiB after the backward (and dQ, dK, dV); largest \
+                 allocation so far {:.1} MiB",
+                mib(after_forward - before),
+                mib(after_backward - before),
+                mib(largest)
+            );
+            drop((o, lse, grads));
+        }
 
         // Through Autodiff, as training runs it: the loss sum(o * dO) adds an elementwise product,
-        // a sum and their backward.
+        // a sum and their backward. Each way of summing the query gradient.
         let autodiff = device.clone().autodiff();
         let to_ad =
             |x: &Tensor<4>| Tensor::<4>::from_data(x.to_data(), &autodiff).cast(DType::BF16);
         let (qa, ka, va, ga) = (to_ad(&q), to_ad(&k), to_ad(&v), to_ad(&grad));
-        let autodiff_ms = median_ms(&autodiff, || {
-            let (q, k, v) = (
+        for &deterministic in &ways {
+            let options = causal.with_deterministic(deterministic);
+            let way = if deterministic { "" } else { ", atomic dQ" };
+            let autodiff_ms = median_ms(&autodiff, || {
+                let (q, k, v) = (
+                    qa.clone().require_grad(),
+                    ka.clone().require_grad(),
+                    va.clone().require_grad(),
+                );
+                let o = attention(
+                    q.clone(),
+                    k.clone(),
+                    v.clone(),
+                    AttentionMask::None,
+                    options,
+                );
+                let grads = (o * ga.clone()).sum().backward();
+                let _ = (q.grad(&grads), k.grad(&grads), v.grad(&grads));
+            });
+            autodiff.sync().unwrap();
+            let (before, _) = memory();
+            let (qr, kr, vr) = (
                 qa.clone().require_grad(),
                 ka.clone().require_grad(),
                 va.clone().require_grad(),
             );
-            let o = attention(q.clone(), k.clone(), v.clone(), AttentionMask::None, causal);
+            let o = attention(
+                qr.clone(),
+                kr.clone(),
+                vr.clone(),
+                AttentionMask::None,
+                options,
+            );
+            autodiff.sync().unwrap();
+            let (after_forward, _) = memory();
             let grads = (o * ga.clone()).sum().backward();
-            let _ = (q.grad(&grads), k.grad(&grads), v.grad(&grads));
-        });
-        autodiff.sync().unwrap();
-        let (before, _) = memory();
-        let (qr, kr, vr) = (
-            qa.clone().require_grad(),
-            ka.clone().require_grad(),
-            va.clone().require_grad(),
-        );
-        let o = attention(
-            qr.clone(),
-            kr.clone(),
-            vr.clone(),
-            AttentionMask::None,
-            causal,
-        );
-        autodiff.sync().unwrap();
-        let (after_forward, _) = memory();
-        let grads = (o * ga.clone()).sum().backward();
-        let kept = (qr.grad(&grads), kr.grad(&grads), vr.grad(&grads));
-        autodiff.sync().unwrap();
-        let (after_backward, _) = memory();
-        println!(
-            "  causal through Autodiff: forward + backward {autodiff_ms:.2} ms; +{:.1} MiB after \
-             the forward, +{:.1} MiB after the backward",
-            mib(after_forward - before),
-            mib(after_backward - before)
-        );
-        drop((kept, grads));
+            let kept = (qr.grad(&grads), kr.grad(&grads), vr.grad(&grads));
+            autodiff.sync().unwrap();
+            let (after_backward, _) = memory();
+            println!(
+                "  causal{way} through Autodiff: forward + backward {autodiff_ms:.2} ms; +{:.1} MiB \
+                 after the forward, +{:.1} MiB after the backward",
+                mib(after_forward - before),
+                mib(after_backward - before)
+            );
+            drop((kept, grads));
+        }
 
         drop((q, k, v, grad));
         if burn_too {

@@ -26,7 +26,8 @@ use burn::tensor::{Device, Tensor, TensorData};
 #[cfg(feature = "cuda")]
 use dash_ops::attention::causal_attention_backward;
 use dash_ops::attention::{
-    AttentionOptions, attention_decode, causal_attention, causal_attention_with_lse, probe,
+    AttentionMask, AttentionOptions, attention_decode, attention_with_lse, causal_attention,
+    causal_attention_with_lse, probe,
 };
 use safetensors::{Dtype, SafeTensors};
 use std::sync::Mutex;
@@ -160,8 +161,10 @@ fn record(name: &'static str) -> Record {
     }
 }
 
-/// The forward with its log-sum-exp, then the backward of `sum(o * grad)`, on `device` (an
-/// autodiff device) with inputs and the output gradient in `dtype`.
+/// The causal forward with its log-sum-exp, then the backward of `sum(o * grad)`, on `device` (an
+/// autodiff device) with inputs and the output gradient in `dtype`, the backward deterministic or
+/// not ([`AttentionOptions::deterministic`]).
+#[allow(clippy::too_many_arguments)]
 fn run(
     device: &Device,
     q: &Host,
@@ -170,12 +173,22 @@ fn run(
     grad: &Host,
     scale: f32,
     dtype: DType,
+    deterministic: bool,
 ) -> Results {
     let q = q.on::<4>(device, dtype).detach().require_grad();
     let k = k.on::<4>(device, dtype).detach().require_grad();
     let v = v.on::<4>(device, dtype).detach().require_grad();
     let grad = grad.on::<4>(device, dtype);
-    let (o, lse) = causal_attention_with_lse(q.clone(), k.clone(), v.clone(), scale);
+    let options = AttentionOptions::causal()
+        .with_scale(scale)
+        .with_deterministic(deterministic);
+    let (o, lse) = attention_with_lse(
+        q.clone(),
+        k.clone(),
+        v.clone(),
+        AttentionMask::None,
+        options,
+    );
     let grads = (o.clone() * grad).sum().backward();
     Results {
         o: Host::from_tensor(o),
@@ -240,14 +253,14 @@ const CUBE_F32_TOLERANCE: [f32; 5] = if cfg!(feature = "autotune") {
 } else {
     [3.2e-7, 1.1e-7, 8.5e-7, 4.6e-7, 3.8e-7]
 };
-/// The kernels in bf16 and f16. The query gradient is summed over the key blocks with atomics, in
-/// whatever order the kernels run: its bounds are just above the largest over eight runs of each
-/// CUDA build (4.48e-3 in bf16, 4.46e-4 in f16; the largest are where few key blocks add up, and
-/// the same in every run).
+/// The kernels in bf16 and f16, the query gradient summed in a fixed order or with atomics: just
+/// above the largest of both over repeated runs of each CUDA build. With atomics the query
+/// gradient's sum comes in whatever order the kernels run; its largest errors are where few key
+/// blocks add up, and the same in every run.
 #[cfg(feature = "cubecl")]
-const BF16_TOLERANCE: [f32; 5] = [3.4e-3, 2.5e-7, 4.6e-3, 4e-3, 4.2e-3];
+const BF16_TOLERANCE: [f32; 5] = [3.4e-3, 2.5e-7, 4.7e-3, 4e-3, 4.2e-3];
 #[cfg(feature = "cubecl")]
-const F16_TOLERANCE: [f32; 5] = [4.6e-4, 1.7e-7, 4.6e-4, 3.6e-4, 4e-4];
+const F16_TOLERANCE: [f32; 5] = [4.6e-4, 1.7e-7, 4.7e-4, 3.6e-4, 4e-4];
 /// Decoding in bf16 against the f32 reference.
 #[cfg(feature = "cubecl")]
 const DECODE_BF16_TOLERANCE: f32 = 2.9e-3;
@@ -262,7 +275,16 @@ fn reference_and_its_backward_match_torch_on_flex() {
     for name in RECORDS {
         let r = record(name);
         let runs = probe::backward_runs();
-        let actual = run(&device, &r.q, &r.k, &r.v, &r.grad, r.scale, DType::F32);
+        let actual = run(
+            &device,
+            &r.q,
+            &r.k,
+            &r.v,
+            &r.grad,
+            r.scale,
+            DType::F32,
+            true,
+        );
         assert!(
             probe::backward_runs() > runs,
             "the written-out backward did not run"
@@ -410,7 +432,8 @@ mod cube {
 
     /// The kernel launches a forward and backward pass over `dims` (`[B, Tq, Tk, Hq, Hkv, D]`) in
     /// `dtype` makes on `device`: one forward and three backward kernels where the kernels take
-    /// them, none where the reference runs. Under CUDA the kernels take every bf16 and f16 call
+    /// them, none where the reference runs; [`launches_kernels`] adds the fourth of a
+    /// deterministic backward whose products split. Under CUDA the kernels take every bf16 and f16 call
     /// with a head dimension of 64, 128 or 256: cards of compute capability 8.0 and later have
     /// all they ask.
     fn expected_launches(device: &Device, dtype: DType, dims: [usize; 6]) -> usize {
@@ -435,12 +458,23 @@ mod cube {
         has
     }
 
-    /// Asserts that `f` launched exactly `expected` kernels: under fusion the kernels run when
-    /// their results are read, so `f` reads them.
+    /// Asserts that `f` launched exactly `expected` kernels, and one more for each backward pass
+    /// whose products split and whose query gradient is the fixed-order one (its key and value
+    /// gradients are rounded from accumulators by a kernel the atomic way runs anyway): under
+    /// fusion the kernels run when their results are read, so `f` reads them. The passes in one
+    /// `f` take their query gradient the same way.
     fn launches_kernels<R>(expected: usize, f: impl FnOnce() -> R) -> R {
         let before = probe::kernel_launches();
+        let (splits, atomics) = (probe::split_runs(), probe::atomic_runs());
         let result = f();
         let launched = probe::kernel_launches() - before;
+        let split = probe::split_runs() - splits;
+        let expected = expected
+            + if probe::atomic_runs() == atomics {
+                split
+            } else {
+                0
+            };
         assert_eq!(
             launched, expected,
             "the kernels made {launched} launches, expected {expected}"
@@ -464,26 +498,44 @@ mod cube {
                 if !has(&device, dtype) {
                     continue;
                 }
-                let expected = expected_launches(&device, dtype, [b, tq, tk, hq, hkv, d]);
-                let (runs, copies) = (probe::backward_runs(), probe::input_copies());
-                let actual = launches_kernels(expected, || {
-                    run(&device, &r.q, &r.k, &r.v, &r.grad, r.scale, dtype)
-                });
-                assert!(
-                    probe::backward_runs() > runs,
-                    "the written-out backward did not run"
-                );
-                assert_eq!(
-                    probe::input_copies(),
-                    copies,
-                    "contiguous inputs were copied"
-                );
-                check(
-                    &format!("cube {label} {}", r.name),
-                    &actual,
-                    &r.expected,
-                    tolerance,
-                );
+                for deterministic in [true, false] {
+                    let expected = expected_launches(&device, dtype, [b, tq, tk, hq, hkv, d]);
+                    let backward = kernels_take(&device, dtype, [b, tq, tk, hq, hkv, d])[1];
+                    let (runs, copies) = (probe::backward_runs(), probe::input_copies());
+                    let atomics = probe::atomic_runs();
+                    let actual = launches_kernels(expected, || {
+                        run(
+                            &device,
+                            &r.q,
+                            &r.k,
+                            &r.v,
+                            &r.grad,
+                            r.scale,
+                            dtype,
+                            deterministic,
+                        )
+                    });
+                    assert!(
+                        probe::backward_runs() > runs,
+                        "the written-out backward did not run"
+                    );
+                    assert_eq!(
+                        probe::input_copies(),
+                        copies,
+                        "contiguous inputs were copied"
+                    );
+                    assert_eq!(
+                        probe::atomic_runs() - atomics,
+                        usize::from(backward && !deterministic),
+                        "the query gradient was not summed the way asked"
+                    );
+                    check(
+                        &format!("cube {label} deterministic {deterministic} {}", r.name),
+                        &actual,
+                        &r.expected,
+                        tolerance,
+                    );
+                }
             }
         }
     }
@@ -504,7 +556,16 @@ mod cube {
             ];
             assert_eq!(expected_launches(&device, DType::F32, dims), 0);
             let actual = launches_kernels(0, || {
-                run(&device, &r.q, &r.k, &r.v, &r.grad, r.scale, DType::F32)
+                run(
+                    &device,
+                    &r.q,
+                    &r.k,
+                    &r.v,
+                    &r.grad,
+                    r.scale,
+                    DType::F32,
+                    true,
+                )
             });
             check(
                 &format!("cube f32 {}", r.name),
@@ -548,7 +609,7 @@ mod cube {
             [1, 6, 2, 70, 150, 64],
             [1, 8, 2, 1, 33, 256],
         ];
-        for split in [false, true] {
+        for (split, deterministic) in [(false, true), (true, true), (false, false), (true, false)] {
             let _forced = ForcedSplit::new(split);
             for (i, dims) in shapes.into_iter().enumerate() {
                 let (q, k, v, grad, scale) = inputs(dims, 100 + 10 * i as u64);
@@ -560,17 +621,32 @@ mod cube {
                     &grad,
                     scale,
                     DType::F32,
+                    true,
                 );
                 let launches = expected_launches(&device, DType::BF16, call_dims(dims));
                 let backward = kernels_take(&device, DType::BF16, call_dims(dims))[1];
                 let (copies, splits) = (probe::input_copies(), probe::split_runs());
+                let atomics = probe::atomic_runs();
                 let actual = launches_kernels(launches, || {
-                    run(&device, &q, &k, &v, &grad, scale, DType::BF16)
+                    run(
+                        &device,
+                        &q,
+                        &k,
+                        &v,
+                        &grad,
+                        scale,
+                        DType::BF16,
+                        deterministic,
+                    )
                 });
                 assert_eq!(probe::input_copies(), copies);
                 assert_eq!(probe::split_runs() - splits, usize::from(split && backward));
+                assert_eq!(
+                    probe::atomic_runs() - atomics,
+                    usize::from(backward && !deterministic)
+                );
                 check(
-                    &format!("cube bf16 split {split} {dims:?}"),
+                    &format!("cube bf16 split {split} deterministic {deterministic} {dims:?}"),
                     &actual,
                     &expected,
                     BF16_TOLERANCE,
@@ -596,6 +672,7 @@ mod cube {
             &grad,
             scale,
             DType::F32,
+            true,
         );
         let device = device();
         let leaf = |h: &Host| layout(h, &device).detach().require_grad();
@@ -824,6 +901,7 @@ mod cuda {
         );
 
         let (launches, copies) = (probe::kernel_launches(), probe::input_copies());
+        let splits = probe::split_runs();
         let (o, lse) = causal_attention_with_lse(q.clone(), k.clone(), v.clone(), scale);
         device.sync().unwrap();
         let forward = memory();
@@ -838,10 +916,13 @@ mod cuda {
         );
         device.sync().unwrap();
         let backward = memory();
+        // The products split here (512 key blocks on 70 multiprocessors leave the last round
+        // light), and a deterministic backward whose products split runs a fourth kernel.
+        let split = probe::split_runs() - splits;
         assert_eq!(
             probe::kernel_launches(),
-            launches + 4,
-            "the forward and the three backward kernels ran, and no other path"
+            launches + 4 + split,
+            "the forward and the backward's kernels ran, and no other path"
         );
         assert_eq!(probe::input_copies(), copies, "an input was copied");
         for gradient in [dq, dk, dv] {

@@ -1,4 +1,4 @@
-//! The CubeCL kernels: the training forward, the three backward kernels, and decoding.
+//! The CubeCL kernels: the training forward, the backward kernels, and decoding.
 //!
 //! Tiles of queries, keys, values and output gradients are staged in shared memory as rows of
 //! 16-byte chunks (eight bf16 or f16), XOR-swizzled so that the eight rows an `ldmatrix` reads at
@@ -16,15 +16,18 @@
 //! - forward: 128 queries per block, eight warps of 16 rows (two per scheduler, so that one
 //!   warp's `ldmatrix` and softmax overlap the other's products), and key blocks of 32 at
 //!   D = 256 (64 below): queries, keys and values take 64 + 16 + 16 KB.
-//! - backward, FlashAttention-2's five products: 32 keys per block and 32 queries per step,
+//! - backward, the products of each key block: 32 keys per block and 32 queries per step,
 //!   eight warps. The two D-long products (`S = Q K^T`, `dP = dO V^T`) are split 2 x 4 over the
-//!   warps (16 queries x 8 keys each), the three 32-long ones 2 x 4 the other way: `dV += P^T dO`
-//!   and `dK += dS^T Q` 16 keys x D/4 columns each, `dQ = dS K` 16 queries x D/4 columns. `P` and
-//!   `dS` cross between the splits through 2 KB of shared memory each; each warp's `dK` and `dV`
-//!   accumulators are 32 registers apiece at D = 256 and stay in registers over the block's
-//!   sweep, while each step's `dQ` (32 registers) goes at once to an f32 accumulator in global
-//!   memory through atomic additions, laid out so that each warp's addition covers 32
-//!   consecutive floats ([`dq_tile()`]).
+//!   warps (16 queries x 8 keys each), the 32-long ones 2 x 4 the other way: `dV += P^T dO` and
+//!   `dK += dS^T Q` 16 keys x D/4 columns each and, with atomic `dQ`, `dQ = dS K` 16 queries x
+//!   D/4 columns. `P` and `dS` cross between the splits through 2 KB of shared memory each; each
+//!   warp's `dK` and `dV` accumulators are 32 registers apiece at D = 256 and stay in registers
+//!   over the block's sweep, while each step's `dQ` (32 registers) goes at once to an f32
+//!   accumulator in global memory through atomic additions, laid out so that each warp's
+//!   addition covers 32 consecutive floats ([`dq_tile()`]).
+//! - backward, `dQ` in a fixed order (the default, in place of the atomic one): 64 queries per
+//!   block (the output gradients take the other 32 KB), eight warps: two per 16 query rows, each
+//!   taking 16 of every 32 keys, their partial `dQ` added through shared memory at the end.
 //!
 //! Every loop reads its next tile from global memory into registers while it computes on the
 //! current one in shared memory, and writes it there after a barrier.
@@ -52,7 +55,8 @@
 //! contiguous; both are `i32`. The backward's f32 accumulators are scratch, zeroed by
 //! `delta_kernel()` and read by `finish_kernel()`: `dQ`'s in tiles of 32 queries in the
 //! products' register order ([`dq_tile()`]), `dK`'s and `dV`'s (when two cubes share a key
-//! block) contiguous `[B, Tk, Hkv, D]`.
+//! block) contiguous `[B, Tk, Hkv, D]`. The fixed-order `dQ` needs none: `dq_kernel()` writes it
+//! from registers.
 
 // Kernel code is expanded by CubeCL's frontend, which takes the plain operators: `div_ceil`,
 // `is_multiple_of` and the compound assignments on vector elements are written out, and a
@@ -75,6 +79,8 @@ pub(crate) type R2 = Const<2>;
 /// Rows of queries per block in the forward (eight warps of 16): with one block per
 /// multiprocessor, two warps per scheduler hide each other's latency.
 pub(crate) const FORWARD_BLOCK_Q: u32 = 128;
+/// Rows of queries per block of the fixed-order `dQ` (eight warps, two per 16 rows).
+pub(crate) const BLOCK_Q: u32 = 64;
 /// Keys per block and queries per step in the backward's products, and queries per tile of
 /// their `dQ` accumulator.
 pub(crate) const BLOCK_KV: u32 = 32;
@@ -1169,6 +1175,359 @@ fn eight<E: Float>(lo: Vector<f32, Const<4>>, hi: Vector<f32, Const<4>>) -> Vect
     out
 }
 
+/// The query gradient in a fixed order, the backward's default: one cube per (64-query block,
+/// query head, batch), eight warps, two per 16 query rows, each taking half of every key block,
+/// their partial `dQ` added through shared memory at the end. Sweeps the key blocks its queries
+/// see in order, recomputing `S` and `dP = dO V^T` per block, `P` from the log-sum-exp,
+/// `dS = P (dP - delta)`, and `dQ += dS K` in registers, so that the same inputs give the same
+/// bits on every run. Writes `dQ` contiguous `[B, Tq, Hq, D]`; `backward_kernel()` then runs the
+/// other products without its own `dQ`.
+#[cube(launch_unchecked)]
+pub(crate) fn dq_kernel<E: Float>(
+    q: &Tensor<Vector<E, V8>>,
+    k: &Tensor<Vector<E, V8>>,
+    v: &Tensor<Vector<E, V8>>,
+    d_o: &Tensor<Vector<E, V8>>,
+    lse: &Tensor<f32>,
+    delta: &Tensor<f32>,
+    dq: &mut Tensor<Vector<E, R2>>,
+    key_mask: &Tensor<i32>,
+    cu_q: &Tensor<i32>,
+    cu_k: &Tensor<i32>,
+    q_blocks: u32,
+    tq: u32,
+    tk: u32,
+    group: u32,
+    q_sb: u32,
+    q_sh: u32,
+    q_st: u32,
+    k_sb: u32,
+    k_sh: u32,
+    k_st: u32,
+    v_sb: u32,
+    v_sh: u32,
+    v_st: u32,
+    do_sb: u32,
+    do_sh: u32,
+    do_st: u32,
+    scale: f32,
+    m_sb: u32,
+    m_st: u32,
+    seqs: u32,
+    left: i32,
+    right: i32,
+    #[comptime] d: u32,
+    #[comptime] block_kv: u32,
+    #[comptime] padded: bool,
+    #[comptime] packed: bool,
+    #[define(E)] _dtype: ElemType,
+) {
+    let def = MmaDefinition::<E, E, f32>::new(16usize, 8usize, 16usize);
+    let chunks = comptime!(d / 8);
+    let half = comptime!(block_kv / 2);
+    let warp = UNIT_POS / 32;
+    let lane = UNIT_POS_PLANE;
+    let g = lane / 4;
+    let t = lane % 4;
+    // Two warps per 16 query rows, each taking half of every key block.
+    let rows = warp % 4;
+    let key_half = warp / 4;
+    let key0 = key_half * half;
+
+    let h = CUBE_POS_Y;
+    let b = CUBE_POS_Z;
+    let hq = CUBE_COUNT_Y;
+    let hk = h / group;
+    let q0 = (q_blocks - 1 - CUBE_POS_X) * BLOCK_Q;
+
+    let q_base = b as usize * q_sb as usize + h as usize * q_sh as usize;
+    let do_base = b as usize * do_sb as usize + h as usize * do_sh as usize;
+    let k_base = b as usize * k_sb as usize + hk as usize * k_sh as usize;
+    let v_base = b as usize * v_sb as usize + hk as usize * v_sh as usize;
+    let m_base = b as usize * m_sb as usize;
+
+    // The keys each row of the block sees, each pair of warps' span of them (the two compute
+    // the same; the first writes), and the block's key tiles.
+    let local_a = rows * 16 + g;
+    let local_b = local_a + 8;
+    let row_a = q0 + local_a;
+    let row_b = q0 + local_b;
+    let mut s_rows = Shared::<[i32]>::new_slice(comptime!((2 * BLOCK_Q) as usize));
+    let mut s_span = Shared::<[i32]>::new_slice(16usize);
+    let (first_tile, n_blocks) = block_bounds(
+        s_rows.as_mut_slice(),
+        s_span.as_mut_slice(),
+        row_a,
+        row_b,
+        local_a,
+        local_b,
+        rows,
+        key_half == 0,
+        tq,
+        tk,
+        left,
+        right,
+        cu_q,
+        cu_k,
+        seqs,
+        packed,
+        4u32,
+        block_kv,
+    );
+    let first_key = first_tile * block_kv;
+    let k_limit = select(n_blocks > 0, tk, 0u32);
+
+    let mut s_q = Shared::<[Vector<E, V8>]>::new_aligned_slice(
+        comptime!((BLOCK_Q * d / 8) as usize),
+        16usize,
+    );
+    let mut s_do = Shared::<[Vector<E, V8>]>::new_aligned_slice(
+        comptime!((BLOCK_Q * d / 8) as usize),
+        16usize,
+    );
+    let mut s_k = Shared::<[Vector<E, V8>]>::new_aligned_slice(
+        comptime!((block_kv * d / 8) as usize),
+        16usize,
+    );
+    let mut s_v = Shared::<[Vector<E, V8>]>::new_aligned_slice(
+        comptime!((block_kv * d / 8) as usize),
+        16usize,
+    );
+    let mut s_pad =
+        Shared::<[i32]>::new_slice(comptime!(if padded { block_kv } else { 1u32 }) as usize);
+
+    load_rows::<E>(
+        q,
+        s_q.as_mut_slice(),
+        q_base,
+        q_st as usize,
+        q0,
+        tq,
+        BLOCK_Q,
+        chunks,
+        256u32,
+    );
+    load_rows::<E>(
+        d_o,
+        s_do.as_mut_slice(),
+        do_base,
+        do_st as usize,
+        q0,
+        tq,
+        BLOCK_Q,
+        chunks,
+        256u32,
+    );
+    load_rows::<E>(
+        k,
+        s_k.as_mut_slice(),
+        k_base,
+        k_st as usize,
+        first_key,
+        k_limit,
+        block_kv,
+        chunks,
+        256u32,
+    );
+    load_rows::<E>(
+        v,
+        s_v.as_mut_slice(),
+        v_base,
+        v_st as usize,
+        first_key,
+        k_limit,
+        block_kv,
+        chunks,
+        256u32,
+    );
+    if comptime!(padded) {
+        let flag = fetch_padding(key_mask, m_base, m_st, first_key, k_limit, block_kv);
+        if UNIT_POS < block_kv {
+            s_pad[UNIT_POS as usize] = flag;
+        }
+    }
+
+    // Rows `row_a` and `row_b` of this head in `[B, Tq, Hq]` order.
+    let first = b as usize * tq as usize * hq as usize + h as usize;
+    let at_a = first + row_a as usize * hq as usize;
+    let at_b = first + row_b as usize * hq as usize;
+    let mut lse_a = 0.0f32;
+    let mut lse_b = 0.0f32;
+    let mut delta_a = 0.0f32;
+    let mut delta_b = 0.0f32;
+    if row_a < tq {
+        lse_a = lse[at_a];
+        delta_a = delta[at_a];
+    }
+    if row_b < tq {
+        lse_b = lse[at_b];
+        delta_b = delta[at_b];
+    }
+    let mut acc_dq = zeros(comptime!(d / 4));
+    let span = half as i32;
+
+    for j in 0..n_blocks {
+        let k0 = first_key + j * block_kv;
+        // K(j) and V(j) are in shared memory: read K(j + 1) and V(j + 1) meanwhile.
+        sync_cube();
+        let limit = select(j + 1 < n_blocks, tk, 0u32);
+        let k_next = fetch_rows::<E>(
+            k,
+            k_base,
+            k_st as usize,
+            k0 + block_kv,
+            limit,
+            block_kv,
+            chunks,
+            256u32,
+        );
+        let v_next = fetch_rows::<E>(
+            v,
+            v_base,
+            v_st as usize,
+            k0 + block_kv,
+            limit,
+            block_kv,
+            chunks,
+            256u32,
+        );
+        let mut pad_next = 1i32;
+        if comptime!(padded) {
+            pad_next = fetch_padding(key_mask, m_base, m_st, k0 + block_kv, limit, block_kv);
+        }
+
+        // This warp's half of the tile.
+        let start = (k0 + key0) as i32;
+        let at = (4 * rows) as usize;
+        {
+            let mut acc_s = scores::<E>(
+                &def,
+                s_q.as_slice(),
+                s_k.as_slice(),
+                rows * 16,
+                key0,
+                d,
+                half,
+            );
+            let acc_dp = scores::<E>(
+                &def,
+                s_do.as_slice(),
+                s_v.as_slice(),
+                rows * 16,
+                key0,
+                d,
+                half,
+            );
+
+            // Mask unless every row of the warp sees the whole half (rows past the queries
+            // aside: nothing of theirs is written).
+            let masked = padded
+                || tile_masked(
+                    q0 + rows * 16,
+                    start,
+                    span,
+                    tq,
+                    tk,
+                    left,
+                    right,
+                    s_span.as_slice(),
+                    at,
+                    packed,
+                );
+            #[unroll]
+            for nt in 0..comptime!(half / 8) {
+                let col = start + (nt * 8 + 2 * t) as i32;
+                let sa = scale_and_mask(
+                    acc_s[(2 * nt) as usize],
+                    scale,
+                    col,
+                    s_rows.as_slice(),
+                    local_a,
+                    s_pad.as_slice(),
+                    k0 as i32,
+                    masked,
+                    padded,
+                );
+                let sb = scale_and_mask(
+                    acc_s[(2 * nt + 1) as usize],
+                    scale,
+                    col,
+                    s_rows.as_slice(),
+                    local_b,
+                    s_pad.as_slice(),
+                    k0 as i32,
+                    masked,
+                    padded,
+                );
+                let pa = (sa - Vector::new(lse_a)).exp();
+                let pb = (sb - Vector::new(lse_b)).exp();
+                acc_s[(2 * nt) as usize] = pa * (acc_dp[(2 * nt) as usize] - Vector::new(delta_a));
+                acc_s[(2 * nt + 1) as usize] =
+                    pb * (acc_dp[(2 * nt + 1) as usize] - Vector::new(delta_b));
+            }
+            accumulate_pv::<E>(&def, &acc_s, s_k.as_slice(), &mut acc_dq, key0, d, half);
+        }
+        sync_cube();
+        store_rows::<E>(&k_next, s_k.as_mut_slice(), block_kv, chunks, 256u32);
+        store_rows::<E>(&v_next, s_v.as_mut_slice(), block_kv, chunks, 256u32);
+        if comptime!(padded) {
+            if UNIT_POS < block_kv {
+                s_pad[UNIT_POS as usize] = pad_next;
+            }
+        }
+    }
+
+    // The second warp of each pair hands its partial dQ to the first through the query and
+    // output-gradient tiles, now free: four f32 per 16-byte slot, lane-minor, in the same
+    // register order on both sides.
+    let slots = comptime!(d / 8);
+    let region = (warp % 2) * comptime!(32 * d / 8);
+    sync_cube();
+    if key_half == 1 {
+        #[unroll]
+        for j in 0..slots {
+            let mut packed_dq = Vector::<f32, Const<4>>::empty();
+            packed_dq.insert(0usize, acc_dq[(2 * j) as usize].extract(0usize));
+            packed_dq.insert(1usize, acc_dq[(2 * j) as usize].extract(1usize));
+            packed_dq.insert(2usize, acc_dq[(2 * j + 1) as usize].extract(0usize));
+            packed_dq.insert(3usize, acc_dq[(2 * j + 1) as usize].extract(1usize));
+            let at = (region + j * 32 + lane) as usize;
+            if rows < 2 {
+                s_q[at] = Vector::<E, V8>::reinterpret(packed_dq);
+            } else {
+                s_do[at] = Vector::<E, V8>::reinterpret(packed_dq);
+            }
+        }
+    }
+    sync_cube();
+    if key_half == 0 {
+        let half_d = comptime!(d / 2) as usize;
+        #[unroll]
+        for j in 0..slots {
+            let at = (region + j * 32 + lane) as usize;
+            let mut slot = s_q[at];
+            if rows >= 2 {
+                slot = s_do[at];
+            }
+            let other = Vector::<f32, Const<4>>::reinterpret(slot);
+            let mut lo = acc_dq[(2 * j) as usize];
+            let mut hi = acc_dq[(2 * j + 1) as usize];
+            lo.insert(0usize, lo.extract(0usize) + other.extract(0usize));
+            lo.insert(1usize, lo.extract(1usize) + other.extract(1usize));
+            hi.insert(0usize, hi.extract(0usize) + other.extract(2usize));
+            hi.insert(1usize, hi.extract(1usize) + other.extract(3usize));
+            // Accumulator vector 2j is row g, 2j + 1 row g + 8, both columns 8 j + 2 t.
+            let col = (j * 4 + t) as usize;
+            if row_a < tq {
+                dq[at_a * half_d + col] = Vector::cast_from(lo * Vector::new(scale));
+            }
+            if row_b < tq {
+                dq[at_b * half_d + col] = Vector::cast_from(hi * Vector::new(scale));
+            }
+        }
+    }
+}
+
 /// Whether a step of the products (queries `[q0, q0 + 32)`, keys `[k0, k0 + 32)`) needs masking
 /// element by element: unless every query sees every key. Packed, from the queries' intervals in
 /// `s_lo` and `s_hi`: the last query's starts at or before `k0` and the first one's ends at or
@@ -1220,19 +1579,21 @@ fn step_bounds(
     }
 }
 
-/// The backward pass's products, FlashAttention-2's five. One cube per (32-key block, key-value
-/// head, batch), eight warps, sweeping the query heads of the group and, for each, the 32-query
-/// steps of the queries that see the block ([`query_range()`]). Each step computes `S = Q K^T`
-/// and `dP = dO V^T` once, split 2 x 4 over the warps (16 queries x 8 keys each); `P` and `dS`
-/// go through shared memory to the 2 x 4 splits of `dQ += dS K` (16 queries x D/4 columns each)
-/// and of `dV += P^T dO` and `dK += dS^T Q` (16 keys x D/4 columns each). `dK` and `dV`
-/// accumulate in registers over the sweep and are written once, contiguous `[B, Tk, Hkv, D]`;
-/// each step's `dQ` is added to its tile of the f32 accumulator `dq` ([`dq_tile()`], zeroed by
-/// `delta_kernel()`) with atomics, unscaled, so that its sum over the key blocks comes in
-/// whatever order the cubes run. With `split`, two cubes share each key block, `CUBE_POS_X`
-/// `2 j` taking the first half of its steps and `2 j + 1` the second, and add their `dK` and
-/// `dV` (scaled) to the f32 accumulators `dk_acc` and `dv_acc` (`[B, Tk, Hkv, D]`, zeroed by
-/// `delta_kernel()`), for `finish_kernel()` to round.
+/// The backward pass's products of each key block: with `atomic_dq`, FlashAttention-2's five;
+/// without, all but `dQ`, which `dq_kernel()` computes in a fixed order. One cube per (32-key
+/// block, key-value head, batch), eight warps, sweeping the query heads of the group and, for
+/// each, the 32-query steps of the queries that see the block ([`query_range()`]). Each step
+/// computes `S = Q K^T` and `dP = dO V^T` once, split 2 x 4 over the warps (16 queries x 8 keys
+/// each); `P` and `dS` go through shared memory to the 2 x 4 splits of `dV += P^T dO` and
+/// `dK += dS^T Q` (16 keys x D/4 columns each) and, with `atomic_dq`, of `dQ += dS K` (16
+/// queries x D/4 columns each). `dK` and `dV` accumulate in registers over the sweep and are
+/// written once, contiguous `[B, Tk, Hkv, D]`; with `atomic_dq`, each step's `dQ` is added to its
+/// tile of the f32 accumulator `dq` ([`dq_tile()`], zeroed by `delta_kernel()`) with atomics,
+/// unscaled, so that its sum over the key blocks comes in whatever order the cubes run. With
+/// `split`, two cubes share each key block, `CUBE_POS_X` `2 j` taking the first half of its
+/// steps and `2 j + 1` the second, and add their `dK` and `dV` (scaled) to the f32 accumulators
+/// `dk_acc` and `dv_acc` (`[B, Tk, Hkv, D]`, zeroed by `delta_kernel()`), for `finish_kernel()`
+/// to round. Either way `dK` and `dV` are the same bits.
 #[cube(launch_unchecked)]
 pub(crate) fn backward_kernel<E: Float>(
     q: &Tensor<Vector<E, V8>>,
@@ -1275,6 +1636,7 @@ pub(crate) fn backward_kernel<E: Float>(
     #[comptime] padded: bool,
     #[comptime] packed: bool,
     #[comptime] split: bool,
+    #[comptime] atomic_dq: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let def = MmaDefinition::<E, E, f32>::new(16usize, 8usize, 16usize);
@@ -1373,8 +1735,6 @@ pub(crate) fn backward_kernel<E: Float>(
     let per_head = select(end_query > first_query, end_step - first_step, 0u32);
     let qr_a = 16 * rg + g;
     let qr_b = qr_a + 8;
-    // This lane's first value in a tile of the `dQ` accumulator ([`dq_tile()`]).
-    let lane_at = (warp * comptime!(d / 8) * 32 + lane) as usize;
 
     // The steps of all the group's query heads, one after the other: step `it` is query block
     // `first_step + it % per_head` of head `hk * group + it / per_head`. Each step reads the
@@ -1382,7 +1742,8 @@ pub(crate) fn backward_kernel<E: Float>(
     // Split, the first cube of the key block takes steps `[0, mid)`, the second `[mid, total)`.
     let total = group * per_head;
     // Each head's steps start `rotation` blocks in, wrapping around, so that the cubes running
-    // side by side add to different tiles of the `dQ` accumulator rather than all to one.
+    // side by side add to different tiles of the `dQ` accumulator rather than all to one. The
+    // order of the sweep, and so of `dK`'s and `dV`'s sums, depends on the block alone.
     let mut rotation = 0u32;
     if per_head > 0 {
         rotation = block % per_head;
@@ -1583,24 +1944,28 @@ pub(crate) fn backward_kernel<E: Float>(
         // `[cols cg, cols cg + cols)`, added to the accumulator at once, in the order of the
         // warps' registers ([`dq_tile()`]): each addition covers 32 consecutive floats, and the
         // additions drain while the products below run.
-        let mut acc_dq = zeros(comptime!(d / 16));
-        #[unroll]
-        for kk in 0..comptime!(BLOCK_KV / 16) {
-            let a = load_a_narrow::<E>(&def, s_ds.as_slice(), 16 * rg, kk);
+        if comptime!(atomic_dq) {
+            let mut acc_dq = zeros(comptime!(d / 16));
             #[unroll]
-            for np in 0..comptime!(cols / 16) {
-                let pair = cg * comptime!(cols / 16) + np;
-                let bk = load_b_cols_pair::<E>(&def, s_k.as_slice(), 16 * kk, pair, chunks);
-                mma::<E>(&def, &a, bk[0], bk[1], &mut acc_dq, 2 * np);
-                mma::<E>(&def, &a, bk[2], bk[3], &mut acc_dq, 2 * np + 1);
+            for kk in 0..comptime!(BLOCK_KV / 16) {
+                let a = load_a_narrow::<E>(&def, s_ds.as_slice(), 16 * rg, kk);
+                #[unroll]
+                for np in 0..comptime!(cols / 16) {
+                    let pair = cg * comptime!(cols / 16) + np;
+                    let bk = load_b_cols_pair::<E>(&def, s_k.as_slice(), 16 * kk, pair, chunks);
+                    mma::<E>(&def, &a, bk[0], bk[1], &mut acc_dq, 2 * np);
+                    mma::<E>(&def, &a, bk[2], bk[3], &mut acc_dq, 2 * np + 1);
+                }
             }
-        }
-        let h = hk * group + it / per_head;
-        let at = dq_tile(b, q0 / BLOCK_KV, h, (tq + BLOCK_KV - 1) / BLOCK_KV, hq, d) + lane_at;
-        #[unroll]
-        for r in 0..comptime!(cols / 2) {
-            let x = acc_dq[(r / 2) as usize].extract((r % 2) as usize);
-            dq[at + (32 * r) as usize].fetch_add(x);
+            let h = hk * group + it / per_head;
+            // This lane's first value in the tile ([`dq_tile()`]).
+            let lane_at = (warp * comptime!(d / 8) * 32 + lane) as usize;
+            let at = dq_tile(b, q0 / BLOCK_KV, h, (tq + BLOCK_KV - 1) / BLOCK_KV, hq, d) + lane_at;
+            #[unroll]
+            for r in 0..comptime!(cols / 2) {
+                let x = acc_dq[(r / 2) as usize].extract((r % 2) as usize);
+                dq[at + (32 * r) as usize].fetch_add(x);
+            }
         }
 
         #[unroll]

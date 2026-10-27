@@ -68,11 +68,16 @@
 //! backpropagate a given gradient `g` through `y` (the gradient of that sum with respect to `y`
 //! is `g`, exactly).
 //!
-//! **Accuracy** (`tests/checkpoint.rs`: stacks of MLP and causal self-attention blocks, every
-//! parameter trained, alone and inside a model whose embedding is tied to its output
-//! projection). The loss and every gradient are plain autodiff's bit for bit, in f32 and in
-//! bf16, on Flex and on CUDA with Burn's default kernels or with `autotune`. What can move them
-//! by roundings, none of it costing accuracy:
+//! **Accuracy** (`tests/checkpoint.rs`: stacks of MLP and causal self-attention blocks built from
+//! Burn's tensor operations, every parameter trained, alone and inside a model whose embedding is
+//! tied to its output projection; and, where its kernels run, two causal blocks on
+//! [`crate::attention`] at 1000 tokens, where 32 key blocks add to the last queries' gradients).
+//! The loss and every gradient are plain autodiff's bit for bit, in f32 and in bf16, on Flex and
+//! on CUDA with Burn's default kernels or with `autotune`, the attention kernels' blocks with
+//! their default deterministic backward. With that backward's query gradient summed with atomics
+//! (`AttentionOptions::deterministic` off) they are not: its last bits move from one backward
+//! pass to the next, and the gradients below it with them (up to 3.0e-5 of a gradient's largest
+//! value in bf16). What can move them by roundings, none of it costing accuracy:
 //!
 //! - An operation a backend computes one way outside autodiff and another way when recorded.
 //!   Flex's layer norm is one: a fused kernel of Flex's own in the forward pass here, Burn's
