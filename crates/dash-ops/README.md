@@ -87,9 +87,9 @@ and 0.51), and the WY part 0.26 against 0.35 with the keys' l2 normalisation; th
 kernels are slower. Its first kernel inverts `I + A` with 64 units in f32, on CUDA cores (0.33 ms
 with the forward's other work, fla's 0.27 in three kernels and the l2 normalisation, its inversion
 on tensor cores in TF32), and the backward's kernel for all but the WY part holds 77 KiB of shared
-memory, so that one cube fits on a multiprocessor and waits on memory between its phases more than
-fla's pipelined kernels do (0.62 ms, against 0.56 for fla's and the queries' l2 normalisation, `dv`
-going to fla's WY kernel). The backward keeps the forward's `T` (8 KiB a chunk of each head) as fla
+memory, so that one cube fits on a multiprocessor (0.62 ms, against 0.56 for fla's and the queries'
+l2 normalisation, `dv` going to fla's WY kernel); how much of either gap those account for has not
+been measured by switching them. The backward keeps the forward's `T` (8 KiB a chunk of each head) as fla
 does. The loss around it in the benchmark (a cast, a product and a sum over the output) takes
 0.96 ms in Burn's kernels and 0.57 in PyTorch's. Heads of 256 run the f32 kernels, three times fla's
 time. Packed sequences cost about what one sequence of their length does: the state passings take
