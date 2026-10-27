@@ -17,9 +17,12 @@
 //!   n x V logits.
 //! - [`loss`]: cross-entropy fused with the output layer over a large vocabulary, with label
 //!   smoothing, z-loss, an ignore index and masked ids, training the output weight too.
-//! - [`conv1d`]: causal depthwise 1-D convolution, with the state a decoder carries.
+//! - [`conv1d`]: causal depthwise 1-D convolution, from a given state and over a batch or packed
+//!   variable-length sequences, with the state a decoder carries.
 //! - [`checkpoint`]: activation checkpointing, not an operation but built on Burn's tensor API:
 //!   a stack of layers run outside autodiff, each layer run again in the backward pass.
+//! - [`sequences`]: packed variable-length sequences, as the operations that take them share
+//!   them.
 //!
 //! # Conventions
 //!
@@ -34,11 +37,11 @@
 //! `[B, T, C]`; an operation over rows takes `[N, D]`, `N` any flattening of the leading
 //! dimensions. A single decoding step drops `T`: `[B, H, D]`, `[B, C]`. State an operation
 //! carries from call to call keeps `B` first and is f32: the gated delta rule's
-//! `[B, H, Dk, Dv]`, a convolution's last inputs `[B, S, C]`. Packed variable-length sequences
-//! lie end to end along `T` with `B = 1`, their boundaries given as cumulative offsets
-//! `cu_seqlens` `[S + 1]` (Int), as flash-attn and fla take them. Inputs may have any strides (a
-//! kernel may copy one it cannot read in place); outputs are contiguous in the documented
-//! layout.
+//! `[B, H, Dk, Dv]`, a convolution's last `W` inputs `[B, W, C]`. Packed variable-length
+//! sequences lie end to end along `T` with `B = 1`, the boundaries of `S` sequences given as
+//! cumulative offsets `cu_seqlens` `[S + 1]` (Int), as flash-attn and fla take them
+//! ([`sequences`]). Inputs may have any strides (a kernel may copy one it cannot read in place);
+//! outputs are contiguous in the documented layout.
 //!
 //! ## Masks
 //!
@@ -105,3 +108,4 @@ pub mod gated_delta;
 pub mod logprob;
 pub mod loss;
 mod reference;
+pub mod sequences;

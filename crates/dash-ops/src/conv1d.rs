@@ -1,67 +1,99 @@
-//! Causal depthwise 1-D convolution over a sequence, of any small kernel width, with an optional
-//! bias and activation; its gradients; and the state a decoder carries from step to step.
+//! Causal depthwise 1-D convolution over sequences, of any small kernel width, with an optional
+//! bias and activation; from a given state or from zeros, over a batch or packed variable-length
+//! sequences; with its gradients, and the step a decoder takes.
 //!
-//! Per channel `c`, with `K` the kernel width and inputs before the first step taken as zero:
+//! Per channel `c` of a sequence of `L` steps, with `K` the kernel width:
 //!
 //! ```text
-//! y[b, t, c]   = bias[c] + sum_{j < K} weight[c, j] * x[b, t - (K - 1) + j, c]
-//! out[b, t, c] = act(y[b, t, c])
+//! y[t, c]   = bias[c] + sum_{j < K} weight[c, j] * h[t - (K - 1) + j, c]
+//! out[t, c] = act(y[t, c])
 //! ```
 //!
-//! `weight[c, K - 1]` multiplies the current step, `weight[c, 0]` the step `K - 1` before it.
-//! Without a bias, `bias[c]` is zero; `act` is the identity or SiLU ([`Activation`]). This is
-//! torch's `F.conv1d(F.pad(x, (K - 1, 0)), weight[:, None, :], bias, groups=C)` on `x` in
-//! `[B, C, T]`, then the activation: what the causal-conv1d package's `causal_conv1d_fn`
-//! computes, and transformers' fallback for it.
+//! `h` is the sequence's history: its inputs `x[0..L]`, preceded by its initial state, the `W`
+//! inputs before its first step (oldest first), and by zeros before those; with no initial state,
+//! by zeros alone. `weight[c, K - 1]` multiplies the current step, `weight[c, 0]` the step `K - 1`
+//! before it. Without a bias, `bias[c]` is zero; `act` is the identity or SiLU ([`Activation`]).
+//! The sequence's final state is the last `W'` steps of its history, `h[L - W'..L]`, zeros where
+//! the history is shorter: what the next call continues from. A sequence run in pieces, each piece
+//! from the final state the previous one left, has the outputs of the whole sequence, and through
+//! `Autodiff` the gradients of the whole, the final state's gradient passed back to the piece
+//! before.
 //!
-//! # Layouts and dtypes
+//! This is torch's `F.conv1d(torch.cat([state, x]), weight[:, None, :], bias, groups=C)` on `x`
+//! in `[C, L]` (`F.pad(x, (K - 1, 0))` without a state), its last `L` outputs, then the
+//! activation: what the causal-conv1d package's `causal_conv1d_fn` computes with
+//! `initial_states` and `return_final_states`, and over packed sequences with `seq_idx` (there
+//! without states), and transformers' fallback for it.
 //!
-//! - `x`, the output and their gradients: `[B, T, C]`. Inputs may have any strides (a kernel
-//!   copies one whose channels are not adjacent); outputs are contiguous.
-//! - `weight`: `[C, K]`, torch's `[C, 1, K]` without its middle axis.
-//! - `bias`: `[C]`, optional.
-//! - the decoding state: `[B, S, C]`, f32, the last `S >= K - 1` inputs, oldest first.
-//! - one decoding step's input and output: `[B, C]`.
+//! # Sequences, layouts and dtypes
+//!
+//! - `x`, the output and their gradients: `[B, T, C]`, every batch element one sequence. Inputs
+//!   may have any strides (a kernel copies one whose channels are not adjacent); outputs are
+//!   contiguous.
+//! - Packed variable-length sequences: `B = 1` and `cu_seqlens` `[N + 1]` (Int), as the
+//!   [gated delta rule](crate::gated_delta) takes them: sequence `s` is steps
+//!   `cu_seqlens[s]..cu_seqlens[s + 1]`, the offsets going from 0 to `T` without decreasing. No
+//!   step of one sequence reads another's, forward or backward: packed, each sequence has what a
+//!   call on it alone gives. A sequence may be empty: it has no outputs, its final state is the
+//!   last `W'` steps of its initial state (zeros in front where `W' > W`), and its initial
+//!   state's gradient is what the final state's gradient gives it.
+//! - `weight`: `[C, K]`, torch's `[C, 1, K]` without its middle axis. `bias`: `[C]`, optional.
+//! - States, initial and final, and their gradients: `[S, W, C]`, f32, one per sequence (`S = B`,
+//!   or `N` packed): the last inputs before a sequence's first step, oldest first. An initial
+//!   state holds `W >= K - 1` steps; a final state `W'` steps, those of the initial state by
+//!   default ([`CausalConv1dOptions::final_state_len`]), `K - 1` without one.
+//! - One decoding step's input and output: `[B, C]`, its state `[B, W, C]`.
 //!
 //! `x`, `weight` and `bias` share one float dtype (f32, bf16 or f16). Arithmetic is in f32
 //! whatever it is, and the output and each gradient are rounded once, to the dtype of the input
-//! they belong to; the weight and bias gradients are reduced over `B x T` in f32 too.
+//! they belong to; the weight and bias gradients are reduced over every step of every sequence
+//! in f32 too.
 //!
-//! The decoding state is f32, as every state an operation carries from call to call: it holds
-//! inputs, which f32 holds exactly in any of the three dtypes, so a prefill followed by single
-//! steps reads the same values as the whole sequence, and models can keep every state of every
-//! layer in one dtype. It costs `S x C x 4` bytes per sequence (72 KiB at `S = 3`,
-//! `C = 6144`). transformers' cache keeps the state as `[B, C, S]` in the model's dtype:
-//! `state.transpose(1, 2).float()` converts it.
+//! States are f32, as every state an operation carries from call to call: they hold inputs, which
+//! f32 holds exactly in any of the three dtypes, so that a sequence continued from a state reads
+//! the values the whole sequence would, and models can keep every state of every layer in one
+//! dtype. A state costs `W x C x 4` bytes per sequence (72 KiB at `W = 3`, `C = 6144`).
+//! transformers' cache keeps it as `[B, C, W]` in the model's dtype: `state.transpose(1, 2).float()`
+//! converts it.
 //!
 //! # Decoding
 //!
-//! [`causal_conv1d_state`] gives the state a prompt leaves; [`causal_conv1d_update`] takes one
-//! token and the state to the token's output and the next state. A prompt's outputs from
-//! [`causal_conv1d`], then each step's, are the outputs of [`causal_conv1d`] over the whole
-//! sequence.
+//! A prompt's final state ([`causal_conv1d`] with [`CausalConv1dOptions::with_final_state`])
+//! starts decoding; [`causal_conv1d_update`] takes one token per sequence and the state to the
+//! token's output and the next state. A prompt's outputs, then each step's, are the outputs of
+//! [`causal_conv1d`] over the whole sequence. Sequences that bring several tokens to one step (a
+//! tool's reply appended to a prompt) take [`causal_conv1d`] from their states, packed if their
+//! lengths differ.
 //!
 //! # Backends
 //!
 //! The trait's default bodies ([`CausalConv1dBackend`]) are the reference, built from Burn's
-//! tensor operations in f32 for any width; every device runs them. On a CubeCL device (any
-//! runtime), kernel widths 1 to [`MAX_KERNEL_WIDTH`] run CubeCL kernels (others run the
-//! reference):
+//! tensor operations in f32 for any width, packed sequences one at a time (their boundaries read
+//! to the host); every device runs them. On a CubeCL device (any runtime), kernel widths 1 to
+//! [`MAX_KERNEL_WIDTH`] run CubeCL kernels (others run the reference), which read `cu_seqlens`
+//! on the device:
 //!
 //! - the forward pass: one kernel; each thread walks a run of steps of one or two channels,
-//!   keeping the last `K - 1` inputs in registers;
-//! - the backward pass: one kernel for the input gradient and partial sums of the weight and bias
-//!   gradients over runs of 64 steps, and one adding those partial sums up. The activation's
-//!   derivative is fused, its pre-activation recomputed from `x`, `weight` and `bias` rather than
-//!   kept, so training holds only the inputs for this operation;
+//!   keeping the last `K - 1` inputs in registers, and where a sequence starts (anywhere, inside
+//!   a thread's run too) fills them from that sequence's initial state; with final states, one
+//!   more kernel gathers them;
+//! - the backward pass: one kernel for the input gradient, the initial states' gradients and
+//!   partial sums of the weight and bias gradients over runs of 64 steps, and one adding those
+//!   partial sums up; with initial states, one more for the rows of their gradients that only
+//!   the final states reach. The activation's derivative is fused, its pre-activation recomputed
+//!   from `x`, `weight`, `bias` and the initial states rather than kept, so training holds only
+//!   the inputs for this operation; the final states' gradient is added to the input gradient in
+//!   f32, before its rounding;
 //! - a decoding step: one kernel.
 //!
-//! The kernels ask of the device cubes of 256 units, and no shared memory or plane operations:
-//! CUDA and wgpu (lavapipe, OpenGL) have that; CubeCL's CPU runtime, with as many units per cube
-//! as cores, runs the reference.
+//! The kernels ask of the device cubes of 256 units, and no shared memory or plane operations,
+//! and with 64-bit `cu_seqlens`, 64-bit integers: CUDA and wgpu (lavapipe, and OpenGL with 32-bit
+//! `cu_seqlens`) have that; CubeCL's CPU runtime, with as many units per cube as cores, runs the
+//! reference.
 //!
 //! On `Autodiff` the forward records one node, whose backward runs
-//! [`CausalConv1dBackend::causal_conv1d_backward`].
+//! [`CausalConv1dBackend::causal_conv1d_backward`]; with final states, two more that hand the
+//! output's and the final states' gradients to it, so that one backward pass takes both.
 
 use burn::backend::autodiff::NodeId;
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
@@ -70,13 +102,17 @@ use burn::backend::autodiff::grads::Gradients;
 use burn::backend::autodiff::ops::{Backward, NodeGuard, Ops, OpsKind};
 use burn::backend::tensor::FloatTensor;
 use burn::backend::{
-    Autodiff, AutodiffBackend, Backend, Dispatch, ExtensionType, backend_extension,
+    Autodiff, AutodiffBackend, Backend, Dispatch, ExtensionType, TensorMetadata, backend_extension,
 };
-use burn::tensor::{DType, Device, Tensor};
+use burn::tensor::{DType, Device, FloatDType, Int, Shape, Tensor};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "flex")]
 use burn::backend::Flex;
+
+/// The packed sequences of a call, as the backend extension takes them: the gated delta rule's.
+pub use crate::sequences::Sequences;
 
 #[cfg(feature = "cubecl")]
 mod cube;
@@ -99,17 +135,63 @@ pub enum Activation {
     Silu,
 }
 
-/// The arguments of the causal convolution that have a usual default.
+/// The arguments of [`causal_conv1d`] that have a usual default: no activation, no final state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CausalConv1dOptions {
     /// The activation after the convolution and the bias. Default: none.
     pub activation: Activation,
+    /// Return each sequence's final state, the last `W'` steps of its history (causal-conv1d's
+    /// `return_final_states`, fla's `output_final_state`). Default: no.
+    pub output_final_state: bool,
+    /// `W'`, the final states' length: `None` for that of the initial states, or `K - 1` without
+    /// them, the least a kernel of width `K` continues from. Default: `None`.
+    pub final_state_len: Option<usize>,
 }
 
 impl CausalConv1dOptions {
     /// The options with `activation`.
     pub fn with_activation(self, activation: Activation) -> Self {
+        Self { activation, ..self }
+    }
+
+    /// The options returning the final states, or not.
+    pub fn with_final_state(self, output_final_state: bool) -> Self {
+        Self {
+            output_final_state,
+            ..self
+        }
+    }
+
+    /// The options returning final states `len` steps long.
+    pub fn with_final_state_len(self, len: usize) -> Self {
+        Self {
+            output_final_state: true,
+            final_state_len: Some(len),
+            ..self
+        }
+    }
+}
+
+/// The arguments of [`causal_conv1d_update`] that have a usual default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CausalConv1dStepOptions {
+    /// The activation after the convolution and the bias. Default: none.
+    pub activation: Activation,
+}
+
+impl CausalConv1dStepOptions {
+    /// The options with `activation`.
+    pub fn with_activation(self, activation: Activation) -> Self {
         Self { activation }
+    }
+}
+
+impl From<CausalConv1dOptions> for CausalConv1dStepOptions {
+    /// The step that continues a call with these options.
+    fn from(options: CausalConv1dOptions) -> Self {
+        Self {
+            activation: options.activation,
+        }
     }
 }
 
@@ -144,6 +226,36 @@ impl<B: Backend> From<Option<FloatTensor<B>>> for Bias<B> {
     }
 }
 
+/// Per-sequence states `[S, W, C]` (f32) or none, as the backend extension takes and returns
+/// them: the initial states, the final states, and the gradients of both.
+#[derive(ExtensionType, Clone, Debug)]
+#[extension_type(fusion: cfg(feature = "fusion"))]
+pub enum State<B: Backend> {
+    /// No states: an initial state of zeros, no final state, or no gradient.
+    None,
+    /// One state per sequence, `[S, W, C]`, f32.
+    Some(FloatTensor<B>),
+}
+
+impl<B: Backend> State<B> {
+    /// The states as an `Option`.
+    pub fn into_option(self) -> Option<FloatTensor<B>> {
+        match self {
+            State::None => None,
+            State::Some(state) => Some(state),
+        }
+    }
+}
+
+impl<B: Backend> From<Option<FloatTensor<B>>> for State<B> {
+    fn from(state: Option<FloatTensor<B>>) -> Self {
+        match state {
+            None => State::None,
+            Some(state) => State::Some(state),
+        }
+    }
+}
+
 /// Counters a test reads to tell which code ran. Not part of the API.
 #[doc(hidden)]
 pub mod probe {
@@ -152,11 +264,14 @@ pub mod probe {
     pub(super) static FORWARD_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static BACKWARD_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static UPDATE_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static STATE_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static SEQUENCE_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static BACKWARD_RUNS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static HOST_READS: AtomicUsize = AtomicUsize::new(0);
 
     /// Launches of this module's CubeCL kernels, all of them (none where the reference runs).
     pub fn kernel_launches() -> usize {
-        forward_launches() + backward_launches() + update_launches()
+        forward_launches() + backward_launches() + update_launches() + state_launches()
     }
 
     /// Runs of the backward pass written out for `Autodiff`.
@@ -164,7 +279,8 @@ pub mod probe {
         BACKWARD_RUNS.load(Ordering::SeqCst)
     }
 
-    /// Launches of the forward kernel.
+    /// Launches of the forward kernels, one per forward pass (a final states' kernel counts among
+    /// [`state_launches`]).
     pub fn forward_launches() -> usize {
         FORWARD_LAUNCHES.load(Ordering::SeqCst)
     }
@@ -179,25 +295,101 @@ pub mod probe {
     pub fn update_launches() -> usize {
         UPDATE_LAUNCHES.load(Ordering::SeqCst)
     }
+
+    /// Launches of the kernels that gather the final states, and that write the rows of the
+    /// initial states' gradients only the final states reach.
+    pub fn state_launches() -> usize {
+        STATE_LAUNCHES.load(Ordering::SeqCst)
+    }
+
+    /// Launches, among the forward and backward ones, of the kernels that take states or packed
+    /// sequences (the others take neither).
+    pub fn sequence_launches() -> usize {
+        SEQUENCE_LAUNCHES.load(Ordering::SeqCst)
+    }
+
+    /// Reads of `cu_seqlens` to the host: the reference's, which splits packed sequences there.
+    /// The kernels read them on the device.
+    pub fn host_reads() -> usize {
+        HOST_READS.load(Ordering::SeqCst)
+    }
 }
 
 /// Whether the CubeCL kernels, rather than the reference, take [`causal_conv1d`], its backward
 /// pass and [`causal_conv1d_update`] on `device` for `x` `[B, T, C]` (a step's `[B, C]` and its
-/// state fit within it), a kernel of width `width` and inputs in `dtype`: widths 1 to
+/// state fit within it), a kernel of width `width` and inputs in `dtype`, with every state and,
+/// `packed`, that many sequences whose `cu_seqlens` are of that dtype: widths 1 to
 /// [`MAX_KERNEL_WIDTH`], on a device with what the kernels ask (module documentation). `false` on
 /// any device not CubeCL's. For tests, as the [`probe`] counters are.
 #[doc(hidden)]
-pub fn kernels_take(device: &Device, dtype: DType, width: usize, shape: [usize; 3]) -> bool {
+pub fn kernels_take(
+    device: &Device,
+    dtype: DType,
+    width: usize,
+    shape: [usize; 3],
+    packed: Option<(usize, DType)>,
+) -> bool {
     #[cfg(feature = "cubecl")]
     if let Some(client) = crate::cube::client(device.as_dispatch()) {
-        return cube::kernels_take(&client, dtype, width, shape);
+        return cube::kernels_take(&client, dtype, width, shape, packed);
     }
-    let _ = (device, dtype, width, shape);
+    let _ = (device, dtype, width, shape, packed);
     false
 }
 
-/// The causal depthwise convolution as a backend extension. The default bodies are the
-/// reference; the [module](self) gives the definition, layouts and dtypes.
+#[cfg(feature = "fusion")]
+mod fusion_meta {
+    use super::{Activation, BiasMetadata, StateMetadata};
+    use crate::sequences::SequencesMetadata;
+    use burn::backend::fusion::custom::TensorSpec;
+    use burn::tensor::{DType, Shape};
+
+    pub(super) fn forward(
+        x: &TensorSpec,
+        _weight: &TensorSpec,
+        _bias: &BiasMetadata,
+        _initial_state: &StateMetadata,
+        sequences: &SequencesMetadata,
+        _activation: &Activation,
+        final_state_len: &Option<usize>,
+    ) -> (TensorSpec, StateMetadata) {
+        let [b, _, c] = x.shape.dims::<3>();
+        let final_state = match final_state_len {
+            None => StateMetadata::None,
+            Some(len) => {
+                let s = match sequences {
+                    SequencesMetadata::Batch => b,
+                    SequencesMetadata::Packed(cu_seqlens) => cu_seqlens.shape[0] - 1,
+                };
+                StateMetadata::Some(TensorSpec::new(Shape::new([s, *len, c]), DType::F32))
+            }
+        };
+        (x.clone(), final_state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn backward(
+        x: &TensorSpec,
+        weight: &TensorSpec,
+        bias: &BiasMetadata,
+        initial_state: &StateMetadata,
+        _sequences: &SequencesMetadata,
+        _grad: &TensorSpec,
+        _grad_final_state: &StateMetadata,
+        _activation: &Activation,
+    ) -> (TensorSpec, TensorSpec, BiasMetadata, StateMetadata) {
+        (
+            x.clone(),
+            weight.clone(),
+            bias.clone(),
+            initial_state.clone(),
+        )
+    }
+}
+
+/// The causal depthwise convolution as a backend extension. Call it through [`causal_conv1d`]
+/// and [`causal_conv1d_update`]; the default bodies are the reference, and the [module](self)
+/// gives the definition, layouts and dtypes.
 #[backend_extension(
     Flex: cfg(feature = "flex"),
     Cube: cfg(feature = "cubecl"),
@@ -205,67 +397,115 @@ pub fn kernels_take(device: &Device, dtype: DType, width: usize, shape: [usize; 
     Autodiff
 )]
 pub trait CausalConv1dBackend: Backend {
-    /// The convolution over a sequence: `x` `[B, T, C]`, `weight` `[C, K]` and the bias to the
-    /// output `[B, T, C]`.
-    #[fusion(dtype = x, shape = x)]
+    /// The convolution over sequences: `x` `[B, T, C]`, `weight` `[C, K]`, the bias and the
+    /// initial states `[S, W, C]` (f32, `W >= K - 1`; zeros where there are none) to the output
+    /// `[B, T, C]` and, with `final_state_len` `Some(W')`, the final states `[S, W', C]` (f32).
+    /// `S` is `B`, or with packed `sequences` their number.
+    #[fusion(meta = fusion_meta::forward)]
     fn causal_conv1d(
         x: FloatTensor<Self>,
         weight: FloatTensor<Self>,
         #[extension_type] bias: Bias<Self>,
-        options: CausalConv1dOptions,
-    ) -> FloatTensor<Self> {
-        reference::forward::<Self>(x, weight, bias, options)
+        #[extension_type] initial_state: State<Self>,
+        #[extension_type] sequences: Sequences<Self>,
+        activation: Activation,
+        final_state_len: Option<usize>,
+    ) -> (FloatTensor<Self>, State<Self>) {
+        reference::forward::<Self>(
+            x,
+            weight,
+            bias,
+            initial_state,
+            sequences,
+            activation,
+            final_state_len,
+        )
     }
 
-    /// The gradients of [`causal_conv1d`](Self::causal_conv1d) with respect to `x`, `weight`
-    /// and the bias, given the gradient of its output, `grad` `[B, T, C]`. The bias gradient
-    /// is [`Bias::None`] when there is no bias.
-    #[fusion(meta = |x, weight, bias, _grad, _options| (x.clone(), weight.clone(), bias.clone()))]
+    /// The gradients of [`causal_conv1d`](Self::causal_conv1d) with respect to `x`, `weight`, the
+    /// bias and the initial states, given the gradient of its output, `grad` `[B, T, C]`, and of
+    /// its final states (none where they have none). The bias and initial-state gradients have
+    /// the variants of the bias and the initial states.
+    #[fusion(meta = fusion_meta::backward)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn causal_conv1d_backward(
         x: FloatTensor<Self>,
         weight: FloatTensor<Self>,
         #[extension_type] bias: Bias<Self>,
+        #[extension_type] initial_state: State<Self>,
+        #[extension_type] sequences: Sequences<Self>,
         grad: FloatTensor<Self>,
-        options: CausalConv1dOptions,
-    ) -> (FloatTensor<Self>, FloatTensor<Self>, Bias<Self>) {
-        reference::backward::<Self>(x, weight, bias, grad, options)
+        #[extension_type] grad_final_state: State<Self>,
+        activation: Activation,
+    ) -> (
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        Bias<Self>,
+        State<Self>,
+    ) {
+        reference::backward::<Self>(
+            x,
+            weight,
+            bias,
+            initial_state,
+            sequences,
+            grad,
+            grad_final_state,
+            activation,
+        )
     }
 
-    /// One decoding step: the new token `x` `[B, C]`, the f32 `state` `[B, S, C]` (`S >= K - 1`),
-    /// `weight` `[C, K]` and the bias to the token's output `[B, C]` and the next state, f32
-    /// `[B, S, C]`: the state without its oldest step, followed by `x`.
-    #[fusion(meta = |x, state, _weight, _bias, _options| (x.clone(), state.clone()))]
+    /// One decoding step: the new token `x` `[B, C]`, `weight` `[C, K]`, the bias and the f32
+    /// `state` `[B, W, C]` (`W >= K - 1`) to the token's output `[B, C]` and the next state, f32
+    /// `[B, W, C]`: the state without its oldest step, followed by `x`.
+    #[fusion(meta = |x, _weight, _bias, state, _activation| (x.clone(), state.clone()))]
     fn causal_conv1d_update(
         x: FloatTensor<Self>,
-        state: FloatTensor<Self>,
         weight: FloatTensor<Self>,
         #[extension_type] bias: Bias<Self>,
-        options: CausalConv1dOptions,
+        state: FloatTensor<Self>,
+        activation: Activation,
     ) -> (FloatTensor<Self>, FloatTensor<Self>) {
-        reference::update::<Self>(x, state, weight, bias, options)
+        reference::update::<Self>(x, weight, bias, state, activation)
     }
 }
 
 #[cfg(feature = "flex")]
 impl CausalConv1dBackend for Flex {}
 
-/// The node `Autodiff` records for the convolution, with `x`, `weight` and, when there is one,
-/// the bias as parents (`N` = 2 or 3).
+/// The node `Autodiff` records for the convolution, with `x`, `weight` and, when there are, the
+/// bias and the initial states as parents (`N` = 2 to 4).
 #[derive(Debug)]
 struct CausalConv1dNode;
 
-/// What the backward pass keeps: the inputs, through the checkpointer, and the options. The
-/// pre-activation is recomputed from the inputs rather than kept.
+/// The gradients the nodes of the output and of the final states hand to the convolution's node,
+/// when there are final states: an `Autodiff` node has one output, so the convolution's node
+/// outputs a token, and two nodes on it output the output and the final states.
+#[derive(Debug)]
+struct Handover<B: Backend> {
+    output: Option<FloatTensor<B>>,
+    final_state: Option<FloatTensor<B>>,
+}
+
+type Shared<B> = Arc<Mutex<Handover<B>>>;
+
+/// What the backward pass keeps: the inputs, through the checkpointer, the packed sequences' and
+/// the activation; with final states, where the outputs' nodes leave their gradients, and the
+/// output's shape and dtype for a gradient of zeros when none is left. The pre-activation is
+/// recomputed from the inputs rather than kept.
 #[derive(Clone, Debug)]
-struct NodeState {
+struct NodeState<B: Backend> {
     x: NodeId,
     weight: NodeId,
     bias: Option<NodeId>,
-    options: CausalConv1dOptions,
+    initial_state: Option<NodeId>,
+    sequences: Sequences<B>,
+    activation: Activation,
+    handover: Option<(Shared<B>, Shape, DType)>,
 }
 
 impl<B: Backend + CausalConv1dBackend, const N: usize> Backward<B, N> for CausalConv1dNode {
-    type State = NodeState;
+    type State = NodeState<B>;
 
     fn backward(
         self,
@@ -274,16 +514,41 @@ impl<B: Backend + CausalConv1dBackend, const N: usize> Backward<B, N> for Causal
         checkpointer: &mut Checkpointer,
     ) {
         probe::BACKWARD_RUNS.fetch_add(1, Ordering::SeqCst);
-        let grad = grads.consume::<B>(&ops.node);
+        let node_grad = grads.consume::<B>(&ops.node);
         let state = ops.state;
         let mut retrieve = |id| checkpointer.retrieve_node_output::<B::FloatTensorPrimitive>(id);
         let x = retrieve(state.x);
         let weight = retrieve(state.weight);
         let bias = Bias::from(state.bias.map(&mut retrieve));
+        let initial_state = State::from(state.initial_state.map(&mut retrieve));
+        let (grad, grad_final_state) = match state.handover {
+            None => (node_grad, State::None),
+            Some((shared, shape, dtype)) => {
+                let handed = std::mem::replace(
+                    &mut *shared.lock().unwrap_or_else(|e| e.into_inner()),
+                    Handover {
+                        output: None,
+                        final_state: None,
+                    },
+                );
+                let grad = handed
+                    .output
+                    .unwrap_or_else(|| B::float_zeros(shape, &x.device(), dtype.into()));
+                (grad, State::from(handed.final_state))
+            }
+        };
         // One pass yields every gradient; those of the weight and the bias are small partial sums
         // per channel and run, not worth a variant without them.
-        let (grad_x, grad_weight, grad_bias) =
-            B::causal_conv1d_backward(x, weight, bias, grad, state.options);
+        let (grad_x, grad_weight, grad_bias, grad_initial_state) = B::causal_conv1d_backward(
+            x,
+            weight,
+            bias,
+            initial_state,
+            state.sequences,
+            grad,
+            grad_final_state,
+            state.activation,
+        );
         let mut parents = ops.parents.into_iter();
         if let Some(node) = parents.next().flatten() {
             grads.register::<B>(node.id, grad_x);
@@ -291,46 +556,160 @@ impl<B: Backend + CausalConv1dBackend, const N: usize> Backward<B, N> for Causal
         if let Some(node) = parents.next().flatten() {
             grads.register::<B>(node.id, grad_weight);
         }
-        if let (Some(node), Bias::Some(grad_bias)) = (parents.next().flatten(), grad_bias) {
+        // The bias, when there is one, is the third parent.
+        if state.bias.is_some()
+            && let (Some(node), Bias::Some(grad_bias)) = (parents.next().flatten(), grad_bias)
+        {
             grads.register::<B>(node.id, grad_bias);
+        }
+        if let (Some(node), State::Some(grad)) = (parents.next().flatten(), grad_initial_state) {
+            grads.register::<B>(node.id, grad);
         }
     }
 }
 
-/// The forward on `Autodiff`: one node over `nodes` (those of `x`, `weight` and the bias, if
-/// any), keeping the inputs when tracked.
-fn record<B: Backend + CausalConv1dBackend, C: CheckpointStrategy, const N: usize>(
-    nodes: [NodeGuard; N],
+/// Which of the convolution's two outputs a [`HandoverNode`] outputs.
+#[derive(Clone, Copy, Debug)]
+enum Slot {
+    Output,
+    FinalState,
+}
+
+/// A node on the convolution's token that outputs the output or the final states, and whose
+/// backward leaves their gradient for the convolution's node.
+#[derive(Debug)]
+struct HandoverNode;
+
+impl<B: Backend> Backward<B, 1> for HandoverNode {
+    type State = (Shared<B>, Slot);
+
+    fn backward(self, ops: Ops<Self::State, 1>, grads: &mut Gradients, _: &mut Checkpointer) {
+        let grad = grads.consume::<B>(&ops.node);
+        let device = grad.device();
+        let (shared, slot) = ops.state;
+        {
+            let mut handover = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let place = match slot {
+                Slot::Output => &mut handover.output,
+                Slot::FinalState => &mut handover.final_state,
+            };
+            *place = Some(grad);
+        }
+        // The token's gradient carries nothing; it only makes the convolution's node run.
+        if let Some(node) = ops.parents.into_iter().next().flatten() {
+            let token = B::float_zeros(Shape::new([1]), &device, FloatDType::F32);
+            grads.register::<B>(node.id, token);
+        }
+    }
+}
+
+/// The inputs of one call on `Autodiff`.
+struct Inputs<B: Backend, C: CheckpointStrategy> {
     x: FloatTensor<Autodiff<B, C>>,
     weight: FloatTensor<Autodiff<B, C>>,
     bias: Option<FloatTensor<Autodiff<B, C>>>,
-    options: CausalConv1dOptions,
-) -> FloatTensor<Autodiff<B, C>> {
+    initial_state: Option<FloatTensor<Autodiff<B, C>>>,
+}
+
+/// The output and the final states of one call on `Autodiff`.
+type Outputs<B, C> = (FloatTensor<Autodiff<B, C>>, State<Autodiff<B, C>>);
+
+/// The forward on `Autodiff`: one node over `nodes` (those of `x`, `weight` and the bias and
+/// initial states, if any), keeping the inputs when tracked; with final states, two nodes on it
+/// for the two outputs.
+fn record<B: Backend + CausalConv1dBackend, C: CheckpointStrategy, const N: usize>(
+    nodes: [NodeGuard; N],
+    inputs: Inputs<B, C>,
+    sequences: Sequences<B>,
+    activation: Activation,
+    final_state_len: Option<usize>,
+) -> Outputs<B, C> {
+    let Inputs {
+        x,
+        weight,
+        bias,
+        initial_state,
+    } = inputs;
     match CausalConv1dNode
         .prepare::<C>(nodes)
         .compute_bound()
         .stateful()
     {
         OpsKind::Tracked(mut prep) => {
-            let state = NodeState {
+            let mut state = NodeState {
                 x: prep.checkpoint(&x),
                 weight: prep.checkpoint(&weight),
                 bias: bias.as_ref().map(|bias| prep.checkpoint(bias)),
-                options,
+                initial_state: initial_state.as_ref().map(|state| prep.checkpoint(state)),
+                sequences: sequences.clone(),
+                activation,
+                handover: None,
             };
-            let bias = Bias::from(bias.map(|bias| bias.into_primitive()));
-            let out = B::causal_conv1d(x.into_primitive(), weight.into_primitive(), bias, options);
-            prep.finish(state, out)
-        }
-        OpsKind::UnTracked(prep) => {
-            let bias = Bias::from(bias.map(|bias| bias.into_primitive()));
-            prep.finish(B::causal_conv1d(
+            let (out, final_state) = B::causal_conv1d(
                 x.into_primitive(),
                 weight.into_primitive(),
-                bias,
-                options,
-            ))
+                Bias::from(bias.map(|bias| bias.into_primitive())),
+                State::from(initial_state.map(|state| state.into_primitive())),
+                sequences,
+                activation,
+                final_state_len,
+            );
+            let State::Some(final_state) = final_state else {
+                return (prep.finish(state, out), State::None);
+            };
+            let shared = Arc::new(Mutex::new(Handover {
+                output: None,
+                final_state: None,
+            }));
+            state.handover = Some((shared.clone(), out.shape(), out.dtype()));
+            let token = B::float_zeros(Shape::new([1]), &out.device(), FloatDType::F32);
+            let token = prep.finish(state, token);
+            let out = hand_over::<B, C>(&token, shared.clone(), Slot::Output, out);
+            let final_state = hand_over::<B, C>(&token, shared, Slot::FinalState, final_state);
+            (out, State::Some(final_state))
         }
+        OpsKind::UnTracked(prep) => {
+            let (out, final_state) = B::causal_conv1d(
+                x.into_primitive(),
+                weight.into_primitive(),
+                Bias::from(bias.map(|bias| bias.into_primitive())),
+                State::from(initial_state.map(|state| state.into_primitive())),
+                sequences,
+                activation,
+                final_state_len,
+            );
+            let final_state = final_state
+                .into_option()
+                .map(<Autodiff<B, C> as AutodiffBackend>::from_inner);
+            (prep.finish(out), State::from(final_state))
+        }
+    }
+}
+
+/// A node on the convolution's `token` that outputs `value`, one of the convolution's outputs.
+fn hand_over<B: Backend, C: CheckpointStrategy>(
+    token: &FloatTensor<Autodiff<B, C>>,
+    shared: Shared<B>,
+    slot: Slot,
+    value: FloatTensor<B>,
+) -> FloatTensor<Autodiff<B, C>> {
+    match HandoverNode
+        .prepare::<C>([token.node()])
+        .compute_bound()
+        .stateful()
+    {
+        OpsKind::Tracked(prep) => prep.finish((shared, slot), value),
+        OpsKind::UnTracked(prep) => prep.finish(value),
+    }
+}
+
+/// The sequences of an `Autodiff` call on its inner backend: int tensors are not tracked.
+fn inner_sequences<B: Backend, C: CheckpointStrategy>(
+    sequences: Sequences<Autodiff<B, C>>,
+) -> Sequences<B> {
+    match sequences {
+        Sequences::Batch => Sequences::Batch,
+        Sequences::Packed(cu_seqlens) => Sequences::Packed(cu_seqlens),
     }
 }
 
@@ -341,16 +720,38 @@ impl<B: Backend + CausalConv1dBackend, C: CheckpointStrategy> CausalConv1dBacken
         x: FloatTensor<Self>,
         weight: FloatTensor<Self>,
         bias: Bias<Self>,
-        options: CausalConv1dOptions,
-    ) -> FloatTensor<Self> {
-        match bias {
-            Bias::None => record::<B, C, 2>([x.node(), weight.node()], x, weight, None, options),
-            Bias::Some(bias) => record::<B, C, 3>(
-                [x.node(), weight.node(), bias.node()],
-                x,
-                weight,
-                Some(bias),
-                options,
+        initial_state: State<Self>,
+        sequences: Sequences<Self>,
+        activation: Activation,
+        final_state_len: Option<usize>,
+    ) -> (FloatTensor<Self>, State<Self>) {
+        let sequences = inner_sequences(sequences);
+        let (bias, initial_state) = (bias.into_option(), initial_state.into_option());
+        let mut nodes = vec![x.node(), weight.node()];
+        nodes.extend(bias.as_ref().map(|bias| bias.node()));
+        nodes.extend(initial_state.as_ref().map(|state| state.node()));
+        let inputs = Inputs {
+            x,
+            weight,
+            bias,
+            initial_state,
+        };
+        let (activation, len) = (activation, final_state_len);
+        let mut nodes = nodes.into_iter();
+        let mut next = || nodes.next().expect("a node per input");
+        match (inputs.bias.is_some(), inputs.initial_state.is_some()) {
+            (false, false) => {
+                record::<B, C, 2>([next(), next()], inputs, sequences, activation, len)
+            }
+            (true, false) | (false, true) => {
+                record::<B, C, 3>([next(), next(), next()], inputs, sequences, activation, len)
+            }
+            (true, true) => record::<B, C, 4>(
+                [next(), next(), next(), next()],
+                inputs,
+                sequences,
+                activation,
+                len,
             ),
         }
     }
@@ -360,24 +761,24 @@ impl<B: Backend + CausalConv1dBackend, C: CheckpointStrategy> CausalConv1dBacken
 
     fn causal_conv1d_update(
         x: FloatTensor<Self>,
-        state: FloatTensor<Self>,
         weight: FloatTensor<Self>,
         bias: Bias<Self>,
-        options: CausalConv1dOptions,
+        state: FloatTensor<Self>,
+        activation: Activation,
     ) -> (FloatTensor<Self>, FloatTensor<Self>) {
         // Decoding needs no gradient, so the inner backend's results are taken as constants.
         // Should a gradient be asked for, the reference runs instead, which Burn differentiates.
         let bias_tracked = matches!(&bias, Bias::Some(bias) if bias.is_tracked());
         if x.is_tracked() || state.is_tracked() || weight.is_tracked() || bias_tracked {
-            return reference::update::<Self>(x, state, weight, bias, options);
+            return reference::update::<Self>(x, weight, bias, state, activation);
         }
         let bias = Bias::from(bias.into_option().map(|bias| bias.into_primitive()));
         let (out, next) = B::causal_conv1d_update(
             x.into_primitive(),
-            state.into_primitive(),
             weight.into_primitive(),
             bias,
-            options,
+            state.into_primitive(),
+            activation,
         );
         (
             <Self as AutodiffBackend>::from_inner(out),
@@ -390,35 +791,82 @@ fn into_bias(bias: Option<Tensor<1>>) -> Bias<Dispatch> {
     Bias::from(bias.map(Tensor::into_dispatch))
 }
 
-/// The causal depthwise convolution of `x` `[B, T, C]` with `weight` `[C, K]`, plus `bias`
-/// `[C]` if given, followed by `options.activation`: `[B, T, C]` in the dtype of `x`.
-/// Differentiable with respect to `x`, `weight` and `bias`. The [module](self) gives the exact
-/// definition.
+/// The causal depthwise convolution of `x` `[B, T, C]` with `weight` `[C, K]`, plus `bias` `[C]`
+/// if given, followed by `options.activation`, each sequence continuing from its initial state
+/// if given; the [module](self) gives the exact definition.
+///
+/// - `initial_state`: `[S, W, C]`, f32, each sequence's last `W >= K - 1` inputs before its first
+///   step, oldest first; zeros when `None`.
+/// - `cu_seqlens`: `None` for one sequence per batch element (`S = B`); else `[N + 1]`, the
+///   boundaries of `S = N` sequences packed along `T` of a batch of one (`B = 1`), from 0 to `T`
+///   without decreasing (a sequence may be empty). On a device running the kernels they are read
+///   there, not back to the host, and not checked.
+/// - `options`: the activation; whether to return the final states, and their length `W'`.
+///
+/// Returns the output `[B, T, C]` in the dtype of `x` and, if asked, the final states
+/// `[S, W', C]`, f32. Differentiable with respect to `x`, `weight`, `bias` and `initial_state`,
+/// through the output and the final states.
 ///
 /// # Panics
 ///
-/// If the shapes disagree (`C` of `x`, `weight` and `bias`), `K` is 0, or `x`, `weight` and
-/// `bias` do not share one dtype.
+/// If the shapes disagree (`C` of `x`, `weight`, `bias` and the states; `S`), `K` is 0, `x`,
+/// `weight` and `bias` do not share one dtype, the initial states are not f32 or shorter than
+/// `K - 1` steps, or packed sequences come with `B > 1`; where the reference runs, if
+/// `cu_seqlens` does not go from 0 to `T` without decreasing.
 pub fn causal_conv1d(
     x: Tensor<3>,
     weight: Tensor<2>,
     bias: Option<Tensor<1>>,
+    initial_state: Option<Tensor<3>>,
+    cu_seqlens: Option<Tensor<1, Int>>,
     options: CausalConv1dOptions,
-) -> Tensor<3> {
-    let [_, _, c] = x.dims();
-    check_parameters("causal_conv1d", c, x.dtype(), &weight, bias.as_ref());
-    Tensor::from_dispatch(<Dispatch as CausalConv1dBackend>::causal_conv1d(
+) -> (Tensor<3>, Option<Tensor<3>>) {
+    let op = "causal_conv1d";
+    let [b, _, c] = x.dims();
+    let k = check_parameters(op, c, x.dtype(), &weight, bias.as_ref());
+    let sequences = match &cu_seqlens {
+        None => b,
+        Some(cu_seqlens) => {
+            assert_eq!(
+                b, 1,
+                "{op}: packed sequences lie along T of a batch of one, got B = {b}"
+            );
+            let [n] = cu_seqlens.dims();
+            assert!(
+                n >= 2,
+                "{op}: cu_seqlens must hold N + 1 >= 2 offsets, got {n}"
+            );
+            n - 1
+        }
+    };
+    if let Some(state) = &initial_state {
+        check_state(op, "initial state", state, [sequences, c], k);
+    }
+    let final_state_len = options.output_final_state.then(|| {
+        options
+            .final_state_len
+            .or(initial_state.as_ref().map(|state| state.dims()[1]))
+            .unwrap_or(k - 1)
+    });
+    let (out, final_state) = <Dispatch as CausalConv1dBackend>::causal_conv1d(
         x.into_dispatch(),
         weight.into_dispatch(),
         into_bias(bias),
-        options,
-    ))
+        State::from(initial_state.map(Tensor::into_dispatch)),
+        Sequences::from(cu_seqlens.map(Tensor::into_dispatch)),
+        options.activation,
+        final_state_len,
+    );
+    (
+        Tensor::from_dispatch(out),
+        final_state.into_option().map(Tensor::from_dispatch),
+    )
 }
 
-/// One decoding step: the new token `x` `[B, C]`, the f32 `state` `[B, S, C]` (the last
-/// `S >= K - 1` inputs, oldest first), `weight` `[C, K]` and `bias` `[C]` if given, to the
-/// token's output `[B, C]` in the dtype of `x` and the next state, f32 `[B, S, C]`. The output
-/// is the last step of [`causal_conv1d`] over the inputs the state holds followed by `x`.
+/// One decoding step: the new token `x` `[B, C]`, `weight` `[C, K]`, `bias` `[C]` if given and
+/// the f32 `state` `[B, W, C]` (the last `W >= K - 1` inputs, oldest first), to the token's
+/// output `[B, C]` in the dtype of `x` and the next state, f32 `[B, W, C]`. The output is the
+/// last step of [`causal_conv1d`] over the token from `state`, the next state its final state.
 ///
 /// # Panics
 ///
@@ -426,55 +874,23 @@ pub fn causal_conv1d(
 /// and `bias` do not share one dtype.
 pub fn causal_conv1d_update(
     x: Tensor<2>,
-    state: Tensor<3>,
     weight: Tensor<2>,
     bias: Option<Tensor<1>>,
-    options: CausalConv1dOptions,
+    state: Tensor<3>,
+    options: CausalConv1dStepOptions,
 ) -> (Tensor<2>, Tensor<3>) {
+    let op = "causal_conv1d_update";
     let [b, c] = x.dims();
-    let [sb, s, sc] = state.dims();
-    let k = check_parameters("causal_conv1d_update", c, x.dtype(), &weight, bias.as_ref());
-    assert!(
-        sb == b && sc == c,
-        "causal_conv1d_update: x [{b}, {c}] and state [{sb}, {s}, {sc}] disagree on the batch or \
-         the channels"
-    );
-    assert!(
-        s + 1 >= k,
-        "causal_conv1d_update: a state of {s} steps cannot feed a kernel of width {k}; it needs \
-         at least {}",
-        k - 1
-    );
-    assert_eq!(
-        state.dtype(),
-        DType::F32,
-        "causal_conv1d_update: the state is f32"
-    );
+    let k = check_parameters(op, c, x.dtype(), &weight, bias.as_ref());
+    check_state(op, "state", &state, [b, c], k);
     let (out, next) = <Dispatch as CausalConv1dBackend>::causal_conv1d_update(
         x.into_dispatch(),
-        state.into_dispatch(),
         weight.into_dispatch(),
         into_bias(bias),
-        options,
+        state.into_dispatch(),
+        options.activation,
     );
     (Tensor::from_dispatch(out), Tensor::from_dispatch(next))
-}
-
-/// The decoding state a prompt `x` `[B, T, C]` leaves: its last `state_len` inputs, oldest
-/// first, as a new f32 tensor `[B, state_len, C]`, with zeros in front when the prompt is
-/// shorter. [`causal_conv1d_update`] continues from it; a kernel of width `K` needs
-/// `state_len >= K - 1`.
-pub fn causal_conv1d_state(x: Tensor<3>, state_len: usize) -> Tensor<3> {
-    let [b, t, c] = x.dims();
-    let state = Tensor::<3>::zeros([b, state_len, c], (&x.device(), DType::F32));
-    let n = t.min(state_len);
-    if n == 0 {
-        return state;
-    }
-    // Assigned into a new tensor rather than sliced, so the state does not hold on to the
-    // prompt's memory.
-    let tail = x.slice([0..b, t - n..t, 0..c]).cast(DType::F32);
-    state.slice_assign([0..b, state_len - n..state_len, 0..c], tail)
 }
 
 /// Checks `weight` `[C, K]` and `bias` `[C]` against `C` channels and the dtype of `x`, and
@@ -500,4 +916,20 @@ fn check_parameters(
         assert_eq!(bias.dtype(), dtype, "{op}: x and bias must share one dtype");
     }
     k
+}
+
+/// Checks a state `[S, W, C]` against `S` sequences, `C` channels and a kernel of width `k`.
+fn check_state(op: &str, what: &str, state: &Tensor<3>, [s, c]: [usize; 2], k: usize) {
+    let [ss, w, sc] = state.dims();
+    assert!(
+        ss == s && sc == c,
+        "{op}: the {what} [{ss}, {w}, {sc}] must be [S, W, C] with S = {s} sequences and C = {c} \
+         channels"
+    );
+    assert!(
+        w + 1 >= k,
+        "{op}: a {what} of {w} steps cannot feed a kernel of width {k}; it needs at least {}",
+        k - 1
+    );
+    assert_eq!(state.dtype(), DType::F32, "{op}: the {what} is f32");
 }

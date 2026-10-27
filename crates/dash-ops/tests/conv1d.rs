@@ -6,7 +6,7 @@
 //!   and without a bias and SiLU, and decoding steps from a random state;
 //! - `tests/fixtures/conv1d/conv1d.safetensors`: transformers 5.15's torch fallbacks
 //!   `causal_conv1d_fn` and `causal_conv1d_update` (kernel width 4 and 3, no bias), whose
-//!   decoding state is `[B, C, S]` in the inputs' dtype: the tests transpose it to `[B, S, C]`
+//!   decoding state is `[B, C, W]` in the inputs' dtype: the tests transpose it to `[B, W, C]`
 //!   and widen it to f32.
 //!
 //! The reduced-precision cases also hold torch's own results in that dtype on CUDA, for
@@ -28,8 +28,7 @@ mod common;
 
 use burn::tensor::{DType, Device, Tensor, TensorData};
 use dash_ops::conv1d::{
-    Activation, CausalConv1dOptions, causal_conv1d, causal_conv1d_state, causal_conv1d_update,
-    kernels_take, probe,
+    Activation, CausalConv1dOptions, causal_conv1d, causal_conv1d_update, kernels_take, probe,
 };
 use safetensors::SafeTensors;
 use serde_json::Value;
@@ -100,7 +99,7 @@ struct Case {
     dtype: DType,
     bias: bool,
     options: CausalConv1dOptions,
-    /// transformers' decoding state, `[B, C, S]` in the case's dtype.
+    /// transformers' decoding state, `[B, C, W]` in the case's dtype.
     transposed_state: bool,
 }
 
@@ -143,7 +142,7 @@ impl Case {
         self.bias.then(|| self.load::<1>("bias", device))
     }
 
-    /// The decoding state, `[B, S, C]` f32.
+    /// The decoding state, `[B, W, C]` f32.
     fn state(&self, device: &Device) -> Tensor<3> {
         let state = self
             .fixtures
@@ -290,7 +289,7 @@ fn torch_error(case: &Case, part: &str) {
 /// Whether the kernels take a case of kernel width `k` in `dtype` for `x` `[B, T, C]` on `device`;
 /// under CUDA they take every width they hold.
 fn takes(device: &Device, dtype: DType, k: usize, shape: [usize; 3]) -> bool {
-    let takes = kernels_take(device, dtype, k, shape);
+    let takes = kernels_take(device, dtype, k, shape, None);
     if common::on_cuda(device) && k <= dash_ops::conv1d::MAX_KERNEL_WIDTH {
         assert!(takes, "CUDA turned the kernels away for K = {k}, {shape:?}");
     }
@@ -330,7 +329,14 @@ fn sequences(device: &Device, label: &str) {
         let grad_out = case.load::<3>("grad_out", device);
 
         let forward = probe::forward_launches();
-        let out = causal_conv1d(x.clone(), weight.clone(), bias.clone(), case.options);
+        let (out, _) = causal_conv1d(
+            x.clone(),
+            weight.clone(),
+            bias.clone(),
+            None,
+            None,
+            case.options,
+        );
         assert_eq!(out.dtype(), dtype);
         worst.check(label, &case, "out", values(out.clone()));
         launched(kernels, probe::forward_launches, forward, &case.name);
@@ -375,10 +381,10 @@ fn steps(device: &Device, label: &str) {
             let launches = probe::update_launches();
             let (out, next) = causal_conv1d_update(
                 x,
-                case.state(&device),
                 weight,
                 case.bias(&device),
-                case.options,
+                case.state(&device),
+                case.options.into(),
             );
             assert_eq!((out.dtype(), next.dtype()), (case.dtype, DType::F32));
             let (expected, _) = case.fixtures.recorded(&case.part("out"));
@@ -411,35 +417,49 @@ fn prefill_then_steps(device: &Device, label: &str) -> f64 {
         let bias = case.bias(device);
         let [b, t, c] = x.dims();
         let kernels = takes(device, case.dtype, k, [b, 1, c]);
-        let sequence = values(causal_conv1d(
-            x.clone(),
-            weight.clone(),
-            bias.clone(),
-            case.options,
-        ));
+        let sequence = values(
+            causal_conv1d(
+                x.clone(),
+                weight.clone(),
+                bias.clone(),
+                None,
+                None,
+                case.options,
+            )
+            .0,
+        );
         let (expected, _) = case.fixtures.recorded(&case.part("out"));
         // The least state that works, transformers' (`S = K`), and a longer one, each after a
         // prefill of a different length: none, one step, and half the sequence.
         for (prefix, state_len) in [(0, k - 1), (1.min(t), k), (t / 2, k + 2)] {
+            // The prompt's outputs and the state it leaves, from one call (none for no prompt).
             let prompt = x.clone().slice([0..b, 0..prefix, 0..c]);
+            let (out, state) = causal_conv1d(
+                prompt,
+                weight.clone(),
+                bias.clone(),
+                None,
+                None,
+                case.options.with_final_state_len(state_len),
+            );
             let mut outputs = Vec::new();
             if prefix > 0 {
-                outputs.push(causal_conv1d(
-                    prompt.clone(),
-                    weight.clone(),
-                    bias.clone(),
-                    case.options,
-                ));
+                outputs.push(out);
             }
-            let mut state = causal_conv1d_state(prompt, state_len);
+            let mut state = state.expect("the final state");
             let launches = probe::update_launches();
             for step in prefix..t {
                 let token = x
                     .clone()
                     .slice([0..b, step..step + 1, 0..c])
                     .reshape([b, c]);
-                let (out, next) =
-                    causal_conv1d_update(token, state, weight.clone(), bias.clone(), case.options);
+                let (out, next) = causal_conv1d_update(
+                    token,
+                    weight.clone(),
+                    bias.clone(),
+                    state,
+                    case.options.into(),
+                );
                 outputs.push(out.reshape([b, 1, c]));
                 state = next;
             }
@@ -521,10 +541,10 @@ fn a_tracked_step_is_differentiable() {
     let k = case.kernel_width();
     let (out, _) = causal_conv1d_update(
         x.clone(),
-        state.clone(),
         weight.clone(),
         Some(bias.clone()),
-        case.options,
+        state.clone(),
+        case.options.into(),
     );
     let grads = out.sum().backward();
     // d out[b, c] / d state[b, s, c] is weight[c, j] for the last K - 1 steps of the state (taps
@@ -673,7 +693,7 @@ mod cube {
             Tensor::<1>::from_data(tensor(bias, vec![c]), (device, dtype)).require_grad()
         });
         let grad = Tensor::<3>::from_data(tensor(grad, vec![b, t, c]), (device, dtype));
-        let out = causal_conv1d(x.clone(), weight.clone(), bias.clone(), options);
+        let (out, _) = causal_conv1d(x.clone(), weight.clone(), bias.clone(), None, None, options);
         let grads = (out.clone() * grad).sum().backward();
         let mut parts = vec![
             values(out),

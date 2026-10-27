@@ -164,7 +164,7 @@ pub fn kernels_take(
 
 #[cfg(feature = "fusion")]
 mod fusion_meta {
-    use crate::gated_delta::SequencesMetadata;
+    use crate::sequences::SequencesMetadata;
     use burn::backend::fusion::custom::TensorSpec;
     use burn::tensor::{DType, Shape};
 
