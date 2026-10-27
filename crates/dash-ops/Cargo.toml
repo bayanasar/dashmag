@@ -16,8 +16,24 @@ rust-version.workspace = true
 default = ["flex"]
 # Flex runs every operation through its reference, built from Burn's own tensor operations.
 flex = ["burn/flex", "burn/simd", "burn/rayon"]
-# CUDA, through the CubeCL backend; custom kernels are written against `burn-cubecl`.
-cuda = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl"]
+# The CubeCL runtimes Burn 0.22 has: each makes its devices available and compiles the CubeCL
+# kernels, which are written once for Burn's one CubeCL backend type and run on whichever runtime
+# a tensor's device names. A device that lacks what a kernel asks for (shared memory, units per
+# cube, a plane width, a dtype) runs the operation's reference instead.
+cuda = ["burn/cuda", "cubecl"]
+# ROCm, through HIP.
+rocm = ["burn/rocm", "cubecl"]
+# wgpu on whichever graphics API the machine offers, kernels compiled to WGSL. `vulkan` and
+# `metal` pin the API and compile to SPIR-V and MSL; `webgpu` pins the browser's WebGPU.
+wgpu = ["burn/wgpu", "cubecl"]
+vulkan = ["burn/vulkan", "wgpu"]
+metal = ["burn/metal", "wgpu"]
+webgpu = ["burn/webgpu", "wgpu"]
+# CubeCL's CPU runtime, kernels compiled through LLVM.
+cpu = ["burn/cpu", "cubecl"]
+# What every runtime above turns on: the CubeCL implementations. Not a runtime itself, and it does
+# not build without one.
+cubecl = ["dep:burn-cubecl", "dep:cubecl"]
 # Burn's lazy fusion. Off by default: it changes which kernels every Burn crate in the same build
 # runs, and the comparisons elsewhere in this workspace are made without it.
 fusion = ["burn/fusion"]

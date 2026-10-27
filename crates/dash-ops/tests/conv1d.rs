@@ -16,13 +16,20 @@
 //! Errors are stated as the largest absolute difference and as that difference over the largest
 //! magnitude of the reference, per output and gradient.
 //!
+//! The same checks run on Flex and on a CubeCL device, any runtime (`DASH_OPS_DEVICE`); each
+//! asserts that the kernels ran exactly where `kernels_take` says they take the case (always
+//! under CUDA), and skips the cases in a dtype the device does not have.
+//!
 //!   cargo test --release -p dash-ops --test conv1d -- --nocapture
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test conv1d -- --nocapture
+//!   DASH_OPS_DEVICE=wgpu:vulkan cargo test --release -p dash-ops --features wgpu --test conv1d
+
+mod common;
 
 use burn::tensor::{DType, Device, Tensor, TensorData};
 use dash_ops::conv1d::{
     Activation, CausalConv1dOptions, causal_conv1d, causal_conv1d_state, causal_conv1d_update,
-    probe,
+    kernels_take, probe,
 };
 use safetensors::SafeTensors;
 use serde_json::Value;
@@ -187,32 +194,47 @@ fn errors(actual: &[f32], expected: &[f32]) -> (f64, f64) {
 /// magnitude, which is 2^-9 to 2^-8 of it in bf16. torch rounds between its steps too (the
 /// convolution's output before SiLU, SiLU's gradient before the convolution's backward), and errs
 /// more.
-fn bound(dtype: DType, part: &str) -> f64 {
+///
+/// On the other CubeCL runtimes (`other`), measured on lavapipe through wgpu, where the kernels
+/// run, and on the CubeCL CPU runtime, where the reference does, three f32 parts err a little
+/// more: lavapipe's exponential (SiLU's) is its own, and the CPU runtime sums in other orders.
+fn bound(dtype: DType, part: &str, other: bool) -> f64 {
     match (dtype, part) {
-        (DType::F32, "out") => 1.4e-7,    // 1.36e-7 / 1.26e-7; torch 1.26e-7
-        (DType::F32, "step") => 1.8e-7,   // 1.72e-7 / 1.56e-7; torch 1.39e-7
-        (DType::F32, "grad_x") => 2.6e-7, // 2.58e-7 / 2.07e-7; torch 2.04e-7
-        (DType::F32, "grad_weight") => 6.1e-7, // 4.53e-7 / 6.01e-7; torch 4.22e-7
-        (DType::F32, "grad_bias") => 4.1e-7, // 2.71e-7 / 4.09e-7; torch 3.41e-7
+        (DType::F32, "out") if other => 1.8e-7, // 1.74e-7 lavapipe / 1.41e-7 CPU runtime
+        (DType::F32, "step") if other => 2.2e-7, // 1.74e-7 / 2.18e-7
+        (DType::F32, "grad_bias") if other => 5.5e-7, // 3.58e-7 / 5.47e-7
+        (DType::F32, "out") => 1.4e-7,          // 1.36e-7 / 1.26e-7; torch 1.26e-7
+        (DType::F32, "step") => 1.8e-7,         // 1.72e-7 / 1.56e-7; torch 1.39e-7
+        (DType::F32, "grad_x") => 2.6e-7,       // 2.58e-7 / 2.07e-7; torch 2.04e-7
+        (DType::F32, "grad_weight") => 6.1e-7,  // 4.53e-7 / 6.01e-7; torch 4.22e-7
+        (DType::F32, "grad_bias") => 4.1e-7,    // 2.71e-7 / 4.09e-7; torch 3.41e-7
         (DType::BF16, "out" | "step") => 3.7e-3, // 3.62e-3 on both; torch 5.05e-3, steps 3.65e-3
-        (DType::BF16, "grad_x") => 3.2e-3, // 3.11e-3 on both; torch 4.26e-3
+        (DType::BF16, "grad_x") => 3.2e-3,      // 3.11e-3 on both; torch 4.26e-3
         (DType::BF16, "grad_weight") => 3.4e-3, // 3.33e-3 on both; torch 4.90e-3
-        (DType::BF16, "grad_bias") => 3.4e-3, // 3.31e-3 on both; torch 3.31e-3
-        (DType::F16, "out") => 2.7e-4,    // 2.67e-4 on both; torch 3.56e-4
-        (DType::F16, "step") => 3.2e-4,   // 3.20e-4 on both; torch 5.44e-4
-        (DType::F16, "grad_x") => 3.2e-4, // 3.14e-4 on both; torch 3.24e-4
-        (DType::F16, "grad_weight") => 3.4e-4, // 3.38e-4 on both; torch 3.80e-4
-        (DType::F16, "grad_bias") => 2.7e-4, // 2.67e-4 on both; torch 2.68e-4
+        (DType::BF16, "grad_bias") => 3.4e-3,   // 3.31e-3 on both; torch 3.31e-3
+        (DType::F16, "out") => 2.7e-4,          // 2.67e-4 on both; torch 3.56e-4
+        (DType::F16, "step") => 3.2e-4,         // 3.20e-4 on both; torch 5.44e-4
+        (DType::F16, "grad_x") => 3.2e-4,       // 3.14e-4 on both; torch 3.24e-4
+        (DType::F16, "grad_weight") => 3.4e-4,  // 3.38e-4 on both; torch 3.80e-4
+        (DType::F16, "grad_bias") => 2.7e-4,    // 2.67e-4 on both; torch 2.68e-4
         _ => panic!("no bound for {dtype:?} {part}"),
     }
 }
 
 /// The largest error over the largest magnitude seen per dtype and part, for the summary each
-/// test prints.
-#[derive(Default)]
-struct Worst(BTreeMap<String, f64>);
+/// test prints, against the bounds of the device's kind (`other`: a CubeCL runtime but CUDA).
+struct Worst(BTreeMap<String, f64>, bool);
+
+/// Whether `device` is a CubeCL device but a CUDA one, whose bounds are [`bound`]'s `other`.
+fn other_runtime(device: &Device) -> bool {
+    common::runtime_of(device).is_some() && !common::on_cuda(device)
+}
 
 impl Worst {
+    fn on(device: &Device) -> Self {
+        Self(BTreeMap::new(), other_runtime(device))
+    }
+
     /// Asserts `actual` against the recorded `part` of `case` and prints the error.
     fn check(&mut self, label: &str, case: &Case, part: &str, actual: Vec<f32>) {
         let (expected, _) = case.fixtures.recorded(&case.part(part));
@@ -229,7 +251,7 @@ impl Worst {
         expected: &[f32],
     ) {
         let (abs, rel) = errors(actual, expected);
-        let bound = bound(case.dtype, part);
+        let bound = bound(case.dtype, part, self.1);
         println!(
             "{label} {} {what}: max abs {abs:.3e}, rel {rel:.3e} (bound {bound:.1e})",
             case.name
@@ -265,7 +287,26 @@ fn torch_error(case: &Case, part: &str) {
     }
 }
 
-/// Asserts that `count` grew past `before` when `kernels` (on CUDA), and did not otherwise.
+/// Whether the kernels take a case of kernel width `k` in `dtype` for `x` `[B, T, C]` on `device`;
+/// under CUDA they take every width they hold.
+fn takes(device: &Device, dtype: DType, k: usize, shape: [usize; 3]) -> bool {
+    let takes = kernels_take(device, dtype, k, shape);
+    if common::on_cuda(device) && k <= dash_ops::conv1d::MAX_KERNEL_WIDTH {
+        assert!(takes, "CUDA turned the kernels away for K = {k}, {shape:?}");
+    }
+    takes
+}
+
+/// The cases of `fixtures` in a dtype `device` has, the sequences or the decoding steps.
+fn cases_on(device: &Device, step: bool) -> Vec<Case> {
+    [GENERAL, TRANSFORMERS]
+        .into_iter()
+        .flat_map(Fixtures::cases)
+        .filter(|case| case.step == step && device.supports_dtype(case.dtype))
+        .collect()
+}
+
+/// Asserts that `count` grew past `before` when `kernels`, and did not otherwise.
 fn launched(kernels: bool, count: fn() -> usize, before: usize, what: &str) {
     assert_eq!(
         count() > before,
@@ -277,16 +318,13 @@ fn launched(kernels: bool, count: fn() -> usize, before: usize, what: &str) {
 }
 
 /// Every sequence case: the output and every gradient through `Autodiff`, whose written-out
-/// backward pass must run, and on CUDA (`kernels`) the forward and backward kernels.
-fn sequences(device: &Device, label: &str, kernels: bool) {
-    let mut worst = Worst::default();
-    for case in [GENERAL, TRANSFORMERS]
-        .into_iter()
-        .flat_map(Fixtures::cases)
-        .filter(|case| !case.step)
-    {
+/// backward pass must run, and where the kernels take the case the forward and backward kernels.
+fn sequences(device: &Device, label: &str) {
+    let mut worst = Worst::on(device);
+    for case in cases_on(device, false) {
         let dtype = case.dtype;
         let x = case.load::<3>("x", device).require_grad();
+        let kernels = takes(device, dtype, case.kernel_width(), x.dims());
         let weight = case.load::<2>("weight", device).require_grad();
         let bias = case.bias(device).map(Tensor::require_grad);
         let grad_out = case.load::<3>("grad_out", device);
@@ -324,16 +362,15 @@ fn sequences(device: &Device, label: &str, kernels: bool) {
 }
 
 /// Every decoding case from a recorded state, on a device with gradients (where the step is
-/// taken as a constant) and on one without; on CUDA (`kernels`) through the step kernel.
-fn steps(device: &Device, label: &str, kernels: bool) {
-    let mut worst = Worst::default();
-    for case in [GENERAL, TRANSFORMERS]
-        .into_iter()
-        .flat_map(Fixtures::cases)
-        .filter(|case| case.step)
-    {
+/// taken as a constant) and on one without; where the kernels take the case, through the step
+/// kernel.
+fn steps(device: &Device, label: &str) {
+    let mut worst = Worst::on(device);
+    for case in cases_on(device, true) {
         for device in [device.clone(), device.clone().autodiff()] {
             let x = case.load::<2>("x", &device);
+            let [b, c] = x.dims();
+            let kernels = takes(&device, case.dtype, case.kernel_width(), [b, 1, c]);
             let weight = case.load::<2>("weight", &device);
             let launches = probe::update_launches();
             let (out, next) = causal_conv1d_update(
@@ -361,22 +398,19 @@ fn steps(device: &Device, label: &str, kernels: bool) {
 }
 
 /// Every sequence case as a prefill of `p` steps, then single steps to its end: the outputs are
-/// the recorded sequence's, and the final state holds its last inputs; on CUDA (`kernels`)
-/// through the step kernel. Returns the largest difference between the steps' outputs and the
-/// sequence's own, computed on `device`.
-fn prefill_then_steps(device: &Device, label: &str, kernels: bool) -> f64 {
-    let mut worst = Worst::default();
+/// the recorded sequence's, and the final state holds its last inputs; where the kernels take
+/// the case, through the step kernel. Returns the largest difference between the steps' outputs
+/// and the sequence's own, computed on `device`.
+fn prefill_then_steps(device: &Device, label: &str) -> f64 {
+    let mut worst = Worst::on(device);
     let mut against_sequence = 0.0f64;
-    for case in [GENERAL, TRANSFORMERS]
-        .into_iter()
-        .flat_map(Fixtures::cases)
-        .filter(|case| !case.step)
-    {
+    for case in cases_on(device, false) {
         let k = case.kernel_width();
         let x = case.load::<3>("x", device);
         let weight = case.load::<2>("weight", device);
         let bias = case.bias(device);
         let [b, t, c] = x.dims();
+        let kernels = takes(device, case.dtype, k, [b, 1, c]);
         let sequence = values(causal_conv1d(
             x.clone(),
             weight.clone(),
@@ -441,22 +475,25 @@ fn prefill_then_steps(device: &Device, label: &str, kernels: bool) -> f64 {
     against_sequence
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn sequence_on_flex_matches_torch() {
     let _serial = serial();
-    sequences(&Device::flex().autodiff(), "flex", false);
+    sequences(&Device::flex().autodiff(), "flex");
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn step_on_flex_matches_torch() {
     let _serial = serial();
-    steps(&Device::flex(), "flex", false);
+    steps(&Device::flex(), "flex");
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn prefill_then_steps_on_flex_equals_the_sequence() {
     let _serial = serial();
-    prefill_then_steps(&Device::flex(), "flex", false);
+    prefill_then_steps(&Device::flex(), "flex");
 }
 
 #[test]
@@ -466,6 +503,7 @@ fn options_default_to_no_activation() {
 
 /// A gradient asked of a decoding step is answered (by the reference, which Burn
 /// differentiates), not dropped: for every input, here with a bias and no activation.
+#[cfg(feature = "flex")]
 #[test]
 fn a_tracked_step_is_differentiable() {
     let _serial = serial();
@@ -529,37 +567,37 @@ fn a_tracked_step_is_differentiable() {
     }
 }
 
-#[cfg(feature = "cuda")]
-mod cuda {
+/// The same checks on a CubeCL device, any runtime: the one `DASH_OPS_DEVICE` names.
+#[cfg(feature = "cubecl")]
+mod cube {
     use super::*;
 
-    fn cuda() -> Device {
-        Device::cuda(0)
-    }
-
-    fn ran(count: impl Fn() -> usize, before: usize, what: &str) {
-        assert!(count() > before, "the {what} kernel did not run");
+    fn device() -> Device {
+        common::cube_device()
     }
 
     #[test]
-    fn sequence_on_cuda_runs_the_kernels() {
+    fn sequence_on_cubecl_matches_torch() {
         let _serial = serial();
-        sequences(&cuda().autodiff(), "cuda", true);
+        println!("{}", common::describe(&device()));
+        sequences(&device().autodiff(), "cubecl");
     }
 
     #[test]
-    fn step_on_cuda_runs_the_kernel() {
+    fn step_on_cubecl_matches_torch() {
         let _serial = serial();
-        steps(&cuda(), "cuda", true);
+        steps(&device(), "cubecl");
     }
 
-    /// On CUDA the steps' outputs are the sequence's to the bit: the forward and step kernels
-    /// share their arithmetic.
+    /// Where the kernels run the steps' outputs are the sequence's to the bit: the forward and
+    /// step kernels share their arithmetic.
     #[test]
-    fn prefill_then_steps_on_cuda_equals_the_sequence() {
+    fn prefill_then_steps_on_cubecl_equals_the_sequence() {
         let _serial = serial();
-        let difference = prefill_then_steps(&cuda(), "cuda", true);
-        assert_eq!(difference, 0.0);
+        let difference = prefill_then_steps(&device(), "cubecl");
+        if takes(&device(), DType::F32, 4, [1, 1, 1]) {
+            assert_eq!(difference, 0.0);
+        }
     }
 
     /// A seeded uniform draw in `[-scale, scale)`.
@@ -648,7 +686,9 @@ mod cuda {
 
     /// The kernels against the reference on Flex at a size the fixtures do not reach: many
     /// runs per sequence, a ragged last run, hundreds of channel vectors, two batches; for
-    /// several widths, with and without a bias and SiLU, and an input read through strides.
+    /// several widths, with and without a bias and SiLU, and an input read through strides. On a
+    /// device the kernels do not take, its reference against Flex's.
+    #[cfg(feature = "flex")]
     #[test]
     fn kernels_match_the_reference_at_scale() {
         let _serial = serial();
@@ -667,6 +707,10 @@ mod cuda {
         ];
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         for (k, has_bias, options, dtype, transposed) in configs {
+            if !common::has(&device(), dtype) {
+                continue;
+            }
+            let kernels = takes(&device(), dtype, k, [b, t, c]);
             let x = uniform(&mut seed, b * t * c, 3.0);
             let weight = uniform(&mut seed, c * k, 0.5);
             let bias = uniform(&mut seed, c, 0.5);
@@ -680,15 +724,15 @@ mod cuda {
             let (forward, backward) = (probe::forward_launches(), probe::backward_launches());
             let shape = [b, t, c, k];
             let actual = run(
-                &cuda().autodiff(),
+                &device().autodiff(),
                 dtype,
                 shape,
                 inputs,
                 options,
                 transposed,
             );
-            ran(probe::forward_launches, forward, "forward");
-            ran(probe::backward_launches, backward, "backward");
+            launched(kernels, probe::forward_launches, forward, "forward");
+            launched(kernels, probe::backward_launches, backward, "backward");
             let expected = run(
                 &Device::flex().autodiff(),
                 dtype,
@@ -699,10 +743,14 @@ mod cuda {
             );
             // Both sides err at f32 rounding, the weight and bias gradients' 2000-term sums most
             // (largest measured: 2.3e-7, 2.2e-7, 1.3e-6, 1.1e-6). In bf16 each side rounds its
-            // own f32 result, at most an ulp apart (3.7e-3, 3.0e-3, 3.7e-5, 5.2e-4).
-            let bounds = match dtype {
-                DType::F32 => [2.4e-7, 2.3e-7, 1.4e-6, 1.2e-6],
-                _ => [3.8e-3, 3.1e-3, 3.8e-5, 5.2e-4],
+            // own f32 result, at most an ulp apart (3.7e-3, 3.0e-3, 3.7e-5, 5.2e-4). The CubeCL
+            // CPU runtime's reference sums those gradients in other orders still (2.2e-6, 2.4e-6;
+            // in bf16 1.5e-4 for the weight's).
+            let bounds = match (dtype, other_runtime(&device())) {
+                (DType::F32, false) => [2.4e-7, 2.3e-7, 1.4e-6, 1.2e-6],
+                (DType::F32, true) => [2.4e-7, 2.3e-7, 2.3e-6, 2.4e-6],
+                (_, false) => [3.8e-3, 3.1e-3, 3.8e-5, 5.2e-4],
+                (_, true) => [3.8e-3, 3.1e-3, 1.5e-4, 5.2e-4],
             };
             let parts = ["out", "grad_x", "grad_weight", "grad_bias"];
             for ((part, bound), (a, e)) in
@@ -710,7 +758,7 @@ mod cuda {
             {
                 let (abs, rel) = errors(a, e);
                 println!(
-                    "cuda against flex at [{b}, {t}, {c}], K = {k}, bias {has_bias}, \
+                    "cubecl against flex at [{b}, {t}, {c}], K = {k}, bias {has_bias}, \
                      {:?}, {dtype:?}, transposed {transposed}, {part}: max abs {abs:.3e}, \
                      rel {rel:.3e}",
                     options.activation
@@ -721,6 +769,7 @@ mod cuda {
     }
 
     /// A width the kernels do not take runs the reference, on CUDA too.
+    #[cfg(feature = "flex")]
     #[test]
     fn wider_kernels_run_the_reference() {
         let _serial = serial();
@@ -739,8 +788,9 @@ mod cuda {
         let silu = CausalConv1dOptions::default().with_activation(Activation::Silu);
         let launches = probe::kernel_launches();
         let runs = probe::backward_runs();
+        assert!(!takes(&device(), DType::F32, k, [b, t, c]));
         let actual = run(
-            &cuda().autodiff(),
+            &device().autodiff(),
             DType::F32,
             [b, t, c, k],
             inputs,
@@ -761,12 +811,16 @@ mod cuda {
             false,
         );
         // The reference on two devices: the same operations, summed in different orders (largest
-        // measured: 5.7e-8, 1.6e-7, 2.8e-7, 1.7e-7).
+        // measured: 5.7e-8, 1.6e-7, 2.8e-7, 1.7e-7); on lavapipe, with its own exponential, and
+        // on the CubeCL CPU runtime, 1.2e-7, 1.6e-7, 4.3e-7, 2.2e-7.
         let parts = ["out", "grad_x", "grad_weight", "grad_bias"];
-        let bounds = [6e-8, 1.7e-7, 2.9e-7, 1.8e-7];
+        let bounds = match other_runtime(&device()) {
+            false => [6e-8, 1.7e-7, 2.9e-7, 1.8e-7],
+            true => [1.2e-7, 1.7e-7, 4.3e-7, 2.3e-7],
+        };
         for ((part, bound), (a, e)) in parts.iter().zip(bounds).zip(actual.iter().zip(&expected)) {
             let (abs, rel) = errors(a, e);
-            println!("cuda against flex, K = {k}, {part}: max abs {abs:.3e}, rel {rel:.3e}");
+            println!("cubecl against flex, K = {k}, {part}: max abs {abs:.3e}, rel {rel:.3e}");
             assert!(rel <= bound, "{part}: {rel:.3e} exceeds {bound:.1e}");
         }
     }

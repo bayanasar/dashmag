@@ -6,8 +6,14 @@
 //! f64 (`out_f64`, ...; stored rounded to f32). The bf16 case holds bf16 inputs (as f32 values),
 //! torch's own bf16 results (`out_torch_bf16`, ...) and the f64 results from the same inputs.
 //!
+//! With a CubeCL runtime's feature the same checks run on that runtime's device
+//! (`tests/common`), the kernels where the device has what they ask and the reference elsewhere.
+//!
 //!   cargo test --release -p dash-ops --test gated_delta_chunk -- --nocapture
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test gated_delta_chunk
+//!   DASH_OPS_DEVICE=wgpu:vulkan cargo test --release -p dash-ops --features wgpu --test gated_delta_chunk
+
+mod common;
 
 use burn::tensor::{DType, Device, Tensor, TensorData};
 use dash_ops::gated_delta::chunk::{chunk_gated_delta_rule, probe};
@@ -177,7 +183,8 @@ fn check(case: &Case, label: &str, res: &Results, suffix: &str, tol: f32) {
 const F32_CASES: [&str; 3] = ["f32_l2norm_state", "f32_plain", "f32_short"];
 
 /// fp32 against torch at fp32 (and at f64): the requirement is 1e-5 relative; the measured errors
-/// are at most 1.2e-6, on Flex and on CUDA (printed with --nocapture).
+/// are at most 1.2e-6, on Flex, on CUDA, and through the reference on lavapipe, on OpenGL over
+/// D3D12 and on CubeCL's CPU runtime (printed with --nocapture).
 const F32_TOL: f32 = 2e-6;
 
 /// bf16 inputs, against the f64 reference from the same inputs. The operation computes in f32
@@ -186,6 +193,13 @@ const F32_TOL: f32 = 2e-6;
 /// queries and keys in bf16, is further off (up to 8.1e-3, printed beside it).
 const BF16_TOL: f32 = 3e-3;
 
+/// f16 inputs: the kernels against the f32 reference from the same inputs. f16 rounds to within
+/// 2^-11 relative: measured at most 4.2e-4, on CUDA in every build and through the reference on
+/// lavapipe and on CubeCL's CPU runtime.
+#[cfg(feature = "cubecl")]
+const F16_VS_REFERENCE: f32 = 5e-4;
+
+#[cfg(feature = "flex")]
 fn check_f32_cases(device: &Device, label: &str) {
     for name in F32_CASES {
         let case = Case::load(name);
@@ -214,12 +228,14 @@ fn check_bf16_case(device: &Device, label: &str) {
     }
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn fp32_on_flex_matches_torch() {
     let _serial = serial();
     check_f32_cases(&Device::flex().autodiff(), "flex");
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn bf16_on_flex_matches_torch() {
     let _serial = serial();
@@ -228,6 +244,7 @@ fn bf16_on_flex_matches_torch() {
 
 /// Without autodiff, and through Autodiff without a gradient, the output and the final state are
 /// those of the gradient run.
+#[cfg(feature = "flex")]
 #[test]
 fn forward_without_gradients_on_flex() {
     let _serial = serial();
@@ -255,7 +272,7 @@ fn forward_without_gradients_on_flex() {
 /// Seeded inputs for shapes too large to record: `(q, k, v, g, beta, h0, d_out, d_state)` as f32
 /// vectors, the model's distributions (`g = -softplus(x) 0.4`, `beta = sigmoid(x)`); keys and
 /// queries normalised when the l2norm is not done in the kernel.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl")]
 fn seeded(
     seed: u64,
     [b, t, h, dk, dv]: [usize; 5],
@@ -314,12 +331,75 @@ fn seeded(
     ]
 }
 
-#[cfg(feature = "cuda")]
-mod cuda {
+/// The same checks on a CubeCL device, any runtime: the one `DASH_OPS_DEVICE` names.
+#[cfg(feature = "cubecl")]
+mod cube {
     use super::*;
     use dash_ops::gated_delta::chunk::{
-        chunk_gated_delta_rule_reference, chunk_gated_delta_rule_reference_backward,
+        chunk_gated_delta_rule_reference, chunk_gated_delta_rule_reference_backward, kernels_take,
     };
+
+    /// How many kernel launches a forward and a backward pass over `[B, T, H, Dk, Dv]` in `dtype`
+    /// make on `device`: three for a forward pass and nine for a backward pass the kernels take,
+    /// none for a pass the reference takes. Under CUDA the kernels take both: cards of compute
+    /// capability 8.0 and later have all they ask.
+    fn expected_launches(device: &Device, dtype: DType, dims: [usize; 5]) -> usize {
+        let [forward, backward] = kernels_take(device, dtype, dims);
+        if common::runtime_of(device) == Some("cuda") {
+            assert!(
+                forward && backward,
+                "CUDA turned the kernels away for {dims:?}"
+            );
+        }
+        3 * usize::from(forward) + 9 * usize::from(backward)
+    }
+
+    /// Whether `device` stores `dtype`; the tests in a dtype it does not skip, saying so.
+    fn has(device: &Device, dtype: DType) -> bool {
+        let has = device.supports_dtype(dtype);
+        if !has {
+            println!("skipped: {} has no {dtype:?}", common::describe(device));
+        }
+        has
+    }
+
+    /// Asserts that `f` launched exactly `expected` kernels: under fusion the kernels run when
+    /// their results are read, so `f` reads them.
+    fn launches_kernels<R>(expected: usize, f: impl FnOnce() -> R) -> R {
+        let before = probe::kernel_launches();
+        let result = f();
+        let launched = probe::kernel_launches() - before;
+        assert_eq!(
+            launched, expected,
+            "the kernels made {launched} launches, expected {expected}"
+        );
+        result
+    }
+
+    /// The recorded cases in `dtype` on `device`, each held to torch, and to its kernels'
+    /// expected launches.
+    fn check_cases_on(device: &Device, label: &str, dtype: DType) {
+        let names: &[&'static str] = if dtype == DType::F32 {
+            &F32_CASES
+        } else {
+            &["bf16_l2norm_state"]
+        };
+        for &name in names {
+            let case = Case::load(name);
+            let (q, v) = (&case.tensors["q"].0, &case.tensors["v"].0);
+            let dims = [q[0], q[1], q[2], q[3], v[3]];
+            let expected = expected_launches(device, dtype, dims);
+            println!("{name}: {dims:?} {dtype:?}, {expected} kernel launches of 12");
+            let ad = device.clone().autodiff();
+            if dtype == DType::F32 {
+                let res = launches_kernels(expected, || run(&case, &ad, dtype));
+                check(&case, label, &res, "", F32_TOL);
+                check(&case, label, &res, "_f64", F32_TOL);
+            } else {
+                launches_kernels(expected, || check_bf16_case(&ad, label));
+            }
+        }
+    }
 
     fn t4(x: &(Vec<usize>, Vec<f32>), device: &Device) -> Tensor<4> {
         Tensor::from_data(TensorData::new(x.1.clone(), x.0.clone()), device)
@@ -334,8 +414,9 @@ mod cuda {
     /// inputs rounded to `dtype`. Returns the largest relative error over the outputs and
     /// gradients, printing each.
     fn kernels_against_reference(label: &str, dims: [usize; 5], l2norm: bool, dtype: DType) -> f32 {
-        let device = Device::cuda(0);
+        let device = common::cube_device();
         let ad = device.clone().autodiff();
+        let expected = expected_launches(&device, dtype, dims);
         let x = seeded(7, dims, !l2norm);
         let leaf4 = |i: usize| t4(&x[i], &ad).cast(dtype).require_grad();
         let leaf3 = |i: usize| t3(&x[i], &ad).cast(dtype).require_grad();
@@ -367,10 +448,10 @@ mod cuda {
             to_vec(h0.grad(&grads).unwrap()),
         ];
         // After the reads: under Burn's fusion the kernels run when their results are needed.
-        // Three for the forward pass, nine for the backward.
-        assert!(
-            probe::kernel_launches() >= launches + 12,
-            "the CUDA kernels did not run"
+        assert_eq!(
+            probe::kernel_launches(),
+            launches + expected,
+            "the kernels made other launches"
         );
         // The reference in f32 from the inputs as the kernels saw them.
         let r4 = |i: usize| t4(&x[i], &device).cast(dtype).cast(DType::F32);
@@ -416,36 +497,31 @@ mod cuda {
     }
 
     #[test]
-    fn fp32_on_cuda_runs_the_kernels_and_matches_torch() {
+    fn fp32_on_cubecl_matches_torch() {
         let _serial = serial();
-        let launches = probe::kernel_launches();
-        check_f32_cases(&Device::cuda(0).autodiff(), "cuda");
-        assert!(
-            probe::kernel_launches() > launches,
-            "the CUDA kernels did not run"
-        );
+        let device = common::cube_device();
+        println!("{}", common::describe(&device));
+        check_cases_on(&device, "cubecl", DType::F32);
     }
 
     #[test]
-    fn bf16_on_cuda_runs_the_kernels_and_matches_torch() {
+    fn bf16_on_cubecl_matches_torch() {
         let _serial = serial();
-        let launches = probe::kernel_launches();
-        check_bf16_case(&Device::cuda(0).autodiff(), "cuda-bf16");
-        assert!(
-            probe::kernel_launches() > launches,
-            "the CUDA kernels did not run"
-        );
+        let device = common::cube_device();
+        if has(&device, DType::BF16) {
+            check_cases_on(&device, "cubecl-bf16", DType::BF16);
+        }
     }
 
     /// Qwen3.5-0.8B's head shapes (Dk = Dv = 128), a sequence ending mid-chunk, two batch
-    /// elements: the kernels within 1e-6 of the reference in fp32 (measured at most 4.9e-7).
+    /// elements: the kernels within 1e-6 of the reference in fp32 (measured at most 5.6e-7).
     #[test]
     fn kernels_match_the_reference_at_model_shapes() {
         let _serial = serial();
         let dims = [2, 300, 3, 128, 128];
-        let worst = kernels_against_reference("cuda f32 l2norm D=128", dims, true, DType::F32);
+        let worst = kernels_against_reference("f32 l2norm D=128", dims, true, DType::F32);
         assert!(worst <= 1e-6, "relative error {worst:.3e}");
-        let worst = kernels_against_reference("cuda f32 plain D=128", dims, false, DType::F32);
+        let worst = kernels_against_reference("f32 plain D=128", dims, false, DType::F32);
         assert!(worst <= 1e-6, "relative error {worst:.3e}");
     }
 
@@ -455,12 +531,28 @@ mod cuda {
     #[test]
     fn kernels_match_the_reference_in_bf16() {
         let _serial = serial();
+        if !has(&common::cube_device(), DType::BF16) {
+            return;
+        }
         let dims = [1, 200, 2, 128, 128];
-        let worst = kernels_against_reference("cuda bf16 l2norm D=128", dims, true, DType::BF16);
+        let worst = kernels_against_reference("bf16 l2norm D=128", dims, true, DType::BF16);
         assert!(worst <= 4e-3, "relative error {worst:.3e}");
     }
 
-    /// Heads larger than the kernels hold run the reference on CUDA, and agree with Flex.
+    /// And in f16.
+    #[test]
+    fn kernels_match_the_reference_in_f16() {
+        let _serial = serial();
+        if !has(&common::cube_device(), DType::F16) {
+            return;
+        }
+        let dims = [1, 200, 2, 128, 128];
+        let worst = kernels_against_reference("f16 l2norm D=128", dims, true, DType::F16);
+        assert!(worst <= F16_VS_REFERENCE, "relative error {worst:.3e}");
+    }
+
+    /// Heads larger than the kernels hold run the reference, and agree with Flex.
+    #[cfg(feature = "flex")]
     #[test]
     fn large_heads_fall_back_to_the_reference() {
         let _serial = serial();
@@ -480,7 +572,7 @@ mod cuda {
             (to_vec(out), to_vec(state.unwrap()))
         };
         let launches = probe::kernel_launches();
-        let (out, state) = run(&Device::cuda(0));
+        let (out, state) = run(&common::cube_device());
         assert_eq!(
             probe::kernel_launches(),
             launches,
@@ -489,7 +581,7 @@ mod cuda {
         let (out_flex, state_flex) = run(&Device::flex());
         let (_, rel_out) = errors(&out, &out_flex);
         let (_, rel_state) = errors(&state, &state_flex);
-        println!("large heads: out rel {rel_out:.3e}, state rel {rel_state:.3e} (cuda vs flex)");
+        println!("large heads: out rel {rel_out:.3e}, state rel {rel_state:.3e} (vs flex)");
         assert!(rel_out <= 1e-6 && rel_state <= 1e-6);
     }
 }

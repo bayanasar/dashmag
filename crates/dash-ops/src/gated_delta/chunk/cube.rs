@@ -1,5 +1,6 @@
-//! The chunked gated delta rule on the CUDA backend, in CubeCL kernels, all in f32 (no tensor
-//! cores), for heads up to [`MAX_HEAD_DIM`] wide. Notation as in `reference.rs`.
+//! The chunked gated delta rule on the CubeCL backend, in CubeCL kernels, all in f32 (no tensor
+//! cores), for heads up to [`MAX_HEAD_DIM`] wide, on devices with what [`requirements`] lists.
+//! Notation as in `reference.rs`.
 //!
 //! Forward: [`prep_kernel`] per chunk (`G`, `A`, `T = (I + A)^-1`, `W`, `U`, `kt` from the raw
 //! inputs, normalising keys when asked); [`state_forward_kernel`] passes the state from chunk to
@@ -21,6 +22,7 @@
 
 use super::reference::{self, CHUNK};
 use super::{ChunkGatedDeltaBackend, probe};
+use crate::cube::Requirements;
 use burn::backend::TensorMetadata;
 use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::ops::FloatTensorOps;
@@ -30,6 +32,7 @@ use burn_cubecl::CubeBackend;
 use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
+use cubecl::client::Client;
 use cubecl::prelude::*;
 use std::sync::atomic::Ordering;
 
@@ -1978,7 +1981,8 @@ fn dwy_kernel<E: Float>(
 
 /// Backward, per chunk, the sum of the parts: the queries' and keys' gradients (through the
 /// l2norm when asked, in their dtype and layout), the gate's (the reverse cumulative sum of
-/// `dG` within the chunk) and `beta`'s. One warp per token, eight tokens per warp.
+/// `dG` within the chunk) and `beta`'s. One warp per token, eight tokens per warp: written for
+/// planes of 32 units, which [`requirements`] asks of the device.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn combine_kernel<E: Float>(
@@ -2617,6 +2621,79 @@ fn backward_fused(
     )
 }
 
+/// Bytes of shared memory the kernels of a forward (or backward) pass hold at most, summed from
+/// each kernel's `Shared` arrays: f32 4 bytes, `V2` 8, `V4` 16. The state passings hold the most,
+/// whatever the heads' width: 90 KiB forward, 98 KiB backward.
+fn shared_bytes(dk: usize, dv: usize, backward: bool) -> usize {
+    // A chunk's 64 rows padded to `depth + 1` columns, and its 64 x 64 blocks padded likewise.
+    let rows = |depth: usize| 64 * (depth + 1);
+    let square = 64 * 65;
+    let prep = 4 * (rows(dk.max(dv)) + 2 * square + 3 * 64);
+    let state_forward = 16 * (128 * 17 + 64 * 32) + 8 * (128 * 16 + 64 * 16);
+    let output = 4 * (rows(dk) + rows(dk).max(16 * dv) + square + 2 * 64);
+    if !backward {
+        return prep.max(state_forward).max(output);
+    }
+    let dvlocal = output;
+    let state_backward = 16 * (128 * 17 + 64 * 32) + 8 * (128 * 16 + 2 * 64 * 16);
+    let dvb = 4 * (square + rows(dv) + 64 + 1024);
+    let dstate = 16 * (3 * 64 * 9 + 2 * dk.div_ceil(16) * 16 * 9) + 4 * 256;
+    let dattn = 4 * (2 * rows(dk) + square + 4224 + 2 * 64);
+    let dwy = 4 * (4224 + 2 * square + rows(dk) + 3 * 64 + 1024);
+    let combine = 4 * 3 * 64;
+    [
+        prep,
+        state_forward,
+        dvlocal,
+        state_backward,
+        dvb,
+        dstate,
+        dattn,
+        dwy,
+        combine,
+    ]
+    .into_iter()
+    .fold(0, usize::max)
+}
+
+/// What the kernels of a forward (or backward) pass over `[B, T, H, Dk, Dv]` ask of the device:
+/// 256 units per cube; `B H N` cubes, one per chunk of each batch element and head, and the
+/// state passings' `ceil(Dv / 32)` by `B H`; the shared memory of [`shared_bytes`]; the tensors
+/// of the kernel binding the most (`prep_kernel`'s 10 forward, `combine_kernel`'s 19 backward);
+/// vectors of four f32; and backward, planes of 32 units, which `combine_kernel` sums over with
+/// `plane_sum`, one plane per token, as CUDA's warps.
+pub(super) fn requirements([b, t, h, dk, dv]: [usize; 5], backward: bool) -> Requirements {
+    let n = t.div_ceil(CHUNK);
+    let per_chunk = Requirements::new((THREADS, 1), (b * h * n, 1), if backward { 19 } else { 10 });
+    let state = Requirements::new((THREADS, 1), (dv.div_ceil(BV), b * h), 10);
+    Requirements {
+        shared_bytes: shared_bytes(dk, dv, backward),
+        vector_size: 4,
+        plane_width: backward.then_some(32),
+        ..per_chunk.max(state)
+    }
+}
+
+/// Whether the kernels take a forward (or backward) pass over inputs of `dtype` and shape
+/// `[B, T, H, Dk, Dv]` on the device `client` serves; the reference runs otherwise.
+pub(super) fn kernels_take(
+    client: &Client,
+    dtype: DType,
+    dims: [usize; 5],
+    backward: bool,
+) -> bool {
+    let [_, _, _, dk, dv] = dims;
+    dk <= MAX_HEAD_DIM
+        && dv <= MAX_HEAD_DIM
+        && requirements(dims, backward).met_on(client, &[dtype])
+}
+
+/// `[B, T, H, Dk, Dv]` of the queries `[B, T, H, Dk]` and the values `[B, T, H, Dv]`.
+fn dims(q: &CubeTensor, v: &CubeTensor) -> [usize; 5] {
+    let [b, t, h, dk] = q.shape().dims::<4>();
+    [b, t, h, dk, v.shape()[3]]
+}
+
 impl ChunkGatedDeltaBackend for CubeBackend {
     fn chunk_gated_delta_forward(
         q: FloatTensor<Self>,
@@ -2628,8 +2705,7 @@ impl ChunkGatedDeltaBackend for CubeBackend {
         use_qk_l2norm: bool,
         _output_final_state: bool,
     ) -> (FloatTensor<Self>, FloatTensor<Self>) {
-        let (dk, dv) = (q.shape()[3], v.shape()[3]);
-        if dk > MAX_HEAD_DIM || dv > MAX_HEAD_DIM {
+        if !kernels_take(&q.client, q.dtype, dims(&q, &v), false) {
             return reference::forward::<Self>(q, k, v, g, beta, initial_state, use_qk_l2norm);
         }
         forward_fused(q, k, v, g, beta, initial_state, use_qk_l2norm)
@@ -2653,8 +2729,7 @@ impl ChunkGatedDeltaBackend for CubeBackend {
         FloatTensor<Self>,
         FloatTensor<Self>,
     ) {
-        let (dk, dv) = (q.shape()[3], v.shape()[3]);
-        if dk > MAX_HEAD_DIM || dv > MAX_HEAD_DIM {
+        if !kernels_take(&q.client, q.dtype, dims(&q, &v), true) {
             return reference::backward::<Self>(
                 q,
                 k,

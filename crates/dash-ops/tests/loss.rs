@@ -20,8 +20,10 @@
 //! path is taken: both inputs requiring a gradient, a frozen weight with and without the entropy
 //! (the second case accumulates the gradient of `hidden` in the forward pass), a frozen `hidden`;
 //! f16 inputs, computed in f32, against f32 inputs of the same values. The probe counters show
-//! which code ran: the CUDA kernels, the written-out backward, and whether it made a second pass
-//! over the vocabulary.
+//! which code ran: the written-out backward, whether it made a second pass over the vocabulary,
+//! and each pass's kernel, which every run asserts launched exactly as often as `kernels_take`
+//! says (always under CUDA); on a CubeCL device without what a pass's kernel asks, that pass's
+//! reference runs on the device and is held to the same fixtures.
 //!
 //! Errors are stated as `max |got - want|` and that over `max |want|` ("relative"), per output;
 //! each tolerance sits just above the largest error measured over the five builds.
@@ -29,11 +31,14 @@
 //!   cargo test --release -p dash-ops --test loss
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test loss
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda,fusion --test loss
+//!   DASH_OPS_DEVICE=wgpu:vulkan cargo test --release -p dash-ops --features wgpu --test loss
+
+mod common;
 
 use burn::backend::{DType, bf16};
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use dash_ops::logprob::{LogprobOptions, chosen_logprob};
-use dash_ops::loss::{CrossEntropyOptions, Reduction, linear_cross_entropy, probe};
+use dash_ops::loss::{CrossEntropyOptions, Reduction, kernels_take, linear_cross_entropy, probe};
 use safetensors::SafeTensors;
 use std::sync::Mutex;
 
@@ -55,6 +60,73 @@ const SMALL_CHUNKS: LogprobOptions = LogprobOptions {
     vocab_chunk: 64,
     row_chunk: 10,
 };
+
+/// The rows of each block `chunks` splits `n` rows into: of equal size but for the last.
+fn blocks(n: usize, chunks: LogprobOptions) -> Vec<usize> {
+    let block = n.div_ceil(n.div_ceil(chunks.row_chunk).max(1)).max(1);
+    (0..n).step_by(block).map(|r0| block.min(n - r0)).collect()
+}
+
+/// The forward pass's chunk-kernel launches over `v` tokens for `n` rows: one per chunk of the
+/// vocabulary in each block of rows.
+fn pass_launches(n: usize, v: usize, chunks: LogprobOptions) -> usize {
+    let rows = blocks(n, chunks);
+    rows.iter()
+        .map(|&rows| v.div_ceil(chunks.vocab_chunk_for(rows)))
+        .sum()
+}
+
+/// The second pass's gradient-kernel launches: every block for every chunk of the vocabulary,
+/// chunked as the first block of rows asks.
+fn gradient_launches(n: usize, v: usize, chunks: LogprobOptions) -> usize {
+    let rows = blocks(n, chunks);
+    rows.len() * v.div_ceil(chunks.vocab_chunk_for(rows[0]))
+}
+
+/// The counters a run's launches are measured from: the two kernels' and the second passes.
+fn counters() -> [usize; 3] {
+    [
+        probe::pass_launches(),
+        probe::gradient_launches(),
+        probe::gradient_passes(),
+    ]
+}
+
+/// Asserts that since `before` each pass's kernel ran as often as `kernels_take` says for `n`
+/// rows over `v` tokens in `dtypes` on `device`: the forward pass's once per chunk and block if
+/// it takes it, the gradient kernel so for every second pass made if it takes that, neither
+/// otherwise. Under CUDA both must take them.
+fn assert_launches(
+    device: &Device,
+    dtypes: [DType; 3],
+    [n, v]: [usize; 2],
+    chunks: LogprobOptions,
+    before: [usize; 3],
+) {
+    let [forward, gradient] = kernels_take(device, dtypes, n, chunks);
+    if common::on_cuda(device) {
+        assert!(forward && gradient, "CUDA turned the kernels away");
+    }
+    let [pass, grad, passes] = counters();
+    let second_passes = passes - before[2];
+    let want_pass = match forward && n > 0 {
+        true => pass_launches(n, v, chunks),
+        false => 0,
+    };
+    let want_grad = match gradient && n > 0 {
+        true => second_passes * gradient_launches(n, v, chunks),
+        false => 0,
+    };
+    let (ran_pass, ran_grad) = (pass - before[0], grad - before[1]);
+    assert_eq!(
+        ran_pass, want_pass,
+        "the chunk kernel ran {ran_pass} times, expected {want_pass}"
+    );
+    assert_eq!(
+        ran_grad, want_grad,
+        "the gradient kernel ran {ran_grad} times, expected {want_grad}"
+    );
+}
 
 /// The values the inputs take: the fixtures' f32 values, or those rounded to bf16.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -257,6 +329,8 @@ fn run(
     }
     let targets = Tensor::<1, Int>::from_data(TensorData::new(case.targets.clone(), [n]), device);
     let upstream = |g: &[f32]| Tensor::<1>::from_data(TensorData::new(g.to_vec(), [n]), device);
+    let dtypes = [dtype, dtype, targets.dtype()];
+    let before = counters();
     let out = linear_cross_entropy(hidden.clone(), weight.clone(), targets, options);
     for x in [Some(&out.loss), Some(&out.logprob), out.entropy.as_ref()]
         .into_iter()
@@ -273,6 +347,7 @@ fn run(
         grad_weight: vec![],
     };
     if !(setup.hidden || setup.weight) {
+        assert_launches(device, dtypes, [n, v], options.chunks, before);
         return outputs;
     }
     let mut objective: Option<Tensor<1>> = None;
@@ -314,6 +389,8 @@ fn run(
         );
         outputs.grad_weight = values(grad);
     }
+    // After the reads: under fusion the kernels run when their results are read.
+    assert_launches(device, dtypes, [n, v], options.chunks, before);
     outputs
 }
 
@@ -424,6 +501,7 @@ fn all_variants(
     }
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn matches_pytorch_on_flex() {
     let _serial = serial();
@@ -436,6 +514,7 @@ fn matches_pytorch_on_flex() {
     );
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn bf16_inputs_on_flex() {
     let _serial = serial();
@@ -497,6 +576,7 @@ fn each_term(
     }
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn each_output_has_its_gradient_on_flex() {
     let _serial = serial();
@@ -577,6 +657,7 @@ fn frozen_weight(
     }
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn frozen_weight_on_flex() {
     let _serial = serial();
@@ -614,6 +695,7 @@ fn hidden_frozen(
     }
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn hidden_frozen_on_flex() {
     let _serial = serial();
@@ -627,6 +709,7 @@ fn hidden_frozen_on_flex() {
 }
 
 /// The chunking is an implementation detail: one chunk, tiny chunks and uneven row blocks agree.
+#[cfg(feature = "flex")]
 #[test]
 fn chunking_does_not_change_the_answer_on_flex() {
     let _serial = serial();
@@ -663,6 +746,7 @@ fn chunking_does_not_change_the_answer_on_flex() {
 }
 
 /// Without autodiff the same values come out, and nothing is recorded.
+#[cfg(feature = "flex")]
 #[test]
 fn untracked_on_flex() {
     let _serial = serial();
@@ -753,6 +837,7 @@ fn agrees_with_chosen_logprob(device: &Device, dtype: DType) {
     assert_eq!(loss_lp[n - 1], f32::NEG_INFINITY);
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn agrees_with_chosen_logprob_on_flex() {
     let _serial = serial();
@@ -808,11 +893,13 @@ fn all_ignored(device: &Device) {
     }
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn empty_batch_on_flex() {
     empty_batch(&Device::flex().autodiff());
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn all_ignored_on_flex() {
     let _serial = serial();
@@ -846,12 +933,14 @@ fn f16_inputs(device: &Device, label: &str) {
 /// output by an ulp and round a gradient to the next f16 (an ulp, at most 2^-10 of the largest).
 const F32_VS_F16: Tolerance = [2e-7, 2e-7, 1e-6, 1e-3, 1e-3];
 
+#[cfg(feature = "flex")]
 #[test]
 fn f16_inputs_on_flex() {
     let _serial = serial();
     f16_inputs(&Device::flex().autodiff(), "flex f16 vs f32");
 }
 
+#[cfg(feature = "flex")]
 #[test]
 #[should_panic(expected = "label_smoothing")]
 fn a_smoothing_above_one_is_refused() {
@@ -867,6 +956,7 @@ fn a_smoothing_above_one_is_refused() {
     );
 }
 
+#[cfg(feature = "flex")]
 #[test]
 #[should_panic(expected = "outside the vocabulary")]
 fn a_masked_id_outside_the_vocabulary_is_refused() {
@@ -882,119 +972,148 @@ fn a_masked_id_outside_the_vocabulary_is_refused() {
     );
 }
 
-#[cfg(feature = "cuda")]
-mod cuda {
+/// The same checks on a CubeCL device, any runtime: the one `DASH_OPS_DEVICE` names. Each run
+/// asserts both passes' kernel launches against `kernels_take`.
+#[cfg(feature = "cubecl")]
+mod cube {
     use super::*;
 
     /// bf16 inputs: the tensor-core path, the gradient of the logits rounded to bf16 for the
     /// matmuls of the second pass, the gradients rounded to bf16 on the way out. Measured:
     /// 1.4e-7, 1.4e-7, 2.6e-7, 4.4e-3, 4.9e-3.
-    const CUDA_BF16: Tolerance = [2e-7, 2e-7, 3e-7, 5e-3, 5e-3];
+    const CUBE_BF16: Tolerance = [2e-7, 2e-7, 3e-7, 5e-3, 5e-3];
     /// f32 inputs: f32 matmuls (IEEE, `CUBECL_CUDA_TF32=0`), nothing rounded. Measured: 1.4e-7,
     /// 9.3e-8, 7.4e-7, 2.7e-6, 3.6e-6.
-    const CUDA_F32: Tolerance = [2e-7, 2e-7, 1e-6, 4e-6, 4e-6];
-    /// bf16 on CUDA against f32 on Flex on the same values, both gradients rounded to bf16, the
-    /// CUDA path's also through the logits' gradient in bf16. Measured: 2.0e-7, 4.5e-7, 5.8e-7,
-    /// 4.6e-3, 4.5e-3 (the largest at D = 1024 and in 1800 rows).
-    const CUDA_VS_FLEX: Tolerance = [3e-7, 5e-7, 1e-6, 5e-3, 5e-3];
+    const CUBE_F32: Tolerance = [2e-7, 2e-7, 1e-6, 4e-6, 4e-6];
+    /// bf16 on the device against f32 on Flex on the same values, both gradients rounded to
+    /// bf16, the kernels' also through the logits' gradient in bf16. Measured: 2.0e-7, 4.5e-7,
+    /// 5.8e-7, 4.6e-3, 4.5e-3 (the largest at D = 1024 and in 1800 rows).
+    #[cfg(feature = "flex")]
+    const CUBE_VS_FLEX: Tolerance = [3e-7, 5e-7, 1e-6, 5e-3, 5e-3];
+    /// bf16 inputs on the other CubeCL runtimes, where the reference runs. Measured on CubeCL's
+    /// CPU runtime, whose exp and log round differently: 1.4e-7, 9.3e-8, 4.3e-7, 2.9e-3, 3.4e-3
+    /// (lavapipe and OpenGL have no bf16).
+    const OTHER_BF16: Tolerance = [2e-7, 2e-7, 4.4e-7, 5e-3, 5e-3];
 
     fn device() -> Device {
-        Device::cuda(0).autodiff()
+        common::cube_device().autodiff()
     }
 
-    /// The kernel ran (the counter grew) around `f`.
-    fn launches<T>(f: impl FnOnce() -> T) -> T {
-        let before = probe::kernel_launches();
-        let out = f();
-        assert!(
-            probe::kernel_launches() > before,
-            "the CUDA kernels did not run"
-        );
-        out
+    /// The bounds of bf16 inputs on `device`.
+    fn bf16_bounds(device: &Device) -> Tolerance {
+        match common::on_cuda(device) {
+            true => CUBE_BF16,
+            false => OTHER_BF16,
+        }
+    }
+
+    /// bf16 inputs, if the device has bf16.
+    fn bf16(device: &Device) -> bool {
+        common::has(device, DType::BF16)
     }
 
     #[test]
-    fn matches_pytorch_on_cuda_bf16() {
+    fn matches_pytorch_on_cubecl_bf16() {
         let _serial = serial();
-        launches(|| {
+        println!("{}", common::describe(&device()));
+        if bf16(&device()) {
             all_variants(
                 &device(),
-                "cuda bf16",
+                "cubecl bf16",
                 Precision::Bf16,
                 DType::BF16,
-                CUDA_BF16,
-            )
-        });
+                bf16_bounds(&device()),
+            );
+        }
     }
 
     #[test]
-    fn matches_pytorch_on_cuda_f32() {
+    fn matches_pytorch_on_cubecl_f32() {
         let _serial = serial();
-        launches(|| all_variants(&device(), "cuda f32", Precision::F32, DType::F32, CUDA_F32));
+        all_variants(
+            &device(),
+            "cubecl f32",
+            Precision::F32,
+            DType::F32,
+            CUBE_F32,
+        );
     }
 
     #[test]
-    fn each_output_has_its_gradient_on_cuda() {
+    fn each_output_has_its_gradient_on_cubecl() {
         let _serial = serial();
-        launches(|| {
+        if bf16(&device()) {
             each_term(
                 &device(),
-                "cuda bf16",
+                "cubecl bf16",
                 Precision::Bf16,
                 DType::BF16,
-                CUDA_BF16,
-            )
-        });
-        launches(|| each_term(&device(), "cuda f32", Precision::F32, DType::F32, CUDA_F32));
+                bf16_bounds(&device()),
+            );
+        }
+        each_term(
+            &device(),
+            "cubecl f32",
+            Precision::F32,
+            DType::F32,
+            CUBE_F32,
+        );
     }
 
     #[test]
-    fn frozen_weight_on_cuda() {
+    fn frozen_weight_on_cubecl() {
         let _serial = serial();
-        launches(|| {
+        if bf16(&device()) {
             frozen_weight(
                 &device(),
-                "cuda bf16",
+                "cubecl bf16",
                 Precision::Bf16,
                 DType::BF16,
-                CUDA_BF16,
-            )
-        });
-        launches(|| frozen_weight(&device(), "cuda f32", Precision::F32, DType::F32, CUDA_F32));
+                bf16_bounds(&device()),
+            );
+        }
+        frozen_weight(
+            &device(),
+            "cubecl f32",
+            Precision::F32,
+            DType::F32,
+            CUBE_F32,
+        );
     }
 
     #[test]
-    fn hidden_frozen_on_cuda() {
+    fn hidden_frozen_on_cubecl() {
         let _serial = serial();
-        launches(|| {
-            hidden_frozen(
-                &device(),
-                "cuda bf16",
-                Precision::Bf16,
-                DType::BF16,
-                CUDA_BF16,
-            )
-        });
+        let (precision, dtype, tolerance) = match bf16(&device()) {
+            true => (Precision::Bf16, DType::BF16, bf16_bounds(&device())),
+            false => (Precision::F32, DType::F32, CUBE_F32),
+        };
+        hidden_frozen(&device(), "cubecl", precision, dtype, tolerance);
     }
 
     #[test]
-    fn agrees_with_chosen_logprob_on_cuda() {
+    fn agrees_with_chosen_logprob_on_cubecl() {
         let _serial = serial();
-        agrees_with_chosen_logprob(&device(), DType::BF16);
+        let dtype = match bf16(&device()) {
+            true => DType::BF16,
+            false => DType::F32,
+        };
+        agrees_with_chosen_logprob(&device(), dtype);
     }
 
     #[test]
-    fn empty_batch_on_cuda() {
+    fn empty_batch_on_cubecl() {
         empty_batch(&device());
     }
 
     #[test]
-    fn all_ignored_on_cuda() {
+    fn all_ignored_on_cubecl() {
         let _serial = serial();
         all_ignored(&device());
     }
 
     /// Random inputs, rounded to bf16 so that both devices see one value.
+    #[cfg(feature = "flex")]
     fn random_case(n: usize, v: usize, d: usize) -> Case {
         let mut rng = 0x9e37_79b9_7f4a_7c15u64 ^ (n * v * d) as u64;
         let mut normal = |scale: f32| {
@@ -1031,8 +1150,9 @@ mod cuda {
         }
     }
 
-    /// The CUDA path with bf16 operands against the reference path on Flex in f32, on the same
-    /// values, every option on.
+    /// The device's path with bf16 operands (f32 on a device without bf16) against the
+    /// reference path on Flex in f32, on the same values, every option on.
+    #[cfg(feature = "flex")]
     fn agrees_with_flex(label: &str, case: &Case, chunks: LogprobOptions) {
         let options = CrossEntropyOptions {
             reduction: Reduction::Sum,
@@ -1043,20 +1163,28 @@ mod cuda {
             chunks,
             ..Default::default()
         };
+        let dtype = match bf16(&device()) {
+            true => DType::BF16,
+            false => DType::F32,
+        };
         let flex = Device::flex().autodiff();
         let want = run(&flex, case, Precision::F32, DType::F32, &options, ALL);
-        let got = launches(|| run(&device(), case, Precision::F32, DType::BF16, &options, ALL));
+        let got = run(&device(), case, Precision::F32, dtype, &options, ALL);
         // Flex rounds its f32 gradients to bf16 too, for a like-for-like comparison.
-        let want = Outputs {
-            grad_hidden: Precision::Bf16.round(&want.grad_hidden),
-            grad_weight: Precision::Bf16.round(&want.grad_weight),
-            ..want
+        let want = match dtype {
+            DType::BF16 => Outputs {
+                grad_hidden: Precision::Bf16.round(&want.grad_hidden),
+                grad_weight: Precision::Bf16.round(&want.grad_weight),
+                ..want
+            },
+            _ => want,
         };
-        check(label, &got, &want, CUDA_VS_FLEX);
+        check(&format!("{label} {dtype:?}"), &got, &want, CUBE_VS_FLEX);
     }
 
     /// At a hidden width of 1024: several row blocks, chunks and a partial last chunk, then the
     /// defaults (one row block, chunks of 4096 with the weight's gradient written in place).
+    #[cfg(feature = "flex")]
     #[test]
     fn agrees_with_flex_at_full_width() {
         let _serial = serial();
@@ -1065,15 +1193,12 @@ mod cuda {
             vocab_chunk: 1024,
             row_chunk: 40,
         };
-        agrees_with_flex("cuda bf16 vs flex, D 1024", &case, small);
-        agrees_with_flex(
-            "cuda bf16 defaults vs flex",
-            &case,
-            LogprobOptions::default(),
-        );
+        agrees_with_flex("cubecl vs flex, D 1024", &case, small);
+        agrees_with_flex("cubecl defaults vs flex", &case, LogprobOptions::default());
     }
 
     /// Large row blocks: 1800 rows in one block and in two.
+    #[cfg(feature = "flex")]
     #[test]
     fn agrees_with_flex_with_large_row_blocks() {
         let _serial = serial();
@@ -1082,13 +1207,15 @@ mod cuda {
             vocab_chunk: 256,
             row_chunk,
         };
-        agrees_with_flex("cuda bf16 vs flex, 1800 rows", &case, options(1800));
-        agrees_with_flex("cuda bf16 vs flex, 2 x 900 rows", &case, options(1000));
+        agrees_with_flex("cubecl vs flex, 1800 rows", &case, options(1800));
+        agrees_with_flex("cubecl vs flex, 2 x 900 rows", &case, options(1000));
     }
 
     #[test]
-    fn f16_inputs_on_cuda() {
+    fn f16_inputs_on_cubecl() {
         let _serial = serial();
-        launches(|| f16_inputs(&device(), "cuda f16 vs f32"));
+        if common::has(&device(), DType::F16) {
+            f16_inputs(&device(), "cubecl f16 vs f32");
+        }
     }
 }

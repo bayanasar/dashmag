@@ -23,24 +23,30 @@
 //! normalised `q` and `k` to bf16.
 //!
 //! The step is a backend extension. Flex runs the reference built from Burn's tensor operations;
-//! CUDA runs one fused CubeCL kernel per step, which reads the state once and writes the new
-//! state in place when the caller hands over the only reference to it, as a decoding loop that
-//! threads the state through does. It is forward only: decoding takes no gradient. On an
-//! autodiff device a step whose inputs are not tracked runs the inner backend's step and returns
-//! untracked tensors; one with a tracked input runs the reference on the autodiff backend, so its
-//! gradients are those of the reference, slow but right.
+//! a CubeCL device (any runtime) runs one fused CubeCL kernel per step, which reads the state once
+//! and writes the new state in place when the caller hands over the only reference to it, as a
+//! decoding loop that threads the state through does. The kernel asks of the device 256 units per
+//! cube and 6 KiB of shared memory, and takes heads up to 256 wide; elsewhere the reference runs
+//! (`kernel_takes` tells which). It runs under CUDA, and under wgpu on OpenGL over D3D12 and on
+//! lavapipe (Vulkan on the CPU); CubeCL's CPU runtime, with as many units per cube as cores, runs
+//! the reference. The step is forward only: decoding takes no gradient. On an autodiff device a
+//! step whose inputs are not tracked runs the inner backend's step and returns untracked tensors;
+//! one with a tracked input runs the reference on the autodiff backend, so its gradients are those
+//! of the reference, slow but right.
 //!
 //! Several sequences packed into one row (`cu_seqlens`) are not supported: each batch row is one
 //! sequence.
 
+#[cfg(feature = "flex")]
+use burn::backend::Flex;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
 use burn::backend::tensor::FloatTensor;
 use burn::backend::{
-    Autodiff, AutodiffBackend, Backend, Dispatch, Flex, TensorMetadata, backend_extension,
+    Autodiff, AutodiffBackend, Backend, Dispatch, TensorMetadata, backend_extension,
 };
-use burn::tensor::{DType, FloatDType, Shape, Tensor};
+use burn::tensor::{DType, Device, FloatDType, Shape, Tensor};
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl")]
 mod kernel;
 
 /// The epsilon of transformers' (and fla's) l2 normalisation of `q` and `k`.
@@ -60,7 +66,12 @@ pub mod probe {
     }
 }
 
-#[backend_extension(Flex, Cube: cfg(feature = "cuda"), Fusion: cfg(feature = "fusion"), Autodiff)]
+#[backend_extension(
+    Flex: cfg(feature = "flex"),
+    Cube: cfg(feature = "cubecl"),
+    Fusion: cfg(feature = "fusion"),
+    Autodiff
+)]
 pub trait GatedDeltaStepBackend: Backend {
     /// One token of the recurrent gated delta rule; see the [module documentation](self).
     /// Returns the output `[B, H, Dv]`, in `q`'s dtype, and the new state `[B, H, Dk, Dv]`, f32.
@@ -82,11 +93,12 @@ pub trait GatedDeltaStepBackend: Backend {
     }
 }
 
+#[cfg(feature = "flex")]
 impl GatedDeltaStepBackend for Flex {}
 
 /// Decoding takes no gradient, so an untracked step runs the inner backend's step (the kernel on
-/// CUDA) and records nothing. A step with a tracked input falls back to the reference on the
-/// autodiff backend, which records Burn's own operations: no written-out backward pass.
+/// a CubeCL device) and records nothing. A step with a tracked input falls back to the reference
+/// on the autodiff backend, which records Burn's own operations: no written-out backward pass.
 impl<B: Backend + GatedDeltaStepBackend, C: CheckpointStrategy> GatedDeltaStepBackend
     for Autodiff<B, C>
 {
@@ -132,9 +144,9 @@ impl<B: Backend + GatedDeltaStepBackend, C: CheckpointStrategy> GatedDeltaStepBa
 /// - `use_qk_l2norm`: transformers' `use_qk_l2norm_in_kernel`, which Qwen3.5 sets.
 ///
 /// Returns the output `[B, H, Dv]` in `q`'s dtype and the new state `[B, H, Dk, Dv]` in f32. The
-/// queries are scaled by `1 / sqrt(Dk)`, as in transformers. On CUDA the new state is written
-/// over the old one when `state` is the only reference to it; pass it by value from one step to
-/// the next to get that.
+/// queries are scaled by `1 / sqrt(Dk)`, as in transformers. Where the kernel runs, the new state
+/// is written over the old one when `state` is the only reference to it; pass it by value from
+/// one step to the next to get that.
 ///
 /// # Panics
 ///
@@ -173,7 +185,7 @@ pub fn gated_delta_step(
 }
 
 /// [`gated_delta_step`] through Burn's tensor operations alone, on any device: the reference
-/// that Flex runs and the CUDA kernel is held to. For tests and benchmarks.
+/// that Flex runs and the kernel is held to. For tests and benchmarks.
 #[doc(hidden)]
 pub fn gated_delta_step_reference(
     q: Tensor<3>,
@@ -205,6 +217,20 @@ pub fn gated_delta_step_reference(
         use_qk_l2norm,
     );
     (Tensor::from_dispatch(out), Tensor::from_dispatch(state))
+}
+
+/// Whether the kernel, rather than the reference, takes a step over inputs of shape
+/// `[B, H, Dk, Dv]` with `q`, `k` and `v` in `dtypes[0]`, `g` in `dtypes[1]` and `beta` in
+/// `dtypes[2]` on `device`: heads up to 256 wide, on a device with what the kernel asks (module
+/// documentation). `false` on any device not CubeCL's. For tests and benchmarks.
+#[doc(hidden)]
+pub fn kernel_takes(device: &Device, dtypes: [DType; 3], dims: [usize; 4]) -> bool {
+    #[cfg(feature = "cubecl")]
+    if let Some(client) = crate::cube::client(device.as_dispatch()) {
+        return kernel::kernel_takes(&client, dtypes, dims);
+    }
+    let _ = (device, dtypes, dims);
+    false
 }
 
 /// Checks that the step's inputs fit together and returns `[B, H, Dk, Dv]`. `shapes` are those

@@ -44,8 +44,9 @@
 //! # Backends
 //!
 //! The trait's default bodies ([`CausalConv1dBackend`]) are the reference, built from Burn's
-//! tensor operations in f32 for any width; every device runs them. On CUDA, kernel widths 1 to
-//! [`MAX_KERNEL_WIDTH`] run CubeCL kernels (others run the reference):
+//! tensor operations in f32 for any width; every device runs them. On a CubeCL device (any
+//! runtime), kernel widths 1 to [`MAX_KERNEL_WIDTH`] run CubeCL kernels (others run the
+//! reference):
 //!
 //! - the forward pass: one kernel; each thread walks a run of steps of one or two channels,
 //!   keeping the last `K - 1` inputs in registers;
@@ -54,6 +55,10 @@
 //!   derivative is fused, its pre-activation recomputed from `x`, `weight` and `bias` rather than
 //!   kept, so training holds only the inputs for this operation;
 //! - a decoding step: one kernel.
+//!
+//! The kernels ask of the device cubes of 256 units, and no shared memory or plane operations:
+//! CUDA and wgpu (lavapipe, OpenGL) have that; CubeCL's CPU runtime, with as many units per cube
+//! as cores, runs the reference.
 //!
 //! On `Autodiff` the forward records one node, whose backward runs
 //! [`CausalConv1dBackend::causal_conv1d_backward`].
@@ -67,17 +72,17 @@ use burn::backend::tensor::FloatTensor;
 use burn::backend::{
     Autodiff, AutodiffBackend, Backend, Dispatch, ExtensionType, backend_extension,
 };
-use burn::tensor::{DType, Tensor};
+use burn::tensor::{DType, Device, Tensor};
 use std::sync::atomic::Ordering;
 
 #[cfg(feature = "flex")]
 use burn::backend::Flex;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl")]
 mod cube;
 mod reference;
 
-/// The widest kernel the CUDA kernels take; wider ones run the reference. Each channel a thread
+/// The widest kernel the CubeCL kernels take; wider ones run the reference. Each channel a thread
 /// carries holds `4 K` f32 values in registers in the backward pass (the taps, the last `K`
 /// inputs and output gradients, and the weight gradient's sums), so the width is bounded by the
 /// register file rather than by the algorithm.
@@ -149,7 +154,7 @@ pub mod probe {
     pub(super) static UPDATE_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static BACKWARD_RUNS: AtomicUsize = AtomicUsize::new(0);
 
-    /// Launches of this module's CUDA kernels, all of them (zero without `--features cuda`).
+    /// Launches of this module's CubeCL kernels, all of them (none where the reference runs).
     pub fn kernel_launches() -> usize {
         forward_launches() + backward_launches() + update_launches()
     }
@@ -176,9 +181,29 @@ pub mod probe {
     }
 }
 
+/// Whether the CubeCL kernels, rather than the reference, take [`causal_conv1d`], its backward
+/// pass and [`causal_conv1d_update`] on `device` for `x` `[B, T, C]` (a step's `[B, C]` and its
+/// state fit within it), a kernel of width `width` and inputs in `dtype`: widths 1 to
+/// [`MAX_KERNEL_WIDTH`], on a device with what the kernels ask (module documentation). `false` on
+/// any device not CubeCL's. For tests, as the [`probe`] counters are.
+#[doc(hidden)]
+pub fn kernels_take(device: &Device, dtype: DType, width: usize, shape: [usize; 3]) -> bool {
+    #[cfg(feature = "cubecl")]
+    if let Some(client) = crate::cube::client(device.as_dispatch()) {
+        return cube::kernels_take(&client, dtype, width, shape);
+    }
+    let _ = (device, dtype, width, shape);
+    false
+}
+
 /// The causal depthwise convolution as a backend extension. The default bodies are the
 /// reference; the [module](self) gives the definition, layouts and dtypes.
-#[backend_extension(Flex: cfg(feature = "flex"), Cube: cfg(feature = "cuda"), Fusion: cfg(feature = "fusion"), Autodiff)]
+#[backend_extension(
+    Flex: cfg(feature = "flex"),
+    Cube: cfg(feature = "cubecl"),
+    Fusion: cfg(feature = "fusion"),
+    Autodiff
+)]
 pub trait CausalConv1dBackend: Backend {
     /// The convolution over a sequence: `x` `[B, T, C]`, `weight` `[C, K]` and the bias to the
     /// output `[B, T, C]`.

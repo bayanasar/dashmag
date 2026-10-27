@@ -175,11 +175,90 @@ pub fn check(
     e
 }
 
-/// The devices the tests run on: Flex always, and the first CUDA device with `--features cuda`.
+/// The devices the tests run on: Flex, and with a CubeCL runtime's feature the device of the
+/// runtime `DASH_OPS_DEVICE` names, as dash-ops' tests take it (`cube_device`).
+// Each device is pushed under its own feature.
+#[allow(unused_mut, clippy::vec_init_then_push)]
 pub fn devices() -> Vec<(&'static str, Device)> {
-    #[allow(unused_mut)]
-    let mut devices = vec![("flex", Device::flex().autodiff())];
-    #[cfg(feature = "cuda")]
-    devices.push(("cuda", Device::cuda(0).autodiff()));
+    let mut devices = Vec::new();
+    #[cfg(feature = "flex")]
+    devices.push(("flex", Device::flex().autodiff()));
+    #[cfg(feature = "cubecl")]
+    devices.push(("cubecl", cube_device().autodiff()));
     devices
+}
+
+/// The [`devices`] that have `dtype`; a test in that dtype skips the others, saying so.
+pub fn devices_with(dtype: DType) -> Vec<(&'static str, Device)> {
+    devices()
+        .into_iter()
+        .filter(|(name, device)| {
+            let has = device.supports_dtype(dtype);
+            if !has {
+                println!("skipped: {name} ({device:?}) has no {dtype:?}");
+            }
+            has
+        })
+        .collect()
+}
+
+/// The CubeCL runtimes, in the order a device is chosen when `DASH_OPS_DEVICE` names none:
+/// Burn's own order for its default device.
+pub const RUNTIMES: [&str; 7] = ["cuda", "metal", "rocm", "vulkan", "webgpu", "wgpu", "cpu"];
+
+/// The CubeCL device the tests run on beside Flex: that of the runtime `DASH_OPS_DEVICE` names,
+/// one of [`RUNTIMES`] whose feature this build has (`wgpu:vulkan`, `wgpu:gl`, `wgpu:dx12` and
+/// `wgpu:metal` pin wgpu's graphics API), else of the first of them it has.
+///
+/// # Panics
+///
+/// If `DASH_OPS_DEVICE` names a runtime this build does not have.
+#[cfg(feature = "cubecl")]
+pub fn cube_device() -> Device {
+    match std::env::var("DASH_OPS_DEVICE") {
+        Ok(name) => runtime(&name).unwrap_or_else(|| {
+            panic!("DASH_OPS_DEVICE={name}: not one of {RUNTIMES:?} built in, with its feature")
+        }),
+        Err(_) => RUNTIMES
+            .into_iter()
+            .find_map(runtime)
+            .expect("every runtime feature turns on `cubecl`, and only they do"),
+    }
+}
+
+/// The device of the runtime `name`, if this build has its feature.
+#[cfg(feature = "cubecl")]
+fn runtime(name: &str) -> Option<Device> {
+    #[allow(unused_imports)]
+    use burn::tensor::DeviceKind;
+    match name {
+        #[cfg(feature = "cuda")]
+        "cuda" => Some(Device::cuda(0)),
+        #[cfg(feature = "metal")]
+        "metal" => Some(Device::metal(DeviceKind::DefaultDevice)),
+        #[cfg(feature = "rocm")]
+        "rocm" => Some(Device::rocm(0)),
+        #[cfg(feature = "vulkan")]
+        "vulkan" => Some(Device::vulkan(DeviceKind::DefaultDevice)),
+        #[cfg(feature = "webgpu")]
+        "webgpu" => Some(Device::webgpu(DeviceKind::DefaultDevice)),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => Some(Device::wgpu(DeviceKind::DefaultDevice)),
+        #[cfg(feature = "cpu")]
+        "cpu" => Some(Device::cpu()),
+        #[cfg(feature = "wgpu")]
+        pinned if pinned.starts_with("wgpu:") => {
+            use burn::backend::{WgpuBackend, WgpuDevice, WgpuDeviceKind};
+            let api = match &pinned["wgpu:".len()..] {
+                "vulkan" => WgpuBackend::Vulkan,
+                "gl" => WgpuBackend::Gl,
+                "dx12" => WgpuBackend::Dx12,
+                "metal" => WgpuBackend::Metal,
+                _ => return None,
+            };
+            let device = WgpuDevice::new(WgpuDeviceKind::DefaultDevice).on(api);
+            Some(Device::new(device))
+        }
+        _ => None,
+    }
 }

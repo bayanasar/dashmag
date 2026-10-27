@@ -105,7 +105,7 @@ fn sub<B: Backend>(a: Ft<B>, b: Ft<B>) -> Ft<B> {
 }
 
 fn mm<B: Backend>(a: Ft<B>, b: Ft<B>) -> Ft<B> {
-    B::float_matmul(a, b)
+    crate::reference::matmul::<B>(a, b)
 }
 
 fn tr<B: Backend>(a: Ft<B>) -> Ft<B> {

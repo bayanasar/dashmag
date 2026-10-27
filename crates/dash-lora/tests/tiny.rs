@@ -475,7 +475,7 @@ fn f32_model_trains_as_peft_does() {
 
 #[test]
 fn bf16_model_trains_as_peft_does() {
-    for (name, device) in devices() {
+    for (name, device) in devices_with(DType::BF16) {
         train(name, &device, "bf16");
     }
 }
@@ -492,7 +492,9 @@ fn adamw_matches_torch_on_torch_gradients() {
             _ => (7e-8, 4.5e-7),
         };
         optimizer_alone(name, &device, "f32", bound);
-        optimizer_alone(name, &device, "bf16", bound);
+        if device.supports_dtype(DType::BF16) {
+            optimizer_alone(name, &device, "bf16", bound);
+        }
     }
 }
 
@@ -500,6 +502,8 @@ fn adamw_matches_torch_on_torch_gradients() {
 fn every_step_s_gradients_match_from_torch_s_parameters() {
     for (name, device) in devices() {
         teacher_forced(name, &device, "f32");
-        teacher_forced(name, &device, "bf16");
+        if device.supports_dtype(DType::BF16) {
+            teacher_forced(name, &device, "bf16");
+        }
     }
 }

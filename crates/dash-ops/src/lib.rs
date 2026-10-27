@@ -2,11 +2,12 @@
 //!
 //! Each operation is a backend extension (`burn::backend::backend_extension`): a trait whose
 //! default body builds the operation from Burn's own tensor operations, which is the reference
-//! every device can run and the tests hold everything else to; a CubeCL kernel on the CUDA
-//! backend where the reference is too slow or holds too much memory; and an implementation for
-//! `Autodiff` with the operation's own backward pass, so that training does not record the
-//! reference's intermediate tensors. `tests/extension_pattern.rs` is the smallest complete
-//! example of the three, and the shape each module here follows.
+//! every device can run and the tests hold everything else to; CubeCL kernels where the
+//! reference is too slow or holds too much memory, run on any CubeCL runtime whose device offers
+//! what they ask; and an implementation for `Autodiff` with the operation's own backward pass,
+//! so that training does not record the reference's intermediate tensors.
+//! `tests/extension_pattern.rs` is the smallest complete example of the three, and the shape
+//! each module here follows.
 //!
 //! - [`gated_delta`]: the gated delta rule of Gated DeltaNet, chunked for training and
 //!   recurrent for decoding.
@@ -63,9 +64,11 @@
 //!
 //! ## Parts
 //!
-//! The reference is the extension trait's default body, built from Burn's tensor operations in
-//! f32; every device runs it, and the tests hold everything else to it. Kernels are CubeCL;
-//! where a kernel does not take an input (a dtype, a head width), the reference runs instead. On
+//! The reference is the extension trait's default body, built from Burn's tensor operations in f32;
+//! every device runs it, and the tests hold everything else to it. Kernels are CubeCL, written once
+//! for every CubeCL runtime (`cuda`, `rocm`, `wgpu` and its `vulkan`, `metal` and `webgpu`, `cpu`);
+//! where a kernel does not take an input (a dtype, a head width), or the device lacks what it asks
+//! (shared memory, units per cube, a plane width, a dtype), the reference runs instead. On
 //! `Autodiff` the forward records one node whose backward is written out, keeping what it needs
 //! rather than the reference's intermediates. Each operation module has a `pub mod probe` with
 //! `fn kernel_launches() -> usize` and, where the backward is written out,
@@ -78,13 +81,26 @@
 //! ...) on seeded inputs and committed under `tests/fixtures/<op>/`. Errors are stated as
 //! `max |got - want|` and as that over `max |want|`, per output and gradient, each asserted just
 //! above the largest measured over every feature set the tests run with: the default (Flex),
-//! `cuda`, `cuda` with `fusion`, `cuda` with `autotune`, and `cuda` with both. Tests that read a
+//! `cuda`, `cuda` with `fusion`, `cuda` with `autotune`, and `cuda` with both; on other CubeCL
+//! runtimes where a machine offers them, `DASH_OPS_DEVICE` naming the device. Tests that read a
 //! global counter or draw from Burn's process-global random generator serialise on a mutex;
 //! inputs come from a seeded host generator, never from Burn's.
+
+// `cubecl` only gathers what every CubeCL runtime needs; one of them names the devices.
+#[cfg(all(
+    feature = "cubecl",
+    not(any(feature = "cuda", feature = "rocm", feature = "wgpu", feature = "cpu"))
+))]
+compile_error!(
+    "turn on a CubeCL runtime: `cuda`, `rocm`, `wgpu` (or `vulkan`, `metal`, `webgpu`) or `cpu`"
+);
 
 pub mod attention;
 pub mod checkpoint;
 pub mod conv1d;
+#[cfg(feature = "cubecl")]
+pub(crate) mod cube;
 pub mod gated_delta;
 pub mod logprob;
 pub mod loss;
+mod reference;

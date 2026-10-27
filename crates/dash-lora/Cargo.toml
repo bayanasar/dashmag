@@ -15,7 +15,18 @@ rust-version.workspace = true
 [features]
 default = ["flex"]
 flex = ["burn/flex", "burn/simd", "burn/rayon"]
-cuda = ["burn/cuda"]
+# The CubeCL runtimes, as in dash-ops. LoRA is built from Burn's own operations, so each only makes
+# its devices available.
+cuda = ["burn/cuda", "cubecl"]
+rocm = ["burn/rocm", "cubecl"]
+wgpu = ["burn/wgpu", "cubecl"]
+vulkan = ["burn/vulkan", "wgpu"]
+metal = ["burn/metal", "wgpu"]
+webgpu = ["burn/webgpu", "wgpu"]
+cpu = ["burn/cpu", "cubecl"]
+# What every runtime above turns on, for tests and examples to ask whether a CubeCL device is
+# there. Not a runtime itself.
+cubecl = []
 # Burn's autotune: each kernel chosen by timing the candidates on the device the first time a
 # shape runs, again in every new process (the tuning cache does not persist). Off by default for
 # the reason fusion is: it changes which kernels, and so which low bits, every Burn crate in the

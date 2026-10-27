@@ -5,18 +5,22 @@
 //! the causal mask a constant the layer function holds; checkpointed one layer or two at a time,
 //! and inside a model whose embedding, below the stack, is tied to its output projection. The
 //! loss, the stack input's gradient and every parameter's gradient are compared, in f32 and in
-//! bf16, on Flex and on CUDA: bit for bit, but for what `same_computation` and the layer norm
-//! test state. The layer function counts its calls: each unit runs once in each pass.
+//! bf16, on Flex and on a CubeCL device (`DASH_OPS_DEVICE`; the bf16 cases where it has bf16):
+//! bit for bit, but for what `same_computation` and the layer norm test state. The layer function
+//! counts its calls: each unit runs once in each pass.
 //!
 //! The stacks are drawn on the host from a seeded generator, not from Burn's process-wide one,
 //! so they do not depend on which other tests run at the same time.
 //!
 //!   cargo test --release -p dash-ops --test checkpoint -- --nocapture
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test checkpoint -- --nocapture
+//!   DASH_OPS_DEVICE=wgpu:vulkan cargo test --release -p dash-ops --features wgpu --test checkpoint
 //!
 //! and with `cuda,fusion`, `cuda,autotune` and `cuda,fusion,autotune`. `DASH_OPS_MEASURE=1`
 //! prints a bound a run exceeds instead of failing (`BOUND EXCEEDED: ...`), so that one run
 //! measures every error of a new build, from which the bounds are set.
+
+mod common;
 
 use std::cell::Cell;
 use std::sync::{Mutex, MutexGuard};
@@ -394,12 +398,16 @@ fn check_run(name: &str, r: &Run, p: &Run, max_rel: f64) {
     }
 }
 
-/// The devices the tests run on: Flex always, and the first CUDA device with `cuda`.
+/// The devices the tests run on: Flex, and the CubeCL device `DASH_OPS_DEVICE` names with a
+/// CubeCL runtime's feature.
+// Each device is pushed under its own feature.
+#[allow(unused_mut, clippy::vec_init_then_push)]
 fn devices() -> Vec<(&'static str, Device)> {
-    #[allow(unused_mut)]
-    let mut devices = vec![("flex", Device::flex().autodiff())];
-    #[cfg(feature = "cuda")]
-    devices.push(("cuda", Device::cuda(0).autodiff()));
+    let mut devices = Vec::new();
+    #[cfg(feature = "flex")]
+    devices.push(("flex", Device::flex().autodiff()));
+    #[cfg(feature = "cubecl")]
+    devices.push(("cubecl", common::cube_device().autodiff()));
     devices
 }
 
@@ -433,6 +441,9 @@ fn checkpointed_stack_gives_plain_autodiff_s_gradients() {
             (F32, "f32", same_computation(name).0),
             (BF16, "bf16", same_computation(name).1),
         ] {
+            if !common::has(&device, precision.values) {
+                continue;
+            }
             let (layers, x) = stack(4, NormKind::Rms, precision, &device, 7);
             let p = plain(&layers, &x, &mask);
             for per_unit in [1, 2] {
@@ -514,6 +525,9 @@ fn a_layer_norm_stack_differs_on_flex_by_roundings() {
             _ => same_computation(name).0,
         };
         check_run(&format!("{name} layer norm f32"), &r, &p, max_rel);
+        if !common::has(&device, DType::BF16) {
+            continue;
+        }
         for seed in 0..8 {
             let (worst, overall) = bf16_ratios(name, NormKind::Layer, &device, seed);
             println!(
@@ -622,6 +636,7 @@ fn a_model_around_the_stack_gives_plain_autodiff_s_gradients() {
 /// On a device with Burn's own (per-operation) checkpointing the leaves the backward pass makes
 /// carry the parameters' strategy, so no operation mixes two; when every parameter is frozen and
 /// only the input's gradient is asked for, the input's strategy.
+#[cfg(feature = "flex")]
 #[test]
 fn checkpointing_runs_under_balanced_checkpointing() {
     let _serial = serial();
@@ -645,6 +660,7 @@ fn checkpointing_runs_under_balanced_checkpointing() {
 
 /// A layer used at two depths of the stack shares its parameters; their gradient is the sum of
 /// both uses', as plain autodiff gives.
+#[cfg(feature = "flex")]
 #[test]
 fn shared_parameters_accumulate_across_layers() {
     let _serial = serial();
@@ -662,6 +678,7 @@ fn shared_parameters_accumulate_across_layers() {
 
 /// A tensor that requires a gradient, used by the layer function without being a parameter of
 /// the layer, would have its gradient lost: refused.
+#[cfg(feature = "flex")]
 #[test]
 #[should_panic(expected = "requires a gradient and is not one of its parameters")]
 fn a_trainable_tensor_outside_the_layers_is_refused() {

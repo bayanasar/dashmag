@@ -281,7 +281,7 @@ fn recomputed_f32_stack_gives_plain_autodiff_s_gradients() {
 #[test]
 fn recomputed_bf16_stack_is_as_close_to_f32_as_plain_autodiff() {
     let _serial = serial();
-    for (name, device) in devices() {
+    for (name, device) in devices_with(DType::BF16) {
         for seed in 0..8 {
             let (worst, overall) = bf16_ratios(name, &device, seed, seed == 0);
             println!(
@@ -305,7 +305,7 @@ fn recomputed_bf16_stack_is_as_close_to_f32_as_plain_autodiff() {
 #[ignore]
 fn bf16_ratios_over_many_seeds() {
     let _serial = serial();
-    for (name, device) in devices() {
+    for (name, device) in devices_with(DType::BF16) {
         let (mut worst, mut overall) = (Vec::new(), Vec::new());
         for seed in 0..64 {
             let (w, o) = bf16_ratios(name, &device, seed, false);

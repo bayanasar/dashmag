@@ -1,4 +1,5 @@
-//! The CUDA path, and the two passes over the vocabulary it shares with [`crate::loss`].
+//! The CubeCL path, and the two passes over the vocabulary it shares with [`crate::loss`], on
+//! devices with what [`pass_requirements`] and [`gradient_requirements`] list.
 //!
 //! [`pass`], per block of rows and chunk of the vocabulary:
 //!
@@ -22,6 +23,7 @@
 
 use super::reference::Rows;
 use super::{ChosenLogprobBackend, LogprobOptions, coefficient, probe};
+use crate::cube::Requirements;
 use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::ops::{FloatTensorOps, IntTensorOps};
 use burn::backend::tensor::{FloatTensor, IntTensor};
@@ -31,6 +33,7 @@ use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::kernel::matmul::{MatmulStrategy, matmul};
 use burn_cubecl::ops::numeric::{empty_device_contiguous_dtype, zeros_client};
 use burn_cubecl::tensor::CubeTensor;
+use cubecl::client::Client;
 use cubecl::{calculate_cube_count_elemwise, prelude::*};
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -51,6 +54,9 @@ const ZSUM: usize = 7;
 /// Threads per cube of [`chunk_kernel`] and [`gradient_kernel`], one cube per row; at most 32
 /// planes.
 const CHUNK_THREADS: u32 = 256;
+
+/// The `f32` slots of [`chunk_kernel`]'s shared memory: six sums of up to 32 planes' partials.
+const SCRATCH: usize = 192;
 
 /// The most rows given to one gradient matmul `[rows, C] x [C, D]`. Burn's default matmul kernel
 /// (no autotune) slows nine-fold from 4096 rows on, bf16 to f32 on an RTX 5070 Ti (7 TFLOPS at
@@ -88,7 +94,7 @@ fn chunk_kernel<P: Float, I: Numeric>(
     let z_col = z.stride(1);
     let (w_row, w_col) = (weights.stride(0), weights.stride(1));
     let (l_row, l_col) = (weights_lo.stride(0), weights_lo.stride(1));
-    let mut scratch = Shared::<[f32]>::new_slice(192usize);
+    let mut scratch = Shared::<[f32]>::new_slice(SCRATCH);
 
     // The target's column in this chunk, or `width` if it is elsewhere (or out of range).
     let target = i64::cast_from(targets[at * targets.stride(0)]) - i64::cast_from(c0);
@@ -273,14 +279,15 @@ fn accumulate_kernel(
     o[o_at] = acc;
 }
 
-/// Per row: `logprob = zt - (m + ln s)` where the target was seen (else `-inf`) and
-/// `entropy = ln s - a / s`.
+/// Per row: `logprob = zt - (m + ln s)` where the target was seen (else `neg_inf`, `-inf`, an
+/// argument because WGSL spells no infinity) and `entropy = ln s - a / s`.
 #[cube(launch_unchecked)]
 fn finish_rows_kernel(
     state: &Tensor<f32>,
     logprob: &mut Tensor<f32>,
     entropy: &mut Tensor<f32>,
     rows: u32,
+    neg_inf: f32,
 ) {
     let row = ABSOLUTE_POS;
     if row >= rows as usize {
@@ -295,7 +302,7 @@ fn finish_rows_kernel(
     if state[base + FOUND * col] > 0.5 {
         logprob[lp_at] = state[base + ZT * col] - (state[base + M * col] + ln_s);
     } else {
-        logprob[lp_at] = f32::new(f32::NEG_INFINITY);
+        logprob[lp_at] = neg_inf;
     }
     entropy[ent_at] = ln_s - state[base + A * col] / s;
 }
@@ -432,6 +439,62 @@ fn write_rows_kernel<W: Float>(
     out[at] = W::cast_from(m[row * m.stride(0) + col * m.stride(1)]);
 }
 
+/// What a [`pass`] over the vocabulary asks of the device for blocks of at most `rows` rows:
+/// [`chunk_kernel`]'s cubes of 256 units, one per row of a block, which sum over planes of any
+/// width at least 8 (one partial sum per plane in 32 slots of shared memory, [`SCRATCH`] f32 in
+/// all), binding six tensors, and 64-bit integers for the targets' columns (a target may be
+/// negative, an ignored row's). The other kernels are elementwise, sized by the device.
+pub(crate) fn pass_requirements(rows: usize) -> Requirements {
+    Requirements {
+        shared_bytes: 4 * SCRATCH,
+        min_plane_width: Some(CHUNK_THREADS / 32),
+        int64: true,
+        ..Requirements::new((CHUNK_THREADS, 1), (rows, 1), 6)
+    }
+}
+
+/// What a [`gradient_pass`] asks for blocks of at most `rows` rows: [`gradient_kernel`]'s cubes
+/// of 256 units, one per row of a block, binding five tensors, and 64-bit integers as the pass's
+/// kernel; no shared memory and no plane operations.
+pub(crate) fn gradient_requirements(rows: usize) -> Requirements {
+    Requirements {
+        int64: true,
+        ..Requirements::new((CHUNK_THREADS, 1), (rows, 1), 5)
+    }
+}
+
+/// Whether the kernels take a pass over the vocabulary (or, with `gradient`, the gradient pass)
+/// for `n` rows of `hidden`, `weight` and `targets` in `dtypes`, chunked by `options`, on the
+/// device `client` serves: its requirements met for the largest block of rows, in the dtypes
+/// the kernels read (the operands', the targets', the weight's and the masked ids' `u32`).
+pub(crate) fn kernels_take(
+    client: &Client,
+    [hidden, weight, targets]: [DType; 3],
+    n: usize,
+    options: LogprobOptions,
+    gradient: bool,
+) -> bool {
+    let rows = options.row_blocks(n).next().map_or(0, |block| block.len());
+    let requirements = match gradient {
+        true => gradient_requirements(rows),
+        false => pass_requirements(rows),
+    };
+    let operand = operand_dtype(hidden, weight);
+    requirements.met_on(client, &[operand, weight, targets, DType::U32])
+}
+
+/// [`kernels_take`] for these tensors.
+pub(crate) fn kernels_take_these(
+    hidden: &CubeTensor,
+    weight: &CubeTensor,
+    targets: &CubeTensor,
+    options: LogprobOptions,
+    gradient: bool,
+) -> bool {
+    let dtypes = [hidden.dtype, weight.dtype, targets.dtype];
+    kernels_take(&hidden.client, dtypes, hidden.shape()[0], options, gradient)
+}
+
 impl ChosenLogprobBackend for CubeBackend {
     fn chosen_logprob(
         hidden: FloatTensor<Self>,
@@ -440,6 +503,11 @@ impl ChosenLogprobBackend for CubeBackend {
         masked: Vec<u32>,
         options: LogprobOptions,
     ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        if !kernels_take_these(&hidden, &weight, &targets, options, false) {
+            let out =
+                super::reference::forward::<Self>(hidden, weight, targets, &masked, options, false);
+            return (out.logprob, out.entropy);
+        }
         let (logprob, entropy, _) = forward(hidden, weight, targets, &masked, options, false);
         (logprob, entropy)
     }
@@ -451,7 +519,16 @@ impl ChosenLogprobBackend for CubeBackend {
         masked: Vec<u32>,
         options: LogprobOptions,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
-        let (logprob, entropy, grad) = forward(hidden, weight, targets, &masked, options, true);
+        let (logprob, entropy, grad) =
+            match kernels_take_these(&hidden, &weight, &targets, options, false) {
+                true => forward(hidden, weight, targets, &masked, options, true),
+                false => {
+                    let out = super::reference::forward::<Self>(
+                        hidden, weight, targets, &masked, options, true,
+                    );
+                    (out.logprob, out.entropy, out.grad)
+                }
+            };
         (logprob, entropy, grad.expect("asked for the gradient"))
     }
 }
@@ -506,6 +583,7 @@ fn forward(
             logprob.clone().into_tensor_arg(),
             entropy.clone().into_tensor_arg(),
             n as u32,
+            f32::NEG_INFINITY,
         );
     }
     // The gradient, in place over `o`.
@@ -538,14 +616,18 @@ fn forward(
 
 /// The matmuls take both operands in one dtype: bf16 when both are, else f32. The bf16 path
 /// splits `o`'s softmax weights in two bf16 parts; f16 parts would lose the probabilities below
-/// 6e-8, which can add up over a large vocabulary, so f16 goes through f32 too. Returns `hidden`
-/// in that dtype, contiguous, and the dtype; the weight is cast chunk by chunk ([`weight_rows`]).
+/// 6e-8, which can add up over a large vocabulary, so f16 goes through f32 too.
+fn operand_dtype(hidden: DType, weight: DType) -> DType {
+    match (hidden, weight) {
+        (DType::BF16, DType::BF16) => DType::BF16,
+        _ => DType::F32,
+    }
+}
+
+/// `hidden` in the operands' dtype ([`operand_dtype`]), contiguous, and that dtype; the weight
+/// is cast chunk by chunk ([`weight_rows`]).
 fn operands(hidden: CubeTensor, weight: &CubeTensor) -> (CubeTensor, DType) {
-    let operand = if hidden.dtype == DType::BF16 && weight.dtype == DType::BF16 {
-        DType::BF16
-    } else {
-        DType::F32
-    };
+    let operand = operand_dtype(hidden.dtype, weight.dtype);
     let hidden = match hidden.dtype == operand {
         true => hidden,
         false => B::float_cast(hidden, FloatDType::F32),

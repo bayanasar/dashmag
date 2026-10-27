@@ -42,21 +42,28 @@
 //! # Backends
 //!
 //! The trait's default body ([`ChosenLogprobBackend`]) is the reference: the algorithm above in
-//! Burn's tensor operations, in f32 throughout (bf16 inputs are widened chunk by chunk). On
-//! the CUDA backend (`--features cuda`) the matmuls take bf16 operands straight to f32 results on
-//! the tensor cores (each product of two bf16 numbers is exact in f32, so the logits are those of
-//! an f32 matmul, up to summation order), and one CubeCL kernel per chunk does the masked online
-//! log-sum-exp and writes the softmax weights for the gradient's matmul. Those weights are f32
-//! values a bf16 matmul cannot take as they are, so they are split into a bf16 part and a bf16
-//! remainder (16 significant bits in all) and both go through the matmul, which keeps the
-//! gradient within about 1e-6 of an f32 computation at the cost of one more matmul.
+//! Burn's tensor operations, in f32 throughout (bf16 inputs are widened chunk by chunk). On a
+//! CubeCL device (any runtime) the matmuls take bf16 operands straight to f32 results (on the
+//! tensor cores where the device has them; each product of two bf16 numbers is exact in f32, so
+//! the logits are those of an f32 matmul, up to summation order), and one CubeCL kernel per chunk
+//! does the masked online log-sum-exp and writes the softmax weights for the gradient's matmul.
+//! Those weights are f32 values a bf16 matmul cannot take as they are, so they are split into a
+//! bf16 part and a bf16 remainder (16 significant bits in all) and both go through the matmul,
+//! which keeps the gradient within about 1e-6 of an f32 computation at the cost of one more
+//! matmul.
+//!
+//! That kernel asks of the device cubes of 256 units, plane operations on planes at least 8 wide
+//! (it sums over planes of whatever width the device runs, one partial sum per plane in shared
+//! memory) and 64-bit integers. CUDA has all three; where the device lacks one (wgpu on lavapipe
+//! or on OpenGL, with no plane operations; CubeCL's CPU runtime, with as many units per cube as
+//! cores) the reference runs on the device instead.
 //!
 //! [`crate::loss`] builds the cross-entropy loss on the same pass over the vocabulary, and adds
 //! the second pass a weight that trains needs.
 
 pub(crate) mod reference;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl")]
 pub(crate) mod cube;
 
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
@@ -68,13 +75,13 @@ use burn::backend::{
     Autodiff, AutodiffBackend, Backend, DType, Dispatch, FloatDType, Shape, TensorMetadata,
     backend_extension,
 };
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{Device, Int, Tensor};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// How the vocabulary and the rows are chunked. The largest chunk of logits held at once is
-/// `rows x vocab_chunk` f32 values, 96 MiB at most at the defaults; with the gradient, the CUDA
-/// backend holds as much again for the softmax weights (in two bf16 parts), two `[rows, D]` f32
-/// buffers and the `[n, D]` f32 gradient it fills.
+/// `rows x vocab_chunk` f32 values, 96 MiB at most at the defaults; with the gradient, the
+/// kernels hold as much again for the softmax weights (in two bf16 parts), two `[rows, D]` f32
+/// buffers and the `[n, D]` f32 gradient they fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogprobOptions {
     /// Vocabulary tokens per chunk (`C`), or 0 (the default) to choose by the size of the row
@@ -126,7 +133,12 @@ impl LogprobOptions {
 /// - `options`: the chunking.
 ///
 /// Outputs are f32: `logprob` `[n]` and `entropy` `[n]`.
-#[backend_extension(Flex, Cube: cfg(feature = "cuda"), Fusion: cfg(feature = "fusion"), Autodiff)]
+#[backend_extension(
+    Flex: cfg(feature = "flex"),
+    Cube: cfg(feature = "cubecl"),
+    Fusion: cfg(feature = "fusion"),
+    Autodiff
+)]
 pub trait ChosenLogprobBackend: Backend {
     /// `(logprob, entropy)`. On `Autodiff`, `logprob` carries the gradient for `hidden`.
     #[fusion(meta = fusion_meta::forward)]
@@ -161,6 +173,7 @@ pub trait ChosenLogprobBackend: Backend {
     }
 }
 
+#[cfg(feature = "flex")]
 impl ChosenLogprobBackend for burn::backend::Flex {}
 
 /// The per-row coefficients of the gradient pass ([`reference::gradient_pass`]), the rows of a
@@ -221,10 +234,30 @@ pub mod probe {
         BACKWARD_RUNS.load(Ordering::SeqCst)
     }
 
-    /// Launches of the CUDA chunk kernel (zero without `--features cuda`).
+    /// Launches of the CubeCL chunk kernel: one per chunk of the vocabulary and block of rows,
+    /// none where the reference runs.
     pub fn kernel_launches() -> usize {
         KERNEL_LAUNCHES.load(Ordering::SeqCst)
     }
+}
+
+/// Whether the CubeCL kernels, rather than the reference, take [`chosen_logprob`] on `device` for
+/// `n` rows, `hidden`, `weight` and `targets` in `dtypes` (in that order) and `options`'
+/// chunking: a device with what the chunk kernel asks (module documentation). `false` on any
+/// device not CubeCL's. For tests, as the [`probe`] counters are.
+#[doc(hidden)]
+pub fn kernels_take(
+    device: &Device,
+    dtypes: [DType; 3],
+    n: usize,
+    options: LogprobOptions,
+) -> bool {
+    #[cfg(feature = "cubecl")]
+    if let Some(client) = crate::cube::client(device.as_dispatch()) {
+        return cube::kernels_take(&client, dtypes, n, options, false);
+    }
+    let _ = (device, dtypes, n, options);
+    false
 }
 
 impl<B: Backend + ChosenLogprobBackend, C: CheckpointStrategy> ChosenLogprobBackend
@@ -337,7 +370,7 @@ pub struct ChosenLogprob {
 /// The log-probability of `targets` under `softmax(hidden @ weight^T)` with the `masked` token
 /// ids removed, and the entropy of that distribution, without holding the n x V logits.
 ///
-/// - `hidden` `[n, D]` (bf16 for the CUDA fast path, or f32); on an autodiff device it may
+/// - `hidden` `[n, D]` (bf16 for the kernels' fast path, or f32); on an autodiff device it may
 ///   require a gradient, and gets one.
 /// - `weight` `[V, D]`, the same dtype as `hidden` for the fast path; frozen: it must not
 ///   require a gradient (this panics if it does).

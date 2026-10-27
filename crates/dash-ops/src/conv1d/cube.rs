@@ -1,4 +1,5 @@
-//! The CUDA kernels, written in CubeCL for kernel widths 1 to [`MAX_KERNEL_WIDTH`].
+//! The CubeCL kernels, for kernel widths 1 to [`MAX_KERNEL_WIDTH`], on devices with what
+//! [`requirements`] lists.
 //!
 //! The operation is memory-bound: `K` multiply-adds per element against a read and a write.
 //! So each thread owns a run of [`TILE`] consecutive steps of one or two neighbouring channels
@@ -23,6 +24,7 @@
 use super::{
     Activation, Bias, CausalConv1dBackend, CausalConv1dOptions, MAX_KERNEL_WIDTH, probe, reference,
 };
+use crate::cube::Requirements;
 use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::tensor::FloatTensor;
 use burn::backend::{DType, Shape, TensorMetadata};
@@ -30,6 +32,7 @@ use burn_cubecl::CubeBackend;
 use burn_cubecl::kernel::{into_contiguous, untile};
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
+use cubecl::client::Client;
 use cubecl::prelude::*;
 use cubecl::tensor_vector_size_parallel;
 use std::sync::atomic::Ordering;
@@ -469,6 +472,44 @@ fn channels_last(tensor: CubeTensor) -> CubeTensor {
     }
 }
 
+/// What a launch of `units` threads binding `tensors` tensors indexed with `address` asks of the
+/// device: cubes of 256 units, as many as the threads need along x; no shared memory and no
+/// plane operations. Vectors of up to [`LANES`] channels, of a width the device offers
+/// (`io_optimized_vector_sizes`), so none it lacks. A launch's threads are counted with one
+/// channel each, the most it could need.
+fn requirements(units: usize, tensors: usize, address: AddressType) -> Requirements {
+    let cubes = units.div_ceil(CUBE as usize);
+    Requirements {
+        address,
+        ..Requirements::new((CUBE, 1), (cubes, 1), tensors as u32)
+    }
+}
+
+/// Whether the device of `inputs[0]` takes a launch of `units` threads binding `tensors`
+/// tensors (the bias among them, if any), indexed as `inputs` and the bias need, `inputs[0]`'s
+/// dtype and f32 read and written.
+fn fits(units: usize, tensors: usize, inputs: &[&CubeTensor], bias: &Bias<CubeBackend>) -> bool {
+    let mut all = inputs.to_vec();
+    if let Bias::Some(bias) = bias {
+        all.push(bias);
+    }
+    let tensors = tensors + usize::from(matches!(bias, Bias::Some(_)));
+    requirements(units, tensors, address_type(&all))
+        .met_on(&inputs[0].client, &[inputs[0].dtype, DType::F32])
+}
+
+/// Whether the kernels take the forward pass, the backward pass and a decoding step on the
+/// device `client` serves for `x` `[B, T, C]`, a kernel of `width` taps and inputs in `dtype`,
+/// counting the most threads and tensors of the three (the backward kernel's: five and a bias).
+pub(super) fn kernels_take(client: &Client, dtype: DType, width: usize, shape: [usize; 3]) -> bool {
+    let [batch, steps, channels] = shape;
+    let units = batch * steps.div_ceil(TILE) * channels;
+    let address = AddressType::from_len(batch * steps * channels);
+    (1..=MAX_KERNEL_WIDTH).contains(&width)
+        && matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
+        && requirements(units, 6, address).met_on(client, &[dtype, DType::F32])
+}
+
 /// Whether the kernels take these inputs: a kernel width from 1 to [`MAX_KERNEL_WIDTH`], and one
 /// float dtype of f32, bf16 and f16 for the weight, the bias and the `others`.
 fn kernels_apply(weight: &CubeTensor, bias: &Bias<CubeBackend>, others: &[&CubeTensor]) -> bool {
@@ -490,13 +531,14 @@ impl CausalConv1dBackend for CubeBackend {
         bias: Bias<Self>,
         options: CausalConv1dOptions,
     ) -> FloatTensor<Self> {
-        if !kernels_apply(&weight, &bias, &[&x]) {
+        let [batch, steps, channels] = x.shape().dims();
+        let units = batch * steps.div_ceil(TILE) * channels;
+        if !kernels_apply(&weight, &bias, &[&x]) || !fits(units, 3, &[&x, &weight], &bias) {
             return reference::forward::<Self>(x, weight, bias, options);
         }
         let x = channels_last(x);
         let weight = untile(weight);
         let bias = bias.into_option().map(untile);
-        let [batch, steps, channels] = x.shape().dims();
         let width = weight.shape().dims::<2>()[1];
         let out =
             empty_device_contiguous_dtype(x.client.clone(), x.device.clone(), x.shape(), x.dtype);
@@ -538,7 +580,12 @@ impl CausalConv1dBackend for CubeBackend {
         options: CausalConv1dOptions,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, Bias<Self>) {
         let [batch, steps, channels] = x.shape().dims();
-        if !kernels_apply(&weight, &bias, &[&x, &grad]) || batch * steps * channels == 0 {
+        // The backward kernel's threads and tensors, more than the reduction's.
+        let units = batch * steps.div_ceil(TILE) * channels;
+        if !kernels_apply(&weight, &bias, &[&x, &grad])
+            || batch * steps * channels == 0
+            || !fits(units, 5, &[&x, &weight, &grad], &bias)
+        {
             return reference::backward::<Self>(x, weight, bias, grad, options);
         }
         let x = channels_last(x);
@@ -627,6 +674,7 @@ impl CausalConv1dBackend for CubeBackend {
         if !kernels_apply(&weight, &bias, &[&x])
             || state.dtype != DType::F32
             || batch * channels == 0
+            || !fits(batch * channels, 5, &[&x, &state, &weight], &bias)
         {
             return reference::update::<Self>(x, state, weight, bias, options);
         }

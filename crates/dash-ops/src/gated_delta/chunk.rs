@@ -35,11 +35,17 @@
 //! from chunk to chunk, and forms the input gradients in each chunk.
 //!
 //! Every backend runs the reference built from Burn's tensor operations (`chunk/reference.rs`).
-//! On CUDA, heads up to 128 wide (`Dk, Dv <= 128`) run CubeCL kernels instead (`chunk/cube.rs`),
-//! all in f32 without tensor cores: per chunk, one kernel forms everything that does not depend
-//! on the state, one passes the state from chunk to chunk, one forms the output; the backward
-//! pass runs the first two again, passes the state's gradient back, and forms the gradients in
-//! five more per-chunk kernels. Wider heads run the reference on CUDA too.
+//! On a CubeCL device (any runtime), heads up to 128 wide (`Dk, Dv <= 128`) run CubeCL kernels
+//! instead (`chunk/cube.rs`), all in f32 without tensor cores: per chunk, one kernel forms
+//! everything that does not depend on the state, one passes the state from chunk to chunk, one
+//! forms the output; the backward pass runs the first two again, passes the state's gradient
+//! back, and forms the gradients in five more per-chunk kernels. The kernels ask of the device
+//! 256 units per cube, up to 90 KiB of shared memory forward and 98 KiB backward, and backward
+//! planes of exactly 32 units: CUDA cards of compute capability 8.0 and later have all of it. On
+//! a device without it, and for wider heads, the reference runs instead (`kernels_take` tells
+//! which): under wgpu on OpenGL over D3D12 and on lavapipe (Vulkan on the CPU), both with 32 KiB
+//! of shared memory and no plane operations, and on CubeCL's CPU runtime (as many units per cube
+//! as cores), for instance.
 //!
 //! Measured against transformers' function at f32 (the tests' fixtures), the output, the final
 //! state and every gradient agree to within 1.12e-6 relative to each tensor's largest value; from
@@ -52,7 +58,7 @@
 
 mod reference;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl")]
 mod cube;
 
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
@@ -64,7 +70,7 @@ use burn::backend::tensor::FloatTensor;
 use burn::backend::{
     Autodiff, AutodiffBackend, Backend, Dispatch, TensorMetadata, backend_extension,
 };
-use burn::tensor::{DType, FloatDType, Shape, Slice, Tensor, TensorCreationOptions};
+use burn::tensor::{DType, Device, FloatDType, Shape, Slice, Tensor, TensorCreationOptions};
 use std::sync::atomic::Ordering;
 
 pub use reference::CHUNK as CHUNK_SIZE;
@@ -87,6 +93,20 @@ pub mod probe {
     pub fn backward_runs() -> usize {
         BACKWARD_RUNS.load(Ordering::SeqCst)
     }
+}
+
+/// Whether the CubeCL kernels take a forward and a backward pass over inputs of `dtype` and
+/// shape `[B, T, H, Dk, Dv]` on `device`, rather than the reference: heads up to 128 wide, on a
+/// device with what the kernels ask (module documentation). `[false, false]` on any device not
+/// CubeCL's. For tests, as the [`probe`] counters are.
+#[doc(hidden)]
+pub fn kernels_take(device: &Device, dtype: DType, dims: [usize; 5]) -> [bool; 2] {
+    #[cfg(feature = "cubecl")]
+    if let Some(client) = crate::cube::client(device.as_dispatch()) {
+        return [false, true].map(|backward| cube::kernels_take(&client, dtype, dims, backward));
+    }
+    let _ = (device, dtype, dims);
+    [false, false]
 }
 
 #[cfg(feature = "fusion")]
@@ -148,7 +168,7 @@ mod fusion_meta {
 /// the initial state always present (zeros when there is none).
 #[backend_extension(
     Flex: cfg(feature = "flex"),
-    Cube: cfg(feature = "cuda"),
+    Cube: cfg(feature = "cubecl"),
     Fusion: cfg(feature = "fusion"),
     Autodiff
 )]

@@ -10,13 +10,15 @@
 //! memory, not plane operations, so the kernel does not depend on the plane width.
 
 use super::{GatedDeltaStepBackend, check_inputs, probe, reference};
+use crate::cube::Requirements;
 use burn::backend::TensorMetadata;
 use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::tensor::FloatTensor;
-use burn::tensor::Shape;
+use burn::tensor::{DType, Shape};
 use burn_cubecl::CubeBackend;
 use burn_cubecl::kernel::{into_contiguous, untile};
 use burn_cubecl::ops::numeric::empty_device_dtype;
+use cubecl::client::Client;
 use cubecl::prelude::*;
 use std::sync::atomic::Ordering;
 
@@ -200,6 +202,34 @@ fn gated_delta_step_kernel<Q: Float, G: Float, Bt: Float>(
     }
 }
 
+/// What the kernel asks of the device for a step over `[B, H, Dk, Dv]`, indexing with `address`:
+/// cubes of 32 by 8 units, one per batch row, head and 32 columns of the state; shared memory for
+/// `q` and `k` and four sums over the units (6 KiB at `Dk = 256`); eight tensors.
+fn requirements([b, h, dk, dv]: [usize; 4], address: AddressType) -> Requirements {
+    let units = COLS * ROW_GROUPS;
+    Requirements {
+        shared_bytes: 4 * (2 * dk + 4 * units),
+        address,
+        ..Requirements::new(
+            (COLS as u32, ROW_GROUPS as u32),
+            (b * h * dv.div_ceil(COLS), 1),
+            8,
+        )
+    }
+}
+
+/// Whether the kernel takes a step over `[B, H, Dk, Dv]` with `q`, `k`, `v` in `dtypes[0]`, `g`
+/// in `dtypes[1]` and `beta` in `dtypes[2]` on the device `client` serves, the tensors indexed
+/// with `u32`; the reference runs otherwise.
+pub(super) fn kernel_takes(client: &Client, dtypes: [DType; 3], dims: [usize; 4]) -> bool {
+    takes(client, dtypes, dims, AddressType::U32)
+}
+
+fn takes(client: &Client, dtypes: [DType; 3], dims: [usize; 4], address: AddressType) -> bool {
+    let [b, h, dk, dv] = dims;
+    b * h * dv > 0 && dk > 0 && dk <= MAX_DK && requirements(dims, address).met_on(client, &dtypes)
+}
+
 impl GatedDeltaStepBackend for CubeBackend {
     fn gated_delta_step(
         q: FloatTensor<Self>,
@@ -222,7 +252,14 @@ impl GatedDeltaStepBackend for CubeBackend {
             ],
             [q.dtype(), k.dtype(), v.dtype(), state.dtype()],
         );
-        if b * h * dv == 0 || dk == 0 || dk > MAX_DK {
+        // The tensors' buffers, as large as any the kernel indexes once they are untiled.
+        let address = [&q, &k, &v, &g, &beta, &state]
+            .iter()
+            .map(|tensor| tensor.required_address_type())
+            .max()
+            .unwrap_or_default();
+        let dtypes = [q.dtype, g.dtype, beta.dtype];
+        if !takes(&q.client, dtypes, [b, h, dk, dv], address) {
             return reference::<Self>(q, k, v, g, beta, state, use_qk_l2norm);
         }
 

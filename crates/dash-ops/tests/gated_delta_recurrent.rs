@@ -17,20 +17,27 @@
 //!
 //! Errors are reported as the largest absolute difference and as that over the largest absolute
 //! reference value ("relative"), and the relative one is asserted just above the largest measured
-//! on Flex and on CUDA, with and without fusion (in brackets below).
+//! (in brackets below) on Flex; on CUDA with and without fusion and autotune; under wgpu on
+//! lavapipe and on OpenGL over D3D12; and on CubeCL's CPU runtime.
+//!
+//! With a CubeCL runtime's feature the same checks run on that runtime's device
+//! (`tests/common`), the kernel where the device has what it asks and the reference elsewhere.
 //!
 //!   cargo test --release -p dash-ops --test gated_delta_recurrent
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test gated_delta_recurrent
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda,fusion --test gated_delta_recurrent
+//!   DASH_OPS_DEVICE=wgpu:vulkan cargo test --release -p dash-ops --features wgpu --test gated_delta_recurrent
+
+mod common;
 
 use burn::tensor::{DType, Device, Tensor, TensorData, bf16};
 use dash_ops::gated_delta::recurrent::gated_delta_step;
 use safetensors::{Dtype, SafeTensors};
 use std::path::Path;
 
-/// fp32 output, against torch or the reference [4.6e-7].
+/// fp32 output, against torch or the reference [4.7e-7].
 const F32_OUT: f32 = 8e-7;
-/// fp32 new state, against torch or the reference [1.9e-7].
+/// fp32 new state, against torch or the reference [2.6e-7, on lavapipe; 1.9e-7 on CUDA].
 const F32_STATE: f32 = 4e-7;
 /// bf16 inputs against torch's own bf16 path, which l2-normalises `q` and `k` in bf16 where this
 /// computes in f32: output [6.9e-3], state [3.4e-3].
@@ -296,85 +303,133 @@ fn check_untracked_autodiff(device: &Device) {
     assert_eq!(state.into_data(), plain_state.into_data());
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn step_matches_torch_on_flex() {
     check_f32_steps(&Device::flex());
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn prefill_with_the_chunked_rule_then_decode_on_flex() {
     check_prefill_then_decode(&Device::flex());
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn bf16_inputs_on_flex() {
     check_bf16_step(&Device::flex());
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn tracked_inputs_take_the_reference_and_its_gradients_on_flex() {
     check_gradients(&Device::flex().autodiff());
 }
 
+#[cfg(feature = "flex")]
 #[test]
 fn untracked_inputs_on_an_autodiff_device_on_flex() {
     check_untracked_autodiff(&Device::flex());
 }
 
-#[cfg(feature = "cuda")]
-mod cuda {
+/// The same checks on a CubeCL device, any runtime: the one `DASH_OPS_DEVICE` names.
+#[cfg(feature = "cubecl")]
+mod cube {
     use super::*;
-    use dash_ops::gated_delta::recurrent::{gated_delta_step_reference, probe};
+    use dash_ops::gated_delta::recurrent::{gated_delta_step_reference, kernel_takes, probe};
     use std::sync::{Mutex, MutexGuard};
 
     /// bf16 output of the kernel against the reference's: both round nearly equal f32 values to
     /// bf16 on their own, so they may differ by one bf16 ulp, 2^-7 [9.3e-4].
     const BF16_KERNEL_VS_REFERENCE: f32 = 8e-3;
+    /// The same in f16: one f16 ulp, 2^-10 [4.7e-4].
+    const F16_KERNEL_VS_REFERENCE: f32 = 1e-3;
 
     fn device() -> Device {
-        Device::cuda(0)
+        common::cube_device()
     }
 
-    /// The kernel counter is shared by the whole process: the CUDA tests take turns, so that
-    /// one test's launches are not counted, or found, in another's.
+    /// The kernel counter is shared by the whole process: the tests take turns, so that one
+    /// test's launches are not counted, or found, in another's.
     fn serial() -> MutexGuard<'static, ()> {
         static TURN: Mutex<()> = Mutex::new(());
         TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Asserts that `f` launched the step's kernel at least `n` times. Under fusion the kernel
-    /// runs when its results are read, so `f` reads them.
-    fn launches_kernel<R>(n: usize, f: impl FnOnce() -> R) -> R {
+    /// Whether the kernel takes steps of shape `[B, H, Dk, Dv]` with `q`, `k`, `v` and `beta`
+    /// in `dtype` and `g` in f32 on `device`, rather than the reference. Under CUDA it takes
+    /// every head it holds: every card has all it asks.
+    fn takes(device: &Device, dtype: DType, dims: [usize; 4]) -> bool {
+        let takes = kernel_takes(device, [dtype, DType::F32, dtype], dims);
+        if common::runtime_of(device) == Some("cuda") && dims[2] <= 256 {
+            assert!(takes, "CUDA turned the kernel away for {dims:?}");
+        }
+        takes
+    }
+
+    /// Whether `device` stores `dtype`; the tests in a dtype it does not skip, saying so.
+    fn has(device: &Device, dtype: DType) -> bool {
+        let has = device.supports_dtype(dtype);
+        if !has {
+            println!("skipped: {} has no {dtype:?}", common::describe(device));
+        }
+        has
+    }
+
+    /// Asserts that `f` launched the step's kernel at least `n` times when `kernel` (the kernel
+    /// takes the steps on this device), and never otherwise. Under fusion the kernel runs when
+    /// its results are read, so `f` reads them.
+    fn launches_kernel<R>(kernel: bool, n: usize, f: impl FnOnce() -> R) -> R {
         let before = probe::kernel_launches();
         let result = f();
         let launched = probe::kernel_launches() - before;
-        assert!(
-            launched >= n,
-            "the CUDA kernel ran {launched} times, expected {n}"
-        );
+        if kernel {
+            assert!(
+                launched >= n,
+                "the kernel ran {launched} times, expected {n}"
+            );
+        } else {
+            assert_eq!(
+                launched, 0,
+                "the kernel ran where the reference should have"
+            );
+        }
         result
     }
 
     #[test]
-    fn step_matches_torch_on_cuda() {
+    fn step_matches_torch_on_cubecl() {
         let _turn = serial();
-        launches_kernel(3, || check_f32_steps(&device()));
+        let device = device();
+        println!("{}", common::describe(&device));
+        // Dk 16 / Dv 24 twice, and Dk = Dv = 128.
+        let kernel = [[1, 2, 16, 24], [1, 2, 128, 128]]
+            .iter()
+            .all(|&dims| takes(&device, DType::F32, dims));
+        launches_kernel(kernel, 3, || check_f32_steps(&device));
     }
 
     #[test]
-    fn prefill_with_the_chunked_rule_then_decode_on_cuda() {
+    fn prefill_with_the_chunked_rule_then_decode_on_cubecl() {
         let _turn = serial();
-        launches_kernel(16, || check_prefill_then_decode(&device()));
+        let device = device();
+        let kernel = takes(&device, DType::F32, [1, 2, 128, 128]);
+        launches_kernel(kernel, 16, || check_prefill_then_decode(&device));
     }
 
     #[test]
-    fn bf16_inputs_on_cuda() {
+    fn bf16_inputs_on_cubecl() {
         let _turn = serial();
-        launches_kernel(1, || check_bf16_step(&device()));
+        let device = device();
+        if has(&device, DType::BF16) {
+            let kernel = takes(&device, DType::BF16, [1, 2, 128, 128]);
+            launches_kernel(kernel, 1, || check_bf16_step(&device));
+        }
     }
 
     #[test]
-    fn tracked_inputs_take_the_reference_and_its_gradients_on_cuda() {
+    fn tracked_inputs_take_the_reference_and_its_gradients_on_cubecl() {
         let _turn = serial();
         let before = probe::kernel_launches();
         check_gradients(&device().autodiff());
@@ -388,7 +443,9 @@ mod cuda {
     #[test]
     fn untracked_inputs_on_an_autodiff_device_run_the_kernel() {
         let _turn = serial();
-        launches_kernel(2, || check_untracked_autodiff(&device()));
+        let device = device();
+        let kernel = takes(&device, DType::F32, [1, 2, 16, 24]);
+        launches_kernel(kernel, 2, || check_untracked_autodiff(&device));
     }
 
     /// Deterministic standard normal values (xorshift and Box-Muller), the same on every device.
@@ -464,6 +521,8 @@ mod cuda {
             beta,
             state,
         } = inputs;
+        let [b, h, dk] = q.dims();
+        let kernel = takes(&q.device(), q.dtype(), [b, h, dk, v.dims()[2]]);
         let (ref_out, ref_state) = gated_delta_step_reference(
             q.clone(),
             k.clone(),
@@ -473,7 +532,7 @@ mod cuda {
             state.clone(),
             use_qk_l2norm,
         );
-        let (out, new_state) = launches_kernel(1, || {
+        let (out, new_state) = launches_kernel(kernel, 1, || {
             let (out, new_state) = gated_delta_step(q, k, v, g, beta, state, use_qk_l2norm);
             (out.into_data(), new_state.into_data())
         });
@@ -501,7 +560,11 @@ mod cuda {
             (DType::F32, true, [F32_OUT, F32_STATE]),
             (DType::F32, false, [F32_OUT, F32_STATE]),
             (DType::BF16, true, [BF16_KERNEL_VS_REFERENCE, F32_STATE]),
+            (DType::F16, true, [F16_KERNEL_VS_REFERENCE, F32_STATE]),
         ] {
+            if !has(&device, dtype) {
+                continue;
+            }
             let what = format!("B8 H16 D128 {dtype:?} l2norm={use_qk_l2norm}");
             kernel_against_reference(
                 inputs([8, 16, 128, 128], dtype, 7, &device),
@@ -593,7 +656,8 @@ mod cuda {
         let beta_t = beta.swap_dims(0, 1).into_data();
         let g = Tensor::<2>::from_data(g_t, &device).swap_dims(0, 1);
         let beta = Tensor::<2>::from_data(beta_t, &device).swap_dims(0, 1);
-        let (out, new_state) = launches_kernel(1, || {
+        let kernel = takes(&device, DType::F32, [b, h, dk, dv]);
+        let (out, new_state) = launches_kernel(kernel, 1, || {
             let (out, new_state) = gated_delta_step(
                 qkv.clone().narrow(2, 0, dk),
                 qkv.clone().narrow(2, dk, dk),
@@ -639,7 +703,8 @@ mod cuda {
         );
         let poison = Tensor::<4>::full([1, 1, dk, dv], f32::NAN, &device);
         let state = Tensor::cat(vec![state, poison], 1).narrow(1, 0, h);
-        let (out, new_state) = launches_kernel(1, || {
+        let kernel = takes(&device, DType::F32, [1, h, dk, dv]);
+        let (out, new_state) = launches_kernel(kernel, 1, || {
             let (out, new_state) = gated_delta_step(q, k, v, g, beta, state, true);
             (out.into_data(), new_state.into_data())
         });
@@ -664,7 +729,8 @@ mod cuda {
             state,
         } = inputs([2, 2, 64, 64], DType::F32, 19, &device);
         let before = state.to_data();
-        let new_state = launches_kernel(1, || {
+        let kernel = takes(&device, DType::F32, [2, 2, 64, 64]);
+        let new_state = launches_kernel(kernel, 1, || {
             gated_delta_step(q, k, v, g, beta, state.clone(), true)
                 .1
                 .into_data()

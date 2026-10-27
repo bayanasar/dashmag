@@ -1,9 +1,10 @@
 //! The reference: the chunked algorithm of the module docs in Burn's tensor operations, f32
-//! throughout. Every backend can run it; the tests hold the CUDA kernels to it, and it to
+//! throughout. Every backend can run it; the tests hold the CubeCL kernels to it, and it to
 //! PyTorch. Its two passes over the vocabulary serve [`crate::loss`] too: [`pass`], the forward
 //! pass, and [`gradient_pass`], the second pass a trained output weight needs.
 
 use super::{LogprobOptions, coefficient};
+use crate::reference::matmul;
 use burn::backend::tensor::{BoolTensor, FloatTensor, IntTensor};
 use burn::backend::{
     Backend, DType, FloatDType, Scalar, Shape, Slice, TensorData, TensorMetadata,
@@ -218,7 +219,7 @@ fn block_pass<B: Backend>(
             weight.clone(),
             &[Slice::from(c0..c1), Slice::full()],
         ));
-        let z = B::float_matmul(hidden.clone(), B::float_transpose(weight_c.clone()));
+        let z = matmul::<B>(hidden.clone(), B::float_transpose(weight_c.clone()));
         let chunk = Chunk::<B>::new(&targets_col, masked, c0, c1, device);
         let masked_fill = |x: FloatTensor<B>, value: f32| chunk.masked_fill(x, value);
 
@@ -260,7 +261,7 @@ fn block_pass<B: Backend>(
             .zsum
             .map(|zsum| B::float_add(zsum, B::float_sum_dim(masked_fill(z, 0.0), 1)));
         st.o =
-            st.o.map(|o| B::float_add(B::float_mul(o, alpha), B::float_matmul(e_other, weight_c)));
+            st.o.map(|o| B::float_add(B::float_mul(o, alpha), matmul::<B>(e_other, weight_c)));
         st.m = m_new;
     }
     st
@@ -289,8 +290,9 @@ impl<B: Backend> Chunk<B> {
             .map(|j| masked.binary_search(&(j as u32)).is_ok())
             .collect();
         let mask: Option<BoolTensor<B>> = in_chunk.iter().any(|&m| m).then(|| {
-            let row = B::bool_from_data(TensorData::new(in_chunk, [1, w]), device);
-            B::bool_expand(row, Shape::new([rows, w]))
+            // In the device's bool dtype: CubeCL devices store bools as integers.
+            let row = TensorData::new(in_chunk, [1, w]).convert_dtype(settings.bool_dtype.into());
+            B::bool_expand(B::bool_from_data(row, device), Shape::new([rows, w]))
         });
         let columns = B::int_reshape(
             B::int_arange(c0 as i64..c1 as i64, device, settings.int_dtype),
@@ -384,7 +386,7 @@ pub(crate) fn gradient_pass<B: Backend>(
                 weight.clone(),
                 &[Slice::from(range.clone()), Slice::full()],
             ));
-            let z = B::float_matmul(h.clone(), B::float_transpose(weight_c.clone()));
+            let z = matmul::<B>(h.clone(), B::float_transpose(weight_c.clone()));
             let chunk = Chunk::<B>::new(&t, masked, range.start, range.end, &device);
             let dz = B::float_sub(z, lse.clone());
             let p = B::float_exp(dz.clone());
@@ -399,9 +401,9 @@ pub(crate) fn gradient_pass<B: Backend>(
                 B::float_expand(target_value.clone(), Shape::new([rows, w])),
             );
             g = chunk.masked_fill(g, 0.0);
-            gh = gh.map(|gh| B::float_add(gh, B::float_matmul(g.clone(), weight_c)));
+            gh = gh.map(|gh| B::float_add(gh, matmul::<B>(g.clone(), weight_c)));
             if want_weight {
-                let part = B::float_matmul(B::float_transpose(g), h.clone());
+                let part = matmul::<B>(B::float_transpose(g), h.clone());
                 grad_weight[k] = Some(match grad_weight[k].take() {
                     Some(sum) => B::float_add(sum, part),
                     None => part,

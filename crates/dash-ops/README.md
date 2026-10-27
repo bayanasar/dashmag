@@ -3,14 +3,14 @@
 Training operations Burn 0.22 does not have built in. Each is a backend extension with its own
 backward pass:
 
-| module | operation | on CUDA |
+| module | operation | kernels |
 |---|---|---|
 | `gated_delta::chunk` | the gated delta rule, chunked, forward and backward | f32 kernels, no tensor cores yet |
 | `gated_delta::recurrent` | the gated delta rule one token at a time, for decoding | one kernel a step |
 | `attention` | causal attention with grouped key-value heads, a backward pass that keeps no T x T scores, and decoding against a key-value cache | FlashAttention-2 style kernels on the tensor cores |
-| `logprob` | the log-probability of chosen tokens under a large vocabulary, with the entropy, without the n x V logits | chunked matmuls and a fused log-sum-exp kernel |
-| `loss` | cross-entropy fused with the output layer over a large vocabulary (mean, sum or none; ignore index, label smoothing, z-loss, masked ids), with each row's log-probability and entropy, gradients for the hidden states and the output weight, without the n x V logits | `logprob`'s pass, and a second pass for the weight's gradient |
-| `conv1d` | causal depthwise conv1d of any kernel width, with an optional bias and activation (none or SiLU), and its decoding state | forward, backward and step kernels for widths 1 to 8 |
+| `logprob` | the log-probability of chosen tokens under a large vocabulary, with the entropy, without the n x V logits | chunked matmuls and a fused log-sum-exp kernel, on devices with plane operations on planes of 8 or more units (CUDA; not lavapipe, OpenGL or the CPU runtime) |
+| `loss` | cross-entropy fused with the output layer over a large vocabulary (mean, sum or none; ignore index, label smoothing, z-loss, masked ids), with each row's log-probability and entropy, gradients for the hidden states and the output weight, without the n x V logits | `logprob`'s pass, and a second pass for the weight's gradient whose kernel takes cubes of 256 units and 64-bit integers (CUDA, lavapipe; not OpenGL or the CPU runtime) |
+| `conv1d` | causal depthwise conv1d of any kernel width, with an optional bias and activation (none or SiLU), and its decoding state | forward, backward and step kernels for widths 1 to 8, on devices with cubes of 256 units (CUDA, lavapipe, OpenGL; not the CPU runtime) |
 | `checkpoint` | activation checkpointing: a stack of layers run outside autodiff, each layer run again in the backward pass (built on Burn's tensor API, not an extension) | the layers' own |
 
 Each operation has three parts: a reference built from Burn's tensor operations, which runs on
@@ -30,7 +30,23 @@ on Burn. See the repository for the full picture.
 ## Features
 
 - `flex` (default): the references, on the CPU.
-- `cuda`: the CubeCL kernels.
+- `cuda`, `rocm`, `wgpu`, `vulkan`, `metal`, `webgpu`, `cpu`: Burn's CubeCL runtimes, each with
+  the CubeCL kernels. Burn 0.22 has one CubeCL backend for all of them, and a tensor's device
+  names the runtime its kernels compile for: CUDA; HIP (`rocm`); WGSL on whichever graphics API
+  wgpu finds (`wgpu`), SPIR-V on Vulkan, MSL on Metal, WGSL in the browser (`webgpu`); LLVM for
+  the CPU (`cpu`). Before it launches, a kernel asks the device for what it needs (units per cube,
+  shared memory, a plane width, 64-bit integers, the dtypes it reads), and a device without it runs
+  the operation's reference. All operations' kernels do so but attention's, which still need `cuda`
+  (other runtimes' devices panic on them). Tested: `cuda` on an RTX 5070 Ti, where every kernel
+  runs; `wgpu` on the same card through OpenGL over D3D12 (Mesa's d3d12 driver under WSL2) and on
+  lavapipe (Vulkan on the CPU), both with 32 KiB of shared memory and no plane operations, where the
+  recurrent step's and conv1d's kernels run (and on lavapipe, with 64-bit integers, the loss's
+  second pass's) and the chunked gated delta rule and `logprob`'s pass (the loss's first) run their
+  references; `cpu`, with as many units per cube as cores, where the references run. `vulkan`
+  crashes lavapipe on any kernel with shared memory, Burn's own included (CubeCL's SPIR-V compiler
+  declares shared memory wrongly where a device lacks explicit workgroup layouts); `rocm` builds but
+  is untested, `metal` and `webgpu` are untested. The tests run the kernels on the device
+  `DASH_OPS_DEVICE` names (`tests/common/mod.rs`).
 - `fusion`: Burn's lazy fusion.
 - `autotune`: Burn's autotune. Matmul-heavy work wants it: on an RTX 5070 Ti, Burn's bf16
   [6144x3584]x[3584x1024] runs at 6 TFLOPS without it and 75 with it.

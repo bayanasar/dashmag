@@ -81,7 +81,7 @@ fn run(device_name: &str, device: &Device, tag: &str) {
 
 #[test]
 fn bf16_base_matches_peft() {
-    for (name, device) in devices() {
+    for (name, device) in devices_with(DType::BF16) {
         run(name, &device, "bf16");
     }
 }

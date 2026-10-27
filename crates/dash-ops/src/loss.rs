@@ -71,12 +71,19 @@
 //!   weight's gradient needs every row's final log-sum-exp before its first chunk, which is why
 //!   it takes the second pass; it holds one chunk of `dz` for all rows, `n x C`.
 //!
-//! On the CUDA backend the matmuls take bf16 operands when both inputs are bf16, with f32
-//! results. In the second pass `dz` is rounded to bf16 for the tensor cores, as torch's bf16
-//! linear layer rounds the gradient of its output; the forward pass's `o` takes its softmax
-//! weights in two bf16 parts, as `chosen_logprob` does. Every other input pair is computed in f32
-//! (f16 too: its parts would lose the smallest probabilities). Everything accumulates in f32;
-//! the gradients come back in the dtypes of `hidden` and `weight`, rounded once.
+//! On a CubeCL device (any runtime) the passes are `chosen_logprob`'s kernels: the matmuls take
+//! bf16 operands when both inputs are bf16, with f32 results. In the second pass `dz` is rounded
+//! to bf16 for the tensor cores, as torch's bf16 linear layer rounds the gradient of its output;
+//! the forward pass's `o` takes its softmax weights in two bf16 parts, as `chosen_logprob` does.
+//! Every other input pair is computed in f32 (f16 too: its parts would lose the smallest
+//! probabilities). Everything accumulates in f32; the gradients come back in the dtypes of
+//! `hidden` and `weight`, rounded once.
+//!
+//! Each pass runs its kernels where the device has what they ask, its reference otherwise: the
+//! forward pass's kernel sums over planes of any width at least 8, which CUDA has and wgpu on
+//! lavapipe or OpenGL does not; the second pass's kernel asks for cubes of 256 units and 64-bit
+//! integers, which lavapipe has, OpenGL lacks the integers and CubeCL's CPU runtime the units
+//! (it has as many units per cube as cores).
 
 use crate::logprob::LogprobOptions;
 use crate::logprob::coefficient;
@@ -90,7 +97,7 @@ use burn::backend::{
     Autodiff, AutodiffBackend, Backend, DType, Dispatch, FloatDType, Scalar, Shape, Slice,
     TensorData, TensorMetadata, backend_extension, get_or_init_device_settings,
 };
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{Device, Int, Tensor};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// How [`linear_cross_entropy`] reduces the rows' losses, as torch's `reduction`.
@@ -179,11 +186,16 @@ pub mod row {
 
 /// The fused linear cross-entropy as a backend extension. Inputs, for both operations:
 ///
-/// - `hidden` `[n, D]` and `weight` `[V, D]`, f32, bf16 or f16, one dtype (the CUDA path takes
-///   the tensor cores for bf16; any other pair is computed in f32);
+/// - `hidden` `[n, D]` and `weight` `[V, D]`, f32, bf16 or f16, one dtype (the kernels take bf16
+///   to the tensor cores; any other pair is computed in f32);
 /// - `targets` `[n]`, any int dtype;
 /// - `options`: as [`linear_cross_entropy`] takes them.
-#[backend_extension(Flex, Cube: cfg(feature = "cuda"), Fusion: cfg(feature = "fusion"), Autodiff)]
+#[backend_extension(
+    Flex: cfg(feature = "flex"),
+    Cube: cfg(feature = "cubecl"),
+    Fusion: cfg(feature = "fusion"),
+    Autodiff
+)]
 pub trait LinearCrossEntropyBackend: Backend {
     /// The forward pass: `(rows, o)`, both f32. `rows` `[row::COUNT, n]` holds per input row its
     /// loss, log-probability and entropy and what the backward pass reads (see [`row`]); `o`
@@ -254,13 +266,16 @@ pub trait LinearCrossEntropyBackend: Backend {
     }
 }
 
+#[cfg(feature = "flex")]
 impl LinearCrossEntropyBackend for burn::backend::Flex {}
 
-#[cfg(feature = "cuda")]
+/// The passes over the vocabulary in `chosen_logprob`'s kernels, each where the device has what
+/// they ask, its reference otherwise.
+#[cfg(feature = "cubecl")]
 mod cube {
     use super::{CrossEntropyOptions, LinearCrossEntropyBackend, Saved, backward, forward, probe};
-    use crate::logprob::cube;
-    use crate::logprob::reference::{Pass, sorted};
+    use crate::logprob::cube::{self, kernels_take_these};
+    use crate::logprob::reference::{self, Pass, sorted};
     use burn::backend::tensor::{FloatTensor, IntTensor};
     use burn_cubecl::CubeBackend;
 
@@ -272,6 +287,7 @@ mod cube {
             options: CrossEntropyOptions,
             accumulate: bool,
         ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+            let kernels = kernels_take_these(&hidden, &weight, &targets, options.chunks, false);
             forward::<Self>(
                 hidden,
                 weight,
@@ -279,6 +295,11 @@ mod cube {
                 &options,
                 accumulate,
                 |hidden, weight, targets, masked, chunks, accumulate, logit_sum| {
+                    if !kernels {
+                        return reference::pass::<Self>(
+                            hidden, weight, targets, masked, chunks, accumulate, logit_sum,
+                        );
+                    }
                     let (state, o) = cube::pass(
                         hidden,
                         weight,
@@ -287,7 +308,7 @@ mod cube {
                         chunks,
                         accumulate,
                         logit_sum,
-                        &probe::KERNEL_LAUNCHES,
+                        &probe::PASS_LAUNCHES,
                     );
                     Pass {
                         rows: cube::rows(state, logit_sum),
@@ -309,6 +330,7 @@ mod cube {
             grad_weight: bool,
         ) -> (FloatTensor<Self>, FloatTensor<Self>) {
             let masked = sorted(&options.masked);
+            let kernels = kernels_take_these(&hidden, &weight, &targets, options.chunks, true);
             backward::<Self>(
                 Saved {
                     hidden,
@@ -320,8 +342,8 @@ mod cube {
                 upstream,
                 &options,
                 [grad_hidden, grad_weight],
-                |hidden, weight, targets, coef, want| {
-                    cube::gradient_pass(
+                |hidden, weight, targets, coef, want| match kernels {
+                    true => cube::gradient_pass(
                         hidden,
                         weight,
                         targets,
@@ -331,8 +353,19 @@ mod cube {
                         options.entropy,
                         want[0],
                         want[1],
-                        &probe::KERNEL_LAUNCHES,
-                    )
+                        &probe::GRADIENT_LAUNCHES,
+                    ),
+                    false => reference::gradient_pass::<Self>(
+                        hidden,
+                        weight,
+                        targets,
+                        &masked,
+                        options.chunks,
+                        coef,
+                        options.entropy,
+                        want[0],
+                        want[1],
+                    ),
                 },
             )
         }
@@ -392,7 +425,8 @@ pub mod probe {
     use super::{AtomicUsize, Ordering};
 
     pub(super) static BACKWARD_RUNS: AtomicUsize = AtomicUsize::new(0);
-    pub(super) static KERNEL_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static PASS_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static GRADIENT_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static GRADIENT_PASSES: AtomicUsize = AtomicUsize::new(0);
 
     /// Runs of the written-out backward pass.
@@ -400,10 +434,20 @@ pub mod probe {
         BACKWARD_RUNS.load(Ordering::SeqCst)
     }
 
-    /// Launches of the CUDA chunk and gradient kernels for the loss (zero without
-    /// `--features cuda`).
+    /// Launches of the loss's CubeCL kernels, both passes' (none where the references run).
     pub fn kernel_launches() -> usize {
-        KERNEL_LAUNCHES.load(Ordering::SeqCst)
+        pass_launches() + gradient_launches()
+    }
+
+    /// Launches of the forward pass's chunk kernel: one per chunk of the vocabulary and block of
+    /// rows.
+    pub fn pass_launches() -> usize {
+        PASS_LAUNCHES.load(Ordering::SeqCst)
+    }
+
+    /// Launches of the second pass's gradient kernel: one per chunk and block.
+    pub fn gradient_launches() -> usize {
+        GRADIENT_LAUNCHES.load(Ordering::SeqCst)
     }
 
     /// Second passes over the vocabulary made by the backward pass (on any backend); none when
@@ -411,6 +455,28 @@ pub mod probe {
     pub fn gradient_passes() -> usize {
         GRADIENT_PASSES.load(Ordering::SeqCst)
     }
+}
+
+/// Whether the CubeCL kernels, rather than the reference, take the forward pass and the second
+/// pass of [`linear_cross_entropy`] on `device`, for `n` rows, `hidden`, `weight` and `targets`
+/// in `dtypes` (in that order) and `chunks`: a device with what each pass's kernel asks (module
+/// documentation). `[false, false]` on any device not CubeCL's. For tests, as the [`probe`]
+/// counters are.
+#[doc(hidden)]
+pub fn kernels_take(
+    device: &Device,
+    dtypes: [DType; 3],
+    n: usize,
+    chunks: LogprobOptions,
+) -> [bool; 2] {
+    #[cfg(feature = "cubecl")]
+    if let Some(client) = crate::cube::client(device.as_dispatch()) {
+        return [false, true].map(|gradient| {
+            crate::logprob::cube::kernels_take(&client, dtypes, n, chunks, gradient)
+        });
+    }
+    let _ = (device, dtypes, n, chunks);
+    [false, false]
 }
 
 /// The forward pass on any backend, given its pass over the vocabulary: `(rows, o)`.
@@ -687,8 +753,9 @@ fn vocab_sum<B: Backend>(weight: FloatTensor<B>, masked: &[u32], chunk: usize) -
     if !masked.is_empty() {
         let int_dtype = get_or_init_device_settings::<B>(&device).int_dtype;
         let ids = masked.iter().map(|&id| id as i64).collect::<Vec<_>>();
-        let ids = B::int_from_data(TensorData::new(ids, [masked.len()]), &device);
-        let ids = B::int_cast(ids, int_dtype);
+        // In the device's int dtype from the start: not every device computes in i64.
+        let ids = TensorData::new(ids, [masked.len()]).convert_dtype(int_dtype.into());
+        let ids = B::int_from_data(ids, &device);
         let rows = to_f32::<B>(B::float_select(weight, 0, ids));
         total = B::float_sub(total, B::float_sum_dim(rows, 0));
     }
@@ -821,7 +888,7 @@ impl<B: Backend + LinearCrossEntropyBackend, C: CheckpointStrategy> LinearCrossE
 /// with each row's log-probability of its target and, if asked, its entropy, without holding
 /// the n x V logits. See the [module](self) for the exact definition.
 ///
-/// - `hidden` `[n, D]`: bf16 for the CUDA fast path, or f32 (f16 is computed in f32); on an
+/// - `hidden` `[n, D]`: bf16 for the kernels' fast path, or f32 (f16 is computed in f32); on an
 ///   autodiff device it may require a gradient, and gets one.
 /// - `weight` `[V, D]`, the same dtype: it may require a gradient too, and gets one.
 /// - `targets` `[n]` token ids; [`CrossEntropyOptions::ignore_index`] marks rows to ignore.
