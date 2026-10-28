@@ -10,6 +10,7 @@ dash-lora's `metal` feature.
 | module | operation | on Metal |
 |---|---|---|
 | `attention` | attention with grouped key-value heads, causality, a sliding window, key padding and packed sequences, its log-sum-exp, a backward pass that keeps no more than a tile of scores, and decoding against a key-value cache | one kernel a tile for the forward pass's online softmax and one for the backward pass's probabilities and score gradients, the products MLX's matmuls; a flash-decoding kernel reading the cache in dash-ops' layout |
+| `checkpoint` | recompute for a stack of layers: forward one layer at a time keeping the inputs, backward one layer at a time from them | MLX's operations, evaluated layer by layer |
 | `conv1d` | causal depthwise conv1d of any small width, with an optional bias and SiLU, from initial states or zeros and to final states, over a batch or packed variable-length sequences, with its gradients; the decoding step | widths 2 to 8: forward, backward and step kernels; others the reference |
 | `gated_delta::chunk` | the gated delta rule, chunked, forward and backward: the l2 normalisation of queries and keys and the query scale as options, from initial states and to final states, over a batch or packed variable-length sequences | the chunks' triangular inverses and the scan from chunk to chunk; the rest MLX's batched operations |
 | `gated_delta::recurrent` | the gated delta rule a token at a time, for decoding: one token of each sequence, or several of each, packed | one kernel a call; its gradient the reference's |
@@ -261,6 +262,18 @@ the term in bf16), the range over two runs:
 The `up` kernel is what makes the exact f32 sum cheap: with MLX's operations instead (the base
 cast to f32, the term formed, added and cast back) the layer took 13.2-14.2 ms and 27.5-27.8 ms
 at +456 and +865 MiB.
+
+Recompute (`tests/checkpoint.rs`) gives a stack of LoRA'd blocks' input gradient and every
+adapter's bit for bit as MLX's autodiff over the whole stack gives them, in f32 and bf16, and
+leaves the layers holding their own arrays. On 8 such blocks (4096 tokens of 1024, hidden 3584,
+bf16, rank 16), a forward and backward pass, the range over two runs:
+
+| | time | peak above the inputs |
+|---|---|---|
+| MLX's autodiff over the stack | 294.8-295.8 ms | +2337 MiB |
+| dash-mlx `checkpoint` | 369.2-369.9 ms | +920 MiB |
+
+    cargo run --release -p dash-mlx --example checkpoint_bench
 
 ## Command buffers
 

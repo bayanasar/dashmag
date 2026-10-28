@@ -9,6 +9,7 @@
 //!
 //! - [`attention`]: attention with grouped key-value heads and the masks models train with, whose
 //!   backward pass keeps no T x T scores, and decoding against a key-value cache.
+//! - [`checkpoint`]: recompute for a stack of layers, one layer's activations alive at a time.
 //! - [`conv1d`]: causal depthwise conv1d with its states, over a batch or packed sequences, and
 //!   its decoding step.
 //! - [`gated_delta`]: the gated delta rule, chunked for training and recurrent for decoding.
@@ -34,6 +35,8 @@
 
 #[cfg(target_os = "macos")]
 pub mod attention;
+#[cfg(target_os = "macos")]
+pub mod checkpoint;
 #[cfg(target_os = "macos")]
 pub mod conv1d;
 #[cfg(target_os = "macos")]
