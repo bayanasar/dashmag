@@ -1,6 +1,6 @@
 [package]
 name = "dash-train"
-description = "Training modules for Burn, reproduced as PyTorch computes them: a masked, class-weighted multi-head cross-entropy, AdamW with beta1 set per step, OneCycleLR, macro-F1, logit calibration. The training loop and command line the crate still holds are moving to the application that uses them."
+description = "Training modules for Burn, reproduced as PyTorch computes them: a masked, class-weighted multi-head cross-entropy, AdamW with beta1 set per step, OneCycleLR, gradient clipping by the global norm, macro-F1, logit calibration. The training loop and command line the crate still holds are moving to the application that uses them."
 readme = "README.md"
 keywords = ["burn", "training", "classification", "machine-learning"]
 categories = ["science"]
@@ -21,6 +21,10 @@ flex = ["burn/flex", "burn/simd", "burn/rayon"]
 cuda = ["burn/cuda"]
 rocm = ["burn/rocm"]
 metal = ["burn/metal"]
+# Burn's lazy fusion and its autotune, as in dash-ops: off by default, for they change which
+# kernels, and so which low bits, every Burn crate in the same build runs.
+fusion = ["burn/fusion"]
+autotune = ["burn/autotune"]
 
 [dependencies]
 burn = { workspace = true, features = ["autodiff", "optim"] }

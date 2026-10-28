@@ -1,0 +1,170 @@
+{
+ "what": "gradients clipped by their global norm, recorded from PyTorch: per case the total norm, the coefficient the gradients were scaled by, and a digest of every clipped gradient",
+ "source": "torch 2.13.0+cu130, CPU (AVX512), one thread: torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type), other arguments default; exact: float64, the squares summed with math.fsum",
+ "cases": [
+ {
+  "name": "clips",
+  "dtype": "f32",
+  "norm_type": "2",
+  "max_norm": 1.0,
+  "params": [
+   {"shape": [1024, 1024], "seed": 1, "exp": 0, "dtype": "f32", "grad": "yes"},
+   {"shape": [3000, 333], "seed": 2, "exp": 1, "dtype": "f32", "grad": "yes"},
+   {"shape": [64, 32, 3, 3], "seed": 3, "exp": -3, "dtype": "f32", "grad": "yes"},
+   {"shape": [12, 64, 65], "seed": 4, "exp": -1, "dtype": "f32", "grad": "yes"},
+   {"shape": [4099], "seed": 5, "exp": -4, "dtype": "f32", "grad": "yes"},
+   {"shape": [16, 2048], "seed": 6, "exp": -2, "dtype": "f32", "grad": "yes"},
+   {"shape": [2048, 16], "seed": 7, "exp": 3, "dtype": "f32", "grad": "yes"},
+   {"shape": [7], "seed": 8, "exp": -2, "dtype": "f32", "grad": "yes"}
+  ],
+  "total": 1193.9361572265625,
+  "coef": 0.0008375657489523292,
+  "exact": 1193.9392838814524,
+  "digests": ["3bb43f81a33e7e45", "630c12323cabf768", "efb1ed72de268435", "e3e03d512b78d942", "b21fed33fa61a2df", "159dceb840cab25d", "b9c090355b92857c", "16a3ceb2e1d6c810"]
+ },
+ {
+  "name": "under",
+  "dtype": "f32",
+  "norm_type": "2",
+  "max_norm": 1500.0,
+  "params": [
+   {"shape": [1024, 1024], "seed": 1, "exp": 0, "dtype": "f32", "grad": "yes"},
+   {"shape": [3000, 333], "seed": 2, "exp": 1, "dtype": "f32", "grad": "yes"},
+   {"shape": [64, 32, 3, 3], "seed": 3, "exp": -3, "dtype": "f32", "grad": "yes"},
+   {"shape": [12, 64, 65], "seed": 4, "exp": -1, "dtype": "f32", "grad": "yes"},
+   {"shape": [4099], "seed": 5, "exp": -4, "dtype": "f32", "grad": "yes"},
+   {"shape": [16, 2048], "seed": 6, "exp": -2, "dtype": "f32", "grad": "yes"},
+   {"shape": [2048, 16], "seed": 7, "exp": 3, "dtype": "f32", "grad": "yes"},
+   {"shape": [7], "seed": 8, "exp": -2, "dtype": "f32", "grad": "yes"}
+  ],
+  "total": 1193.9361572265625,
+  "coef": 1.0,
+  "exact": 1193.9392838814524,
+  "digests": ["6ac2bbc5054088a0", "2d711a3ec6e42a87", "258379ba088f031d", "c6c1bcf44c68f431", "f1145d14144f6975", "70a07ce62f621ec0", "f439dc8479a93516", "716f402c08177649"]
+ },
+ {
+  "name": "inf",
+  "dtype": "f32",
+  "norm_type": "inf",
+  "max_norm": 0.3,
+  "params": [
+   {"shape": [1024, 1024], "seed": 1, "exp": 0, "dtype": "f32", "grad": "yes"},
+   {"shape": [3000, 333], "seed": 2, "exp": 1, "dtype": "f32", "grad": "yes"},
+   {"shape": [64, 32, 3, 3], "seed": 3, "exp": -3, "dtype": "f32", "grad": "yes"},
+   {"shape": [12, 64, 65], "seed": 4, "exp": -1, "dtype": "f32", "grad": "yes"},
+   {"shape": [4099], "seed": 5, "exp": -4, "dtype": "f32", "grad": "yes"},
+   {"shape": [16, 2048], "seed": 6, "exp": -2, "dtype": "f32", "grad": "yes"},
+   {"shape": [2048, 16], "seed": 7, "exp": 3, "dtype": "f32", "grad": "yes"},
+   {"shape": [7], "seed": 8, "exp": -2, "dtype": "f32", "grad": "yes"}
+  ],
+  "total": 15.995689392089844,
+  "coef": 0.018755052238702774,
+  "exact": 15.995689392089844,
+  "digests": ["1dccb0c9909d7f1a", "b740b9482eb03011", "2028fa13b91347e7", "d1b90149299130ee", "9b5d22bb5314f678", "414d4bb0615af33c", "1bbbbc0c67b83840", "b6784f8519f806f7"]
+ },
+ {
+  "name": "frozen",
+  "dtype": "f32",
+  "norm_type": "2",
+  "max_norm": 0.7,
+  "params": [
+   {"shape": [1024, 512], "seed": 11, "exp": -10, "dtype": "bf16", "grad": "frozen"},
+   {"shape": [8, 512], "seed": 12, "exp": -1, "dtype": "f32", "grad": "yes"},
+   {"shape": [1024, 8], "seed": 13, "exp": 2, "dtype": "f32", "grad": "yes"},
+   {"shape": [1024], "seed": 14, "exp": -12, "dtype": "bf16", "grad": "frozen"},
+   {"shape": [256], "seed": 15, "exp": -14, "dtype": "f32", "grad": "unused"},
+   {"shape": [10, 1024], "seed": 16, "exp": 0, "dtype": "f32", "grad": "yes"}
+  ],
+  "total": 95.37713623046875,
+  "coef": 0.007339284755289555,
+  "exact": 95.37712700005017,
+  "digests": [null, "683bad78721391b3", "1401e4ea2866d6ee", null, null, "6f1559ccd6b39a32"]
+ },
+ {
+  "name": "single",
+  "dtype": "f32",
+  "norm_type": "2",
+  "max_norm": 5.0,
+  "params": [
+   {"shape": [1000003], "seed": 21, "exp": 0, "dtype": "f32", "grad": "yes"}
+  ],
+  "total": 577.4949951171875,
+  "coef": 0.008658084087073803,
+  "exact": 577.4996032891644,
+  "digests": ["8125294a191e337f"]
+ },
+ {
+  "name": "clips",
+  "dtype": "bf16",
+  "norm_type": "2",
+  "max_norm": 1.0,
+  "params": [
+   {"shape": [1024, 1024], "seed": 1, "exp": 0, "dtype": "bf16", "grad": "yes"},
+   {"shape": [3000, 333], "seed": 2, "exp": 1, "dtype": "bf16", "grad": "yes"},
+   {"shape": [64, 32, 3, 3], "seed": 3, "exp": -3, "dtype": "bf16", "grad": "yes"},
+   {"shape": [12, 64, 65], "seed": 4, "exp": -1, "dtype": "bf16", "grad": "yes"},
+   {"shape": [4099], "seed": 5, "exp": -4, "dtype": "bf16", "grad": "yes"},
+   {"shape": [16, 2048], "seed": 6, "exp": -2, "dtype": "bf16", "grad": "yes"},
+   {"shape": [2048, 16], "seed": 7, "exp": 3, "dtype": "bf16", "grad": "yes"},
+   {"shape": [7], "seed": 8, "exp": -2, "dtype": "bf16", "grad": "yes"}
+  ],
+  "total": 1192.0,
+  "coef": 0.0008392333984375,
+  "exact": 1193.9607120093287,
+  "digests": ["fe070c24983adbf2", "12c102e40ba26b11", "1fe3fca6148ace78", "ae7659d97df8a673", "7210a6710f59b8c1", "1bbe552cd6855028", "cec80e4921fe9860", "9f6cf4e4cfdbbc95"]
+ },
+ {
+  "name": "under",
+  "dtype": "bf16",
+  "norm_type": "2",
+  "max_norm": 1500.0,
+  "params": [
+   {"shape": [1024, 1024], "seed": 1, "exp": 0, "dtype": "bf16", "grad": "yes"},
+   {"shape": [3000, 333], "seed": 2, "exp": 1, "dtype": "bf16", "grad": "yes"},
+   {"shape": [64, 32, 3, 3], "seed": 3, "exp": -3, "dtype": "bf16", "grad": "yes"},
+   {"shape": [12, 64, 65], "seed": 4, "exp": -1, "dtype": "bf16", "grad": "yes"},
+   {"shape": [4099], "seed": 5, "exp": -4, "dtype": "bf16", "grad": "yes"},
+   {"shape": [16, 2048], "seed": 6, "exp": -2, "dtype": "bf16", "grad": "yes"},
+   {"shape": [2048, 16], "seed": 7, "exp": 3, "dtype": "bf16", "grad": "yes"},
+   {"shape": [7], "seed": 8, "exp": -2, "dtype": "bf16", "grad": "yes"}
+  ],
+  "total": 1192.0,
+  "coef": 1.0,
+  "exact": 1193.9607120093287,
+  "digests": ["90fdba0b1b65dd87", "f1e4f74fa54e4f7f", "63a05b94b57fa9ec", "3f19113090ecdde4", "ca9b65676a5a277a", "f265af3a4d25b4ea", "e86c1c0b6868e5aa", "edc6e0b3d04c1c91"]
+ },
+ {
+  "name": "inf",
+  "dtype": "bf16",
+  "norm_type": "inf",
+  "max_norm": 0.3,
+  "params": [
+   {"shape": [1024, 1024], "seed": 1, "exp": 0, "dtype": "bf16", "grad": "yes"},
+   {"shape": [3000, 333], "seed": 2, "exp": 1, "dtype": "bf16", "grad": "yes"},
+   {"shape": [64, 32, 3, 3], "seed": 3, "exp": -3, "dtype": "bf16", "grad": "yes"},
+   {"shape": [12, 64, 65], "seed": 4, "exp": -1, "dtype": "bf16", "grad": "yes"},
+   {"shape": [4099], "seed": 5, "exp": -4, "dtype": "bf16", "grad": "yes"},
+   {"shape": [16, 2048], "seed": 6, "exp": -2, "dtype": "bf16", "grad": "yes"},
+   {"shape": [2048, 16], "seed": 7, "exp": 3, "dtype": "bf16", "grad": "yes"},
+   {"shape": [7], "seed": 8, "exp": -2, "dtype": "bf16", "grad": "yes"}
+  ],
+  "total": 16.0,
+  "coef": 0.018798828125,
+  "exact": 16.0,
+  "digests": ["d7c8c45d03e1f33e", "1c5e4e949412707f", "b8a0febffb0f9c8f", "b2c5f6a430877a7b", "ac783cf0d2db375d", "faddfaaacce4f95a", "8effc7813703f001", "e38b729549ca2c72"]
+ },
+ {
+  "name": "single",
+  "dtype": "bf16",
+  "norm_type": "2",
+  "max_norm": 5.0,
+  "params": [
+   {"shape": [1000003], "seed": 21, "exp": 0, "dtype": "bf16", "grad": "yes"}
+  ],
+  "total": 576.0,
+  "coef": 0.0086669921875,
+  "exact": 577.5056012563184,
+  "digests": ["3755a08ccf498651"]
+ }
+ ]
+}

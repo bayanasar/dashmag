@@ -8,6 +8,9 @@
 //! - [`optim`]: AdamW as `torch.optim.AdamW` computes it, with beta1 set per step; with
 //!   the schedules attached, held to PyTorch over a whole schedule.
 //! - [`schedule`]: `OneCycleLR` — learning rate per parameter group, and beta1.
+//! - [`clip`]: gradients clipped by their global norm, as `torch.nn.utils.clip_grad_norm_`
+//!   clips them for PPO and GRPO: one norm over every gradient a module's parameters have,
+//!   accumulated in f32 and returned as a tensor, with no read back to the host.
 //! - [`metrics`]: macro-F1 per head on validation, rounded as the recipe rounds it before
 //!   it picks the best epoch.
 //! - [`calibrate`]: one class's logit shifted by the value best on validation, folded
@@ -25,6 +28,9 @@
 //!   the same run as that seed there. Comparisons are between sets of seeds.
 //! - The crop's resize. torchvision resizes a `uint8` crop with its own antialiased
 //!   bilinear filter; here it is `dash-image`'s, which is Pillow's.
+//! - A bf16 gradient's norm. torch rounds each gradient's norm, the total and the clipping
+//!   coefficient to bf16; [`clip`] keeps them in f32 and rounds only the coefficient, for the
+//!   multiplication.
 //! - Batch norm's running variance. Burn keeps the biased batch variance, PyTorch the
 //!   unbiased one; they differ by a factor n / (n - 1), n the values per channel in a
 //!   batch — at least 6272 for MobileNetV3-Small at batch 128 and 224 x 224, so 1.6e-4
@@ -32,6 +38,7 @@
 
 pub mod cache;
 pub mod calibrate;
+pub mod clip;
 pub mod data;
 pub mod loss;
 pub mod metrics;
