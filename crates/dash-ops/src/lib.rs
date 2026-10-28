@@ -21,6 +21,8 @@
 //!   variable-length sequences, with the state a decoder carries.
 //! - [`lowrank`]: low-rank products `base + scale · (x Aᵀ) Bᵀ` of small rank, as LoRA and the
 //!   adapters built on it add to a frozen layer, with f32 factors over inputs of any float dtype.
+//! - [`sample`]: sampling the next token on the device, with temperature, top-k, top-p and
+//!   masked ids, from a counter-based generator, and the token's log-probabilities.
 //! - [`checkpoint`]: activation checkpointing, not an operation but built on Burn's tensor API:
 //!   a stack of layers run outside autodiff, each layer run again in the backward pass.
 //! - [`sequences`]: packed variable-length sequences, as the operations that take them share
@@ -111,4 +113,5 @@ pub mod logprob;
 pub mod loss;
 pub mod lowrank;
 mod reference;
+pub mod sample;
 pub mod sequences;
