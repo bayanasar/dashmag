@@ -114,6 +114,7 @@ for each configuration over three rounds; on flat logits every mode's device tim
 within 1% of the peaked figure. The kernel
 takes a cube a row, so a batch of 8 leaves most of the card idle; greedy's wall clock there,
 0.15 ms against 21.7 us on the device, is the host's part of the call.
+FlashInfer's fused sampling, which serving engines use on CUDA, has not been run beside it.
 
 The low-rank product's row is by device time under Nsight Systems: the kernels and Burn's own
 matmuls from `lowrank_bench`, PEFT's term the same way on PyTorch, from its timed passes but for
