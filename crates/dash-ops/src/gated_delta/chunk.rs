@@ -50,19 +50,22 @@
 //! compute capability 8.0 and later), every product runs on tensor cores (`chunk/cube/tc.rs`),
 //! with f32 accumulation. Their intermediates that only feed products are kept in the input
 //! dtype, as fla keeps them: `W`, `U`, the normalised keys, `T`, the state entering each chunk and
-//! `V'`, and backward `gamma Q`, the output's gradient, the state's gradient leaving each chunk,
-//! `dV'`, `dV_b` and `dKbg`. The decays, `A` and its inversion, the state carried from chunk to
-//! chunk and its gradient (in registers), the partial gradients summed within a kernel, the keys'
-//! gradient passed between the last two kernels, and the final states and the initial states'
-//! gradient stay f32. Backward they take six kernels: `W`, `U` and the keys from the kept `T`, the
-//! state passed forward, `P^T dO`, the state's gradient passed back, then one kernel for all but
-//! the WY part (the queries' and values' gradients whole) and one for the WY part (the keys', the
-//! gate's and `beta`'s). They ask of the device 256 units per cube (128 for the state passings, so
-//! that each cube holds a block of 32 state columns in four warps), planes of exactly 32 units
-//! (the warps the fragments are laid out over), 16-byte vectors, and shared memory up to 76.5 KiB
-//! (the backward's kernel for all but the WY part, at `Dk = Dv = 128`; the first kernel's 73.3
-//! KiB); the state passings hold 44 KiB forward and 48 KiB backward at `Dk = 128`, so that two of
-//! them fit on a multiprocessor of 100 KiB. Otherwise (f32 inputs, other widths, or a device without the instructions) the f32
+//! `V'`, and backward `gamma Q` (formed from the queries where the state's gradient is passed
+//! back), the state's gradient leaving each chunk, `dV'`, `dV_b` and `dKbg`; the output's gradient
+//! is read in that dtype by each kernel that uses it. The decays, `A` and its inversion, the state
+//! carried from chunk to chunk and its gradient (in registers), the partial gradients summed
+//! within a kernel, the keys' gradient passed between the last two kernels, and the final states
+//! and the initial states' gradient stay f32. Backward they take six kernels: `W`, `U` and the
+//! keys from the kept `T`, the state passed forward, `P^T dO` (which writes only it, and each
+//! query row's normalisation factor), the state's gradient passed back, then one kernel for all
+//! but the WY part (the queries' and values' gradients whole) and one for the WY part (the keys',
+//! the gate's and `beta`'s). They ask of the device 256 units per cube (128 for the state
+//! passings, so that each cube holds a block of 32 state columns in four warps, and for `P^T dO`,
+//! so that three of its cubes fit on a multiprocessor), planes of exactly 32 units (the warps the
+//! fragments are laid out over), 16-byte vectors, and shared memory up to 80.25 KiB (the output
+//! kernel, at `Dk = Dv = 128`; backward, the first kernel's 73.3 KiB where it runs again, the
+//! kernel for all but the WY part 68.5 KiB); the state passings hold 44 KiB forward and 48.5 KiB
+//! backward at `Dk = 128`, so that two of them fit on a multiprocessor of 100 KiB. Otherwise (f32 inputs, other widths, or a device without the instructions) the f32
 //! kernels run, in IEEE f32 without tensor cores, nine of them backward. Queries and keys wider
 //! than 128 run f32 kernels of their own (`chunk/cube/wide.rs`) that hold them and the state's
 //! rows a half (128 columns) at a time. The f32 kernels ask 256 units per cube; shared memory up
@@ -86,10 +89,10 @@
 //! digits), and against the f32 reference to within 7.02e-3 (the final states), and 1.13e-2 for
 //! the gate's gradient without the l2 normalisation, a difference of sums within each chunk; from
 //! f16 inputs, to within 7.46e-4 of the f32 reference. On an otherwise idle RTX 5070 Ti, 6144
-//! tokens with 16 heads of 128 and bf16 inputs take 2.72 ms of device time forward and backward in
-//! this operation's kernels as one sequence, 2.60 ms as four packed ones (fla 0.5.2, run in turn
-//! with them: 2.59 and 2.35 ms), and 0.81 and 0.79 ms forward (fla: 0.68 and 0.69 ms); the loss
-//! around it in the benchmark adds 0.96 ms of Burn's kernels (PyTorch's: 0.57). With heads of 256,
+//! tokens with 16 heads of 128 and bf16 inputs take 2.57 ms of device time forward and backward in
+//! this operation's kernels as one sequence, 2.44 ms as four packed ones (fla 0.5.2, run in turn
+//! with them: 2.54 and 2.37 ms), and 0.81 and 0.79 ms forward (fla: 0.69 and 0.70 ms); the loss
+//! around it in the benchmark adds 1.01 ms of Burn's kernels (PyTorch's: 0.57). With heads of 256,
 //! on the f32 kernels, 19.7 and 5.4 ms (fla: 6.6 and 1.9 ms) (`examples/gated_delta_chunk_bench.rs`,
 //! device times summed from `nsys`).
 

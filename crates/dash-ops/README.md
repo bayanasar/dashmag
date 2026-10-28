@@ -65,12 +65,12 @@ then leaves it no room.
 ## Measured
 
 On one RTX 5070 Ti (sm_120) under WSL2 with nothing else on the card, bf16, against PyTorch 2.13
-on the same card, the two run in turn (2026-10-27; sampling 2026-10-28), built with `cuda` only
-unless a row says otherwise:
+on the same card, the two run in turn (2026-10-27; sampling, and the chunked gated delta rule at
+heads of 128, 2026-10-28), built with `cuda` only unless a row says otherwise:
 
 | operation | shape | dash-ops | PyTorch |
 |---|---|---|---|
-| gated delta rule, chunked, forward + backward | 6144 tokens, 16 heads of 128: one sequence / four packed of 1536 | this operation's kernels 2.72 / 2.60 ms on the device (with the benchmark's loss 3.68 / 3.58; 4.1 / 4.0 ms on the host), +400 / +408 MiB; forward alone 0.81 / 0.79 ms on the device | fla's kernels 2.59 / 2.35 ms (with the loss 3.16 / 2.92; 3.5 / 3.3 ms on the host), +398 / +398 MiB; forward 0.68 / 0.69 ms (fla 0.5.2) |
+| gated delta rule, chunked, forward + backward | 6144 tokens, 16 heads of 128: one sequence / four packed of 1536 | this operation's kernels 2.57 / 2.44 ms on the device (with the benchmark's loss 3.58 / 3.45), +400 / +408 MiB; forward alone 0.81 / 0.79 ms on the device | fla's kernels 2.54 / 2.37 ms (with the loss 3.11 / 2.94), +398 / +398 MiB; forward 0.69 / 0.70 ms (fla 0.5.2) |
 | gated delta rule, chunked, forward + backward | the same with 16 heads of 256 (the f32 kernels) | 19.7 / 20.0 ms on the device, +1548 / +1985 MiB; forward 5.4 / 5.7 ms | 6.6 / 6.2 ms; forward 1.9 / 1.7 ms (fla 0.5.2) |
 | gated delta rule, one decoding step | batch 8, 16 heads of 128, 18 layers in turn | 21.7 us a layer (bf16 inputs 21.5) | 30.5 us (bf16 31.1; fla 0.5.2) |
 | attention, forward + backward | 6144 tokens, 8 query and 2 key-value heads of 256: causal; no mask; 4 packed sequences of 1536; causal within a window of 1024 | on the device, deterministic (the default): 9.17 ms, +60 MiB (and 24 MiB of f32 accumulators during the backward); 17.6 ms; 2.59 ms; 3.07 ms; with atomics: 7.62 ms (72 MiB of accumulators); 14.9 ms; 2.33 ms; 2.69 ms (wall clock 9.6; 18.1; 2.9; 3.4 ms and with atomics 8.0; 15.3; 2.7; 3.0 ms) | flash on the device: 7.30 ms, +204 MiB; 14.7 ms; 2.34 ms as a padded batch of 4; the window through flex_attention 4.35 ms |
@@ -83,17 +83,18 @@ unless a row says otherwise:
 
 The device times are sums over `nsys`'s kernels; each row's two sides ran alternately, two or three
 rounds each, and the figures are their medians. At heads of 128, forward and backward, the chunked
-gated delta rule's kernels on tensor cores take 1.05 times fla's time (1.11 packed): the state
-passings take 0.87 ms against fla's 0.92 (0.25 ms forward, twice, and 0.38 backward, against 0.20
-and 0.51), and the WY part 0.26 against 0.35 with the keys' l2 normalisation; the other per-chunk
-kernels are slower. Its first kernel inverts `I + A` with 64 units in f32, on CUDA cores (0.33 ms
-with the forward's other work, fla's 0.27 in three kernels and the l2 normalisation, its inversion
-on tensor cores in TF32), and the backward's kernel for all but the WY part holds 77 KiB of shared
-memory, so that one cube fits on a multiprocessor (0.62 ms, against 0.56 for fla's and the queries'
-l2 normalisation, `dv` going to fla's WY kernel); how much of either gap those account for has not
-been measured by switching them. The backward keeps the forward's `T` (8 KiB a chunk of each head) as fla
-does. The loss around it in the benchmark (a cast, a product and a sum over the output) takes
-0.96 ms in Burn's kernels and 0.57 in PyTorch's. Heads of 256 run the f32 kernels, three times fla's
+gated delta rule's kernels on tensor cores take 1.01 times fla's time (1.03 packed). Kernel by
+kernel, over one sequence: the state passings 0.90 ms against fla's 0.92 (0.25 ms forward, twice,
+and 0.41 backward, against 0.20 and 0.51); the WY part 0.26 against 0.26 and the local `dv` 0.11
+against 0.12; the first kernel 0.33 against 0.20 in fla's three, the output 0.24 against 0.18,
+recomputing `W` and `U` backward 0.18 against 0.16, and the kernel for all but the WY part 0.55
+against 0.40; fla's l2 normalisation of the queries and keys, 0.12 ms forward and 0.18 backward,
+runs in kernels of its own, where these fold it into theirs. The first kernel inverts `I + A` with
+64 units in f32, on CUDA cores, where fla inverts on tensor cores in TF32, and the kernel for all
+but the WY part holds 68.5 KiB of shared memory, so that one cube fits on a multiprocessor; how
+much of either gap those account for has not been measured by switching them.
+The backward keeps the forward's `T` (8 KiB a chunk of each head) as fla does. The loss around it in the benchmark (a cast, a product and a sum over the output) takes
+1.01 ms in Burn's kernels and 0.57 in PyTorch's. Heads of 256 run the f32 kernels, three times fla's
 time. Packed sequences cost about what one sequence of their length does: the state passings take
 each sequence's chunks in turn, two of their cubes fitting on a multiprocessor on tensor cores (44
 and 48 KiB of shared memory), one in f32.

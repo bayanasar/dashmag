@@ -2982,9 +2982,10 @@ fn backward_fused(
 
 /// The backward pass on tensor cores, six kernels: `W`, `U` and the keys again from the `T` the
 /// forward pass kept (or the forward's prep again, where it kept none), the forward's state
-/// passing again, `dv_local`, the state's gradient passed back, then `tc_dqk_kernel` (all but the
-/// WY part, the queries' and the values' gradients whole) and `tc_wy_kernel` (the WY part, the
-/// keys', the gate's and `beta`'s gradients).
+/// passing again, `dv_local` (and each query row's l2 normalisation factor), the state's gradient
+/// passed back, then `tc_dqk_kernel` (all but the WY part, the queries' and the values' gradients
+/// whole) and `tc_wy_kernel` (the WY part, the keys', the gate's and `beta`'s gradients). The
+/// queries and the output's gradient are read where they are used, in `[B, T, H, D]`.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn tc_backward(
     q: CubeTensor,
@@ -3029,8 +3030,12 @@ fn tc_backward(
     let (count, dim) = l.per_chunk();
     let d_out = aligned(reference::to_dtype::<B>(d_out, dtype));
     let dv_local = empty_with(&q, l.chunked(dv), dtype);
-    let qg = empty_with(&q, l.chunked(dk), dtype);
-    let d_o = empty_with(&q, l.chunked(dv), dtype);
+    // Each query row's factor, for the state passing's `gamma Q`: kept with the l2 norm only.
+    let q_factor = if use_qk_l2norm {
+        empty_like(&q, l.per_token())
+    } else {
+        empty_like(&q, Shape::new([1]))
+    };
     launched_tc();
     // SAFETY (this and the per-chunk launches below): each cube reads its chunk's rows below the
     // chunk's count of tokens from the `[B, T, H, D]` tensors and its chunk of the chunked ones,
@@ -3039,14 +3044,13 @@ fn tc_backward(
         tc::tc_dvlocal_kernel::launch_unchecked(
             &client,
             count.clone(),
-            dim,
+            CubeDim::new_1d(tc::DVLOCAL_UNITS),
             q.clone().into_tensor_arg(),
             k.clone().into_tensor_arg(),
             p.gcum.clone().into_tensor_arg(),
             d_out.clone().into_tensor_arg(),
             dv_local.clone().into_tensor_arg(),
-            qg.clone().into_tensor_arg(),
-            d_o.clone().into_tensor_arg(),
+            q_factor.clone().into_tensor_arg(),
             l.plan.clone().into_tensor_arg(),
             t as u32,
             n as u32,
@@ -3066,7 +3070,8 @@ fn tc_backward(
     let d_initial = empty_like(&q, Shape::new([l.seqs, h, dk, dv]));
     let state_count = CubeCount::Static(dv.div_ceil(tc::STATE_COLS) as u32, (l.seqs * h) as u32, 1);
     launched_tc();
-    // SAFETY: as the forward state passing's.
+    // SAFETY: as the forward state passing's; the queries' and the output gradient's rows it reads
+    // are those of each chunk below its count of tokens, as the per-chunk kernels read them.
     unsafe {
         tc::tc_state_backward_kernel::launch_unchecked(
             &client,
@@ -3074,19 +3079,24 @@ fn tc_backward(
             CubeDim::new_1d(tc::STATE_UNITS),
             p.kn.clone().into_tensor_arg(),
             p.w.clone().into_tensor_arg(),
-            qg.into_tensor_arg(),
-            d_o.clone().into_tensor_arg(),
+            q.clone().into_tensor_arg(),
+            q_factor.into_tensor_arg(),
+            d_out.clone().into_tensor_arg(),
             dv_local.into_tensor_arg(),
             p.gcum.clone().into_tensor_arg(),
             d_last.into_tensor_arg(),
             l.offsets.clone().into_tensor_arg(),
+            l.plan.clone().into_tensor_arg(),
             ds_next.clone().into_tensor_arg(),
             dvn.clone().into_tensor_arg(),
             d_initial.clone().into_tensor_arg(),
+            t as u32,
             n as u32,
             h as u32,
+            scale,
             dk as u32,
             dv as u32,
+            use_qk_l2norm,
             l.packed,
             elem,
         );
@@ -3113,7 +3123,7 @@ fn tc_backward(
             p.gcum.clone().into_tensor_arg(),
             p.t.into_tensor_arg(),
             dvn.into_tensor_arg(),
-            d_o.into_tensor_arg(),
+            d_out.into_tensor_arg(),
             v_new.into_tensor_arg(),
             states.into_tensor_arg(),
             ds_next.into_tensor_arg(),
@@ -3334,15 +3344,17 @@ fn tc_shared_bytes(dk: usize, dv: usize, backward: bool) -> usize {
             .into_iter()
             .fold(0, usize::max);
     }
-    // The backward kernels stage the products over `Dv` (and the WY kernel those over `Dk`) 64
-    // columns at a time.
+    // The WY kernel stages the products over `Dv` and `Dk` 64 columns at a time, the kernel for
+    // all but the WY part those over `Dv` 32 at a time (two blocks of `S` and of `dS` at once).
+    // `P^T dO` holds the queries' tile (where the output's gradient goes next) and the keys'.
     let (vb, kb) = (dv.min(64), dk.min(64));
     let small = |count: usize| 4 * 64 * count;
     let wu = tile(64, dk) + tile(64, dk.max(dv)) + tile(64, 64) + small(3);
-    let dvlocal = 2 * tile(64, dk) + tile(64, dv) + tile(64, 64) + 4 * 64;
-    let state_backward = 2 * tile(64, dk) + tile(dk, tc::STATE_COLS) + 2 * tile(64, tc::STATE_COLS);
+    let dvlocal = tile(64, dk.max(dv)) + tile(64, dk) + small(1);
+    let state_backward =
+        2 * tile(64, dk) + tile(dk, tc::STATE_COLS) + 2 * tile(64, tc::STATE_COLS) + small(2);
     let dqk = 2 * tile(64, dk.max(dv))
-        + 2 * tile(64, vb)
+        + 2 * tile(64, dv.min(32))
         + tile(64, dv)
         + tile(64, 64)
         + small(10)
@@ -3355,8 +3367,8 @@ fn tc_shared_bytes(dk: usize, dv: usize, backward: bool) -> usize {
 }
 
 /// What the tensor-core kernels of a forward (or backward) pass over `[B, T, H, Dk, Dv]` ask
-/// of the device: 256 units per cube for the per-chunk kernels and 128 for the state passings,
-/// their cube counts (as [`requirements`] counts them), the shared memory of
+/// of the device: 256 units per cube for the per-chunk kernels (128 for `P^T dO`) and 128 for the
+/// state passings, their cube counts (as [`requirements`] counts them), the shared memory of
 /// [`tc_shared_bytes`], the tensors of the kernel binding the most, 16-byte vectors, and planes
 /// of exactly 32 units, the warps whose lanes the tensor-core fragments are laid out over.
 fn tc_requirements(
@@ -3376,7 +3388,7 @@ fn tc_requirements(
     let state = Requirements::new(
         (tc::STATE_UNITS, 1),
         (dv.div_ceil(tc::STATE_COLS), rows * h),
-        9,
+        if backward { 13 } else { 9 },
     );
     Requirements {
         shared_bytes: tc_shared_bytes(dk, dv, backward),
