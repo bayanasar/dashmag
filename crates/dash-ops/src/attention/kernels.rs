@@ -13,9 +13,14 @@
 //! for 16 rows of the output is 128 registers per lane, so a warp owns 16 query rows, and that a
 //! 16-row tile of queries, keys, values or output gradients is 8 KB:
 //!
-//! - forward: 128 queries per block, eight warps of 16 rows (two per scheduler, so that one
-//!   warp's `ldmatrix` and softmax overlap the other's products), and key blocks of 32 at
-//!   D = 256 (64 below): queries, keys and values take 64 + 16 + 16 KB.
+//! - forward: a warp per 16 query rows. At D = 256, 128 queries per block, eight warps (two per
+//!   scheduler, so that one warp's `ldmatrix` and softmax overlap the other's products), and key
+//!   blocks of 32: queries, keys and values take 64 + 16 + 16 KB. At D = 128, 128 queries and key
+//!   blocks of 64 (32 + 16 + 16 KB); at D = 64, 64 queries, four warps, and key blocks of 64
+//!   (8 + 8 + 8 KB), several blocks to a multiprocessor. FlashAttention's 64 queries and 64 keys
+//!   at D = 256 (four warps, 96 KB) is slower here: reading the next key and value tiles at once
+//!   takes 128 registers a lane beside the output's 128, reading them one after the other leaves
+//!   one warp per scheduler waiting on the loads.
 //! - backward, the products of each key block: 32 keys per block and 32 queries per step,
 //!   eight warps. The two D-long products (`S = Q K^T`, `dP = dO V^T`) are split 2 x 4 over the
 //!   warps (16 queries x 8 keys each), the 32-long ones 2 x 4 the other way: `dV += P^T dO` and
@@ -76,9 +81,6 @@ pub(crate) type V8 = Const<8>;
 /// Two elements: one 32-bit MMA register of bf16 or f16, or two f32 accumulator columns.
 pub(crate) type R2 = Const<2>;
 
-/// Rows of queries per block in the forward (eight warps of 16): with one block per
-/// multiprocessor, two warps per scheduler hide each other's latency.
-pub(crate) const FORWARD_BLOCK_Q: u32 = 128;
 /// Rows of queries per block of the fixed-order `dQ` (eight warps, two per 16 rows).
 pub(crate) const BLOCK_Q: u32 = 64;
 /// Keys per block and queries per step in the backward's products, and queries per tile of

@@ -26,8 +26,7 @@ use burn::tensor::{Device, Tensor, TensorData};
 #[cfg(feature = "cuda")]
 use dash_ops::attention::causal_attention_backward;
 use dash_ops::attention::{
-    AttentionMask, AttentionOptions, attention_decode, attention_with_lse, causal_attention,
-    causal_attention_with_lse, probe,
+    AttentionMask, AttentionOptions, attention_decode, attention_with_lse, causal_attention, probe,
 };
 use safetensors::{Dtype, SafeTensors};
 use std::sync::Mutex;
@@ -419,7 +418,7 @@ fn decode_with_gradients_is_attention_with_one_query_on_flex() {
 #[cfg(all(feature = "cubecl", feature = "flex"))]
 mod cube {
     use super::*;
-    use dash_ops::attention::{decode_kernels_take, kernels_take};
+    use dash_ops::attention::{causal_attention_with_lse, decode_kernels_take, kernels_take};
 
     fn device() -> Device {
         common::cube_device().autodiff()
@@ -841,6 +840,7 @@ mod cube {
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
+    use dash_ops::attention::causal_attention_with_lse;
 
     /// What CubeCL's pools on device 0 hold.
     struct Memory {

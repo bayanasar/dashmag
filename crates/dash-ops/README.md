@@ -65,8 +65,8 @@ then leaves it no room.
 ## Measured
 
 On one RTX 5070 Ti (sm_120) under WSL2 with nothing else on the card, bf16, against PyTorch 2.13
-on the same card, the two run in turn (2026-10-27; sampling, and the chunked gated delta rule at
-heads of 128, 2026-10-28), built with `cuda` only unless a row says otherwise:
+on the same card, the two run in turn (2026-10-27; sampling, the chunked gated delta rule at heads
+of 128 and attention's forward at heads of 64, 2026-10-28), built with `cuda` only unless a row says otherwise:
 
 | operation | shape | dash-ops | PyTorch |
 |---|---|---|---|
@@ -74,6 +74,7 @@ heads of 128, 2026-10-28), built with `cuda` only unless a row says otherwise:
 | gated delta rule, chunked, forward + backward | the same with 16 heads of 256 (the f32 kernels) | 19.7 / 20.0 ms on the device, +1548 / +1985 MiB; forward 5.4 / 5.7 ms | 6.6 / 6.2 ms; forward 1.9 / 1.7 ms (fla 0.5.2) |
 | gated delta rule, one decoding step | batch 8, 16 heads of 128, 18 layers in turn | 21.7 us a layer (bf16 inputs 21.5) | 30.5 us (bf16 31.1; fla 0.5.2) |
 | attention, forward + backward | 6144 tokens, 8 query and 2 key-value heads of 256: causal; no mask; 4 packed sequences of 1536; causal within a window of 1024 | on the device, deterministic (the default): 9.17 ms, +60 MiB (and 24 MiB of f32 accumulators during the backward); 17.6 ms; 2.59 ms; 3.07 ms; with atomics: 7.62 ms (72 MiB of accumulators); 14.9 ms; 2.33 ms; 2.69 ms (wall clock 9.6; 18.1; 2.9; 3.4 ms and with atomics 8.0; 15.3; 2.7; 3.0 ms) | flash on the device: 7.30 ms, +204 MiB; 14.7 ms; 2.34 ms as a padded batch of 4; the window through flex_attention 4.35 ms |
+| attention, forward | 6144 tokens, 8 query and 2 key-value heads of 64: causal; no mask; 4 packed sequences of 1536; causal within a window of 1024 | on the device 0.528; 0.902; 0.145; 0.163 ms (in the tiles of 128 queries that heads of 128 and 256 keep: 0.587; 1.09; 0.175; 0.199 ms) | flash through PyTorch's SDPA on the device: 0.557 ms (cuDNN's 0.510); 0.887 ms; 0.150 ms as a padded batch of 4; the window through flex_attention 0.169 ms |
 | attention, decoding | batch 8, 6144 cached keys: the whole cache; lengths from 100 to 6144; a window of 1024 | on the device 131 us; 36 us; 15 us a layer (wall clock over 24 calls between synchronisations: 146; 59; 37 us, the last two bound by the host's dispatch) | on the device 130 us; 3663 us (a padding mask); 26 us (the last 1025 keys) (wall clock 137; 3716; 34 us) |
 | sampling a token | batch 8 / 32, 248320 classes, bf16 logits peaked as a model's: greedy; temperature 0.7; with top-p 0.95, and on flat logits, where the cut keeps over half the vocabulary; top-k 50; temperature 0.7, top-k 50, top-p 0.95 | on the device 21.7 / 21.8 us; 136 / 136 us; 228 / 230 us, flat 460 / 462 us; 48.2 / 48.2 us; 49.4 / 49.4 us (wall clock under Nsight Systems 0.15 / 0.14; 0.27 / 0.27; 0.51 / 0.51, flat 0.75 / 0.74; 0.17 / 0.17; 0.17 / 0.17 ms) | sort, softmax, cumulative sum and multinomial, as Hugging Face's and vLLM's PyTorch samplers form them: on the device 67.9 / 152 us; 157 / 406 us; 720 / 2545 us, flat 706 / 2523 us; 131 / 338 us; 142 / 389 us (wall clock 0.12 / 0.21; 0.29 / 0.51; 0.96 / 2.85, flat 0.94 / 2.85; 0.42 / 0.50; 0.45 / 0.62 ms) |
 | log-probability, forward + backward | 3072 tokens, 248320 classes, width 1024 | 78.9 ms, +216 MiB (70.4 ms with `fusion` and `autotune`) | 86.7 ms, +8730 MiB |

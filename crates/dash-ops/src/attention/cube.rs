@@ -9,8 +9,8 @@
 //! kernels index their outputs and the per-row statistics densely.
 
 use super::kernels::{
-    BLOCK_KV, BLOCK_Q, FORWARD_BLOCK_Q, backward_kernel, decode_merge_kernel, decode_split_kernel,
-    delta_kernel, dq_kernel, finish_kernel, forward_kernel,
+    BLOCK_KV, BLOCK_Q, backward_kernel, decode_merge_kernel, decode_split_kernel, delta_kernel,
+    dq_kernel, finish_kernel, forward_kernel,
 };
 use super::{
     AttentionBackend, AttentionMaskPrimitive, AttentionOptions, CacheLengths, MaskShape,
@@ -39,10 +39,27 @@ const VECTOR: usize = 8;
 /// lanes its rows and columns, and the reductions shuffle across those lanes.
 const PLANE: u32 = 32;
 
-/// The forward's key block for head dimension `d`: 32 keys at 256, so that 128 queries, the keys
-/// and the values fit in 99 KB of shared memory; 64 below.
+/// The fixed-order `dQ` kernel's key block for head dimension `d`: 32 keys at 256, so that its 64
+/// queries, their output gradients, the keys and the values fit in 99 KB of shared memory; 64
+/// below.
 fn block_kv(d: usize) -> u32 {
     if d > 128 { 32 } else { 64 }
+}
+
+/// The forward's tiles for head dimension `d`, `(queries per cube, keys per step)`, the queries
+/// sixteen to a warp. At 256, 128 queries (eight warps, two per scheduler) and 32 keys, so that
+/// the queries, the keys and the values fit in 99 KB of shared memory; at 128, 128 queries and 64
+/// keys; at 64, 64 queries (four warps) and 64 keys, 24 KB, so that several cubes share a
+/// multiprocessor, which there takes less time than 128 queries (at 128 the two are close, 128
+/// queries ahead on packed sequences). FlashAttention's 64 queries and 64 keys at 256 take more
+/// time here: the next tiles are read through registers, and one warp per scheduler leaves the
+/// reads exposed (the kernels' documentation).
+fn forward_tiles(d: usize) -> (u32, u32) {
+    match d {
+        64 => (64, 64),
+        128 => (128, 64),
+        _ => (128, 32),
+    }
 }
 
 /// `[B, Tq, Tk, Hq, Hkv, D]` of queries `[B, Tq, Hq, D]` and keys `[B, Tk, Hkv, D]`.
@@ -58,23 +75,19 @@ fn bounds_bytes(rows: usize, groups: usize, keys: usize) -> usize {
     4 * (2 * rows + 4 * groups + keys)
 }
 
-/// What the forward kernel asks: 256 units per cube, a cube per 128 queries of each query head
-/// (and batch element), the query, key and value tiles, the rows' key intervals, the warps'
-/// spans and the padding flags in shared memory, eight tensors, 16-byte vectors and planes of
-/// 32.
+/// What the forward kernel asks: two units per query of its tile ([`forward_tiles`]), a cube per
+/// tile of queries of each query head (and batch element), the query, key and value tiles, the
+/// rows' key intervals, the warps' spans and the padding flags in shared memory, eight tensors,
+/// 16-byte vectors and planes of 32.
 fn forward_requirements([_, tq, _, hq, _, d]: [usize; 6]) -> Requirements {
-    let bkv = block_kv(d) as usize;
-    let rows = FORWARD_BLOCK_Q as usize;
+    let (block_q, bkv) = forward_tiles(d);
+    let (rows, bkv) = (block_q as usize, bkv as usize);
     let tiles = (rows + 2 * bkv) * d * 2;
     Requirements {
         shared_bytes: tiles + bounds_bytes(rows, rows / 16, bkv),
         vector_size: VECTOR,
         plane_width: Some(PLANE),
-        ..Requirements::new(
-            (2 * FORWARD_BLOCK_Q, 1),
-            (tq.div_ceil(FORWARD_BLOCK_Q as usize), hq),
-            8,
-        )
+        ..Requirements::new((2 * block_q, 1), (tq.div_ceil(rows), hq), 8)
     }
 }
 
@@ -413,7 +426,8 @@ fn forward(
     let [k_sb, k_sh, k_st] = sequence_strides(&key);
     let [v_sb, v_sh, v_st] = sequence_strides(&value);
     let [m_sb, m_st] = mask.key_strides;
-    let q_blocks = tq.div_ceil(FORWARD_BLOCK_Q as usize);
+    let (block_q, bkv) = forward_tiles(d);
+    let q_blocks = tq.div_ceil(block_q as usize);
     let cube_count = CubeCount::Static(q_blocks as u32, hq as u32, b as u32);
     let dtype = dtype_to_storage_type(query.dtype);
     launched();
@@ -424,7 +438,7 @@ fn forward(
         forward_kernel::launch_unchecked(
             &client,
             cube_count,
-            CubeDim::new_1d(2 * FORWARD_BLOCK_Q),
+            CubeDim::new_1d(2 * block_q),
             query.into_tensor_arg(),
             key.into_tensor_arg(),
             value.into_tensor_arg(),
@@ -453,8 +467,8 @@ fn forward(
             mask.right,
             scale,
             d as u32,
-            FORWARD_BLOCK_Q,
-            block_kv(d),
+            block_q,
+            bkv,
             mask.padded,
             mask.packed,
             dtype,

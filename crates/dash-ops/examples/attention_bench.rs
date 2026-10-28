@@ -9,24 +9,26 @@
 //!                                                # "causal", "window", "no mask", "decoding")
 //!   ... --example attention_bench -- 6144 atomic # the backward with atomics only ("fixed":
 //!                                                # the deterministic one only)
+//!   ... --example attention_bench -- 6144 d128   # heads of 128 (or "d64") rather than 256
 //!
-//! Training: T tokens, queries `[1, T, 8, 256]`, keys and values `[1, T, 2, 256]`, with each mask
-//! in turn: causal; none (every query sees every key); four packed sequences of `T / 4`
-//! tokens, causal within each; causal within a sliding window of 1024 keys. For each, the forward
-//! (with its log-sum-exp), the backward and both, the backward in both ways: deterministic, the
-//! default (`delta`, the fixed-order query gradient, the other four products, and where the
-//! products split the key and value gradients rounded from their f32 accumulators), and with
-//! atomics (`delta`, the five products, the gradients rounded from their f32 accumulators); for
-//! causal also both through `Autodiff` with `sum(o * dO)` as the loss, and the memory, each way. Decoding: batch 8, one query each (`[8, 8, 256]`), against a
-//! 6144-token cache (`[8, 6144, 2, 256]`), per layer: the whole cache, mixed cache lengths, and a
-//! window of 1024. Beside them, Burn's own `attention`, on inputs of its own in its layout,
-//! `[B, H, T, D]`, which takes no grouped heads (the key-value heads are expanded for it), and,
-//! for decoding, its flash kernel asked for by name. Each time is the median of 20 runs after 3
-//! warm-ups, with the device synchronised around each run, so a time includes one launch and
-//! synchronisation; decoding is also timed over 24 calls between synchronisations, as a step over
-//! the layers runs. Memory is the growth of the bytes CubeCL's pools hold in use, read after
-//! synchronising (under Burn's fusion nothing has run before), and the largest single allocation
-//! the pools that hold tensors served.
+//! Training: T tokens, queries `[1, T, 8, D]`, keys and values `[1, T, 2, D]` (D = 256 unless an
+//! argument says 64 or 128), with each mask in turn: causal; none (every query sees every key);
+//! four packed sequences of `T / 4` tokens, causal within each; causal within a sliding window of
+//! 1024 keys. For each, the forward (with its log-sum-exp), the backward and both, the backward in
+//! both ways: deterministic, the default (`delta`, the fixed-order query gradient, the other four
+//! products, and where the products split the key and value gradients rounded from their f32
+//! accumulators), and with atomics (`delta`, the five products, the gradients rounded from their
+//! f32 accumulators); for causal also both through `Autodiff` with `sum(o * dO)` as the loss, and
+//! the memory, each way. Decoding: batch 8, one query each (`[8, 8, 256]`), against a 6144-token
+//! cache (`[8, 6144, 2, 256]`), per layer: the whole cache, mixed cache lengths, and a window of
+//! 1024. Beside them, Burn's own `attention`, on inputs of its own in its layout, `[B, H, T, D]`,
+//! which takes no grouped heads (the key-value heads are expanded for it), and, for decoding, its
+//! flash kernel asked for by name. Each time is the median of 20 runs after 3 warm-ups, with the
+//! device synchronised around each run, so a time includes one launch and synchronisation; decoding
+//! is also timed over 24 calls between synchronisations, as a step over the layers runs. Memory is
+//! the growth of the bytes CubeCL's pools hold in use, read after synchronising (under Burn's
+//! fusion nothing has run before), and the largest single allocation the pools that hold tensors
+//! served.
 //!
 //! The times are wall clock; on a card other work shares, compare device times instead: run the
 //! benchmark under `nsys profile -t cuda` and take each kernel's median from
@@ -115,6 +117,14 @@ mod bench {
             .get(1)
             .map_or(6144, |a| a.parse().expect("sequence length"));
         let burn_too = args.iter().any(|a| a == "burn");
+        // The head dimension: 256 unless "d64" or "d128" says otherwise.
+        let d: usize = if args.iter().any(|a| a == "d64") {
+            64
+        } else if args.iter().any(|a| a == "d128") {
+            128
+        } else {
+            256
+        };
         // Which ways of summing the backward's query gradient run: deterministic, atomic.
         let ways: Vec<bool> = match (
             args.iter().any(|a| a == "fixed"),
@@ -128,11 +138,14 @@ mod bench {
         let filters: Vec<&str> = args[1..]
             .iter()
             .map(String::as_str)
-            .filter(|a| a.parse::<usize>().is_err() && !["burn", "fixed", "atomic"].contains(a))
+            .filter(|a| {
+                a.parse::<usize>().is_err()
+                    && !["burn", "fixed", "atomic", "d64", "d128"].contains(a)
+            })
             .collect();
         let picked = |name: &str| filters.is_empty() || filters.iter().any(|f| name.starts_with(f));
         let device = Device::cuda(0);
-        let (b, hq, hkv, d) = (1, 8, 2, 256);
+        let (b, hq, hkv) = (1, 8, 2);
         println!("training: B {b}, Hq {hq}, Hkv {hkv}, T {t}, D {d}, bf16");
 
         let q = random([b, t, hq, d], &device);
