@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dash-core", "crates/dash-image", "crates/dash-models", "crates/dash-burn", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli", "crates/dash-train", "crates/dash-ops", "crates/dash-lora", "crates/dash-contract", "crates/dash-conformance", "crates/dash-peft"]
+members = ["crates/dash-core", "crates/dash-image", "crates/dash-models", "crates/dash-burn", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli", "crates/dash-train", "crates/dash-ops", "crates/dash-lora", "crates/dash-contract", "crates/dash-conformance", "crates/dash-peft", "crates/dash-mlx"]
 exclude = ["patches"]
 
 [workspace.package]
@@ -26,6 +26,7 @@ dash-contract = { path = "crates/dash-contract", version = "0.0.1" }
 dash-conformance = { path = "crates/dash-conformance" }
 dash-lora = { path = "crates/dash-lora", version = "0.0.1" }
 dash-peft = { path = "crates/dash-peft", version = "0.0.1" }
+dash-mlx = { path = "crates/dash-mlx", version = "0.0.1" }
 # Pinned exactly: Burn changes its API and its record format between minor releases, and an
 # upgrade is its own change, checked against the same references.
 burn = { version = "=0.22.1", default-features = false, features = ["std"] }
@@ -34,6 +35,15 @@ burn = { version = "=0.22.1", default-features = false, features = ["std"] }
 # to the crates every other member shares.
 burn-cubecl = { version = "=0.22.1", default-features = false, features = ["std"] }
 cubecl = { version = "=0.11.1", default-features = false, features = ["std"] }
+# MLX from Rust, for dash-mlx on Apple silicon: mlx-rs and mlx-sys from bayanasar/mlx-rs's
+# `dashmag` branch, which is upstream main (oxiglade/mlx-rs) with three branches merged, each meant
+# as an upstream pull request: `feat/checkpoint-custom-vjp`, MLX's checkpoint and custom VJP in
+# mlx-rs; `feat/mlx-sys-prebuilt`, mlx-sys linking a prebuilt MLX (`MLX_SYS_PREBUILT`), since
+# building MLX needs Xcode's Metal compiler; and `feat/mlx-c-0.8.0`, MLX 0.32.4. Pinned to a
+# commit, as Burn is to a version, and an upgrade is its own change; when upstream releases them,
+# these go back to crates.io.
+mlx-rs = { git = "https://github.com/bayanasar/mlx-rs.git", rev = "954e5e6e6cfb611e6a3718604cac2a1f1ae42df4" }
+mlx-sys = { git = "https://github.com/bayanasar/mlx-rs.git", rev = "954e5e6e6cfb611e6a3718604cac2a1f1ae42df4" }
 
 # cubecl-cuda 0.11.1 as published, but for one hunk: `CUBECL_CUDA_TF32=0` keeps f32 matmuls
 # and convolutions in IEEE f32 on compute capability 8.0 and later. Burn has no setting for
