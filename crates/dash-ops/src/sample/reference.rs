@@ -18,13 +18,14 @@ use burn::backend::{
     get_or_init_device_settings,
 };
 
-/// `(tokens, logprob, sampling_logprob)`: the tokens `[B]` in `out_dtype`, the two log-probabilities
-/// `[B]` f32. `options.masked` is sorted, free of repeats, each id `< V` and fewer than `V`.
+/// `(tokens, logprob, tempered_logprob, sampling_logprob)`: the tokens `[B]` in `out_dtype`, the
+/// three log-probabilities `[B]` f32. `options.masked` is sorted, free of repeats, each id `< V`
+/// and fewer than `V`.
 pub(crate) fn sample<B: Backend>(
     logits: FloatTensor<B>,
     options: &SampleOptions,
     out_dtype: IntDType,
-) -> (IntTensor<B>, FloatTensor<B>, FloatTensor<B>) {
+) -> (IntTensor<B>, FloatTensor<B>, FloatTensor<B>, FloatTensor<B>) {
     let shape = logits.shape();
     assert_eq!(
         shape.num_dims(),
@@ -36,6 +37,7 @@ pub(crate) fn sample<B: Backend>(
     if b == 0 {
         return (
             B::int_zeros(Shape::new([0]), &device, out_dtype),
+            full::<B>([0], 0.0, &device),
             full::<B>([0], 0.0, &device),
             full::<B>([0], 0.0, &device),
         );
@@ -67,14 +69,20 @@ pub(crate) fn sample<B: Backend>(
         None => B::int_zeros(Shape::new([b, 1]), &device, out_dtype),
     };
 
-    let (tokens, sampling) = if options.is_greedy() {
+    // The tokens, and the tempered and the sampling log-probabilities `[B, 1]` where they are not
+    // another output's: `None` takes `logprob` for the tempered one at tau = 1, and the tempered
+    // one for the sampling one where nothing is cut.
+    let (tokens, tempered, sampling) = if options.is_greedy() {
         let tokens = B::float_argmax(zm.clone(), 1, out_dtype);
-        (tokens, full::<B>([b, 1], 0.0, &device))
+        // The point mass at the token, for both.
+        let zero = full::<B>([b, 1], 0.0, &device);
+        (tokens, Some(zero.clone()), Some(zero))
     } else {
         let tau = options.inverse_temperature();
         let unmasked = v - options.masked.len();
         let s = B::float_mul_scalar(B::float_sub(zm.clone(), m.clone()), Scalar::from(tau));
         let kept = kept::<B>(&zm, &m, mask.as_ref(), options, unmasked, tau, out_dtype);
+        let cut = kept.is_some();
         let noise = gumbel::<B>(options, [b, v], &device, bool_dtype);
         let leave_out = match (kept, &mask) {
             (Some(kept), _) => Some(B::bool_not(kept)),
@@ -87,18 +95,33 @@ pub(crate) fn sample<B: Backend>(
         };
         let score = drop(B::float_add(s.clone(), noise), f32::NEG_INFINITY);
         let tokens = B::float_argmax(score, 1, out_dtype);
-        let total = tree_sum::<B>(drop(B::float_exp(s.clone()), 0.0));
+        let weights = B::float_exp(s.clone());
         let s_t = B::float_gather(1, s, tokens.clone());
-        (tokens, B::float_sub(s_t, B::float_log(total)))
+        // Over U: the masked tokens' weights are exp(-inf) = 0.
+        let tempered = (tau != 1.0).then(|| {
+            let total = tree_sum::<B>(weights.clone());
+            B::float_sub(s_t.clone(), B::float_log(total))
+        });
+        // Over P, where the cuts leave it short of U.
+        let sampling = cut.then(|| {
+            let total = tree_sum::<B>(drop(weights, 0.0));
+            B::float_sub(s_t, B::float_log(total))
+        });
+        (tokens, tempered, sampling)
     };
     let tokens = B::int_mask_where(tokens, degenerate.clone(), first_unmasked);
     let z_t = B::float_gather(1, z, tokens.clone());
     let logprob = B::float_sub(z_t, lse);
-    let sampling = B::float_mask_where(sampling, degenerate, full::<B>([b, 1], f32::NAN, &device));
+    let tempered = tempered.unwrap_or_else(|| logprob.clone());
+    let sampling = sampling.unwrap_or_else(|| tempered.clone());
+    let nan = |x: FloatTensor<B>| {
+        B::float_mask_where(x, degenerate.clone(), full::<B>([b, 1], f32::NAN, &device))
+    };
     (
         B::int_reshape(tokens, Shape::new([b])),
         column(logprob),
-        column(sampling),
+        column(nan(tempered)),
+        column(nan(sampling)),
     )
 }
 

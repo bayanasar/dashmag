@@ -1,7 +1,7 @@
 //! Sampling the next token on the device, for a decoder's step: from the logits `[B, V]` of one
-//! position per sequence, one token id per row, with its log-probability under the model's
-//! distribution and under the distribution it was drawn from. Temperature, top-k, top-p and
-//! masked ids as the options say; greedy decoding at temperature 0.
+//! position per sequence, one token id per row, with its log-probability under three
+//! distributions: the model's, the model's at the temperature, and the one it was drawn from.
+//! Temperature, top-k, top-p and masked ids as the options say; greedy decoding at temperature 0.
 //!
 //! # Definition
 //!
@@ -21,7 +21,10 @@
 //!
 //! **Greedy** ([`SampleOptions::temperature`] 0): `t` is the lowest id `i` in `U` with `z_i = m`,
 //! which is Burn's `argmax` over the row with the masked logits at `-inf`; top-k and top-p change
-//! nothing. The distribution drawn from is the point mass at `t`, so `sampling_logprob = 0`.
+//! nothing. The distribution drawn from is the point mass at `t`, so `sampling_logprob = 0`; the
+//! model's distribution at temperature 0 is taken as the same point mass (the limit of the softmax
+//! of `z / T` as `T` falls to 0 where the row's largest logit is not tied), so
+//! `tempered_logprob = 0` too.
 //!
 //! **Sampling** (temperature `T > 0`), with `tau = 1 / T` rounded to f32 (at most `f32::MAX`), the
 //! options' `k` ([`SampleOptions::top_k`]) and `p` ([`SampleOptions::top_p`]):
@@ -35,24 +38,43 @@
 //!                                                      sum_{j in K, z_j >= v} w_j >= p W,
 //!                                                      W = sum_{j in K} w_j
 //! t    = argmax_{i in P} (s_i + g_i)                 ties to the lowest id
+//! tempered_logprob = s_t - ln sum_{i in U} w_i
 //! sampling_logprob = s_t - ln sum_{i in P} w_i
 //! ```
 //!
 //! `g_i` is a standard Gumbel variate (below), so `t` is drawn from the softmax of the tempered
 //! logits over `P` (the Gumbel-max trick: the largest of `s_i + g_i` falls on `i` with probability
 //! `w_i / sum_P w`), and `sampling_logprob` is the token's log-probability under that
-//! distribution. Top-k keeps every token tied with the `k`-th largest logit, so `|K| >= k`; top-p
-//! keeps the top tokens of `K` until their tempered mass first reaches `p` of `K`'s, with every
-//! token tied with the last one: top-k first, then top-p over what it keeps, both after the
-//! temperature, the order of Hugging Face's samplers and vLLM's. `p = 0` keeps the largest logit
-//! and its ties; `p = 1` keeps `K` whole. Both cuts compare logits, so the temperature does not
-//! move them (`s` is a non-decreasing function of `z`); the masses that place `v` are the tempered
-//! ones, `w`, summed in f32.
+//! distribution; `tempered_logprob` is its log-probability under the softmax of the tempered
+//! logits over all of `U`, nothing cut: the log-softmax of `z / T`, to the rounding of `tau`.
+//! Top-k keeps every token tied with the `k`-th largest logit, so `|K| >= k`; top-p keeps the top
+//! tokens of `K` until their tempered mass first reaches `p` of `K`'s, with every token tied with
+//! the last one: top-k first, then top-p over what it keeps, both after the temperature, the order
+//! of Hugging Face's samplers and vLLM's. `p = 0` keeps the largest logit and its ties; `p = 1`
+//! keeps `K` whole. Both cuts compare logits, so the temperature does not move them (`s` is a
+//! non-decreasing function of `z`); the masses that place `v` are the tempered ones, `w`, summed
+//! in f32.
+//!
+//! The three side by side, at the token `t`, with what each is for:
+//!
+//! ```text
+//! logprob           log softmax(z)      over U   the model's log-probability of the token
+//! tempered_logprob  log softmax(z / T)  over U   RL's importance ratio at the rollout temperature
+//! sampling_logprob  log softmax(z / T)  over P   the distribution the token was drawn from
+//! ```
+//!
+//! RL trainers such as TRL's GRPO trainer and verl's actor divide the logits by the rollout
+//! temperature before their log-softmax and cut nothing, so the ratio of their log-probability to
+//! the rollout's wants `tempered_logprob`. The kernel and the reference return the same bits where
+//! two of them are the same number, the one taken from the other rather than computed again:
+//! `tempered_logprob` is `logprob` at temperature 1 (`tau = 1`), and `sampling_logprob` is
+//! `tempered_logprob` where nothing is cut (`k = 0` or `k >= |U|`, and `p = 1`); so at temperature
+//! 1 with nothing cut the three are one number.
 //!
 //! A row whose logits in `U` are all `-inf` has no distribution: its token is its lowest id in
-//! `U`, and both log-probabilities are NaN. Logits are otherwise finite, or `-inf` for a token the
-//! model rules out (which is never drawn, and keeps its place in the cuts' counts); NaN and `+inf`
-//! give unspecified results.
+//! `U`, and the three log-probabilities are NaN. Logits are otherwise finite, or `-inf` for a token
+//! the model rules out (which is never drawn, and keeps its place in the cuts' counts); NaN and
+//! `+inf` give unspecified results.
 //!
 //! # Random numbers
 //!
@@ -219,8 +241,8 @@ impl SampleOptions {
     Autodiff
 )]
 pub trait SampleBackend: Backend {
-    /// `(tokens, logprob, sampling_logprob)` for `logits` `[B, V]` (f32, bf16 or f16): the token
-    /// ids `[B]` in `out_dtype` and two `[B]` f32 log-probabilities, as the
+    /// `(tokens, logprob, tempered_logprob, sampling_logprob)` for `logits` `[B, V]` (f32, bf16 or
+    /// f16): the token ids `[B]` in `out_dtype` and three `[B]` f32 log-probabilities, as the
     /// [module documentation](self) defines them. `options` come with their masked ids sorted and
     /// free of repeats, each `< V`, fewer than `V`. The default body is the reference.
     #[fusion(meta = fusion_meta::sample)]
@@ -228,7 +250,12 @@ pub trait SampleBackend: Backend {
         logits: FloatTensor<Self>,
         options: SampleOptions,
         out_dtype: IntDType,
-    ) -> (IntTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+    ) -> (
+        IntTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    ) {
         reference::sample::<Self>(logits, &options, out_dtype)
     }
 }
@@ -236,7 +263,7 @@ pub trait SampleBackend: Backend {
 #[cfg(feature = "flex")]
 impl SampleBackend for burn::backend::Flex {}
 
-/// Output metadata for Burn's lazy fusion: `[B]` tokens in the asked int dtype, two `[B]` f32.
+/// Output metadata for Burn's lazy fusion: `[B]` tokens in the asked int dtype, three `[B]` f32.
 #[cfg(feature = "fusion")]
 mod fusion_meta {
     use super::SampleOptions;
@@ -247,10 +274,11 @@ mod fusion_meta {
         logits: &TensorSpec,
         _options: &SampleOptions,
         out_dtype: &IntDType,
-    ) -> (TensorSpec, TensorSpec, TensorSpec) {
+    ) -> (TensorSpec, TensorSpec, TensorSpec, TensorSpec) {
         let rows = Shape::new([logits.shape[0]]);
         (
             TensorSpec::new(rows.clone(), DType::from(*out_dtype)),
+            TensorSpec::new(rows.clone(), DType::F32),
             TensorSpec::new(rows.clone(), DType::F32),
             TensorSpec::new(rows, DType::F32),
         )
@@ -309,27 +337,41 @@ impl<B: Backend + SampleBackend, C: CheckpointStrategy> SampleBackend for Autodi
         logits: FloatTensor<Self>,
         options: SampleOptions,
         out_dtype: IntDType,
-    ) -> (IntTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
-        let (tokens, logprob, sampling) =
+    ) -> (
+        IntTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    ) {
+        let (tokens, logprob, tempered, sampling) =
             B::sample(<Self as AutodiffBackend>::inner(logits), options, out_dtype);
         (
             tokens,
             <Self as AutodiffBackend>::from_inner(logprob),
+            <Self as AutodiffBackend>::from_inner(tempered),
             <Self as AutodiffBackend>::from_inner(sampling),
         )
     }
 }
 
-/// What [`sample`] returns, each `[B]`.
+/// What [`sample`] returns, each `[B]`: the token and its log-probability under three
+/// distributions, side by side (the [module documentation](self) defines them).
 #[derive(Debug, Clone)]
 pub struct Sampled {
     /// The token drawn for each row, in the device's int dtype.
     pub tokens: Tensor<1, Int>,
     /// Its log-probability under the model's distribution: the log-softmax of the raw logits over
-    /// the unmasked vocabulary, at temperature 1. f32.
+    /// the unmasked vocabulary, at temperature 1. The model's log-probability of the token. f32.
     pub logprob: Tensor<1>,
+    /// Its log-probability under the model's distribution at the temperature: the log-softmax of
+    /// the logits divided by `T` over the unmasked vocabulary, nothing cut; 0 when greedy. What an
+    /// RL trainer's importance ratio takes at the rollout temperature (TRL's GRPO trainer and
+    /// verl's actor divide the logits by it before their log-softmax). `logprob`'s bits at
+    /// temperature 1. f32.
+    pub tempered_logprob: Tensor<1>,
     /// Its log-probability under the distribution it was drawn from: the softmax of the tempered
-    /// logits over the tokens top-k and top-p keep; 0 when greedy. f32.
+    /// logits over the tokens top-k and top-p keep; 0 when greedy. `tempered_logprob`'s bits when
+    /// they cut nothing. f32.
     pub sampling_logprob: Tensor<1>,
 }
 
@@ -345,7 +387,7 @@ pub fn sample(logits: Tensor<2>, options: &SampleOptions) -> Sampled {
     check(v, options);
     let device = logits.device();
     let out_dtype = get_or_init_device_settings::<Dispatch>(device.as_dispatch()).int_dtype;
-    let (tokens, logprob, sampling) = <Dispatch as SampleBackend>::sample(
+    let (tokens, logprob, tempered, sampling) = <Dispatch as SampleBackend>::sample(
         logits.into_dispatch(),
         options.normalised(),
         out_dtype,
@@ -353,6 +395,7 @@ pub fn sample(logits: Tensor<2>, options: &SampleOptions) -> Sampled {
     Sampled {
         tokens: Tensor::from_dispatch(tokens),
         logprob: Tensor::from_dispatch(logprob),
+        tempered_logprob: Tensor::from_dispatch(tempered),
         sampling_logprob: Tensor::from_dispatch(sampling),
     }
 }
@@ -365,11 +408,12 @@ pub fn sample_reference(logits: Tensor<2>, options: &SampleOptions) -> Sampled {
     check(v, options);
     let device = logits.device();
     let out_dtype = get_or_init_device_settings::<Dispatch>(device.as_dispatch()).int_dtype;
-    let (tokens, logprob, sampling) =
+    let (tokens, logprob, tempered, sampling) =
         reference::sample::<Dispatch>(logits.into_dispatch(), &options.normalised(), out_dtype);
     Sampled {
         tokens: Tensor::from_dispatch(tokens),
         logprob: Tensor::from_dispatch(logprob),
+        tempered_logprob: Tensor::from_dispatch(tempered),
         sampling_logprob: Tensor::from_dispatch(sampling),
     }
 }

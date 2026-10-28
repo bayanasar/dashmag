@@ -4,9 +4,11 @@
 //! ...`, so it meets its tokens in increasing id.
 //!
 //! 1. **Statistics** (always): each unit's largest unmasked logit (the lowest id on ties), its
-//!    lowest unmasked id, and the online sum `sum exp(z - m)` (for top-p alone also
-//!    `sum exp((z - m) tau)`), rescaled once a vector where the vector raises the unit's maximum;
-//!    the cube combines them into `m`, the argmax, `lse` and `W`. Greedy decoding ends here.
+//!    lowest unmasked id, and the online sum `sum exp(z - m)` (for top-p alone, and for any cut
+//!    at a temperature other than 1, also `sum exp((z - m) tau)`), rescaled once a vector where the
+//!    vector raises the unit's maximum; the cube combines them into `m`, the argmax, `lse` and
+//!    `W`, the tempered sum over `U` that `tempered_logprob` takes where a cut leaves `P` short of
+//!    `U`. Greedy decoding ends here.
 //! 2. **Candidates** (top-k or top-p): a lower bound on the cut, every token above which is
 //!    gathered into shared memory (an atomic append per plane, then a sort, so that the order does
 //!    not depend on the units' timing). For top-k, the `k`-th largest of the units' maxima: they
@@ -28,7 +30,8 @@
 //! 4. **Gumbel pass** (the temperature alone, or after 3): every kept token's score, its words
 //!    drawn four tokens to a Philox call; every unit starts from the argmax's score (the argmax is
 //!    always kept), and a group of four whose best tempered logit is more than 23 below the score
-//!    to beat (23 being above the largest `g`) draws no words. It also sums the kept weights.
+//!    to beat (23 being above the largest `g`) draws no words. It also sums the kept weights: with
+//!    nothing cut, over `U`, the one sum both tempered log-probabilities take.
 //!
 //! Every sum the cuts compare is formed in an order fixed by the device's plane width and the cube
 //! size, and the shared-memory appends are sorted before use, so that a device gives the same bits
@@ -1186,7 +1189,8 @@ fn gumbel_pass<E: Float, N: Size>(
 }
 
 /// One cube per row of `logits` `[B, V / N]` (vectors of `N` along the contiguous rows): the
-/// token, its log-probability under the model and under the distribution drawn from.
+/// token, its log-probability under the model, under the model at the temperature and under the
+/// distribution drawn from. `with_w` asks step 1 for the tempered sum over `U`.
 #[cube(launch_unchecked)]
 #[allow(
     clippy::too_many_arguments,
@@ -1198,6 +1202,7 @@ fn sample_kernel<E: Float, I: Int, N: Size>(
     bits: &Tensor<u32>,
     tokens: &mut Tensor<I>,
     logprob: &mut Tensor<f32>,
+    tempered: &mut Tensor<f32>,
     sampling: &mut Tensor<f32>,
     key_lo: u32,
     key_hi: u32,
@@ -1213,6 +1218,7 @@ fn sample_kernel<E: Float, I: Int, N: Size>(
     #[comptime] cut_k: bool,
     #[comptime] cut_p: bool,
     #[comptime] has_mask: bool,
+    #[comptime] with_w: bool,
     #[comptime] capacity: usize,
     #[define(E, I)] _dtypes: [ElemType; 2],
 ) {
@@ -1231,7 +1237,6 @@ fn sample_kernel<E: Float, I: Int, N: Size>(
     };
 
     // 1. Statistics.
-    let with_w = cut_p && !cut_k;
     let mut st = Stats {
         mx: neg_inf,
         ix: 0xFFFF_FFFFu32,
@@ -1289,10 +1294,10 @@ fn sample_kernel<E: Float, I: Int, N: Size>(
 
     let mut token = arg;
     let mut kept_total = 1.0f32;
+    let mut w_total = 0.0f32;
     if degenerate {
         token = lowest;
     } else if !greedy {
-        let mut w_total = 0.0f32;
         if with_w {
             w_total = sum_f32(st.sw * ((st.mx - m) * tau).exp(), &mut smem, 3usize);
         }
@@ -1485,13 +1490,31 @@ fn sample_kernel<E: Float, I: Int, N: Size>(
         tokens[index as usize] = I::cast_from(token);
         if degenerate {
             logprob[index as usize] = nan;
+            tempered[index as usize] = nan;
             sampling[index as usize] = nan;
         } else {
-            logprob[index as usize] = z_t - lse;
+            let model = z_t - lse;
+            logprob[index as usize] = model;
             if greedy {
+                tempered[index as usize] = 0.0f32;
                 sampling[index as usize] = 0.0f32;
             } else {
-                sampling[index as usize] = (z_t - m) * tau - kept_total.ln();
+                // Over U: `logprob` at tau = 1; else step 1's tempered sum where a cut leaves P
+                // short of U, and with nothing cut step 4's, which P = U makes the same.
+                let mut over_u = model;
+                if tau != 1.0f32 {
+                    let mut total = kept_total;
+                    if cut_k || cut_p {
+                        total = w_total;
+                    }
+                    over_u = (z_t - m) * tau - total.ln();
+                }
+                tempered[index as usize] = over_u;
+                if cut_k || cut_p {
+                    sampling[index as usize] = (z_t - m) * tau - kept_total.ln();
+                } else {
+                    sampling[index as usize] = over_u;
+                }
             }
         }
     }
@@ -1549,7 +1572,7 @@ fn requirements(client: &Client, b: usize, vector: usize) -> Option<Requirements
         shared_bytes: shared_bytes(capacity),
         vector_size: vector,
         min_plane_width: Some(units / SLOTS as u32),
-        ..Requirements::new((units, 1), (b, 1), 5)
+        ..Requirements::new((units, 1), (b, 1), 6)
     })
 }
 
@@ -1568,7 +1591,12 @@ impl SampleBackend for CubeBackend {
         logits: FloatTensor<Self>,
         options: SampleOptions,
         out_dtype: IntDType,
-    ) -> (IntTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+    ) -> (
+        IntTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+        FloatTensor<Self>,
+    ) {
         let shape = logits.shape();
         assert_eq!(
             shape.num_dims(),
@@ -1586,9 +1614,10 @@ impl SampleBackend for CubeBackend {
         };
         let tokens = empty(Shape::new([b]), out_dtype.into());
         let logprob = empty(Shape::new([b]), DType::F32);
+        let tempered = empty(Shape::new([b]), DType::F32);
         let sampling = empty(Shape::new([b]), DType::F32);
         if b == 0 {
-            return (tokens, logprob, sampling);
+            return (tokens, logprob, tempered, sampling);
         }
         let logits = into_contiguous(logits);
         let dtype = logits.dtype;
@@ -1615,11 +1644,15 @@ impl SampleBackend for CubeBackend {
         let greedy = options.is_greedy();
         let cut_k = !greedy && options.top_k_cut(unmasked).is_some();
         let cut_p = !greedy && options.top_p_cut().is_some();
+        let tau = options.inverse_temperature();
+        // The tempered sum over U in step 1: top-p alone compares it, and where a cut leaves P
+        // short of U `tempered_logprob` takes it, but at tau = 1, where it is `logprob`.
+        let with_w = (cut_p && !cut_k) || ((cut_k || cut_p) && tau != 1.0);
         let (key, offset) = super::philox::key_and_offset(options.seed, options.offset);
         probe::KERNEL_LAUNCHES.fetch_add(1, Ordering::SeqCst);
         // SAFETY: each cube reads its row's vectors below `V / N` (the logits are contiguous and
         // `N` divides `V`), mask words below `ceil(V / 32)` (only with a mask), candidate slots
-        // below the capacity, and writes its row's three outputs; the shapes come from the tensors.
+        // below the capacity, and writes its row's four outputs; the shapes come from the tensors.
         unsafe {
             sample_kernel::launch_unchecked(
                 &client,
@@ -1630,6 +1663,7 @@ impl SampleBackend for CubeBackend {
                 bits.into_tensor_arg(),
                 tokens.clone().into_tensor_arg(),
                 logprob.clone().into_tensor_arg(),
+                tempered.clone().into_tensor_arg(),
                 sampling.clone().into_tensor_arg(),
                 key[0],
                 key[1],
@@ -1638,13 +1672,14 @@ impl SampleBackend for CubeBackend {
                 unmasked as u32,
                 options.top_k.min(u32::MAX as usize) as u32,
                 options.top_p,
-                options.inverse_temperature(),
+                tau,
                 f32::NEG_INFINITY,
                 f32::NAN,
                 greedy,
                 cut_k,
                 cut_p,
                 has_mask,
+                with_w,
                 capacity,
                 [
                     dtype_to_storage_type(dtype),
@@ -1652,6 +1687,6 @@ impl SampleBackend for CubeBackend {
                 ],
             );
         }
-        (tokens, logprob, sampling)
+        (tokens, logprob, tempered, sampling)
     }
 }

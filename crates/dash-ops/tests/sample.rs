@@ -2,20 +2,24 @@
 //!
 //! The definition (the module documentation) is computed here once more in f64, and every draw is
 //! held to it: the token must be one of the kept set, `logprob` the log-softmax of the raw logits
-//! over the unmasked ids, `sampling_logprob` the log-probability under the kept set's tempered
-//! softmax. The distribution is held to the kept set's probabilities by chi-square tests over many
-//! draws: each call draws as many rows of one row of logits (the rows draw independent numbers),
-//! each call with its own offset. Small rows test the cuts' ties and limits (top-k with ties at the
-//! `k`-th logit, `k = 1`, `k >= V`; top-p with ties at the cut, `p = 1`, `p = 1e-6`, `p = 0`; both;
-//! masked ids); rows of tied groups larger than the kernel's shared memory, and rows built for
-//! each of the routes the kernel's top-p takes, test its slower passes. Greedy decoding is held to
-//! Burn's argmax in every dtype, the draws to the same bits from run to run. The Gumbel variates
-//! are held word by word to their values in f64, at the top of the range and where their
-//! computation changes, and seeds whose words lie at the very top draw the definition's tokens.
+//! over the unmasked ids, `tempered_logprob` that of the tempered logits, `sampling_logprob` the
+//! log-probability under the kept set's tempered softmax; and the outputs that are one number by
+//! the definition (`tempered_logprob` and `logprob` at temperature 1, `sampling_logprob` and
+//! `tempered_logprob` with nothing cut) to the same bits. The distribution is held to the kept
+//! set's probabilities by chi-square tests over many draws: each call draws as many rows of one row
+//! of logits (the rows draw independent numbers), each call with its own offset. Small rows test
+//! the cuts' ties and limits (top-k with ties at the `k`-th logit, `k = 1`, `k >= V`; top-p with
+//! ties at the cut, `p = 1`, `p = 1e-6`, `p = 0`; both; masked ids); rows of tied groups larger
+//! than the kernel's shared memory, and rows built for each of the routes the kernel's top-p takes,
+//! test its slower passes. Greedy decoding is held to Burn's argmax in every dtype, the draws to
+//! the same bits from run to run. The Gumbel variates are held word by word to their values in f64,
+//! at the top of the range and where their computation changes, and seeds whose words lie at the
+//! very top draw the definition's tokens.
 //!
 //! The reference runs on Flex; on the CubeCL device `DASH_OPS_DEVICE` names (`tests/common`) the
 //! kernel where the device has what it asks, held also to the reference on that device token for
-//! token, at the decoding shape `V = 248320` with batches of 8 and 32 among others.
+//! token, at the decoding shape `V = 248320` with batches of 8 and 32 among others (there its
+//! `tempered_logprob` to f64 too).
 //!
 //! Errors are stated as `max |got - want|`; each bound sits just above the largest measured over
 //! every build the tests run with.
@@ -41,17 +45,19 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// `sampling_logprob` and `logprob` against their f64 values on rows of a few tokens: f32
-/// roundings of the logits' differences, the sums and the logarithms (measured: 4.70e-7).
+/// `sampling_logprob`, `tempered_logprob` and `logprob` against their f64 values on rows of a few
+/// tokens: f32 roundings of the logits' differences, the sums and the logarithms (measured: 4.70e-7;
+/// `tempered_logprob` 4.697e-7 on lavapipe, 4.105e-7 elsewhere).
 const LOGPROB_EXACT: f64 = 1e-6;
 
-/// The same at the larger rows, `V` from 1000 to 100000 (measured: 1.006e-6 on lavapipe, 9.01e-7
-/// elsewhere, both at 75729 kept tokens of 100000).
+/// The same at the larger rows, `V` from 1000 to 248320 (measured: 1.006e-6 on lavapipe, 9.01e-7
+/// elsewhere, both at 75729 kept tokens of 100000; `tempered_logprob` 1.346e-6 at 248320 on CUDA,
+/// 6.563e-7 at 100000).
 const LOGPROB_LARGE: f64 = 2e-6;
 
 /// The kernel's log-probabilities against the reference's on one device: their sums are formed in
 /// different orders, and the two land an ulp apart at values from 16 to 32 (measured: 1.91e-6,
-/// 2^-19); twice that.
+/// 2^-19, `tempered_logprob` too: 1.907e-6); twice that.
 #[cfg(feature = "cubecl")]
 const KERNEL_REFERENCE: f64 = 4e-6;
 
@@ -66,6 +72,7 @@ const GUMBEL: f64 = 6e-6;
 struct Out {
     tokens: Vec<i64>,
     logprob: Vec<f32>,
+    tempered: Vec<f32>,
     sampling: Vec<f32>,
 }
 
@@ -79,17 +86,22 @@ impl Out {
                 .try_to_vec::<i64>()
                 .unwrap(),
             logprob: values(&sampled.logprob),
+            tempered: values(&sampled.tempered_logprob),
             sampling: values(&sampled.sampling_logprob),
         }
     }
 
-    /// The same bits: tokens, and both log-probabilities bit for bit (NaN as NaN).
+    /// The same bits: tokens, and the three log-probabilities bit for bit (NaN as NaN).
     fn same_bits(&self, other: &Out) -> bool {
-        let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
         self.tokens == other.tokens
             && bits(&self.logprob) == bits(&other.logprob)
+            && bits(&self.tempered) == bits(&other.tempered)
             && bits(&self.sampling) == bits(&other.sampling)
     }
+}
+
+fn bits(x: &[f32]) -> Vec<u32> {
+    x.iter().map(|v| v.to_bits()).collect()
 }
 
 fn values(x: &Tensor<1>) -> Vec<f32> {
@@ -193,6 +205,9 @@ struct Exact {
     prob: Vec<f64>,
     /// The log-softmax of the raw logits over the unmasked ids, per token (`-inf` when masked).
     log_softmax: Vec<f64>,
+    /// The log-softmax of the tempered logits over the unmasked ids, per token (`-inf` when
+    /// masked); greedy, the point mass at the token: 0 there, `-inf` elsewhere.
+    tempered: Vec<f64>,
 }
 
 impl Exact {
@@ -228,6 +243,7 @@ impl Exact {
                 kept: vec![top],
                 prob: vec![1.0],
                 log_softmax,
+                tempered: tempered_log_softmax(z, options),
             };
         }
         let tau = (1.0f32 / options.temperature).min(f32::MAX) as f64;
@@ -260,6 +276,7 @@ impl Exact {
             kept,
             prob,
             log_softmax,
+            tempered: tempered_log_softmax(z, options),
         }
     }
 
@@ -269,6 +286,36 @@ impl Exact {
             .position(|&i| i == token)
             .map(|at| self.prob[at])
     }
+}
+
+/// The log-softmax of the tempered logits `(z - m) tau` over the unmasked ids of the row `z` in
+/// f64, per token (`-inf` when masked); greedy, the point mass at the lowest id holding the
+/// largest logit (0 there, `-inf` elsewhere).
+fn tempered_log_softmax(z: &[f32], options: &SampleOptions) -> Vec<f64> {
+    let masked = |i: usize| options.masked.contains(&(i as u32));
+    let unmasked: Vec<usize> = (0..z.len()).filter(|&i| !masked(i)).collect();
+    let m = unmasked
+        .iter()
+        .map(|&i| z[i] as f64)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if options.temperature == 0.0 {
+        let top = unmasked.iter().copied().find(|&i| z[i] as f64 == m);
+        return (0..z.len())
+            .map(|i| match Some(i) == top {
+                true => 0.0,
+                false => f64::NEG_INFINITY,
+            })
+            .collect();
+    }
+    let tau = (1.0f32 / options.temperature).min(f32::MAX) as f64;
+    let s = |i: usize| (z[i] as f64 - m) * tau;
+    let lse = unmasked.iter().map(|&i| s(i).exp()).sum::<f64>().ln();
+    (0..z.len())
+        .map(|i| match masked(i) {
+            true => f64::NEG_INFINITY,
+            false => s(i) - lse,
+        })
+        .collect()
 }
 
 /// The chi-square statistic of `counts` against `n` draws of `probs`, cells of fewer than five
@@ -327,7 +374,7 @@ fn check_distribution(
     let v = z.len();
     let exact = Exact::of(z, options);
     let mut counts = vec![0u64; exact.kept.len()];
-    let mut worst = (0.0f64, 0.0f64);
+    let mut worst = (0.0f64, 0.0f64, 0.0f64);
     let values: Vec<f32> = (0..rows).flat_map(|_| z.iter().copied()).collect();
     for call in 0..calls {
         let options = SampleOptions {
@@ -348,6 +395,9 @@ fn check_distribution(
             let logprob = out.logprob[r] as f64;
             worst.0 = worst.0.max((sampling - p.ln()).abs());
             worst.1 = worst.1.max((logprob - exact.log_softmax[t]).abs());
+            worst.2 = worst
+                .2
+                .max((out.tempered[r] as f64 - exact.tempered[t]).abs());
         }
     }
     let n = (rows * calls) as u64;
@@ -355,14 +405,15 @@ fn check_distribution(
     let bound = chi_square_bound(df);
     println!(
         "{label:34} {n} draws, kept {:?}{}: chi-square {statistic:.2} on {df} df (bound {bound:.2}); \
-         sampling_logprob max abs {:.3e}, logprob max abs {:.3e}",
+         sampling_logprob max abs {:.3e}, logprob max abs {:.3e}, tempered_logprob max abs {:.3e}",
         &exact.kept[..exact.kept.len().min(8)],
         if exact.kept.len() > 8 { "..." } else { "" },
         worst.0,
         worst.1,
+        worst.2,
     );
     assert!(
-        worst.0 <= LOGPROB_EXACT && worst.1 <= LOGPROB_EXACT,
+        worst.0 <= LOGPROB_EXACT && worst.1 <= LOGPROB_EXACT && worst.2 <= LOGPROB_EXACT,
         "{label}: log-probabilities off by {worst:?}"
     );
     // One cell (a single kept token) leaves nothing to test.
@@ -552,6 +603,18 @@ fn distribution_cases() -> Vec<(&'static str, Vec<f32>, SampleOptions, Vec<usize
             },
             vec![0, 2, 3],
         ),
+        (
+            "masked, top-k 3, temperature 0.8",
+            twelve.clone(),
+            SampleOptions {
+                top_k: 3,
+                masked: vec![11, 0],
+                temperature: 0.8,
+                seed: 16,
+                ..options.clone()
+            },
+            vec![1, 2, 8],
+        ),
     ]
 }
 
@@ -584,7 +647,7 @@ fn draws_follow_the_kept_sets_on_flex() {
 
 /// Greedy decoding is Burn's argmax of the row with the masked logits at `-inf`, bit for bit, in
 /// every dtype, with ties (bf16 has many) to the lowest id; `logprob` is the log-softmax at the
-/// token, `sampling_logprob` 0.
+/// token, `tempered_logprob` and `sampling_logprob` 0.
 fn greedy_is_argmax(device: &Device, reference: bool) {
     let _serial = serial();
     for dtype in [DType::F32, DType::BF16, DType::F16] {
@@ -632,6 +695,7 @@ fn greedy_is_argmax(device: &Device, reference: bool) {
                 assert!(exact.kept.contains(&t), "{dtype:?} {dims:?} row {row}");
                 worst = worst.max((out.logprob[row] as f64 - exact.log_softmax[t]).abs());
                 assert_eq!(out.sampling[row], 0.0, "{dtype:?} {dims:?} row {row}");
+                assert_eq!(out.tempered[row], 0.0, "{dtype:?} {dims:?} row {row}");
             }
             println!(
                 "greedy {dtype:?} {dims:?}: tokens equal Burn's argmax; logprob max abs {worst:.3e}"
@@ -751,8 +815,13 @@ fn edges(device: &Device, reference: bool) {
         // A vocabulary of one.
         let out = go(&[0.25], [1, 1], options);
         assert_eq!(
-            (out.tokens[0], out.logprob[0], out.sampling[0]),
-            (0, 0.0, 0.0),
+            (
+                out.tokens[0],
+                out.logprob[0],
+                out.tempered[0],
+                out.sampling[0]
+            ),
+            (0, 0.0, 0.0, 0.0),
             "{options:?}"
         );
         // All but one masked.
@@ -768,8 +837,13 @@ fn edges(device: &Device, reference: bool) {
             },
         );
         assert_eq!(
-            (out.tokens[0], out.logprob[0], out.sampling[0]),
-            (17, 0.0, 0.0),
+            (
+                out.tokens[0],
+                out.logprob[0],
+                out.tempered[0],
+                out.sampling[0]
+            ),
+            (17, 0.0, 0.0, 0.0),
             "{options:?}"
         );
         // Huge and tiny logits, and -inf: finite log-probabilities, never a -inf token.
@@ -789,13 +863,18 @@ fn edges(device: &Device, reference: bool) {
         let t = out.tokens[0] as usize;
         assert!(values[t] > 1e38, "{options:?}: drew {t}");
         assert!(
-            out.logprob[0].is_finite() && out.sampling[0].is_finite(),
+            out.logprob[0].is_finite()
+                && out.tempered[0].is_finite()
+                && out.sampling[0].is_finite(),
             "{options:?}: {out:?}"
         );
         let values = vec![-3e38, -3.1e38, f32::NEG_INFINITY, -3.2e38];
         let out = go(&values, [1, 4], options);
         assert!(
-            out.tokens[0] != 2 && out.logprob[0].is_finite() && out.sampling[0].is_finite(),
+            out.tokens[0] != 2
+                && out.logprob[0].is_finite()
+                && out.tempered[0].is_finite()
+                && out.sampling[0].is_finite(),
             "{options:?}: {out:?}"
         );
         // A row whose unmasked logits are all -inf: its lowest unmasked id, NaN log-probabilities.
@@ -810,7 +889,7 @@ fn edges(device: &Device, reference: bool) {
         );
         assert_eq!(out.tokens[0], 1, "{options:?}");
         assert!(
-            out.logprob[0].is_nan() && out.sampling[0].is_nan(),
+            out.logprob[0].is_nan() && out.tempered[0].is_nan() && out.sampling[0].is_nan(),
             "{options:?}: {out:?}"
         );
     }
@@ -846,6 +925,126 @@ fn edges(device: &Device, reference: bool) {
 #[test]
 fn edges_on_flex() {
     edges(&Device::flex(), false);
+}
+
+/// The outputs that are one number by the definition, to the same bits, through the operation (the
+/// kernel where it runs) and through the reference: at temperature 1 `tempered_logprob` is
+/// `logprob`, cut or not; with nothing cut (top-k 0 or at least the unmasked vocabulary, top-p 1)
+/// `sampling_logprob` is `tempered_logprob`, at any temperature; so at temperature 1 with nothing
+/// cut the three are one. In every dtype the device has, with masked ids and without.
+fn identities(device: &Device) {
+    let _serial = serial();
+    let dtypes: Vec<DType> = [DType::F32, DType::BF16, DType::F16]
+        .into_iter()
+        .filter(|&dtype| common::has(device, dtype))
+        .collect();
+    let d = SampleOptions::default();
+    // Each case: whether `tempered_logprob` is `logprob`, and whether `sampling_logprob` is
+    // `tempered_logprob`.
+    let cases = [
+        ("temperature 1", 51, d.clone(), true, true),
+        (
+            "temperature 1, top-k above V, masked",
+            52,
+            SampleOptions {
+                top_k: 1 << 20,
+                masked: vec![0, 7, 999],
+                ..d.clone()
+            },
+            true,
+            true,
+        ),
+        (
+            "temperature 0.7",
+            53,
+            SampleOptions {
+                temperature: 0.7,
+                ..d.clone()
+            },
+            false,
+            true,
+        ),
+        (
+            "temperature 1.3, top-p 1, masked",
+            54,
+            SampleOptions {
+                temperature: 1.3,
+                top_p: 1.0,
+                masked: vec![1, 500],
+                ..d.clone()
+            },
+            false,
+            true,
+        ),
+        (
+            "temperature 1, top-p 0.9",
+            55,
+            SampleOptions {
+                top_p: 0.9,
+                ..d.clone()
+            },
+            true,
+            false,
+        ),
+        (
+            "temperature 1, top-k 50, masked",
+            56,
+            SampleOptions {
+                top_k: 50,
+                masked: vec![2, 3],
+                ..d.clone()
+            },
+            true,
+            false,
+        ),
+    ];
+    for (label, seed, options, tempered_is_logprob, sampling_is_tempered) in cases {
+        let options = SampleOptions { seed, ..options };
+        for (dims, scale, lift) in [
+            ([5, 1000], 2.0, 6.0),
+            ([3, 1031], 1.0, 0.0),
+            ([4, 20_000], 3.0, 10.0),
+        ] {
+            let values = random_logits(seed, dims, scale, lift);
+            for &dtype in &dtypes {
+                for (who, out) in [
+                    ("operation", run(device, &values, dims, dtype, &options)),
+                    (
+                        "reference",
+                        run_reference(device, &values, dims, dtype, &options),
+                    ),
+                ] {
+                    let at = format!("{label} {dims:?} {dtype:?}, the {who}'s");
+                    if tempered_is_logprob {
+                        assert_eq!(
+                            bits(&out.tempered),
+                            bits(&out.logprob),
+                            "{at} tempered_logprob is not logprob"
+                        );
+                    }
+                    if sampling_is_tempered {
+                        assert_eq!(
+                            bits(&out.sampling),
+                            bits(&out.tempered),
+                            "{at} sampling_logprob is not tempered_logprob"
+                        );
+                    }
+                }
+            }
+        }
+        let held = match (tempered_is_logprob, sampling_is_tempered) {
+            (true, true) => "the three the same bits",
+            (true, false) => "tempered_logprob logprob's bits",
+            _ => "sampling_logprob tempered_logprob's bits",
+        };
+        println!("identities, {label}: {held}");
+    }
+}
+
+#[cfg(feature = "flex")]
+#[test]
+fn identities_hold_bit_for_bit_on_flex() {
+    identities(&Device::flex());
 }
 
 /// Groups of tokens tied at one logit, larger than the kernel's candidate capacity: the cuts fall
@@ -904,7 +1103,7 @@ fn tied_groups(device: &Device, calls: usize) {
             group_prob[i / group] += exact.prob[at];
         }
         let values: Vec<f32> = (0..rows).flat_map(|_| z.iter().copied()).collect();
-        let mut worst = 0.0f64;
+        let (mut worst, mut tempered) = (0.0f64, 0.0f64);
         for call in 0..calls {
             let options = SampleOptions {
                 offset: call as u64,
@@ -917,6 +1116,7 @@ fn tied_groups(device: &Device, calls: usize) {
                     .prob_of(t)
                     .unwrap_or_else(|| panic!("{label}: token {t} outside the kept set"));
                 worst = worst.max((out.sampling[r] as f64 - p.ln()).abs());
+                tempered = tempered.max((out.tempered[r] as f64 - exact.tempered[t]).abs());
                 groups[t / group] += 1;
             }
         }
@@ -925,7 +1125,8 @@ fn tied_groups(device: &Device, calls: usize) {
         let bound = chi_square_bound(df);
         println!(
             "{label:38} {n} draws, groups {groups:?} of {group_prob:.3?}: chi-square {statistic:.2} on \
-             {df} df (bound {bound:.2}); sampling_logprob max abs {worst:.3e}"
+             {df} df (bound {bound:.2}); sampling_logprob max abs {worst:.3e}, tempered_logprob max \
+             abs {tempered:.3e}"
         );
         assert!(
             df == 0 || statistic <= bound,
@@ -934,6 +1135,10 @@ fn tied_groups(device: &Device, calls: usize) {
         assert!(
             worst <= LOGPROB_LARGE,
             "{label}: sampling_logprob off by {worst:e}"
+        );
+        assert!(
+            tempered <= LOGPROB_LARGE,
+            "{label}: tempered_logprob off by {tempered:e}"
         );
     }
 }
@@ -1069,7 +1274,7 @@ fn top_p_routes(device: &Device, capacity: usize) {
             false => (4, 1),
         };
         let values: Vec<f32> = (0..rows).flat_map(|_| z.iter().copied()).collect();
-        let mut worst = 0.0f64;
+        let (mut worst, mut tempered) = (0.0f64, 0.0f64);
         for call in 0..calls {
             let options = SampleOptions {
                 offset: call,
@@ -1087,15 +1292,20 @@ fn top_p_routes(device: &Device, capacity: usize) {
                     .prob_of(t)
                     .unwrap_or_else(|| panic!("{label}: token {t} outside the kept set"));
                 worst = worst.max((out.sampling[r] as f64 - prob.ln()).abs());
+                tempered = tempered.max((out.tempered[r] as f64 - exact.tempered[t]).abs());
             }
         }
         println!(
-            "top-p route {route} ({label}): {} kept of {v}; the reference's tokens; sampling_logprob max abs {worst:.3e}",
+            "top-p route {route} ({label}): {} kept of {v}; the reference's tokens; sampling_logprob max abs {worst:.3e}, tempered_logprob max abs {tempered:.3e}",
             exact.kept.len()
         );
         assert!(
             worst <= LOGPROB_LARGE,
             "{label}: sampling_logprob off by {worst:e}"
+        );
+        assert!(
+            tempered <= LOGPROB_LARGE,
+            "{label}: tempered_logprob off by {tempered:e}"
         );
     }
 }
@@ -1228,9 +1438,9 @@ fn top_words_draw_as_defined(device: &Device, reference: bool) {
             "seed {seed}: drew token {} (the one at -30 is {at})",
             out.tokens[0]
         );
-        // At temperature 1 with nothing cut, both are 0 - ln(3 + e^-30).
+        // At temperature 1 with nothing cut, all three are 0 - ln(3 + e^-30).
         let exact = -(3.0f64 + (-30.0f64).exp()).ln();
-        for got in [out.logprob[0], out.sampling[0]] {
+        for got in [out.logprob[0], out.tempered[0], out.sampling[0]] {
             assert!(
                 (got as f64 - exact).abs() <= LOGPROB_EXACT,
                 "seed {seed}: {got} against {exact}"
@@ -1275,6 +1485,11 @@ mod cube {
     #[test]
     fn edges_on_cubecl() {
         edges(&device(), false);
+    }
+
+    #[test]
+    fn identities_hold_bit_for_bit_on_cubecl() {
+        identities(&device());
     }
 
     #[test]
@@ -1377,15 +1592,16 @@ mod cube {
         ]
     }
 
-    /// The kernel against the reference on the same device, token for token: the same tokens,
-    /// both log-probabilities within the stated bounds. Returns the largest differences.
+    /// The kernel against the reference on the same device, token for token: the same tokens, the
+    /// three log-probabilities within the stated bounds. Returns the largest differences, and the
+    /// kernel's outputs.
     fn against_reference(
         label: &str,
         values: &[f32],
         dims: [usize; 2],
         dtype: DType,
         options: &SampleOptions,
-    ) -> (f64, f64) {
+    ) -> ([f64; 3], Out) {
         let device = device();
         let options = SampleOptions {
             masked: options
@@ -1408,15 +1624,23 @@ mod cube {
                 .map(|(&x, &y)| (x as f64 - y as f64).abs())
                 .fold(0.0, f64::max)
         };
-        let d = (
+        let d = [
             diff(&got.logprob, &want.logprob),
             diff(&got.sampling, &want.sampling),
-        );
+            diff(&got.tempered, &want.tempered),
+        ];
         println!(
-            "{label:40} {dims:?} {dtype:?}: the same tokens; logprob max abs {:.3e}, sampling_logprob max abs {:.3e}",
-            d.0, d.1
+            "{label:40} {dims:?} {dtype:?}: the same tokens; logprob max abs {:.3e}, sampling_logprob max abs {:.3e}, tempered_logprob max abs {:.3e}",
+            d[0], d[1], d[2]
         );
-        d
+        (d, got)
+    }
+
+    /// The largest of each of three differences.
+    fn widen(worst: &mut [f64; 3], d: [f64; 3]) {
+        for (w, d) in worst.iter_mut().zip(d) {
+            *w = w.max(d);
+        }
     }
 
     /// Kernel and reference on rows of many shapes (vocabularies that no vector width or cube
@@ -1433,7 +1657,7 @@ mod cube {
             common::describe(&device),
             kernel_capacity(&device)
         );
-        let mut worst = (0.0f64, 0.0f64);
+        let mut worst = [0.0f64; 3];
         for (seed, dims, scale, lift) in [
             (1, [1, 7], 1.0, 0.0),
             (2, [3, 1000], 2.0, 6.0),
@@ -1448,50 +1672,57 @@ mod cube {
                     continue;
                 }
                 for (label, options) in modes() {
-                    let (lp, sp) = against_reference(label, &values, dims, dtype, &options);
-                    worst = (worst.0.max(lp), worst.1.max(sp));
+                    let (d, _) = against_reference(label, &values, dims, dtype, &options);
+                    widen(&mut worst, d);
                 }
             }
         }
         println!(
-            "kernel vs reference: the same tokens; logprob max abs {:.3e}, sampling_logprob max abs {:.3e}",
-            worst.0, worst.1
+            "kernel vs reference: the same tokens; logprob max abs {:.3e}, sampling_logprob max abs {:.3e}, tempered_logprob max abs {:.3e}",
+            worst[0], worst[1], worst[2]
         );
-        assert!(
-            worst.0 <= KERNEL_REFERENCE && worst.1 <= KERNEL_REFERENCE,
-            "{worst:?}"
-        );
+        assert!(worst.iter().all(|&w| w <= KERNEL_REFERENCE), "{worst:?}");
     }
 
     /// The decoding shape: `V = 248320`, batches of 8 and 32, bf16 and f32 logits, peaked (a
-    /// model's) and flat (the refinement passes under top-p).
+    /// model's) and flat (the refinement passes under top-p); the kernel's `tempered_logprob`
+    /// also against its f64 value.
     #[test]
     fn the_kernel_draws_the_references_tokens_at_the_decoding_shape() {
         let _serial = serial();
         if !kernel_runs([32, 248_320]) {
             return;
         }
-        let mut worst = (0.0f64, 0.0f64);
+        let v = 248_320;
+        let (mut worst, mut tempered) = ([0.0f64; 3], 0.0f64);
         for b in [8, 32] {
-            let dims = [b, 248_320];
+            let dims = [b, v];
             for (kind, scale, lift) in [("peaked", 3.0, 12.0), ("flat", 1.0, 0.0)] {
                 let values = random_logits(b as u64, dims, scale, lift);
                 for dtype in [DType::BF16, DType::F32] {
                     for (label, options) in modes() {
                         let label = format!("{kind} {label}");
-                        let (lp, sp) = against_reference(&label, &values, dims, dtype, &options);
-                        worst = (worst.0.max(lp), worst.1.max(sp));
+                        let (d, got) = against_reference(&label, &values, dims, dtype, &options);
+                        widen(&mut worst, d);
+                        // Every mode's masked ids lie below V.
+                        for r in 0..b {
+                            let row = &values[r * v..(r + 1) * v];
+                            let exact = tempered_log_softmax(row, &options)[got.tokens[r] as usize];
+                            tempered = tempered.max((got.tempered[r] as f64 - exact).abs());
+                        }
                     }
                 }
             }
         }
         println!(
-            "V 248320: kernel vs reference, the same tokens; logprob max abs {:.3e}, sampling_logprob max abs {:.3e}",
-            worst.0, worst.1
+            "V 248320: kernel vs reference, the same tokens; logprob max abs {:.3e}, sampling_logprob max abs {:.3e}, tempered_logprob max abs {:.3e}",
+            worst[0], worst[1], worst[2]
         );
+        println!("V 248320: the kernel's tempered_logprob against f64, max abs {tempered:.3e}");
+        assert!(worst.iter().all(|&w| w <= KERNEL_REFERENCE), "{worst:?}");
         assert!(
-            worst.0 <= KERNEL_REFERENCE && worst.1 <= KERNEL_REFERENCE,
-            "{worst:?}"
+            tempered <= LOGPROB_LARGE,
+            "tempered_logprob off by {tempered:e}"
         );
     }
 }
