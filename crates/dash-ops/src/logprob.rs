@@ -1,18 +1,10 @@
 //! The log-probability of chosen tokens under a large vocabulary, computed in chunks so that
 //! the n x V logits are never held, with the entropy beside it.
 //!
-//! For rows `i` of `hidden` `[n, D]`, an output weight `[V, D]` (an output head, often tied to
-//! the input embedding) and target ids `t[i]`:
-//!
-//! ```text
-//! z[i, j]       = hidden[i] . weight[j]                        (the logits, never all held)
-//! logprob[i]    = z[i, t[i]] - logsumexp_j z[i, j]
-//! entropy[i]    = -sum_j p[i, j] log p[i, j],   p[i, j] = softmax_j z[i, j]
-//! ```
-//!
-//! where `j` runs over the vocabulary minus the masked token ids: a masked token takes no part in
-//! the log-sum-exp nor in the entropy, as if its logit were `-inf`. A target that is itself
-//! masked (or outside `0..V`) has `logprob = -inf`.
+//! [`dash_contract::logprob`] defines the operation, which every implementation of it shares:
+//! the log-probability and the entropy over the unmasked vocabulary, the shapes and dtypes, which
+//! input gets a gradient, and the chunking ([`LogprobOptions`]). This module implements it on
+//! Burn.
 //!
 //! # How it is computed
 //!
@@ -58,6 +50,14 @@
 //! or on OpenGL, with no plane operations; CubeCL's CPU runtime, with as many units per cube as
 //! cores) the reference runs on the device instead.
 //!
+//! With the gradient, the kernels hold as much again as the chunk of logits for the softmax
+//! weights (in two bf16 parts), two `[rows, D]` f32 buffers and the `[n, D]` f32 gradient they
+//! fill. [`LogprobOptions`]' defaults are those of Burn's default bf16 matmul kernel on an RTX
+//! 5070 Ti: of 4096 and 8192 vocabulary tokens a chunk, the faster at each size of row block (at
+//! 1200 rows, forward and backward take 36.8 ms with 4096 and 44.8 ms with 8192; at 3072 rows,
+//! 80.7 ms and 78.9 ms); and blocks of 3072 rows, which keep every matmul under 4096 rows, from
+//! which that kernel slows nine-fold on the gradient's `[rows, C] x [C, D]`.
+//!
 //! [`crate::loss`] builds the cross-entropy loss on the same pass over the vocabulary, and adds
 //! the second pass a weight that trains needs.
 
@@ -78,45 +78,16 @@ use burn::backend::{
 use burn::tensor::{Device, Int, Tensor};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// How the vocabulary and the rows are chunked. The largest chunk of logits held at once is
-/// `rows x vocab_chunk` f32 values, 96 MiB at most at the defaults; with the gradient, the
-/// kernels hold as much again for the softmax weights (in two bf16 parts), two `[rows, D]` f32
-/// buffers and the `[n, D]` f32 gradient they fill.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LogprobOptions {
-    /// Vocabulary tokens per chunk (`C`), or 0 (the default) to choose by the size of the row
-    /// block: 4096 tokens below 2304 rows, 8192 from there. On an RTX 5070 Ti those are the faster
-    /// of the two for Burn's default bf16 matmul kernel (at 1200 rows, forward and backward take
-    /// 36.8 ms with 4096 and 44.8 ms with 8192; at 3072 rows, 80.7 ms and 78.9 ms).
-    pub vocab_chunk: usize,
-    /// The most rows per block, at least 1; the rows are split into equal blocks no larger.
-    /// Every block makes its own pass over the vocabulary, reading the whole weight. The default,
-    /// 3072, keeps every matmul under 4096 rows, from which the default kernel slows nine-fold
-    /// on the gradient's `[rows, C] x [C, D]`.
-    pub row_chunk: usize,
-}
+pub use dash_contract::logprob::LogprobOptions;
 
-impl Default for LogprobOptions {
-    fn default() -> Self {
-        Self {
-            vocab_chunk: 0,
-            row_chunk: 3072,
-        }
-    }
-}
-
-impl LogprobOptions {
-    /// The vocabulary chunk for a block of `rows` rows.
-    pub fn vocab_chunk_for(&self, rows: usize) -> usize {
-        match self.vocab_chunk {
-            0 if rows < 2304 => 4096,
-            0 => 8192,
-            chunk => chunk,
-        }
-    }
-
+/// The row blocks of [`LogprobOptions`]: the references and the kernels walk the same blocks.
+pub(crate) trait RowBlocks {
     /// The row blocks of `n` rows: as few as `row_chunk` allows, of equal size but for the last.
-    pub(crate) fn row_blocks(&self, n: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    fn row_blocks(&self, n: usize) -> impl Iterator<Item = std::ops::Range<usize>>;
+}
+
+impl RowBlocks for LogprobOptions {
+    fn row_blocks(&self, n: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
         let block = n.div_ceil(n.div_ceil(self.row_chunk).max(1)).max(1);
         (0..n).step_by(block).map(move |r0| r0..(r0 + block).min(n))
     }

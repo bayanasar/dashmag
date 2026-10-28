@@ -1,0 +1,13 @@
+[package]
+name = "dash-contract"
+description = "The contract of Dashmag's operations, written once for every implementation of them: what each computes, the shapes, layouts and dtypes it takes and returns, its masks and states, and its options as plain data. No framework dependencies."
+readme = "README.md"
+keywords = ["machine-learning", "attention", "deep-learning"]
+categories = ["science"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]

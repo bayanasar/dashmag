@@ -4,7 +4,7 @@
 //! the mask and the options, which keys each query sees; it is what Flex runs and what the
 //! kernels are held to, not what training on a GPU should run.
 
-use super::{AttentionMaskPrimitive, AttentionOptions, CacheLengths};
+use super::{AttentionMaskPrimitive, AttentionOptions, CacheLengths, Reach};
 use crate::reference::matmul;
 use burn::backend::tensor::{BoolTensor, FloatTensor, IntTensor};
 use burn::backend::{

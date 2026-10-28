@@ -3,7 +3,7 @@
 //! PyTorch. Its two passes over the vocabulary serve [`crate::loss`] too: [`pass`], the forward
 //! pass, and [`gradient_pass`], the second pass a trained output weight needs.
 
-use super::{LogprobOptions, coefficient};
+use super::{LogprobOptions, RowBlocks, coefficient};
 use crate::reference::matmul;
 use burn::backend::tensor::{BoolTensor, FloatTensor, IntTensor};
 use burn::backend::{

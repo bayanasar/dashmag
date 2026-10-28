@@ -45,7 +45,7 @@
 //! them all; wgpu on lavapipe or OpenGL (no plane operations) and CubeCL's CPU runtime (as many
 //! units per cube as cores) run the reference.
 
-use super::{SampleBackend, SampleOptions, probe};
+use super::{Cuts, SampleBackend, SampleOptions, probe};
 use crate::cube::Requirements;
 use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::ops::IntTensorOps;
@@ -147,7 +147,8 @@ fn philox(
     (c0, c1, c2, c3)
 }
 
-/// The Gumbel variate of a word, as the module documentation gives it.
+/// The Gumbel variate of a word, as `dash_contract::sample` defines it, `E` in the module
+/// documentation's two forms.
 #[cube]
 fn gumbel(x: u32) -> f32 {
     let upper = x >= 0x8000_0000u32;

@@ -2,56 +2,11 @@
 //! none, causality, key padding, packed variable-length sequences and a sliding window. The
 //! backward pass keeps no T x T scores, and decoding runs against a key-value cache.
 //!
-//! # The operation
-//!
-//! For each batch element, query head `h` and query `i`, over the keys `j` the query sees:
-//!
-//! ```text
-//! out[i] = sum_j p[i, j] v[j],   p[i, j] = exp(s[i, j] - lse[i]),   s[i, j] = scale q[i] . k[j]
-//! lse[i] = log sum_j exp(s[i, j])
-//! ```
-//!
-//! with the keys and values of key-value head `h / (Hq / Hkv)`: `Hq` is a multiple of `Hkv`, as
-//! with PyTorch's `enable_gqa=True`. `scale` defaults to `1 / sqrt(D)`.
-//!
-//! # Shapes and dtypes
-//!
-//! The crate's layout: queries `[B, Tq, Hq, D]`, keys and values `[B, Tk, Hkv, D]`, the output
-//! `[B, Tq, Hq, D]` and the log-sum-exp `[B, Tq, Hq]`, the order a projection's `[B, T, H * D]`
-//! output reshapes to without a copy (PyTorch's `scaled_dot_product_attention` takes the heads
-//! before the time, `[B, H, T, D]`; flash-attn takes this order). `Tq` and `Tk` are independent.
-//! A decoding step drops the time: one query per sequence, `[B, Hq, D]`, against the cache
-//! `[B, S, Hkv, D]`, returns `[B, Hq, D]`. Queries, keys and values share one float dtype (f32,
-//! bf16 or f16), which the output takes; the log-sum-exp is f32; everything is accumulated in
-//! f32, and each gradient is rounded once, to its input's dtype.
-//!
-//! # Which keys a query sees
-//!
-//! Positions are aligned at the bottom right: query `i` sits at key position `i + Tk - Tq`, so
-//! that with `Tq == Tk` query `i` is key `i`, a chunk of queries continuing a cached prefix
-//! comes after the whole prefix, and a single query comes after every key. Around that position
-//! [`AttentionOptions`] says how far a query sees, as flash-attn's `causal` and `window_size`:
-//!
-//! - `causal`: no key after the query's position;
-//! - `window`, [`Window`] `{ left, right }`: no key more than `left` positions before it or
-//!   `right` after it (with `causal`, none after it whatever `right` says).
-//!
-//! Beside that, the [`AttentionMask`] passed as an argument, since it is data:
-//!
-//! - [`AttentionMask::None`]: every key, for encoders and cross-attention;
-//! - [`AttentionMask::KeyPadding`]: a boolean mask `[B, Tk]`, `true` where a key is left out
-//!   (padding), as Burn's masks are;
-//! - [`AttentionMask::Packed`]: variable-length sequences packed end to end along the time,
-//!   `B = 1`, their boundaries the cumulative offsets `cu_seqlens_q` and `cu_seqlens_k`
-//!   (`[S + 1]`, Int) of flash-attn's variable-length API. A query sees only the keys of its own
-//!   sequence, and causality and the window apply within each sequence, aligned at its bottom
-//!   right. Offsets start at 0 and do not decrease; positions past the last offset belong to no
-//!   sequence: those queries see no key and those keys are seen by no query.
-//!
-//! A query that sees no key at all (every key padded, a causal query before the first key when
-//! `Tk < Tq`, an empty window) returns zeros and a log-sum-exp of `-inf`, and takes no part in
-//! any gradient: its own query gradient is zero. flash-attn does the same, and so does PyTorch
-//! 2.13's `scaled_dot_product_attention` on the CPU (its math backend and its kernel alike).
+//! [`dash_contract::attention`] defines the operation, which every implementation of it shares:
+//! what it computes, its shapes and dtypes, which keys a query sees under the options
+//! ([`AttentionOptions`], [`Window`]) and the masks ([`AttentionMask`]: none, key padding, packed
+//! sequences), what a query that sees no key returns, and decoding against a key-value cache.
+//! This module implements it on Burn.
 //!
 //! # Functions
 //!
@@ -251,100 +206,20 @@ pub mod probe {
     }
 }
 
-/// A sliding window around each query's position (after the bottom-right alignment): the query
-/// sees no key more than `left` positions before it or `right` after it, as flash-attn's
-/// `window_size = (left, right)`. `usize::MAX` leaves that side unbounded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Window {
-    /// How many keys before the query's position it sees, besides the one at it.
-    pub left: usize,
-    /// How many keys after the query's position it sees; with `causal`, none whatever this says.
-    pub right: usize,
+pub use dash_contract::attention::{AttentionOptions, Window};
+
+/// [`dash_contract::attention::AttentionMask`] over Burn's tensors: the key padding mask a
+/// `Tensor<2, Bool>`, the offsets of packed sequences `Tensor<1, Int>`.
+pub type AttentionMask = dash_contract::attention::AttentionMask<Tensor<2, Bool>, Tensor<1, Int>>;
+
+/// How far a query sees before and after its position, `usize::MAX` for no bound: the window,
+/// and causality's bound after it.
+pub(crate) trait Reach {
+    fn reach(&self) -> (usize, usize);
 }
 
-/// The arguments of attention that have a usual default.
-///
-/// The default is attention over every key, with no causality and no window, scaled by
-/// `1 / sqrt(D)`: what PyTorch's `scaled_dot_product_attention` and flash-attn do by default,
-/// and what encoders and cross-attention use; and a backward pass that gives the same bits on
-/// every run. [`AttentionOptions::causal`] gives the decoder's.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AttentionOptions {
-    /// Whether a query sees no key after its own position. Default: `false`.
-    pub causal: bool,
-    /// The factor on the scores; `None` (the default) for `1 / sqrt(D)`.
-    pub scale: Option<f32>,
-    /// A sliding window, or `None` (the default) for none.
-    pub window: Option<Window>,
-    /// Whether the backward pass gives the same bits on every run. Default: `true`: the query
-    /// gradient is summed over the key blocks in a fixed order, by a kernel of its own, seven
-    /// T x T x D products in all. `false` lets the CubeCL kernels add it with f32 atomics in
-    /// whatever order their cubes run, as flash-attn does unless asked for `deterministic`: five
-    /// products and less backward time (the [module documentation](self) has the figures), and
-    /// the query gradient's last bits vary from run to run. The output and the key and value
-    /// gradients are the same either way, and the reference, which runs elsewhere, has one way.
-    pub deterministic: bool,
-}
-
-impl Default for AttentionOptions {
-    fn default() -> Self {
-        Self {
-            causal: false,
-            scale: None,
-            window: None,
-            deterministic: true,
-        }
-    }
-}
-
-impl AttentionOptions {
-    /// Causal attention, otherwise the defaults.
-    pub fn causal() -> Self {
-        Self {
-            causal: true,
-            ..Self::default()
-        }
-    }
-
-    /// The options with causality on or off.
-    pub fn with_causal(self, causal: bool) -> Self {
-        Self { causal, ..self }
-    }
-
-    /// The options with the factor on the scores.
-    pub fn with_scale(self, scale: f32) -> Self {
-        Self {
-            scale: Some(scale),
-            ..self
-        }
-    }
-
-    /// The options with a sliding window of `left` keys before each query's position and
-    /// `right` after it.
-    pub fn with_window(self, left: usize, right: usize) -> Self {
-        Self {
-            window: Some(Window { left, right }),
-            ..self
-        }
-    }
-
-    /// The options with the backward pass deterministic or not
-    /// ([`AttentionOptions::deterministic`]).
-    pub fn with_deterministic(self, deterministic: bool) -> Self {
-        Self {
-            deterministic,
-            ..self
-        }
-    }
-
-    /// The factor on the scores for a head dimension of `d`.
-    pub fn scale_for(&self, d: usize) -> f32 {
-        self.scale.unwrap_or((1.0 / (d as f64).sqrt()) as f32)
-    }
-
-    /// How far a query sees before and after its position, `usize::MAX` for no bound: the
-    /// window, and causality's bound after it.
-    pub(crate) fn reach(&self) -> (usize, usize) {
+impl Reach for AttentionOptions {
+    fn reach(&self) -> (usize, usize) {
         let (left, right) = self
             .window
             .map_or((usize::MAX, usize::MAX), |w| (w.left, w.right));
@@ -352,45 +227,18 @@ impl AttentionOptions {
     }
 }
 
-/// Which keys each query may see, beside the causality and the window of [`AttentionOptions`];
-/// the [module documentation](self) gives the definitions.
-// A `Tensor` is large (it holds any backend's handle), and a mask is built for a call and
-// consumed by it: boxing the variants would only add an allocation.
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, Default)]
-pub enum AttentionMask {
-    /// Every key.
-    #[default]
-    None,
-    /// `[B, Tk]`, `true` where a key is left out.
-    KeyPadding(Tensor<2, Bool>),
-    /// Packed variable-length sequences, `B = 1`: the cumulative offsets of the queries and of
-    /// the keys, `[S + 1]` each, sequence `s` holding queries `cu_seqlens_q[s]..cu_seqlens_q[s + 1]`
-    /// and keys `cu_seqlens_k[s]..cu_seqlens_k[s + 1]`.
-    Packed {
-        /// The queries' offsets, `[S + 1]`.
-        cu_seqlens_q: Tensor<1, Int>,
-        /// The keys' offsets, `[S + 1]`.
-        cu_seqlens_k: Tensor<1, Int>,
-    },
-}
-
-impl AttentionMask {
-    /// The mask as the backend extension takes it.
-    fn into_primitive(self) -> AttentionMaskPrimitive<Dispatch> {
-        match self {
-            AttentionMask::None => AttentionMaskPrimitive::None,
-            AttentionMask::KeyPadding(mask) => {
-                AttentionMaskPrimitive::KeyPadding(mask.into_dispatch())
-            }
-            AttentionMask::Packed {
-                cu_seqlens_q,
-                cu_seqlens_k,
-            } => AttentionMaskPrimitive::Packed {
-                cu_seqlens_q: cu_seqlens_q.into_dispatch(),
-                cu_seqlens_k: cu_seqlens_k.into_dispatch(),
-            },
-        }
+/// The mask as the backend extension takes it.
+fn mask_primitive(mask: AttentionMask) -> AttentionMaskPrimitive<Dispatch> {
+    match mask {
+        AttentionMask::None => AttentionMaskPrimitive::None,
+        AttentionMask::KeyPadding(mask) => AttentionMaskPrimitive::KeyPadding(mask.into_dispatch()),
+        AttentionMask::Packed {
+            cu_seqlens_q,
+            cu_seqlens_k,
+        } => AttentionMaskPrimitive::Packed {
+            cu_seqlens_q: cu_seqlens_q.into_dispatch(),
+            cu_seqlens_k: cu_seqlens_k.into_dispatch(),
+        },
     }
 }
 
@@ -422,7 +270,7 @@ pub enum CacheLengths<B: Backend> {
     Lengths(IntTensor<B>),
 }
 
-/// Attention and its backward pass, with the masks of the [module documentation](self), and
+/// Attention and its backward pass, with the masks of [`dash_contract::attention`], and
 /// decoding against a key-value cache. The default bodies are the reference.
 #[backend_extension(
     Flex: cfg(feature = "flex"),
@@ -681,7 +529,7 @@ impl<B: Backend + AttentionBackend, C: CheckpointStrategy> AttentionBackend for 
 }
 
 /// The dimensions of one call, `[B, Tq, Tk, Hq, Hkv, D]`, checked against each other and against
-/// the mask, as the module documentation gives them.
+/// the mask, as [`dash_contract::attention`] gives them.
 ///
 /// # Panics
 ///
@@ -776,13 +624,13 @@ fn check_decode_shapes(
 }
 
 /// Attention for training: `query` `[B, Tq, Hq, D]`, `key` and `value` `[B, Tk, Hkv, D]`, the
-/// keys each query sees given by `mask` and `options` (module documentation); returns
+/// keys each query sees given by `mask` and `options` ([`dash_contract::attention`]); returns
 /// `[B, Tq, Hq, D]` in the dtype of `query`. On an autodiff device, the backward pass is
 /// [`attention_backward`].
 ///
 /// # Panics
 ///
-/// If the shapes do not fit together (module documentation).
+/// If the shapes do not fit together ([`dash_contract::attention`]).
 pub fn attention(
     query: Tensor<4>,
     key: Tensor<4>,
@@ -802,7 +650,7 @@ pub fn attention_with_lse(
     mask: AttentionMask,
     options: AttentionOptions,
 ) -> (Tensor<4>, Tensor<3>) {
-    let mask = mask.into_primitive();
+    let mask = mask_primitive(mask);
     check_shapes(
         &query.dims(),
         &key.dims(),
@@ -834,7 +682,7 @@ pub fn attention_backward(
     mask: AttentionMask,
     options: AttentionOptions,
 ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
-    let mask = mask.into_primitive();
+    let mask = mask_primitive(mask);
     let [b, tq, _, hq, _, _] = check_shapes(
         &query.dims(),
         &key.dims(),

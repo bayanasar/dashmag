@@ -107,6 +107,7 @@ fn activate<B: Backend>(y: FloatTensor<B>, activation: Activation) -> FloatTenso
     match activation {
         Activation::None => y,
         Activation::Silu => B::float_mul(y.clone(), B::sigmoid(y)),
+        _ => unreachable!("{activation:?}: refused by the public functions"),
     }
 }
 
@@ -125,6 +126,7 @@ fn activation_grad<B: Backend>(
             let slope = B::float_add_scalar(B::float_mul(y, one_minus_s), 1.0f32.into());
             B::float_mul(grad, B::float_mul(s, slope))
         }
+        _ => unreachable!("{activation:?}: refused by the public functions"),
     }
 }
 

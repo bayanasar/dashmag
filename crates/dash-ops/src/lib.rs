@@ -30,45 +30,14 @@
 //!
 //! # Conventions
 //!
-//! Every operation follows these, and new code is held to them, so that one operation's output
-//! feeds the next without a copy or a cast. Each module's documentation gives its shapes,
-//! dtypes and options in their terms.
-//!
-//! ## Layout
-//!
-//! Sequences are batch-major, then time: `[B, T, ...]`, the order a linear layer's output
-//! reshapes to without a copy. Tensors split into heads are `[B, T, H, D]`, tensors of channels
-//! `[B, T, C]`; an operation over rows takes `[N, D]`, `N` any flattening of the leading
-//! dimensions. A single decoding step drops `T`: `[B, H, D]`, `[B, C]`. State an operation
-//! carries from call to call keeps `B` first and is f32: the gated delta rule's
-//! `[B, H, Dk, Dv]`, a convolution's last `W` inputs `[B, W, C]`. Packed variable-length
-//! sequences lie end to end along `T` with `B = 1`, the boundaries of `S` sequences given as
-//! cumulative offsets `cu_seqlens` `[S + 1]` (Int), as flash-attn and fla take them
-//! ([`sequences`]). Inputs may have any strides (a kernel may copy one it cannot read in place);
-//! outputs are contiguous in the documented layout.
-//!
-//! ## Masks
-//!
-//! A boolean mask is `true` where an element is left out, as in Burn's `mask_fill` and its
-//! padding masks; a list of indices names the elements left out (vocabulary ids). Causality is
-//! an option, not a mask tensor, aligned at the bottom right when keys outnumber queries. A
-//! left-out element takes no part in any sum or normalisation; what a row with nothing left
-//! returns is stated by its operation.
-//!
-//! ## Dtypes
-//!
-//! The floating inputs of one call share one dtype, f32, bf16 or f16, apart from arguments
-//! documented as f32 (states, and gates models compute in f32). Arithmetic accumulates in f32;
-//! outputs and gradients come back in the dtype of the input they belong to, rounded once from
-//! f32, unless the operation names an intermediate it rounds to the input's dtype for the tensor
-//! cores. Statistics an operation returns per row (a log-sum-exp, log-probabilities, entropies)
-//! are f32 whatever the inputs' dtype. f32 inputs are computed in IEEE f32: on CUDA with
-//! `CUBECL_CUDA_TF32=0`, without which Burn 0.22 runs f32 matmuls in TF32.
-//!
-//! ## Options
-//!
-//! Arguments with a usual default go in an options struct implementing `Default`, like
-//! [`logprob::LogprobOptions`]; a softmax scale defaults to `1 / sqrt(D)`.
+//! Every operation follows the conventions of [`dash_contract`], which every implementation of
+//! these operations shares: the layout, masks, dtypes and options, and how a call outside an
+//! operation's contract is refused (here, by a panic with the operation's name, listed under
+//! `# Panics`). Each operation's contract (its definition, shapes, dtypes and options) is written
+//! in the module of the same name there, whose option types this crate re-exports where they
+//! have always been; each module here documents its implementation. f32 inputs are computed in
+//! IEEE f32: on CUDA with `CUBECL_CUDA_TF32=0`, without which Burn 0.22 runs f32 matmuls in TF32.
+//! New code is held to those conventions and to these:
 //!
 //! ## Parts
 //!

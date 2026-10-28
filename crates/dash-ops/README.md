@@ -20,11 +20,15 @@ every device and is what the tests hold the kernels to; CubeCL kernels, which ru
 runtime whose device offers what they ask; and an implementation for `Autodiff` with a
 written-out backward pass, so that training records one node instead of the reference's
 intermediate tensors. `tests/extension_pattern.rs` is the smallest complete example of that
-shape. Shapes, dtypes and what each operation matches are in its module's documentation.
+shape. Each operation's definition, shapes, dtypes and options, and what it matches, are in
+the module of the same name in [`dash-contract`](https://crates.io/crates/dash-contract),
+written once for every implementation of these operations; this crate re-exports its option
+types and documents its own kernels in each module.
 
 Every operation follows one set of conventions (layout, `[B, T, H, D]` for tensors split into
-heads; masks; dtypes; options; parts; tests), written out under "Conventions" in the crate
-documentation (`src/lib.rs`).
+heads; masks; dtypes; options; how a call outside an operation's contract is refused), written
+out in `dash-contract`'s crate documentation; this crate's own (parts, tests) are under
+"Conventions" in its crate documentation (`src/lib.rs`).
 
 Part of [Dashmag](https://github.com/bayanasar/dashmag) — a machine-learning library in Rust
 on Burn. See the repository for the full picture.

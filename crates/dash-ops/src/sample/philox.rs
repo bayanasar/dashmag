@@ -30,7 +30,7 @@ pub(crate) fn philox4x32_10(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
     c
 }
 
-/// The key and the upper half of the counter for `seed` and `offset`, as the module documentation
+/// The key and the upper half of the counter for `seed` and `offset`, as `dash_contract::sample`
 /// gives them: `(seed lo, seed hi)` and `(offset lo, offset hi)`.
 pub(crate) fn key_and_offset(seed: u64, offset: u64) -> ([u32; 2], [u32; 2]) {
     (

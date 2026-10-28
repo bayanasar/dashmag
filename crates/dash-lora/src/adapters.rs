@@ -88,12 +88,7 @@ use burn::tensor::Device;
 
 use crate::linear::Lora;
 
-/// PEFT's default adapter name: the adapter `get_peft_model` and `PeftModel.from_pretrained`
-/// create unless told otherwise, and the one `save_pretrained` writes at the top of its directory
-/// (every other adapter in a subdirectory named after it). Here, the adapter
-/// [`LoraLinear::with_lora`](crate::LoraLinear::with_lora) adds and a layer uses until
-/// [`AdapterChoice::set_adapter`] chooses another.
-pub const DEFAULT_ADAPTER: &str = "default";
+pub use dash_contract::lora::DEFAULT_ADAPTER;
 
 /// The container type the adapters report to Burn's module traversals, after the convention of
 /// derived modules (`Struct:<type>` for the container whose entries are being entered).

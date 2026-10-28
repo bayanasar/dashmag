@@ -1,38 +1,14 @@
 //! The chunked gated delta rule, forward and backward, for training.
 //!
-//! [`chunk_gated_delta_rule`] computes the gated delta rule (the [parent module](super) states
-//! it) over sequences of any length, as transformers' `torch_chunk_gated_delta_rule` and fla's
-//! `chunk_gated_delta_rule` do: in chunks of 64 tokens, within a chunk through the WY
-//! representation of the products of its Householder-like updates, and the state carried from
-//! chunk to chunk.
+//! [`dash_contract::gated_delta::chunk`] defines [`chunk_gated_delta_rule`], which every
+//! implementation of it shares: what it computes and matches, in chunks of 64 tokens, its inputs,
+//! packed sequences, outputs, options ([`ChunkGatedDeltaOptions`]), dtypes and gradients. This
+//! module implements it on Burn.
 //!
-//! - Inputs: queries and keys `[B, T, H, Dk]`, values `[B, T, H, Dv]` in one float dtype (f32,
-//!   bf16 or f16); `g`, the log of the decay (`<= 0`), and `beta`, both `[B, T, H]`, each in that
-//!   dtype or in f32 (models compute `g` in f32), read as f32; an optional initial state per
-//!   sequence, f32.
-//! - Sequences: every batch element one sequence, or packed sequences, `B = 1` with
-//!   `cu_seqlens` `[S + 1]` (the [parent module](super) gives the layout); the states are then
-//!   `[S, H, Dk, Dv]`. Each packed sequence is chunked on its own, as fla does: its chunks start at
-//!   its first token, the last one shorter, so no chunk holds two sequences and every chunk's
-//!   arithmetic is what a call on that sequence alone does.
-//! - Outputs: `o` `[B, T, H, Dv]` in the queries' dtype and, when asked, each sequence's final
-//!   state `[B, H, Dk, Dv]` (packed, `[S, H, Dk, Dv]`) in f32, from which [`super::recurrent`]
-//!   continues decoding.
-//! - Options ([`ChunkGatedDeltaOptions`]): the l2 normalisation of queries and keys, the query
-//!   scale (`1 / sqrt(Dk)` by default), and whether to return the final states.
-//! - Arithmetic accumulates in f32 whatever the inputs' dtype; the outputs and gradients are
-//!   rounded once, to their dtype. From f32 inputs everything is computed in IEEE f32, as
-//!   transformers does. From bf16 and f16 inputs the kernels on tensor cores (below) take the
-//!   products' operands in the input dtype, as fla does: the intermediates that only feed
-//!   products are rounded to it. (transformers normalises bf16 queries and keys in bf16 before
-//!   casting; here, as in fla, they are normalised in f32.)
-//!
-//! Gradients flow to the queries, keys, values, `g`, `beta` and the initial states, and from both
-//! the output and the final states. The backward pass is written out: it keeps the inputs from
-//! the forward pass and, where the kernels on tensor cores run, the per-chunk `T = (I + A)^-1` (in
-//! the inputs' dtype, 8 KiB a chunk of each head, as fla keeps it); it recomputes each chunk's
-//! other quantities, passes the state's gradient back from chunk to chunk, and forms the input
-//! gradients in each chunk.
+//! The backward pass is written out: it keeps the inputs from the forward pass and, where the
+//! kernels on tensor cores run, the per-chunk `T = (I + A)^-1` (in the inputs' dtype, 8 KiB a
+//! chunk of each head, as fla keeps it); it recomputes each chunk's other quantities, passes the
+//! state's gradient back from chunk to chunk, and forms the input gradients in each chunk.
 //!
 //! Every backend runs the reference built from Burn's tensor operations (`chunk/reference.rs`),
 //! packed sequences one at a time. On a CubeCL device (any runtime), heads up to
@@ -114,48 +90,12 @@ use burn::backend::{
 use burn::tensor::{DType, Device, FloatDType, Int, Shape, Slice, Tensor, TensorCreationOptions};
 use std::sync::atomic::Ordering;
 
+pub use dash_contract::gated_delta::chunk::ChunkGatedDeltaOptions;
 pub use reference::CHUNK as CHUNK_SIZE;
 
 /// The widest heads (`Dk` and `Dv`) the CubeCL kernels take, as fla's; wider heads run the
 /// reference.
 pub const MAX_KERNEL_HEAD_DIM: usize = 256;
-
-/// The options of [`chunk_gated_delta_rule`] that have a usual default; the defaults are fla's
-/// and transformers': no normalisation, the scale `1 / sqrt(Dk)`, no final state.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ChunkGatedDeltaOptions {
-    /// Normalise queries and keys to unit length first, `x / sqrt(sum(x^2) + 1e-6)`
-    /// (transformers' and fla's `use_qk_l2norm_in_kernel`).
-    pub qk_l2norm: bool,
-    /// The queries' scale, applied after the normalisation; `None` for `1 / sqrt(Dk)` (fla's
-    /// `scale=None`).
-    pub scale: Option<f32>,
-    /// Return each sequence's state after its last token (fla's `output_final_state`).
-    pub output_final_state: bool,
-}
-
-impl ChunkGatedDeltaOptions {
-    /// The options with the l2 normalisation of queries and keys on or off.
-    pub fn with_qk_l2norm(self, qk_l2norm: bool) -> Self {
-        Self { qk_l2norm, ..self }
-    }
-
-    /// The options with the query scale `scale`.
-    pub fn with_scale(self, scale: f32) -> Self {
-        Self {
-            scale: Some(scale),
-            ..self
-        }
-    }
-
-    /// The options returning the final states, or not.
-    pub fn with_final_state(self, output_final_state: bool) -> Self {
-        Self {
-            output_final_state,
-            ..self
-        }
-    }
-}
 
 /// Counters tests read to tell which path ran. Not part of the API.
 #[doc(hidden)]
@@ -334,9 +274,9 @@ mod fusion_meta {
 }
 
 /// The chunked gated delta rule as a backend extension. Call it through
-/// [`chunk_gated_delta_rule`]; the methods take the layout described in the module docs, with
-/// an initial state for every sequence always present (zeros when there is none) and the query
-/// scale resolved.
+/// [`chunk_gated_delta_rule`]; the methods take the layout [`dash_contract::gated_delta`] gives,
+/// with an initial state for every sequence always present (zeros when there is none) and the
+/// query scale resolved.
 #[backend_extension(
     Flex: cfg(feature = "flex"),
     Cube: cfg(feature = "cubecl"),
@@ -828,8 +768,8 @@ fn check_inputs(
     }
 }
 
-/// The chunked gated delta rule over `B` sequences, or over `S` packed ones (chunk size 64; the
-/// [module](self) and its [parent](super) give the definition).
+/// The chunked gated delta rule over `B` sequences, or over `S` packed ones (chunk size 64;
+/// [`dash_contract::gated_delta::chunk`] and its parent give the definition).
 ///
 /// - `q`, `k`: `[B, T, H, Dk]`; `v`: `[B, T, H, Dv]`, one float dtype for the three.
 /// - `g`: `[B, T, H]`, the log of the decay, `<= 0`; `beta`: `[B, T, H]`; each in the queries'

@@ -37,6 +37,7 @@ autotune = ["burn/autotune"]
 
 [dependencies]
 burn = { workspace = true, features = ["autodiff", "optim"] }
+dash-contract = { workspace = true }
 dash-ops = { workspace = true }
 safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }

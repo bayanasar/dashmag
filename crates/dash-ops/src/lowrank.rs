@@ -4,26 +4,9 @@
 //! adapters built on it (DoRA's low-rank part, LoRA-FA, PiSSA's residual, QLoRA's over a
 //! dequantized base) and a linear layer factored into two (`base` absent, `scale` 1).
 //!
-//! ```text
-//! h[n, j] = sum_k x[n, k] U[k, j]                      [N, r], f32
-//! y[n, m] = base[n, m] + scale · sum_j h[n, j] V[j, m]  [N, out]
-//! ```
-//!
-//! # Shapes and dtypes
-//!
-//! - `x`: `[.., in]`, f32, bf16 or f16, its leading dimensions any flattening of `N` rows.
-//! - `U` `[in, r]` and `V` `[r, out]`: f32, as an adapter's factors are kept whatever the model's
-//!   dtype (PEFT's default for a bf16 model), with any strides: a transposed view of PEFT's
-//!   `[r, in]` and `[out, r]` is read in place.
-//! - `base`: `[.., out]` with the leading dimensions of `x`, in any float dtype, or none.
-//! - The output: `[.., out]`, the sum computed in f32 and rounded once to the base's dtype, as
-//!   PEFT's `(result + lora).to(result.dtype)` does; without a base, `scale · (x U) V` in f32.
-//!
-//! Every product is f32 (IEEE f32 on CUDA with `CUBECL_CUDA_TF32=0`): `x` is read exactly into
-//! f32, and the products and their sums are f32 as PEFT's on an f32 adapter. The gradients: `dx`
-//! in `x`'s dtype, rounded once from f32; `dU` and `dV` f32; the base's, the output's gradient
-//! itself. `dz = dy · scale` is rounded to f32 before it enters the products, as autodiff of
-//! `(h V) · scale` computes it.
+//! [`dash_contract::lowrank`] defines the product, which every implementation of it shares: the
+//! definition, the shapes and dtypes of `x`, the factors, the base and the output, the precision
+//! of every product, and the gradients' dtypes. This module implements it on Burn.
 //!
 //! # Backends
 //!
@@ -106,26 +89,7 @@ mod reference;
 /// kernel holds a factor column of `r` values per output column it owns in registers.
 pub const MAX_RANK: usize = 64;
 
-/// The arguments of [`low_rank`] that have a usual default.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LowRankOptions {
-    /// The factor on `(x U) V`, applied in f32 before the base is added: LoRA's
-    /// `lora_alpha / r` (`lora_alpha / √r` with rsLoRA). Default: 1.
-    pub scale: f64,
-}
-
-impl Default for LowRankOptions {
-    fn default() -> Self {
-        Self { scale: 1.0 }
-    }
-}
-
-impl LowRankOptions {
-    /// The options with `scale`.
-    pub fn with_scale(self, scale: f64) -> Self {
-        Self { scale }
-    }
-}
+pub use dash_contract::lowrank::LowRankOptions;
 
 /// A tensor or none, as the backend extension takes and returns them (an `Option` of a tensor
 /// does not cross Burn's dispatch boundary; this enum does): the base, and the gradients a
@@ -279,7 +243,7 @@ mod fusion_meta {
 }
 
 /// The low-rank product as a backend extension, on rows: call it through [`low_rank`]. The
-/// default bodies are the reference; the [module](self) gives the definition and dtypes.
+/// default bodies are the reference; [`dash_contract::lowrank`] gives the definition and dtypes.
 #[backend_extension(
     Flex: cfg(feature = "flex"),
     Cube: cfg(feature = "cubecl"),
@@ -495,9 +459,10 @@ impl<B: Backend + LowRankBackend, C: CheckpointStrategy> LowRankBackend for Auto
 
 /// `base + scale · (x U) V` for `x` `[.., in]`, `u` `[in, r]` and `v` `[r, out]` (f32, any
 /// strides), and `base` `[.., out]` with the leading dimensions of `x`: the sum in f32, rounded
-/// once to the base's dtype; without a base, `scale · (x U) V` in f32. The [module](self) gives the
-/// precision of each part. Differentiable with respect to `x`, `u`, `v` and `base`. With LoRA's
-/// factors in PEFT's layout, `u` and `v` are `A` and `B` transposed (`a.transpose()`, a view).
+/// once to the base's dtype; without a base, `scale · (x U) V` in f32. [`dash_contract::lowrank`]
+/// gives the precision of each part. Differentiable with respect to `x`, `u`, `v` and `base`.
+/// With LoRA's factors in PEFT's layout, `u` and `v` are `A` and `B` transposed
+/// (`a.transpose()`, a view).
 ///
 /// A 2-D `x` is taken as it is; any other is flattened to rows and the output shaped back, which
 /// records a reshape on each.

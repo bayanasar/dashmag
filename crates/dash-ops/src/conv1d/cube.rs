@@ -133,6 +133,7 @@ fn activate<N: Size>(y: Vector<f32, N>, #[comptime] activation: Activation) -> V
     match activation {
         Activation::None => y,
         Activation::Silu => y / (Vector::<f32, N>::new(1.0f32) + (-y).exp()),
+        _ => unreachable!("an activation the public functions refuse"),
     }
 }
 
@@ -156,6 +157,7 @@ fn pre_activation_grad<N: Size>(
             let sigma = one / (one + (-y).exp());
             grad * sigma * (one + y * (one - sigma))
         }
+        _ => unreachable!("an activation the public functions refuse"),
     }
 }
 

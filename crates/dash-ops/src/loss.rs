@@ -5,37 +5,10 @@
 //! log-probability of its target and, if asked, its entropy. Gradients flow to `hidden` and,
 //! when it requires one, to `weight`: an output head trains through it.
 //!
-//! # Definition
-//!
-//! For rows `i` of `hidden` `[n, D]`, an output weight `[V, D]` and targets `t = t[i]`, with `U`
-//! the vocabulary less the masked ids and `K = |U|` its size:
-//!
-//! ```text
-//! z[i, j]    = hidden[i] . weight[j]                          (the logits, never all held)
-//! lse[i]     = log sum_{j in U} exp z[i, j]
-//! logprob[i] = z[i, t] - lse[i]
-//! entropy[i] = -sum_{j in U} p[i, j] log p[i, j],     p[i, j] = exp(z[i, j] - lse[i])
-//! loss[i]    = (1 - eps) (lse[i] - z[i, t]) + eps (lse[i] - mean_{j in U} z[i, j]) + lambda lse[i]^2
-//! ```
-//!
-//! - `eps` is [`CrossEntropyOptions::label_smoothing`], torch's: the target distribution is
-//!   `1 - eps` on the target and `eps / K` on every class, so its second term is
-//!   `eps / K sum_{j in U} -log p[i, j]`. A masked id is not a class: `K` counts the unmasked ids
-//!   (torch's is the width of its logits, which has no masked ids).
-//! - `lambda` is [`CrossEntropyOptions::z_loss`]: PaLM's auxiliary loss on the softmax's
-//!   normaliser, `lambda log(Z)^2` with `log Z = lse` (PaLM uses `1e-4`); fused linear
-//!   cross-entropy kernels call it the lse-square scale.
-//! - Masked ids take no part in any sum: their logits are as if `-inf`. A target that is masked,
-//!   or outside `0..V` without being the ignore index, has probability zero: `logprob = -inf` and
-//!   `loss = +inf`, which is what torch computes with the masked logits at `-inf`. Its gradient
-//!   stays finite: the target's logit is then a constant.
-//! - A row whose target is [`CrossEntropyOptions::ignore_index`] (torch's `-100` by default) is
-//!   ignored: its loss, log-probability and entropy are 0, it receives no gradient, and the mean
-//!   does not count it.
-//!
-//! [`Reduction`] reduces the rows' losses as torch's `reduction` does: the mean over the counted
-//! rows (NaN when every row is ignored, as torch), their sum, or none (`[n]`). The
-//! log-probability and the entropy are per row; each takes a gradient as the loss does.
+//! [`dash_contract::loss`] defines the loss, which every implementation of it shares: the
+//! definition, the label smoothing, z-loss, masked ids and ignored rows, the [`Reduction`]s, the
+//! shapes and dtypes, and the options ([`CrossEntropyOptions`]). This module implements it on
+//! Burn, in the terms used there.
 //!
 //! # The gradient
 //!
@@ -100,52 +73,7 @@ use burn::backend::{
 use burn::tensor::{Device, Int, Tensor};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// How [`linear_cross_entropy`] reduces the rows' losses, as torch's `reduction`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Reduction {
-    /// The mean over the rows that are not ignored, `[1]`.
-    #[default]
-    Mean,
-    /// The sum over the rows, `[1]`.
-    Sum,
-    /// Each row's loss, `[n]` (0 for an ignored row).
-    None,
-}
-
-/// The options of [`linear_cross_entropy`]. The defaults are torch's `F.cross_entropy`'s: the
-/// mean, ignore index `-100`, no label smoothing; and no z-loss, no masked id, no entropy.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CrossEntropyOptions {
-    /// How the rows' losses are reduced.
-    pub reduction: Reduction,
-    /// The target id of rows to ignore.
-    pub ignore_index: i64,
-    /// `eps` in `0..=1`: torch's `label_smoothing`.
-    pub label_smoothing: f32,
-    /// `lambda >= 0`, the z-loss coefficient: `lambda lse^2` is added to each row's loss.
-    pub z_loss: f32,
-    /// Token ids taken out of the softmax, in any order, each `< V`.
-    pub masked: Vec<u32>,
-    /// Whether to return each row's entropy (with its gradient). Without it, and with a weight
-    /// that requires no gradient, the backward pass needs no second pass over the vocabulary.
-    pub entropy: bool,
-    /// How the vocabulary and the rows are chunked.
-    pub chunks: LogprobOptions,
-}
-
-impl Default for CrossEntropyOptions {
-    fn default() -> Self {
-        Self {
-            reduction: Reduction::Mean,
-            ignore_index: -100,
-            label_smoothing: 0.0,
-            z_loss: 0.0,
-            masked: Vec::new(),
-            entropy: false,
-            chunks: LogprobOptions::default(),
-        }
-    }
-}
+pub use dash_contract::loss::{CrossEntropyOptions, Reduction};
 
 /// What [`linear_cross_entropy`] returns, all f32.
 #[derive(Debug, Clone)]
@@ -886,7 +814,7 @@ impl<B: Backend + LinearCrossEntropyBackend, C: CheckpointStrategy> LinearCrossE
 
 /// Cross-entropy of `softmax(hidden @ weight^T)` (the `masked` ids removed) against `targets`,
 /// with each row's log-probability of its target and, if asked, its entropy, without holding
-/// the n x V logits. See the [module](self) for the exact definition.
+/// the n x V logits. See [`dash_contract::loss`] for the exact definition.
 ///
 /// - `hidden` `[n, D]`: bf16 for the kernels' fast path, or f32 (f16 is computed in f32); on an
 ///   autodiff device it may require a gradient, and gets one.

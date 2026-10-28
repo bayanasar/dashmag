@@ -28,6 +28,7 @@ autotune = ["burn/autotune"]
 
 [dependencies]
 burn = { workspace = true, features = ["autodiff", "optim"] }
+dash-contract = { workspace = true }
 dash-core = { workspace = true }
 dash-image = { workspace = true }
 # The published PyTorch checkpoint a run starts from is read directly.

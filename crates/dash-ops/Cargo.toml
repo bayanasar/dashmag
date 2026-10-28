@@ -46,6 +46,7 @@ autotune = ["burn/autotune"]
 
 [dependencies]
 burn = { workspace = true, features = ["autodiff", "extension"] }
+dash-contract = { workspace = true }
 burn-cubecl = { workspace = true, optional = true }
 cubecl = { workspace = true, optional = true }
 

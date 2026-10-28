@@ -1,8 +1,8 @@
-//! Packed variable-length sequences, as every operation that takes them takes them: a batch of
-//! one whose tokens lie end to end along `T`, the boundaries the cumulative offsets `cu_seqlens`
-//! `[S + 1]` (Int, any int dtype) of `S` sequences, from 0 to `T` without decreasing (a sequence
-//! may be empty), as flash-attn and fla take them. The gated delta rule and causal conv1d take
-//! them as [`Sequences`]; attention, whose queries and keys have boundaries of their own, as its
+//! Packed variable-length sequences, as the gated delta rule and causal conv1d take them
+//! ([`Sequences`]): a batch of one whose tokens lie end to end along `T`, the boundaries the
+//! cumulative offsets `cu_seqlens` `[S + 1]` (Int, any int dtype) of `S` sequences, from 0 to `T`
+//! without decreasing (a sequence may be empty), as flash-attn and fla take them. Attention,
+//! whose queries and keys have boundaries of their own and may end before `T`, takes them as its
 //! mask.
 
 use burn::backend::tensor::IntTensor;

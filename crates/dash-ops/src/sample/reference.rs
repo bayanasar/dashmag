@@ -1,4 +1,4 @@
-//! The reference: the module documentation's definition in Burn's tensor operations, in f32. Every
+//! The reference: `dash_contract::sample`'s definition in Burn's tensor operations, in f32. Every
 //! backend runs it; the tests hold the kernel to it. The cuts come from the row sorted in
 //! descending order: the `k`-th largest logit is the sorted row's entry `k - 1`, and top-p's logit
 //! the sorted entry at which the cumulative sum of the sorted weights first reaches `p` of their
@@ -11,7 +11,7 @@
 //! (a relative error near `1e-4` in the log-sum-exp; the top-p cut moved by a whole tie group of
 //! bf16 logits), where the trees stay within a few `1e-7` of the sums in f64.
 
-use super::{SampleOptions, philox};
+use super::{Cuts, SampleOptions, philox};
 use burn::backend::tensor::{BoolTensor, FloatTensor, IntTensor};
 use burn::backend::{
     Backend, DType, FloatDType, IntDType, Scalar, Shape, Slice, TensorData, TensorMetadata,
@@ -125,7 +125,7 @@ pub(crate) fn sample<B: Backend>(
     )
 }
 
-/// The tokens top-k and top-p keep, `[B, V]` (`P` in the module documentation), or `None` when
+/// The tokens top-k and top-p keep, `[B, V]` (`P` in the definition), or `None` when
 /// neither cuts: every unmasked token. `zm` is the row with the masked logits at `-inf`, `m` its
 /// maximum `[B, 1]`.
 #[allow(clippy::too_many_arguments)]

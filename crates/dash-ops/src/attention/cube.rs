@@ -13,7 +13,7 @@ use super::kernels::{
     dq_kernel, finish_kernel, forward_kernel,
 };
 use super::{
-    AttentionBackend, AttentionMaskPrimitive, AttentionOptions, CacheLengths, MaskShape,
+    AttentionBackend, AttentionMaskPrimitive, AttentionOptions, CacheLengths, MaskShape, Reach,
     check_decode_shapes, check_shapes, probe, reference,
 };
 use crate::cube::Requirements;

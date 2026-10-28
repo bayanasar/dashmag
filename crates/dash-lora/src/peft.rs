@@ -704,26 +704,7 @@ impl PeftAdapter {
     }
 }
 
-/// How [`PeftAdapter::apply_with`] gives the caller's layers an adapter.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ApplyOptions {
-    /// The name the adapter takes in each layer, PEFT's `adapter_name`: [`DEFAULT_ADAPTER`] by
-    /// default.
-    pub name: String,
-    /// Whether its factors train (require a gradient), PEFT's `is_trainable`: true by default.
-    /// A frozen adapter records nothing for autodiff, gets no gradient and so no optimizer state;
-    /// its dropout, if it has any, still acts in training, as PEFT's does.
-    pub trainable: bool,
-}
-
-impl Default for ApplyOptions {
-    fn default() -> Self {
-        Self {
-            name: DEFAULT_ADAPTER.to_string(),
-            trainable: true,
-        }
-    }
-}
+pub use dash_contract::lora::ApplyOptions;
 
 fn to_data(name: &str, view: &TensorView<'_>) -> Result<TensorData, PeftError> {
     let dtype = match view.dtype() {
