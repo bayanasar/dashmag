@@ -29,7 +29,7 @@ mod common;
 use burn::backend::{DType, Dispatch};
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use dash_ops::logprob::{
-    ChosenLogprobBackend, LogprobOptions, chosen_logprob, kernels_take, probe,
+    ChosenLogprobBackend, LogprobOptions, VocabChunk, chosen_logprob, kernels_take, probe,
 };
 use safetensors::SafeTensors;
 use std::sync::Mutex;

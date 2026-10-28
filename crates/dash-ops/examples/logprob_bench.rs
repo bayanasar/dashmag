@@ -32,7 +32,7 @@ mod bench {
     use burn::backend::{Backend, DType};
     use burn::tensor::{Device, Distribution, Int, Tensor};
     use burn_cubecl::{CubeBackend, CubeDevice};
-    use dash_ops::logprob::{LogprobOptions, chosen_logprob};
+    use dash_ops::logprob::{LogprobOptions, VocabChunk, chosen_logprob};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Instant;

@@ -35,8 +35,10 @@
 /// `rows x vocab_chunk` f32 values, 96 MiB at most at the defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogprobOptions {
-    /// Vocabulary tokens per chunk (`C`), or 0 (the default) to choose by the size of the row
-    /// block: 4096 tokens below 2304 rows, 8192 from there.
+    /// Vocabulary tokens per chunk (`C`), or 0 (the default) for the implementation's own choice,
+    /// which may depend on the rows in a block and which each implementation documents: the chunk
+    /// sets what is held at once and the order of the sums, and what is fastest differs between
+    /// devices.
     pub vocab_chunk: usize,
     /// The most rows per block, at least 1; the rows are split into equal blocks no larger.
     /// Every block makes its own pass over the vocabulary, reading the whole weight. Default:
@@ -53,13 +55,3 @@ impl Default for LogprobOptions {
     }
 }
 
-impl LogprobOptions {
-    /// The vocabulary chunk for a block of `rows` rows.
-    pub fn vocab_chunk_for(&self, rows: usize) -> usize {
-        match self.vocab_chunk {
-            0 if rows < 2304 => 4096,
-            0 => 8192,
-            chunk => chunk,
-        }
-    }
-}

@@ -58,7 +58,7 @@
 //! integers, which lavapipe has, OpenGL lacks the integers and CubeCL's CPU runtime the units
 //! (it has as many units per cube as cores).
 
-use crate::logprob::LogprobOptions;
+use crate::logprob::{LogprobOptions, VocabChunk};
 use crate::logprob::coefficient;
 use crate::logprob::reference::{self, Pass, Rows, cast, dims2, full, sorted, to_f32};
 use burn::backend::autodiff::checkpoint::base::Checkpointer;

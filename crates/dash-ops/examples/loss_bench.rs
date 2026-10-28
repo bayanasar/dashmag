@@ -43,7 +43,7 @@ mod bench {
     use burn::backend::{Backend, DType};
     use burn::tensor::{Device, Distribution, Int, Tensor};
     use burn_cubecl::{CubeBackend, CubeDevice};
-    use dash_ops::logprob::LogprobOptions;
+    use dash_ops::logprob::{LogprobOptions, VocabChunk};
     use dash_ops::loss::{CrossEntropyOptions, linear_cross_entropy};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

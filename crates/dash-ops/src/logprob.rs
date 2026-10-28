@@ -80,6 +80,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub use dash_contract::logprob::LogprobOptions;
 
+/// The vocabulary chunk dash-ops walks for a block of `rows` rows: [`LogprobOptions::vocab_chunk`]
+/// when it is set, and for 0, 4096 tokens below 2304 rows and 8192 from there.
+pub trait VocabChunk {
+    /// The vocabulary chunk for a block of `rows` rows.
+    fn vocab_chunk_for(&self, rows: usize) -> usize;
+}
+
+impl VocabChunk for LogprobOptions {
+    fn vocab_chunk_for(&self, rows: usize) -> usize {
+        match self.vocab_chunk {
+            0 if rows < 2304 => 4096,
+            0 => 8192,
+            chunk => chunk,
+        }
+    }
+}
+
 /// The row blocks of [`LogprobOptions`]: the references and the kernels walk the same blocks.
 pub(crate) trait RowBlocks {
     /// The row blocks of `n` rows: as few as `row_chunk` allows, of equal size but for the last.

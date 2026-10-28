@@ -22,7 +22,7 @@
 //! chunk's rows of the gradient of `weight`, written in place.
 
 use super::reference::Rows;
-use super::{ChosenLogprobBackend, LogprobOptions, RowBlocks, coefficient, probe};
+use super::{ChosenLogprobBackend, LogprobOptions, RowBlocks, VocabChunk, coefficient, probe};
 use crate::cube::Requirements;
 use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::ops::{FloatTensorOps, IntTensorOps};

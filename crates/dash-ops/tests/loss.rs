@@ -37,7 +37,7 @@ mod common;
 
 use burn::backend::{DType, bf16};
 use burn::tensor::{Device, Int, Tensor, TensorData};
-use dash_ops::logprob::{LogprobOptions, chosen_logprob};
+use dash_ops::logprob::{LogprobOptions, VocabChunk, chosen_logprob};
 use dash_ops::loss::{CrossEntropyOptions, Reduction, kernels_take, linear_cross_entropy, probe};
 use safetensors::SafeTensors;
 use std::sync::Mutex;
