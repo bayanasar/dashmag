@@ -15,12 +15,14 @@ dash-lora's `metal` feature.
 | `gated_delta::chunk` | the gated delta rule, chunked, forward and backward: the l2 normalisation of queries and keys and the query scale as options, from initial states and to final states, over a batch or packed variable-length sequences | the chunks' triangular inverses and the scan from chunk to chunk; the rest MLX's batched operations |
 | `gated_delta::recurrent` | the gated delta rule a token at a time, for decoding: one token of each sequence, or several of each, packed | one kernel a call; its gradient the reference's |
 | `logprob` | the chosen tokens' log-probabilities and entropies over a large vocabulary with a frozen output weight, masked tokens left out, without the n x V logits; the gradient to the hidden states | one kernel a chunk of the vocabulary for the online log-sum-exp and the entropy, one for the backward pass's weights; the logits and the weighted sums MLX's matmuls |
+| `loss` | cross-entropy straight from the hidden states and the output weight: torch's reductions, ignore index and label smoothing, a z-loss and masked tokens, each row's log-probability and, if asked, its entropy, without the n x V logits; the gradients to the hidden states and the weight | `logprob`'s pass, one kernel a chunk for the gradient of the logits; the products MLX's matmuls |
 | `lowrank` | the low-rank product `base + scale · (x U) V` with its gradients, f32 throughout, the sum rounded once | dash-ops' `up` kernel for the sum with the base; the rest MLX's matmuls |
 | `lora` | LoRA's layer: a frozen base at its own precision, f32 adapters never folded into it, several by name over one base, the choice of one | through `lowrank` |
 
 The operations build on three MLX functions: `checkpoint` and `custom_vjp`, which mlx-rs does not
 wrap yet and the workspace's mlx-rs adds (below), and `MetalKernel`, which mlx-rs 0.33.0 wraps.
-`tests/hooks.rs` holds each to plain MLX operations.
+`tests/hooks.rs` holds each to plain MLX operations. `loss` also calls MLX's `depends`, which
+mlx-sys binds and mlx-rs does not wrap, to order its backward pass's products.
 
 Part of [Dashmag](https://github.com/bayanasar/dashmag). See the repository for the full picture.
 
@@ -170,6 +172,43 @@ there, its choice on CUDA. At these 3072 rows, with MLX's default TF32, over two
 | 3072, dash-mlx's | 127.6-131.0 ms, +1118 MiB | 434.9-439.1 ms, +1193 MiB |
 | 4096 | 127.0-130.6 ms, +1165 MiB | 444.5-452.7 ms, +1304 MiB |
 | 8192 | 127.9-130.1 ms, +1549 MiB | 585.2-620.1 ms, +1672 MiB |
+
+The fused linear cross-entropy (`tests/loss.rs`, on dash-ops' `loss` fixtures: `basic`, `peaked`
+with logits up to 38 and targets at p = 0.98, `wide`, each in its four variants: torch's defaults;
+label smoothing, a z-loss and masked ids; a sum with a masked target, `+inf`; each row's loss with
+another ignore index), through the kernels and through MLX's operations, with both inputs taking a
+gradient, each term of the objective alone, a frozen weight, a frozen `hidden` and other chunkings,
+the largest over every comparison, to three figures and rounded up, with dash-ops' bounds:
+
+| | loss | log-probability | entropy | gradient to `hidden` | gradient to `weight` |
+|---|---|---|---|---|---|
+| f32, kernels | 1.38e-7 (2e-7) | 9.27e-8 (2e-7) | 7.37e-7 (1e-6) | 2.22e-6 (4e-6) | 1.88e-6 (4e-6) |
+| f32, the reference (MLX's operations) | 1.38e-7 (2e-7) | 1.37e-7 (2e-7) | 7.37e-7 (1e-6) | 1.45e-6 (4e-6) | 1.71e-6 (4e-6) |
+| bf16 inputs, the gradients rounded to bf16 | 9.27e-8 (2e-7) | 9.27e-8 (2e-7) | 4.94e-7 (5e-7) | 2.88e-3 (3e-3) | 3.43e-3 (4e-3) |
+
+f16 inputs give f32 inputs' values to the bit, the gradients rounded to f16. The kernels are within
+3.19e-7 of the reference at D 1024 over 20,000 tokens with label smoothing, a z-loss, the entropy,
+masked ids, targets out of range and an ignored row; two runs give the same bits in f32 and bf16;
+the log-probability and its gradient are `logprob`'s within the test's bound of 1e-6.
+
+The loss at the workload's shapes, 3072 rows of 1024 against a bf16 head of 248,320 tokens, the mean;
+against mlx-rs's `losses::CrossEntropy` over the whole logits as mlx-lm's trainer forms its loss
+(the head's bf16 product cast to f32), the range over two runs:
+
+| | forward | forward + backward, frozen head | forward + backward, head trained |
+|---|---|---|---|
+| dash-mlx, chunks of 3072 | 127-131 ms, +1118 MiB | 425-432 ms, +1158 MiB | 574-575 ms, +2638 MiB |
+| mlx-rs's `CrossEntropy`, the whole logits | 126 ms, +4365 MiB | 453-454 ms, +12378 MiB | 618-626 ms, +12863 MiB |
+| dash-mlx with `MLX_ENABLE_TF32=0` | 353 ms, +1118 MiB | 1080 ms, +1158 MiB | 1420 ms, +2638 MiB |
+
+    cargo run --release -p dash-mlx --example loss_bench
+
+The forward pass takes as long as the baseline's: both are one product over the vocabulary,
+dash-mlx's in f32 (exact from bf16 inputs), the baseline's in bf16, its logits rounded to bf16. A
+backward pass walks the vocabulary once more: two matmuls a chunk with a frozen head (LoRA's
+case), three with the head trained. There each chunk's two products wait for each other
+(`src/loss.rs`); without that, MLX held every chunk's gradient of the logits at once, +5205 MiB in
+672 ms (one run).
 
 Attention (`tests/attention.rs`, on dash-ops' ten attention records: causal with grouped heads and
 `Tq != Tk`, no mask, a window with and without causality, key padding with and without causality,
