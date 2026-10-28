@@ -10,6 +10,8 @@
 //! - [`conv1d`]: causal depthwise conv1d with its states, over a batch or packed sequences, and
 //!   its decoding step.
 //! - [`gated_delta`]: the gated delta rule, chunked for training and recurrent for decoding.
+//! - [`logprob`]: the chosen tokens' log-probabilities and entropies over a large vocabulary,
+//!   without the n x V logits.
 //!
 //! The operations compute in f32 inside. MLX runs f32 matrix products in TF32 on GPUs that have
 //! it unless `MLX_ENABLE_TF32=0`; the f32 bounds the tests hold the operations to assume it is off.
@@ -32,3 +34,5 @@ pub mod conv1d;
 pub mod gated_delta;
 #[cfg(target_os = "macos")]
 mod kernel;
+#[cfg(target_os = "macos")]
+pub mod logprob;

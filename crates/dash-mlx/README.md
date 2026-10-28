@@ -12,6 +12,7 @@ dash-lora's `metal` feature.
 | `conv1d` | causal depthwise conv1d of any small width, with an optional bias and SiLU, from initial states or zeros and to final states, over a batch or packed variable-length sequences, with its gradients; the decoding step | widths 2 to 8: forward, backward and step kernels; others the reference |
 | `gated_delta::chunk` | the gated delta rule, chunked, forward and backward: the l2 normalisation of queries and keys and the query scale as options, from initial states and to final states, over a batch or packed variable-length sequences | the chunks' triangular inverses and the scan from chunk to chunk; the rest MLX's batched operations |
 | `gated_delta::recurrent` | the gated delta rule a token at a time, for decoding: one token of each sequence, or several of each, packed | one kernel a call; its gradient the reference's |
+| `logprob` | the chosen tokens' log-probabilities and entropies over a large vocabulary with a frozen output weight, masked tokens left out, without the n x V logits; the gradient to the hidden states | one kernel a chunk of the vocabulary for the online log-sum-exp and the entropy, one for the backward pass's weights; the logits and the weighted sums MLX's matmuls |
 
 The operations build on three MLX functions: `checkpoint` and `custom_vjp`, which mlx-rs does not
 wrap yet and the workspace's mlx-rs adds (below), and `MetalKernel`, which mlx-rs 0.33.0 wraps.
@@ -64,6 +65,20 @@ with dash-ops' bounds; f32 with `MLX_ENABLE_TF32=0` (below).
 Packed sequences give each sequence's values, to the bit, as a call on it alone. Each kernel run
 twice on the same inputs gives the same bits, in f32 and bf16, the chunked rule's forward and
 backward and the step, over one sequence and packed (`kernels_repeat_bit_for_bit`).
+
+The chosen tokens' log-probabilities (`tests/logprob.rs`, on dash-ops' `logprob` fixtures:
+`basic`, `peaked` with targets at p = 0.99 and logits up to 49, `wide`, each with and without its
+masked ids, with dash-ops' small chunks and the defaults), the largest over every comparison, to
+three figures and rounded up, with dash-ops' bounds:
+
+| | log-probability | entropy | gradient to `hidden` |
+|---|---|---|---|
+| f32, kernels | 8.82e-8 (2e-7) | 1.08e-6 (2e-6) | 3.95e-7 (1e-6) |
+| f32, the reference (MLX's operations) | 8.82e-8 (2e-7) | 9.91e-7 (2e-6) | 3.95e-7 (1e-6) |
+| bf16 inputs, the gradient rounded to bf16 | 8.82e-8 (2e-7) | 1.08e-6 (2e-6) | 3.29e-3 (4e-3) |
+
+The kernels are within 2.16e-7 of the reference at D 1024 over 20,000 tokens with masked ids and
+targets out of range, and two runs give the same bits in f32 and bf16.
 
 Speed and memory on an Apple M6 (32 GB), MLX 0.32.3, bf16, against mlx-lm's operations (the
 state's rows prepended, MLX's `conv1d`, SiLU), timed by the same example in the same process:
@@ -119,6 +134,38 @@ for four: the state moves in and out once a call either way, but here the sums o
 meet in threadgroup memory, four barriers a token, where in mlx-lm's `[Dv, Dk]` layout a lane's
 rows lie together and its sums are `simd_sum`s. Run over 6144 tokens of one sequence, it takes
 13 to 14% less time than mlx-lm's kernel and a third of its memory.
+
+The chosen tokens' log-probabilities and entropies, 3072 rows of 1024 against a frozen bf16 head
+of 248,320 tokens, the gradient to the hidden states; against MLX's operations as mlx-lm's
+trainer forms its loss (the whole logits, then log-softmax), the range over two runs:
+
+| | forward | forward + backward |
+|---|---|---|
+| dash-mlx, chunks of 3072 | 129-131 ms, +1118 MiB | 437-443 ms, +1193 MiB |
+| MLX's operations, the whole logits | 264 ms, +7275 MiB | 582-591 ms, +13833 MiB |
+| dash-mlx with `MLX_ENABLE_TF32=0` | 353 ms, +1118 MiB | 1070 ms, +1193 MiB |
+
+    cargo run --release -p dash-mlx --example logprob_bench
+
+dash-mlx forms its logits in f32, exact from bf16 inputs; with MLX's TF32 (the default) those
+products run on the M6's neural accelerators, and with it off on its simdgroup matrices, three
+times slower. The baseline's bf16 matmul rounds its logits to bf16 and does not depend on the
+setting. A forward pass alone walks the vocabulary once; with the gradient, three matmuls a
+chunk where dash-ops takes two (`src/logprob.rs`). The peak above the 3 MiB the outputs need is
+MLX's: it keeps a command buffer's temporaries until the GPU has run it, so several chunks' logits
+are held at once.
+
+With `vocab_chunk` 0, dash-mlx walks chunks of 3072 tokens at any number of rows, its own choice:
+the chunk sets what is held at once and the order of the sums, not what is computed, and the
+fastest chunk differs between devices. dash-ops takes 4096 tokens below 2304 rows and 8192 from
+there, its choice on CUDA. At these 3072 rows, with MLX's default TF32, over two runs each
+(`CHUNKS=3072,4096,8192`):
+
+| vocabulary chunk | forward | forward + backward |
+|---|---|---|
+| 3072, dash-mlx's | 127.6-131.0 ms, +1118 MiB | 434.9-439.1 ms, +1193 MiB |
+| 4096 | 127.0-130.6 ms, +1165 MiB | 444.5-452.7 ms, +1304 MiB |
+| 8192 | 127.9-130.1 ms, +1549 MiB | 585.2-620.1 ms, +1672 MiB |
 
 ## f32 and TF32
 
