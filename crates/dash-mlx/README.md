@@ -9,6 +9,7 @@ dash-lora's `metal` feature.
 
 | module | operation | on Metal |
 |---|---|---|
+| `attention` | attention with grouped key-value heads, causality, a sliding window, key padding and packed sequences, its log-sum-exp, a backward pass that keeps no more than a tile of scores, and decoding against a key-value cache | one kernel a tile for the forward pass's online softmax and one for the backward pass's probabilities and score gradients, the products MLX's matmuls; a flash-decoding kernel reading the cache in dash-ops' layout |
 | `conv1d` | causal depthwise conv1d of any small width, with an optional bias and SiLU, from initial states or zeros and to final states, over a batch or packed variable-length sequences, with its gradients; the decoding step | widths 2 to 8: forward, backward and step kernels; others the reference |
 | `gated_delta::chunk` | the gated delta rule, chunked, forward and backward: the l2 normalisation of queries and keys and the query scale as options, from initial states and to final states, over a batch or packed variable-length sequences | the chunks' triangular inverses and the scan from chunk to chunk; the rest MLX's batched operations |
 | `gated_delta::recurrent` | the gated delta rule a token at a time, for decoding: one token of each sequence, or several of each, packed | one kernel a call; its gradient the reference's |
@@ -166,6 +167,83 @@ there, its choice on CUDA. At these 3072 rows, with MLX's default TF32, over two
 | 3072, dash-mlx's | 127.6-131.0 ms, +1118 MiB | 434.9-439.1 ms, +1193 MiB |
 | 4096 | 127.0-130.6 ms, +1165 MiB | 444.5-452.7 ms, +1304 MiB |
 | 8192 | 127.9-130.1 ms, +1549 MiB | 585.2-620.1 ms, +1672 MiB |
+
+Attention (`tests/attention.rs`, on dash-ops' ten attention records: causal with grouped heads and
+`Tq != Tk`, no mask, a window with and without causality, key padding with and without causality,
+packed sequences, packed cross attention with a window), the output, the log-sum-exp and the
+three gradients of `sum(o * do)`, through the tile kernels and through MLX's operations, the
+largest over every comparison:
+
+| | o | lse | dq | dk | dv |
+|---|---|---|---|---|---|
+| f32 | 3.27e-7 | 1.25e-7 | 3.74e-7 | 3.12e-7 | 2.41e-7 |
+| bf16 | 3.00e-3 | 1.25e-7 | 3.98e-3 | 4.15e-3 | 3.82e-3 |
+
+In bf16 within dash-ops' kernel bounds; in f32 within the bounds dash-ops gives its f32 runs when
+the kernels doing the sums differ from those its tighter bounds were measured on ("a few
+roundings": 1e-6, the log-sum-exp 2e-7), since MLX's matmuls sum in their own order. At sizes the
+records do not reach (1300 queries and keys causal, 700 against 1300 in a window of 300, 1300
+against 1100 unmasked: several tiles to a block, the last partial), against plain attention in
+float64, within the same bounds: o 9.95e-7, lse 1.20e-7, dq 6.39e-7, dk 7.87e-7, dv 7.96e-7. A
+query that sees no key gives zeros, `-inf` and no gradient; decoding is the training path with one
+query, in bf16 within one rounding; two runs give the same bits.
+
+At 6144 tokens, 8 / 2 heads of 256, bf16, causal, against MLX's fused
+`scaled_dot_product_attention` (its backward pass MLX's own), the range over two runs:
+
+| | forward | forward + backward |
+|---|---|---|
+| dash-mlx | 41.1-41.2 ms, +1472 MiB | 134-138 ms, +2112 MiB |
+| MLX's fused attention | 11.3-11.4 ms, +24 MiB | 134 ms, +1968 MiB |
+| dash-mlx with `MLX_MAX_OPS_PER_BUFFER=2` (one run) | 40.8 ms, +790 MiB | 129 ms, +1598 MiB |
+| MLX's fused attention with `MLX_MAX_OPS_PER_BUFFER=2` (one run) | 11.3 ms, +24 MiB | 135 ms, +1968 MiB |
+
+| decoding step, batch 32, 3072 cached keys, per layer of 6 | |
+|---|---|
+| dash-mlx, the cache `[B, S, Hkv, D]` read in place | 1.43 ms, +51 MiB |
+| MLX's fused attention, the cache `[B, Hkv, S, D]` | 1.61-3.20 ms (over six runs) |
+| MLX's fused attention through a transposed view of `[B, S, Hkv, D]` (which it copies) | 4.59-4.61 ms, +1153 MiB |
+
+    cargo run --release -p dash-mlx --example attention_bench
+
+dash-mlx's attention is the contract's, f32-accurate where MLX's fused kernel is not (in bf16
+it rounds the probabilities before the value product: 4.78e-3 off the records against dash-ops'
+3.4e-3), and gives the log-sum-exp. For training it takes as long as MLX's own and a little more
+memory. The tiles' products run on the neural accelerators, but MLX runs a long chain of small
+operations ahead of the GPU and keeps each one's temporaries until the GPU has run it, so many
+tiles' arrays are held at once; the smaller each operation's arrays, the less. The backward pass
+works a tile of 512 queries by 512 keys at a time: as a key block against all its queries it took
+141.7 ms at +2672 MiB. Evaluating inside the operation, per key block or once, took the backward's
+peak to +7461 MiB under MLX's autodiff, where training runs it (measured; the likely cause, not
+verified, is that MLX keeps arrays evaluated during a trace attached to their inputs). Smaller
+command buffers help, as the table shows, but MLX reads `MLX_MAX_OPS_PER_BUFFER` once per
+process, so a training program sets it, not the operation. A fused kernel would hold one tile; on
+the simdgroup matrices (about 5.1 TFLOPS here) it would trade speed for that.
+
+When the caller needs neither the log-sum-exp nor dash-ops' bf16 bound, and the mask is none,
+causal or key padding, MLX's fused attention is the better call for training: a quarter of the
+forward pass's time and no tiles held, the backward about as long with a little less memory. A
+window or packed sequences it takes only as a materialised `Tq x Tk` mask.
+
+Decoding
+reads `[B, S, Hkv, D]` in place: each threadgroup takes a sequence, a key-value head and a split of its
+cache, reads each key and value row once for the group's query heads, keeps the softmax online in
+f32 and meets its simdgroups once at the end; the splits are merged by their maxima and sums.
+Being memory-bound it needs no matrix units, and it takes 1.43 ms a layer where MLX's kernel, on
+its own layout, takes 1.61 to 3.20. Its gradient, to the query and the cache, is MLX's.
+
+## Command buffers
+
+MLX keeps each queued operation's temporaries until the GPU has run the command buffer that holds
+it, and puts as many operations in a buffer as `MLX_MAX_OPS_PER_BUFFER` allows. MLX reads that
+variable once per process, when it first uses the GPU, so an operation cannot set it: a training
+program does, in its environment, before it starts. Attention's training path is where it
+matters most here. At 6144 tokens (the attention table above) with `MLX_MAX_OPS_PER_BUFFER=2`, a
+forward and backward pass took 129 ms at +1598 MiB, against 134-138 ms at +2112 MiB with MLX's
+default, and the forward pass alone peaked at +790 MiB against +1472 (one run; MLX's fused
+attention 134-135 ms at +1968 MiB either way).
+
+    MLX_MAX_OPS_PER_BUFFER=2 cargo run --release -p dash-mlx --example attention_bench
 
 ## f32 and TF32
 
