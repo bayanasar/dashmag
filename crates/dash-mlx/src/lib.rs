@@ -19,6 +19,8 @@
 //! - [`lora`]: LoRA's layer over a frozen base, several adapters by name, the choice of one.
 //! - [`loss`]: cross-entropy from the hidden states and the output weight, with its reductions,
 //!   ignore index, label smoothing, z-loss and masked ids, without the n x V logits.
+//! - [`sample`]: the next token drawn on the device, as dash-ops draws it: temperature, top-k,
+//!   top-p and masked ids, the same random numbers, three log-probabilities.
 //!
 //! The operations compute in f32 inside. MLX runs f32 matrix products in TF32 on GPUs that have
 //! it unless `MLX_ENABLE_TF32=0`; the f32 bounds the tests hold the operations to assume it is off.
@@ -54,3 +56,5 @@ pub mod lora;
 pub mod loss;
 #[cfg(target_os = "macos")]
 pub mod lowrank;
+#[cfg(target_os = "macos")]
+pub mod sample;

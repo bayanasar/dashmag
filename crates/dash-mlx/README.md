@@ -18,6 +18,7 @@ dash-lora's `metal` feature.
 | `loss` | cross-entropy straight from the hidden states and the output weight: torch's reductions, ignore index and label smoothing, a z-loss and masked tokens, each row's log-probability and, if asked, its entropy, without the n x V logits; the gradients to the hidden states and the weight | `logprob`'s pass, one kernel a chunk for the gradient of the logits; the products MLX's matmuls |
 | `lowrank` | the low-rank product `base + scale · (x U) V` with its gradients, f32 throughout, the sum rounded once | dash-ops' `up` kernel for the sum with the base; the rest MLX's matmuls |
 | `lora` | LoRA's layer: a frozen base at its own precision, f32 adapters never folded into it, several by name over one base, the choice of one | through `lowrank` |
+| `sample` | the next token drawn on the device, as dash-ops draws it: temperature, top-k, top-p and masked ids, the same Philox words and Gumbel variates, the token's log-probability under the model, the tempered distribution and the one drawn from | one kernel for the generator; the cuts and the draw MLX's operations |
 
 The operations build on three MLX functions: `checkpoint` and `custom_vjp`, which mlx-rs does not
 wrap yet and the workspace's mlx-rs adds (below), and `MetalKernel`, which mlx-rs 0.33.0 wraps.
@@ -313,6 +314,55 @@ bf16, rank 16), a forward and backward pass, the range over two runs:
 | dash-mlx `checkpoint` | 369.2-369.9 ms | +920 MiB |
 
     cargo run --release -p dash-mlx --example checkpoint_bench
+
+The next token (`tests/sample.rs`, dash-ops' sampling tests on MLX): every draw against the
+definition computed in f64 (the token one of the kept set, and `logprob`, `tempered_logprob` and
+`sampling_logprob` within dash-ops' bounds, 4.11e-7 on rows of a few tokens (1e-6) and 9.95e-7 at
+100,000 tokens and the decoding width (2e-6)); dash-ops' fifteen distribution cases (ties at the
+`k`-th logit and at top-p's cut, `k = 1`, `k >= V`, `p = 0`, `p = 1e-6`, `p = 1`, both cuts, masked
+ids) and a sixteenth, masked ids under top-k at temperature 0.8, where the tempered sum feeds
+`tempered_logprob` alone, 98,304 draws each, within their chi-square tests at dash-ops'
+significance level, and tied
+groups of 5000 tokens; greedy decoding MLX's argmax in f32, bf16 and f16; the edges (one token,
+every token but one masked, huge and `-inf` logits, a row with no finite logit); the same bits from
+run to run. The draws are dash-ops' own: the device's Philox words are the host generator's token
+for token (the generator checked against Random123's known answers), the Gumbel variates within
+2.19e-6 of f64 (6e-6), and at 248,320 tokens the token is the definition's, `argmax (s + g)` over
+the kept set from the host's words in f64, and top-p's cut the definition's, on every row whose
+f64 crossing does not lie within 2e-6 of the row's mass of a tie group's end; those rows are
+marked and counted. At temperature 1 with nothing cut the three log-probabilities are equal to the
+bit.
+
+How often top-p's cut differs from the definition's (`examples/sample_cuts.rs`, 40,960 rows of
+248,320 bf16 logits each flat and peaked, `p` 0.9 and 0.95, 163,840 cuts): only where the crossing
+lies within 2e-6 of a group's end (1,946 cuts, 1.19%), and there on 28 cuts with the balanced tree
+the sampler takes (dash-ops' reference's order), against 49 with a tree formed in pairs and 75 with
+MLX's scan. At temperature 0.7 (163,840 cuts more), 2,888 cuts lie near a group's end (1.77%), and
+the three differ on 39, 81 and 150, all of them there.
+
+Sampling 32 rows of bf16 logits over 248,320 tokens, a decoding step of 32 sequences, against
+mlx-lm's sampler as MLX's operations (`logits - logsumexp`, top-k by `argpartition`, top-p by
+`argsort` and `cumsum`, `random.categorical` of the logits over the temperature; mlx-lm cuts top-p
+at temperature 1, dash-ops at the temperature), the range over two runs:
+
+| | dash-mlx | mlx-lm's sampler |
+|---|---|---|
+| greedy | 0.838-0.861 ms, +30 MiB | 1.25 ms, +61 MiB |
+| temperature 1 | 3.80 ms, +182 MiB | 6.40 ms, +121 MiB |
+| top-k 50 | 14.7 ms, +402 MiB | 22.6 ms, +333 MiB |
+| top-p 0.9 | 35.8-35.9 ms, +1047 MiB | 30.6 ms, +553 MiB |
+| top-k 50, top-p 0.9, temperature 0.8 | 36.6 ms, +1055 MiB | 42.4 ms, +796 MiB |
+| the row sorted in descending order alone (MLX's `sort_axis`, f32) | 9.62 ms, +182 MiB | |
+
+    cargo run --release -p dash-mlx --example sample_bench
+    cargo run --release -p dash-mlx --example sample_cuts
+
+The cuts take a sort of the row, 9.62 ms of top-k's 14.7 here; dash-ops' kernel finds them
+without one. Top-p's tree is 18 passes over the row: with MLX's scan instead it took 17.1 ms at
++500 MiB, with the tree formed in pairs 22.6 ms at +632 MiB (the pairs in one run). The variates
+are `[B, V]` f32, 32 MiB at this shape, about half of what the temperature alone holds above
+mlx-lm's (+182 against +121 MiB). A kernel forming the scores, the cuts and the draw in one
+pass, as dash-ops' does, would remove both the sort and that array.
 
 ## Command buffers
 
