@@ -4,21 +4,27 @@
 //! its output's dtype, a term left out of the loss taking none), and outputs are read back as f32.
 //!
 //! What the bodies cannot ask of every implementation, which of dash-mlx's kernels a call ran, is
-//! checked here around the calls: conv1d's forward and decoding kernels ran exactly where they
-//! take the call, and so did its backward kernels over plain sequences.
+//! checked here around the calls: conv1d's forward and decoding kernels, the chunked gated delta
+//! rule's inverses' and scan's kernels and the step's kernel ran exactly where they take the call;
+//! so did conv1d's backward kernels over plain sequences, and the scan's backward kernel wherever
+//! gradients were asked for.
 #![allow(dead_code)]
 
 use dash_conformance::{
     Adapter, Attention, AttentionDecode, AttentionOut, ChosenLogprob, ChosenLogprobOut,
-    ChunkGatedDelta, ChunkGatedDeltaOut, Conv1d, Conv1dGrads, Conv1dOut, Conv1dStep, Conv1dStepOut,
-    DType, GatedDeltaStep, GatedDeltaStepOut, HostTensor, Unsupported,
+    ChunkGatedDelta, ChunkGatedDeltaGrads, ChunkGatedDeltaOut, Conv1d, Conv1dGrads, Conv1dOut,
+    Conv1dStep, Conv1dStepOut, DType, GatedDeltaStep, GatedDeltaStepGrads, GatedDeltaStepOut,
+    HostTensor, Unsupported,
 };
 use dash_mlx::conv1d::{self, causal_conv1d, causal_conv1d_update};
+use dash_mlx::gated_delta::chunk::{self, chunk_gated_delta_rule};
+use dash_mlx::gated_delta::recurrent::{self, gated_delta_step};
 use mlx_rs::error::Exception;
 use mlx_rs::ops::zeros_dtype;
 use mlx_rs::transforms::fallible_vjp;
 use mlx_rs::{Array, Dtype};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// MLX's GPU, as the conformance bodies drive it.
 pub struct Mlx;
@@ -72,6 +78,38 @@ pub fn host(a: &Array) -> HostTensor {
 pub fn offsets(offsets: &[i64]) -> Array {
     let values: Vec<i32> = offsets.iter().map(|&o| o as i32).collect();
     Array::from_slice(&values, &[values.len() as i32])
+}
+
+/// The f32 bounds assume IEEE f32 matmuls; MLX runs them in TF32 on GPUs that have it unless
+/// `MLX_ENABLE_TF32=0`, which puts errors near 5e-4 (measured on an Apple M6). Checked with one
+/// 64 x 64 product against the same product summed in f64.
+pub fn require_ieee_f32_matmul() {
+    let n = 64;
+    let a: Vec<f32> = (0..n * n)
+        .map(|i| ((i * 7919 % 1013) as f32 / 1013.0) - 0.5)
+        .collect();
+    let b: Vec<f32> = (0..n * n)
+        .map(|i| ((i * 104729 % 997) as f32 / 997.0) - 0.5)
+        .collect();
+    let product = Array::from_slice(&a, &[n as i32, n as i32])
+        .matmul(Array::from_slice(&b, &[n as i32, n as i32]))
+        .unwrap();
+    let product = host(&product).values;
+    let (mut err, mut scale) = (0f64, 0f64);
+    for i in 0..n {
+        for j in 0..n {
+            let exact: f64 = (0..n)
+                .map(|k| a[i * n + k] as f64 * b[k * n + j] as f64)
+                .sum();
+            err = err.max((product[i * n + j] as f64 - exact).abs());
+            scale = scale.max(exact.abs());
+        }
+    }
+    assert!(
+        err / scale < 1e-5,
+        "f32 matmuls run at {:.1e} relative error, not IEEE f32: run with MLX_ENABLE_TF32=0",
+        err / scale
+    );
 }
 
 /// The operation's refusal, an error that names it (`<op>: ...`), as the adapter reports it: the
@@ -141,6 +179,10 @@ fn launched(kernels: bool, count: impl Fn() -> usize, before: usize, what: &str)
         count() - before,
         if kernels { "some" } else { "none" }
     );
+}
+
+fn load(counter: &'static AtomicUsize) -> impl Fn() -> usize {
+    || counter.load(Ordering::SeqCst)
 }
 
 impl Adapter for Mlx {
@@ -230,15 +272,117 @@ impl Adapter for Mlx {
 
     fn chunk_gated_delta_rule(
         &self,
-        _: &ChunkGatedDelta,
+        call: &ChunkGatedDelta,
     ) -> Result<ChunkGatedDeltaOut, Unsupported> {
-        Err(Unsupported(
-            "chunk_gated_delta_rule: not in dash-mlx yet".into(),
-        ))
+        let [q, k, v, g, beta] = [&call.q, &call.k, &call.v, &call.g, &call.beta].map(array);
+        let initial = call.initial_state.as_ref().map(array);
+        let cu = call.cu_seqlens.as_deref().map(offsets);
+        let [b, t, h, dk] = q.shape()[..] else {
+            panic!("q is [B, T, H, Dk]")
+        };
+        let dv = v.shape()[3];
+        let what = format!("chunk_gated_delta_rule {:?} Dv = {dv}", q.shape());
+        let counters = [
+            &chunk::counters::INVERSE_KERNEL,
+            &chunk::counters::SCAN_FORWARD_KERNEL,
+            &chunk::counters::SCAN_BACKWARD_KERNEL,
+        ];
+        let before = counters.map(|c| c.load(Ordering::SeqCst));
+        let has_initial = initial.is_some();
+        let f = |p: &[Array]| {
+            let initial = has_initial.then(|| &p[5]);
+            chunk_gated_delta_rule(
+                &p[0],
+                &p[1],
+                &p[2],
+                &p[3],
+                &p[4],
+                initial,
+                cu.as_ref(),
+                call.options,
+            )
+        };
+        let mut primals = vec![q.clone(), k, v, g, beta];
+        primals.extend(initial);
+        let cotangents = call
+            .grad
+            .as_ref()
+            .map(|d| (Some(&d.out), d.final_state.as_ref()));
+        let out = (&[b, t, h, dv][..], q.dtype());
+        let (out, final_state, grads) =
+            run("chunk_gated_delta_rule", f, &primals, out, cotangents)?;
+        let grads = grads.map(|grads| {
+            let mut grads = grads.iter().map(host);
+            let mut next = || grads.next().expect("a gradient");
+            ChunkGatedDeltaGrads {
+                q: next(),
+                k: next(),
+                v: next(),
+                g: next(),
+                beta: next(),
+                initial_state: has_initial.then(&mut next),
+            }
+        });
+        let scan = chunk::scan_kernels_take(dk, dv);
+        let [inverse, forward, backward] = counters.map(load);
+        launched(true, inverse, before[0], &what);
+        launched(scan, forward, before[1], &what);
+        launched(scan && grads.is_some(), backward, before[2], &what);
+        Ok(ChunkGatedDeltaOut {
+            out: host(&out),
+            final_state: final_state.as_ref().map(host),
+            grads,
+        })
     }
 
-    fn gated_delta_step(&self, _: &GatedDeltaStep) -> Result<GatedDeltaStepOut, Unsupported> {
-        Err(Unsupported("gated_delta_step: not in dash-mlx yet".into()))
+    fn gated_delta_step(&self, call: &GatedDeltaStep) -> Result<GatedDeltaStepOut, Unsupported> {
+        let primals = [&call.q, &call.k, &call.v, &call.g, &call.beta, &call.state].map(array);
+        let cu = call.cu_seqlens.as_deref().map(offsets);
+        let [n, h, dk] = primals[0].shape()[..] else {
+            panic!("q is [B, H, Dk]")
+        };
+        let dv = primals[2].shape()[2];
+        let before = recurrent::counters::STEP_KERNEL.load(Ordering::SeqCst);
+        let f = |p: &[Array]| {
+            let (out, state) = gated_delta_step(
+                &p[0],
+                &p[1],
+                &p[2],
+                &p[3],
+                &p[4],
+                &p[5],
+                cu.as_ref(),
+                call.options,
+            )?;
+            Ok((out, Some(state)))
+        };
+        let cotangents = call.grad.as_ref().map(|d| (Some(&d.out), Some(&d.state)));
+        let out = (&[n, h, dv][..], primals[0].dtype());
+        let (out, state, grads) = run("gated_delta_step", f, &primals, out, cotangents)?;
+        let grads = grads.map(|grads| {
+            let [q, k, v, g, beta, state] = <[Array; 6]>::try_from(grads)
+                .expect("six gradients")
+                .map(|grad| host(&grad));
+            GatedDeltaStepGrads {
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state,
+            }
+        });
+        launched(
+            recurrent::kernel_takes(dk),
+            load(&recurrent::counters::STEP_KERNEL),
+            before,
+            &format!("gated_delta_step {:?}", primals[0].shape()),
+        );
+        Ok(GatedDeltaStepOut {
+            out: host(&out),
+            state: host(&state.expect("the new states")),
+            grads,
+        })
     }
 
     fn chosen_logprob(&self, _: &ChosenLogprob) -> Result<ChosenLogprobOut, Unsupported> {

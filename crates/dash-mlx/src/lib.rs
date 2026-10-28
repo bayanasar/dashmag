@@ -7,8 +7,12 @@
 //! states in and out), so that an application can target either backend, and holds each operation
 //! to their test fixtures.
 //!
-//! - [`conv1d`]: causal depthwise conv1d and its decoding state, dash-ops' `conv1d`, plus the
-//!   convolution continued from a state.
+//! - [`conv1d`]: causal depthwise conv1d with its states, over a batch or packed sequences, and
+//!   its decoding step.
+//! - [`gated_delta`]: the gated delta rule, chunked for training and recurrent for decoding.
+//!
+//! The operations compute in f32 inside. MLX runs f32 matrix products in TF32 on GPUs that have
+//! it unless `MLX_ENABLE_TF32=0`; the f32 bounds the tests hold the operations to assume it is off.
 //!
 //! The operations build on three MLX functions: [`mlx_rs::transforms::checkpoint`] and
 //! [`mlx_rs::transforms::custom_vjp`], from the workspace's mlx-rs (bayanasar/mlx-rs's `dashmag`
@@ -24,5 +28,7 @@
 
 #[cfg(target_os = "macos")]
 pub mod conv1d;
+#[cfg(target_os = "macos")]
+pub mod gated_delta;
 #[cfg(target_os = "macos")]
 mod kernel;
