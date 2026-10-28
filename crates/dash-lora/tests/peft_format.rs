@@ -33,7 +33,7 @@ fn layers_for(adapters: &[&PeftAdapter], device: &Device) -> Vec<(String, LoraLi
     let mut shapes = std::collections::BTreeMap::new();
     for adapter in adapters {
         for (path, w) in adapter.modules() {
-            let shape = (w.b.shape().as_slice()[0], w.a.shape().as_slice()[1]);
+            let shape = (w.b.shape()[0], w.a.shape()[1]);
             assert_eq!(*shapes.entry(path.to_string()).or_insert(shape), shape);
         }
     }
@@ -327,10 +327,18 @@ fn lora_takes_scale_and_dropout_from_the_configuration() {
     let device = Device::flex().autodiff();
     let mut adapter = PeftAdapter::read(fixture("peft_tiny")).unwrap();
     adapter.config.set("lora_dropout", 0.25);
-    let lora = adapter.lora("layers.0.q_proj", &device).unwrap().unwrap();
+    let lora = adapter
+        .lora::<LoraLinear>("layers.0.q_proj", &device)
+        .unwrap()
+        .unwrap();
     assert_eq!(lora.dropout.prob, 0.25);
     assert_eq!(lora.scale, 2.5);
-    assert!(adapter.lora("layers.0.o_proj", &device).unwrap().is_none());
+    assert!(
+        adapter
+            .lora::<LoraLinear>("layers.0.o_proj", &device)
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// What `json.dumps(config, indent=2, sort_keys=True)` prints: a field set later still lands
