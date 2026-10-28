@@ -81,7 +81,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub use dash_contract::logprob::LogprobOptions;
 
 /// The vocabulary chunk dash-ops walks for a block of `rows` rows: [`LogprobOptions::vocab_chunk`]
-/// when it is set, and for 0, 4096 tokens below 2304 rows and 8192 from there.
+/// when it is set, and for 0, 4096 tokens below 2304 rows and 8192 from there, so that at the
+/// default `row_chunk` (3072 rows) the chunk of logits held at once is 96 MiB at most.
 pub trait VocabChunk {
     /// The vocabulary chunk for a block of `rows` rows.
     fn vocab_chunk_for(&self, rows: usize) -> usize;

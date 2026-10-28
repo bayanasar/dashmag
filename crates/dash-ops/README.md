@@ -119,7 +119,7 @@ log-probability). FlashInfer's figures are its samplers' kernels and the casts a
 them, the token only, as an engine asks when it wants no log-probability; with the two
 untruncated ones beside it, which dash-ops returns as well (it returns the truncated one too,
 which FlashInfer does not form), they are the second set. Against the token alone dash-ops takes
-0.085 to 0.23 times FlashInfer's time with top-k, 0.27 with top-k and top-p at batch 32 and 0.93 to
+0.085 to 0.23 times FlashInfer's time with top-k, 0.27 to 0.28 with top-k and top-p at batch 32 and 0.93 to
 0.94 at batch 8, but 1.65 times with the temperature alone at batch 8 and 1.92, or 3.86 on flat
 logits, with top-p alone there. Both launch one block a row of 1024 units at batch 8, so the gap is
 in a row's work, not in how much of the card is used, and it has not been profiled. On flat

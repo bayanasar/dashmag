@@ -32,7 +32,7 @@
 //! not what is computed.
 
 /// How the vocabulary and the rows are chunked. The largest chunk of logits held at once is
-/// `rows x vocab_chunk` f32 values, 96 MiB at most at the defaults.
+/// `rows x vocab_chunk` f32 values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogprobOptions {
     /// Vocabulary tokens per chunk (`C`), or 0 (the default) for the implementation's own choice,
