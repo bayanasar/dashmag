@@ -14,6 +14,8 @@ dash-lora's `metal` feature.
 | `gated_delta::chunk` | the gated delta rule, chunked, forward and backward: the l2 normalisation of queries and keys and the query scale as options, from initial states and to final states, over a batch or packed variable-length sequences | the chunks' triangular inverses and the scan from chunk to chunk; the rest MLX's batched operations |
 | `gated_delta::recurrent` | the gated delta rule a token at a time, for decoding: one token of each sequence, or several of each, packed | one kernel a call; its gradient the reference's |
 | `logprob` | the chosen tokens' log-probabilities and entropies over a large vocabulary with a frozen output weight, masked tokens left out, without the n x V logits; the gradient to the hidden states | one kernel a chunk of the vocabulary for the online log-sum-exp and the entropy, one for the backward pass's weights; the logits and the weighted sums MLX's matmuls |
+| `lowrank` | the low-rank product `base + scale · (x U) V` with its gradients, f32 throughout, the sum rounded once | dash-ops' `up` kernel for the sum with the base; the rest MLX's matmuls |
+| `lora` | LoRA's layer: a frozen base at its own precision, f32 adapters never folded into it, several by name over one base, the choice of one | through `lowrank` |
 
 The operations build on three MLX functions: `checkpoint` and `custom_vjp`, which mlx-rs does not
 wrap yet and the workspace's mlx-rs adds (below), and `MetalKernel`, which mlx-rs 0.33.0 wraps.
@@ -231,6 +233,34 @@ cache, reads each key and value row once for the group's query heads, keeps the 
 f32 and meets its simdgroups once at the end; the splits are merged by their maxima and sums.
 Being memory-bound it needs no matrix units, and it takes 1.43 ms a layer where MLX's kernel, on
 its own layout, takes 1.61 to 3.20. Its gradient, to the query and the cache, is MLX's.
+
+The low-rank product (`tests/lowrank.rs`, on dash-ops' ten recorded cases: f32, bf16 and f16,
+ranks 1 to 64, with and without a base, rows as a batch, long sums) within dash-ops' bounds, the
+largest over every output and gradient: 3.78e-7 in f32 (8e-7), 3.30e-3 in bf16 (3.5e-3), 2.78e-4 in
+f16 (3e-4), the base's gradient exact. LoRA (`tests/lora.rs`, on dash-lora's fixtures recorded from
+PEFT 0.20): one layer's output and the gradients of `x`, A and B bit-identical to PEFT's, with a
+bf16 and with an f32 base; a two-block model with a trainable and a frozen adapter over one base,
+the logits under each choice and with none within 2.32e-7 of PEFT in f32 (in bf16 the default's
+bit-identical, the reference's one logit one bf16 unit apart: two correct bf16 products rounding an
+element to neighbouring values), the loss within 2.17e-7, and the gradients, which reach the
+trained adapter alone, within 5.09e-7 in f32 and in bf16 0.95 to 1.02 times as far from the exact
+gradients as PEFT's own; a choice of one adapter over a shared base gives, bit for bit, what a
+layer holding it alone gives.
+
+A LoRA'd layer at 6144 tokens of 1024, a frozen bf16 `[6144, 1024]` weight, rank 16, against
+mlx-lm's `LoRALinear` (`linear(x) + (scale * ((x @ lora_a) @ lora_b)).astype(x.dtype)`, which adds
+the term in bf16), the range over two runs:
+
+| | forward | forward + backward (x, A, B) |
+|---|---|---|
+| dash-mlx `LoraLinear` | 8.78-8.81 ms, +169 MiB | 21.2-21.4 ms, +386 MiB |
+| mlx-lm's `LoRALinear` | 9.83-9.92 ms, +312 MiB | 21.9-22.3 ms, +505 MiB |
+
+    cargo run --release -p dash-mlx --example lora_bench
+
+The `up` kernel is what makes the exact f32 sum cheap: with MLX's operations instead (the base
+cast to f32, the term formed, added and cast back) the layer took 13.2-14.2 ms and 27.5-27.8 ms
+at +456 and +865 MiB.
 
 ## Command buffers
 

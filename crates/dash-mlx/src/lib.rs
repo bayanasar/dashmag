@@ -14,6 +14,8 @@
 //! - [`gated_delta`]: the gated delta rule, chunked for training and recurrent for decoding.
 //! - [`logprob`]: the chosen tokens' log-probabilities and entropies over a large vocabulary,
 //!   without the n x V logits.
+//! - [`lowrank`]: the low-rank product `base + scale · (x U) V` LoRA's layers use.
+//! - [`lora`]: LoRA's layer over a frozen base, several adapters by name, the choice of one.
 //!
 //! The operations compute in f32 inside. MLX runs f32 matrix products in TF32 on GPUs that have
 //! it unless `MLX_ENABLE_TF32=0`; the f32 bounds the tests hold the operations to assume it is off.
@@ -40,3 +42,7 @@ pub mod gated_delta;
 mod kernel;
 #[cfg(target_os = "macos")]
 pub mod logprob;
+#[cfg(target_os = "macos")]
+pub mod lora;
+#[cfg(target_os = "macos")]
+pub mod lowrank;
