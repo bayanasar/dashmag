@@ -13,7 +13,8 @@
 //!   one base, the reference frozen.
 //! - [`PeftAdapter`] and [`PeftConfig`] ([`peft`]): PEFT 0.20's files, read and written back
 //!   unchanged, one directory per adapter; the caller says which of its layers each PEFT module
-//!   path names.
+//!   path names. The format is [`dash_peft`]'s, re-exported; [`LoraLinear`] is one of its
+//!   [`AdapterLayer`](peft::AdapterLayer)s.
 //!
 //! Activation checkpointing, which trains a stack of LoRA'd layers with each layer's forward pass
 //! run again in the backward pass so that only the layers' inputs stay alive between the passes,

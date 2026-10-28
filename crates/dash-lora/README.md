@@ -39,7 +39,12 @@ the mapping from PEFT's module paths to the caller's layers is the caller's.
   5070 Ti where two layers take 14.56 MiB, as with PEFT (`examples/lora_layer.rs`).
 - `PeftAdapter`, `PeftConfig`: PEFT's files, read and written back byte for byte;
   `apply_with` gives the caller's layers an adapter under a name, trainable or frozen (PEFT's
-  `adapter_name` and `is_trainable`), and `from_layers_named` takes it back.
+  `adapter_name` and `is_trainable`), and `from_layers_named` takes it back. The format is
+  `dash-peft`'s, with no tensor library, re-exported here; `LoraLinear` is one of its
+  `AdapterLayer`s. Two calls changed with the move (the crates are 0.0.1): a module's factors
+  are dash-peft's `HostTensor`s, checked to hold their shape, rather than Burn's `TensorData`
+  (`w.a.shape()[0]`, was `w.a.shape().as_slice()[0]`), and `PeftAdapter::lora` names the layer it
+  builds (`adapter.lora::<LoraLinear>(path, &device)`, was `adapter.lora(path, &device)`).
 
 Activation checkpointing (a stack's forward pass run outside autodiff, each layer run again in the
 backward pass, as `torch.utils.checkpoint` around each block does) lives in `dash-ops`, as

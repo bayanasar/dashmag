@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dash-core", "crates/dash-image", "crates/dash-models", "crates/dash-burn", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli", "crates/dash-train", "crates/dash-ops", "crates/dash-lora", "crates/dash-contract", "crates/dash-conformance"]
+members = ["crates/dash-core", "crates/dash-image", "crates/dash-models", "crates/dash-burn", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli", "crates/dash-train", "crates/dash-ops", "crates/dash-lora", "crates/dash-contract", "crates/dash-conformance", "crates/dash-peft"]
 exclude = ["patches"]
 
 [workspace.package]
@@ -25,6 +25,7 @@ dash-contract = { path = "crates/dash-contract", version = "0.0.1" }
 # leaves it out.
 dash-conformance = { path = "crates/dash-conformance" }
 dash-lora = { path = "crates/dash-lora", version = "0.0.1" }
+dash-peft = { path = "crates/dash-peft", version = "0.0.1" }
 # Pinned exactly: Burn changes its API and its record format between minor releases, and an
 # upgrade is its own change, checked against the same references.
 burn = { version = "=0.22.1", default-features = false, features = ["std"] }
