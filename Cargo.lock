@@ -2399,6 +2399,8 @@ dependencies = [
 name = "dash-mlx"
 version = "0.0.1"
 dependencies = [
+ "dash-conformance",
+ "dash-contract",
  "mlx-rs",
  "mlx-sys",
 ]

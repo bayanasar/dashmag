@@ -227,9 +227,14 @@ fn metal_kernel_computes_what_the_operations_do() -> Result<()> {
         assert_eq!(out[0].dtype(), dtype);
         let diff = max_abs_diff(&out[0], &expected);
         println!("{dtype:?}: max abs difference {diff:e}");
-        // Within one rounding of values below 16: the kernel's multiply-add may be fused into one
-        // rounding where the operations round twice. f32 measured 9.5e-7, one ulp at 8 to 16.
-        let bound = if dtype == Dtype::Float32 { 2e-6 } else { 0.07 };
+        // Within a unit or two in the last place of values below 16: the kernel's multiply-add may
+        // be fused into one rounding where the operations round twice. One unit at 8 to 16 is
+        // 9.5e-7 in f32, 6.25e-2 in bf16 and 7.8e-3 in f16, and each measured exactly one.
+        let bound = match dtype {
+            Dtype::Float32 => 2e-6,
+            Dtype::Bfloat16 => 0.07,
+            _ => 1.6e-2,
+        };
         assert!(diff <= bound, "{dtype:?}: {diff}");
     }
     Ok(())
