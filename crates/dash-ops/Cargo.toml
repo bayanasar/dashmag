@@ -51,5 +51,6 @@ burn-cubecl = { workspace = true, optional = true }
 cubecl = { workspace = true, optional = true }
 
 [dev-dependencies]
+dash-conformance = { workspace = true }
 safetensors = "0.8"
 serde_json = "1"

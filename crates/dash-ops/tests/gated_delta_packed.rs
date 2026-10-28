@@ -1,28 +1,13 @@
 //! The gated delta rule over packed variable-length sequences, with a query scale of its own, and
-//! with heads 256 wide: the chunked rule and the step, held to fla 0.5.2 (packed, with
-//! `cu_seqlens`) and to transformers' torch functions in float64 called once per sequence.
+//! with heads 256 wide: `dash_conformance::gated_delta_packed`'s tests (the chunked rule and the
+//! step against fla 0.5.2 and transformers in float64, packed against per-sequence calls, the
+//! step's gradients, the default scale) through the Burn adapter, on Flex and on a CubeCL device,
+//! any runtime; on the CubeCL device each case held to the kernels' expected launches.
 //!
-//! The fixtures in `tests/fixtures/gated_delta_packed/` hold the inputs, the gradients fed back
-//! (`d_out`, `d_state`) and the results, with the suffix `_f64` (transformers in float64, one call
-//! per sequence, stored rounded to f32) and `_fla` (fla over the packed inputs, f32 in IEEE on
-//! CUDA; for the step, no gradients; not for the 256-wide cases, the largest files, where fla
-//! agrees with float64 to f32 rounding as on the others):
-//!
-//! - `chunk_f32`: six sequences of 37, 64, 0, 100, 5 and 1 tokens (boundaries inside chunks, a
-//!   sequence one chunk long, an empty one, one of a single token), 2 heads, Dk = Dv = 16, queries
-//!   and keys normalised, initial states and final-state gradients;
-//! - `chunk_f32_scale`: 70 and 130 tokens, Dk 32, Dv 16, the scale 0.3, no normalisation, no
-//!   initial state, no final-state gradient;
-//! - `chunk_bf16`: 50, 90 and 20 tokens, Dk = Dv = 32, bf16 inputs (`g` in f32), against float64
-//!   from the same values (fla's own bf16 results beside them);
-//! - `chunk_wide_k`, `chunk_wide_v`: 40 and 25 tokens, Dk = 256 (Dv 24) and Dv = 256 (Dk 16);
-//! - `step_f32`, `step_f32_scale`: the step over packed tokens, sequences of 1, 3, 0 and 2 tokens
-//!   (the l2 normalisation), and of 2, 1 and 4 (the scale 0.7).
-//!
-//! Errors are the largest absolute difference and that over the largest absolute reference value
-//! ("relative"); the relative one is asserted just above the largest measured over every build
-//! (Flex; `cuda`; `cuda` with `fusion`, with `autotune`, with both) and on lavapipe and CubeCL's
-//! CPU runtime.
+//! What is dash-ops' own stays here: packed against per-sequence calls and the packed step
+//! against token-by-token steps with each sequence's or token's inputs narrowed out of the packed
+//! tensors on the device; the kernels against the reference on the same device, packed and in
+//! bf16, with heads 256 wide, and the step's kernel at decoding sizes.
 //!
 //!   cargo test --release -p dash-ops --test gated_delta_packed -- --nocapture
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test gated_delta_packed
@@ -31,9 +16,14 @@
 mod common;
 
 use burn::tensor::{DType, Device, Int, Tensor, TensorData};
+use common::adapter::Burn;
+use dash_conformance::errors_f32 as errors;
+use dash_conformance::gated_delta_packed::{
+    self as packed, BF16_VS_F64, Fixture, PACKED_VS_SEQUENCES, Results, STEP_VS_REF, STEPS, check,
+    check_chunk_bf16, check_chunk_f32, check_step_gradients, check_steps, packed_against_sequences,
+};
 use dash_ops::gated_delta::chunk::{self, ChunkGatedDeltaOptions, chunk_gated_delta_rule};
 use dash_ops::gated_delta::recurrent::{GatedDeltaStepOptions, gated_delta_step};
-use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
@@ -43,136 +33,15 @@ fn serial() -> MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The chunked rule, f32, against transformers in float64 [measured: 1.23e-6].
-const F32_VS_F64: f32 = 1.5e-6;
-/// The chunked rule, f32, against fla's packed f32 path [measured: 2.03e-6]. fla computes its
-/// gates in base 2 and in its own order, a few f32 roundings from the exact result itself.
-const F32_VS_FLA: f32 = 2.5e-6;
-/// bf16 inputs against float64 from the same values, where the reference or the f32 kernels run:
-/// one bf16 rounding of each output and gradient, at most 2^-9 relative to its largest value
-/// [measured: 2.58e-3]; fla's own bf16 path is further off (6.4e-3, printed beside it).
-const BF16_VS_F64: f32 = 3e-3;
-/// The same where the kernels on tensor cores run, with bf16 operands as fla's [measured: 5.58e-3,
-/// the queries' gradient; fla's 6.36e-3].
-#[cfg(feature = "cubecl")]
-const BF16_TC_VS_F64: f32 = 6e-3;
-/// The step, f32, its output and new states against transformers in float64 and fla [measured:
-/// 2.3e-7].
-const STEP_VS_REF: f32 = 3e-7;
-/// The tracked step's gradients (the reference on the autodiff backend) against float64
-/// [measured: 3.1e-7].
-const STEP_GRAD: f32 = 4e-7;
-/// Packed against per-sequence calls of the same operation on the same device: every chunk's
-/// arithmetic is the same, so they agree to the bit [measured: 0 on every build].
-const PACKED_VS_SEQUENCES: f32 = 0.0;
-
-/// One recorded fixture: its tensors as f32 (the boundaries as i64) and its metadata.
-struct Fixture {
-    name: &'static str,
-    meta: HashMap<String, serde_json::Value>,
-    floats: HashMap<String, (Vec<usize>, Vec<f32>)>,
-    cu_seqlens: Vec<i64>,
-}
-
-impl Fixture {
-    fn load(name: &'static str) -> Self {
-        let path = format!(
-            "{}/tests/fixtures/gated_delta_packed/{name}.safetensors",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        let (_, metadata) = SafeTensors::read_metadata(&bytes).unwrap();
-        let meta = metadata
-            .metadata()
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::from_str(v).unwrap()))
-            .collect();
-        let st = SafeTensors::deserialize(&bytes).unwrap();
-        let mut floats = HashMap::new();
-        let mut cu_seqlens = Vec::new();
-        for (key, view) in st.tensors() {
-            match view.dtype() {
-                Dtype::F32 => {
-                    let data = view
-                        .data()
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                        .collect();
-                    floats.insert(key, (view.shape().to_vec(), data));
-                }
-                Dtype::I64 => {
-                    assert_eq!(key, "cu_seqlens");
-                    cu_seqlens = view
-                        .data()
-                        .chunks_exact(8)
-                        .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
-                        .collect();
-                }
-                other => panic!("{key}: unexpected dtype {other:?}"),
-            }
-        }
-        Self {
-            name,
-            meta,
-            floats,
-            cu_seqlens,
-        }
-    }
-
-    fn flag(&self, key: &str) -> bool {
-        self.meta[key].as_bool().unwrap()
-    }
-
-    fn scale(&self) -> Option<f32> {
-        self.meta["scale"].as_f64().map(|x| x as f32)
-    }
-
-    fn has(&self, key: &str) -> bool {
-        self.floats.contains_key(key)
-    }
-
-    fn get(&self, key: &str) -> &[f32] {
-        &self
-            .floats
-            .get(key)
-            .unwrap_or_else(|| panic!("{}: no {key}", self.name))
-            .1
-    }
-
-    fn tensor<const D: usize>(&self, key: &str, device: &Device) -> Tensor<D> {
-        let (shape, data) = &self.floats[key];
-        Tensor::from_data(TensorData::new(data.clone(), shape.clone()), device)
-    }
-
-    fn cu_seqlens(&self, device: &Device) -> Tensor<1, Int> {
-        cu_seqlens(&self.cu_seqlens, device)
-    }
-
-    /// The elements of one sequence's state, `H Dk Dv`.
-    fn state_len(&self) -> usize {
-        ["heads", "dk", "dv"]
-            .iter()
-            .map(|key| self.meta[*key].as_u64().unwrap() as usize)
-            .product()
-    }
-
-    /// The sequences' token spans.
-    fn spans(&self) -> Vec<std::ops::Range<usize>> {
-        self.cu_seqlens
-            .windows(2)
-            .map(|w| w[0] as usize..w[1] as usize)
-            .collect()
-    }
+/// The fixture's tensor `key` on `device`, f32.
+fn tensor<const D: usize>(case: &Fixture, key: &str, device: &Device) -> Tensor<D> {
+    let host = case.tensor(key);
+    Tensor::from_data(TensorData::new(host.values, host.shape), device)
 }
 
 fn cu_seqlens(offsets: &[i64], device: &Device) -> Tensor<1, Int> {
     Tensor::from_data(TensorData::new(offsets.to_vec(), [offsets.len()]), device)
 }
-
-/// What one run gave: outputs and gradients as f32 vectors.
-type Results = HashMap<&'static str, Vec<f32>>;
 
 fn to_vec<const D: usize>(t: Tensor<D>) -> Vec<f32> {
     t.cast(DType::F32)
@@ -181,50 +50,12 @@ fn to_vec<const D: usize>(t: Tensor<D>) -> Vec<f32> {
         .unwrap()
 }
 
-/// Max abs error, and max abs error relative to the reference's max abs value.
-fn errors(actual: &[f32], expected: &[f32]) -> (f32, f32) {
-    assert_eq!(actual.len(), expected.len());
-    let mut max_err = 0f32;
-    let mut scale = 0f32;
-    for (a, e) in actual.iter().zip(expected) {
-        assert!(a.is_finite(), "non-finite value {a}");
-        max_err = max_err.max((a - e).abs());
-        scale = scale.max(e.abs());
-    }
-    (max_err, max_err / scale.max(f32::MIN_POSITIVE))
-}
-
-/// Compares every result with the fixture's `<name><suffix>`, printing the errors, and asserts
-/// the relative error is at most `tol`.
-fn check(case: &Fixture, label: &str, res: &Results, suffix: &str, tol: f32) {
-    let mut keys: Vec<_> = res
-        .keys()
-        .copied()
-        .filter(|key| case.has(&format!("{key}{suffix}")))
-        .collect();
-    keys.sort();
-    assert!(
-        !keys.is_empty(),
-        "{}: nothing to compare with {suffix}",
-        case.name
-    );
-    let mut failed = Vec::new();
-    for key in keys {
-        let (abs, rel) = errors(&res[key], case.get(&format!("{key}{suffix}")));
-        println!(
-            "{:16} {label:12} {key:6} vs {:8} max abs {abs:.3e} rel {rel:.3e}",
-            case.name,
-            &suffix[1..]
-        );
-        if rel > tol {
-            failed.push(format!("{key} {rel:.3e}"));
-        }
-    }
-    assert!(
-        failed.is_empty(),
-        "{} {label}: relative errors above {tol:.1e} against {suffix}: {failed:?}",
-        case.name
-    );
+/// The sequences' token spans.
+fn spans(case: &Fixture) -> Vec<std::ops::Range<usize>> {
+    case.cu_seqlens
+        .windows(2)
+        .map(|w| w[0] as usize..w[1] as usize)
+        .collect()
 }
 
 /// The options a chunked fixture was recorded with, the final states returned.
@@ -236,16 +67,16 @@ fn chunk_options(case: &Fixture) -> ChunkGatedDeltaOptions {
     }
 }
 
-/// The chunked rule over the fixture's packed sequences on `device` (an autodiff device), the
-/// queries, keys, values and `beta` in `dtype` (`g` stays f32): forward and backward.
-fn run_chunk(case: &Fixture, device: &Device, dtype: DType) -> Results {
-    let leaf4 = |key: &str| case.tensor::<4>(key, device).cast(dtype).require_grad();
+/// The chunked rule over the fixture's packed sequences on `device` (an autodiff device), f32:
+/// forward and backward.
+fn packed_chunk(case: &Fixture, device: &Device) -> Results {
+    let leaf4 = |key: &str| tensor::<4>(case, key, device).require_grad();
     let (q, k, v) = (leaf4("q"), leaf4("k"), leaf4("v"));
-    let g = case.tensor::<3>("g", device).require_grad();
-    let beta = case.tensor::<3>("beta", device).cast(dtype).require_grad();
+    let g = tensor::<3>(case, "g", device).require_grad();
+    let beta = tensor::<3>(case, "beta", device).require_grad();
     let h0 = case
         .flag("initial_state")
-        .then(|| case.tensor::<4>("h0", device).require_grad());
+        .then(|| tensor::<4>(case, "h0", device).require_grad());
     let runs = chunk::probe::backward_runs();
     let (out, state) = chunk_gated_delta_rule(
         q.clone(),
@@ -254,15 +85,13 @@ fn run_chunk(case: &Fixture, device: &Device, dtype: DType) -> Results {
         g.clone(),
         beta.clone(),
         h0.clone(),
-        Some(case.cu_seqlens(device)),
+        Some(cu_seqlens(&case.cu_seqlens, device)),
         chunk_options(case),
     );
     let state = state.expect("the final states, asked for");
-    assert_eq!(out.dtype(), dtype);
-    assert_eq!(state.dtype(), DType::F32);
-    let mut loss = (out.clone().cast(DType::F32) * case.tensor::<4>("d_out", device)).sum();
+    let mut loss = (out.clone() * tensor::<4>(case, "d_out", device)).sum();
     if case.flag("final_state_grad") {
-        loss = loss + (state.clone() * case.tensor::<4>("d_state", device)).sum();
+        loss = loss + (state.clone() * tensor::<4>(case, "d_state", device)).sum();
     }
     let grads = loss.backward();
     assert!(
@@ -283,28 +112,27 @@ fn run_chunk(case: &Fixture, device: &Device, dtype: DType) -> Results {
     res
 }
 
-/// The same inputs, each sequence a call of its own (a batch of one, unpacked), the results laid
-/// out as the packed call's.
-fn run_chunk_per_sequence(case: &Fixture, device: &Device) -> Results {
+/// The same inputs, each sequence a call of its own (a batch of one, unpacked) on its inputs
+/// narrowed out of the packed tensors, views at an offset into them, the results laid out as the
+/// packed call's.
+fn chunk_per_sequence(case: &Fixture, device: &Device) -> Results {
     let options = chunk_options(case);
+    let state_len = ["heads", "dk", "dv"]
+        .map(|key| case.number(key))
+        .iter()
+        .product();
     let mut parts: HashMap<&'static str, Vec<Vec<f32>>> = HashMap::new();
     let mut push = |key: &'static str, x: Vec<f32>| parts.entry(key).or_default().push(x);
-    for (s, span) in case.spans().into_iter().enumerate() {
-        let slice4 = |key: &str| {
-            case.tensor::<4>(key, device)
-                .narrow(1, span.start, span.len())
-        };
-        let slice3 = |key: &str| {
-            case.tensor::<3>(key, device)
-                .narrow(1, span.start, span.len())
-        };
-        let state_of = |key: &str| case.tensor::<4>(key, device).narrow(0, s, 1);
+    for (s, span) in spans(case).into_iter().enumerate() {
+        let slice4 = |key: &str| tensor::<4>(case, key, device).narrow(1, span.start, span.len());
+        let slice3 = |key: &str| tensor::<3>(case, key, device).narrow(1, span.start, span.len());
+        let state_of = |key: &str| tensor::<4>(case, key, device).narrow(0, s, 1);
         let h0 = case
             .flag("initial_state")
             .then(|| state_of("h0").require_grad());
         if span.is_empty() {
             // Nothing to run: the state passes through, and so does its gradient.
-            let zeros = || vec![0.0; case.state_len()];
+            let zeros = || vec![0.0; state_len];
             push("state", h0.map_or_else(zeros, to_vec));
             if case.flag("initial_state") {
                 let d = if case.flag("final_state_grad") {
@@ -357,10 +185,11 @@ fn run_chunk_per_sequence(case: &Fixture, device: &Device) -> Results {
         .collect()
 }
 
-/// Packed against per-sequence calls on one device: the largest relative difference.
-fn packed_against_sequences(case: &Fixture, device: &Device, label: &str) -> f32 {
-    let packed = run_chunk(case, device, DType::F32);
-    let apart = run_chunk_per_sequence(case, device);
+/// Packed against per-sequence calls on one device, each sequence's inputs views of the packed
+/// tensors: the largest relative difference.
+fn packed_against_sequences_from_views(case: &Fixture, device: &Device, label: &str) -> f32 {
+    let packed = packed_chunk(case, device);
+    let apart = chunk_per_sequence(case, device);
     let mut keys: Vec<_> = packed.keys().copied().collect();
     keys.sort();
     let mut worst = 0f32;
@@ -375,108 +204,39 @@ fn packed_against_sequences(case: &Fixture, device: &Device, label: &str) -> f32
     worst
 }
 
-const CHUNK_F32: [&str; 4] = [
-    "chunk_f32",
-    "chunk_f32_scale",
-    "chunk_wide_k",
-    "chunk_wide_v",
-];
-
-fn check_chunk_f32(device: &Device, label: &str) {
-    for name in CHUNK_F32 {
-        let case = Fixture::load(name);
-        let res = run_chunk(&case, device, DType::F32);
-        check(&case, label, &res, "_f64", F32_VS_F64);
-        if case.flag("fla") {
-            check(&case, label, &res, "_fla", F32_VS_FLA);
-        }
-    }
-}
-
-fn check_chunk_bf16(device: &Device, label: &str, tol: f32) {
-    let case = Fixture::load("chunk_bf16");
-    let res = run_chunk(&case, device, DType::BF16);
-    check(&case, label, &res, "_f64", tol);
-    // For the record: fla's own bf16 path against the same float64 reference.
-    let mut keys: Vec<_> = res.keys().copied().collect();
-    keys.sort();
-    for key in keys {
-        let (abs, rel) = errors(
-            case.get(&format!("{key}_fla")),
-            case.get(&format!("{key}_f64")),
-        );
-        println!(
-            "{:16} {:12} {key:6} vs f64      max abs {abs:.3e} rel {rel:.3e}",
-            case.name, "fla-bf16"
-        );
+/// The options a step fixture was recorded with.
+fn step_options(case: &Fixture) -> GatedDeltaStepOptions {
+    GatedDeltaStepOptions {
+        qk_l2norm: case.flag("l2norm"),
+        scale: case.scale(),
     }
 }
 
 /// The step over the fixture's packed tokens on `device`, without gradients: output and states.
-fn run_step(case: &Fixture, device: &Device) -> Results {
-    let options = GatedDeltaStepOptions {
-        qk_l2norm: case.flag("l2norm"),
-        scale: case.scale(),
-    };
+fn packed_step(case: &Fixture, device: &Device) -> Results {
     let (out, state) = gated_delta_step(
-        case.tensor("q", device),
-        case.tensor("k", device),
-        case.tensor("v", device),
-        case.tensor("g", device),
-        case.tensor("beta", device),
-        case.tensor("h0", device),
-        Some(case.cu_seqlens(device)),
-        options,
+        tensor(case, "q", device),
+        tensor(case, "k", device),
+        tensor(case, "v", device),
+        tensor(case, "g", device),
+        tensor(case, "beta", device),
+        tensor(case, "h0", device),
+        Some(cu_seqlens(&case.cu_seqlens, device)),
+        step_options(case),
     );
     assert_eq!(state.dtype(), DType::F32);
     Results::from([("out", to_vec(out)), ("state", to_vec(state))])
 }
 
-/// The step with tracked inputs (the reference on the autodiff backend): its gradients.
-fn run_step_gradients(case: &Fixture, device: &Device) -> Results {
-    let options = GatedDeltaStepOptions {
-        qk_l2norm: case.flag("l2norm"),
-        scale: case.scale(),
-    };
-    let leaf3 = |key: &str| case.tensor::<3>(key, device).require_grad();
-    let leaf2 = |key: &str| case.tensor::<2>(key, device).require_grad();
-    let (q, k, v) = (leaf3("q"), leaf3("k"), leaf3("v"));
-    let (g, beta) = (leaf2("g"), leaf2("beta"));
-    let h0 = case.tensor::<4>("h0", device).require_grad();
-    let (out, state) = gated_delta_step(
-        q.clone(),
-        k.clone(),
-        v.clone(),
-        g.clone(),
-        beta.clone(),
-        h0.clone(),
-        Some(case.cu_seqlens(device)),
-        options,
-    );
-    let loss = (out * case.tensor::<3>("d_out", device)).sum()
-        + (state * case.tensor::<4>("d_state", device)).sum();
-    let grads = loss.backward();
-    Results::from([
-        ("dq", to_vec(q.grad(&grads).unwrap())),
-        ("dk", to_vec(k.grad(&grads).unwrap())),
-        ("dv", to_vec(v.grad(&grads).unwrap())),
-        ("dg", to_vec(g.grad(&grads).unwrap())),
-        ("dbeta", to_vec(beta.grad(&grads).unwrap())),
-        ("dh0", to_vec(h0.grad(&grads).unwrap())),
-    ])
-}
-
-/// The step token by token, each sequence apart: what the packed step must give.
-fn run_step_per_token(case: &Fixture, device: &Device) -> Results {
-    let options = GatedDeltaStepOptions {
-        qk_l2norm: case.flag("l2norm"),
-        scale: case.scale(),
-    };
-    let row3 = |key: &str, t: usize| case.tensor::<3>(key, device).narrow(0, t, 1);
-    let row2 = |key: &str, t: usize| case.tensor::<2>(key, device).narrow(0, t, 1);
+/// The step token by token, each sequence apart, each token's inputs and each sequence's state
+/// narrowed out of the packed tensors: what the packed step must give.
+fn step_per_token(case: &Fixture, device: &Device) -> Results {
+    let options = step_options(case);
+    let row3 = |key: &str, t: usize| tensor::<3>(case, key, device).narrow(0, t, 1);
+    let row2 = |key: &str, t: usize| tensor::<2>(case, key, device).narrow(0, t, 1);
     let (mut outs, mut states) = (Vec::new(), Vec::new());
-    for (s, span) in case.spans().into_iter().enumerate() {
-        let mut state = case.tensor::<4>("h0", device).narrow(0, s, 1);
+    for (s, span) in spans(case).into_iter().enumerate() {
+        let mut state = tensor::<4>(case, "h0", device).narrow(0, s, 1);
         for t in span {
             let (out, next) = gated_delta_step(
                 row3("q", t),
@@ -496,15 +256,15 @@ fn run_step_per_token(case: &Fixture, device: &Device) -> Results {
     Results::from([("out", outs.concat()), ("state", states.concat())])
 }
 
-const STEPS: [&str; 2] = ["step_f32", "step_f32_scale"];
-
-fn check_steps(device: &Device, label: &str) {
+/// The packed step against transformers in float64 and fla, and against itself token by token
+/// from views of the packed tensors (to the bit).
+fn check_steps_from_views(device: &Device, label: &str) {
     for name in STEPS {
         let case = Fixture::load(name);
-        let res = run_step(&case, device);
+        let res = packed_step(&case, device);
         check(&case, label, &res, "_f64", STEP_VS_REF);
         check(&case, label, &res, "_fla", STEP_VS_REF);
-        let apart = run_step_per_token(&case, device);
+        let apart = step_per_token(&case, device);
         for key in ["out", "state"] {
             let (abs, rel) = errors(&res[key], &apart[key]);
             println!(
@@ -515,14 +275,6 @@ fn check_steps(device: &Device, label: &str) {
     }
 }
 
-fn check_step_gradients(device: &Device, label: &str) {
-    for name in STEPS {
-        let case = Fixture::load(name);
-        let res = run_step_gradients(&case, &device.clone().autodiff());
-        check(&case, label, &res, "_f64", STEP_GRAD);
-    }
-}
-
 #[cfg(feature = "flex")]
 mod flex {
     use super::*;
@@ -530,21 +282,33 @@ mod flex {
     #[test]
     fn packed_chunks_on_flex_match_fla_and_transformers() {
         let _serial = serial();
-        check_chunk_f32(&Device::flex().autodiff(), "flex");
+        check_chunk_f32(&Burn::new(Device::flex().autodiff()), "flex").all_ran();
     }
 
     #[test]
     fn packed_bf16_chunks_on_flex() {
         let _serial = serial();
-        check_chunk_bf16(&Device::flex().autodiff(), "flex-bf16", BF16_VS_F64);
+        let flex = Burn::new(Device::flex().autodiff());
+        check_chunk_bf16(&flex, "flex-bf16", BF16_VS_F64).all_ran();
     }
 
     #[test]
     fn packed_chunks_on_flex_are_per_sequence_calls() {
         let _serial = serial();
+        let flex = Burn::new(Device::flex().autodiff());
+        for name in ["chunk_f32", "chunk_f32_scale"] {
+            let worst = packed_against_sequences(&flex, &Fixture::load(name), "flex").all_ran();
+            assert!(worst <= PACKED_VS_SEQUENCES, "{name}: {worst:.3e}");
+        }
+    }
+
+    #[test]
+    fn packed_chunks_on_flex_from_views_are_per_sequence_calls() {
+        let _serial = serial();
         let device = Device::flex().autodiff();
         for name in ["chunk_f32", "chunk_f32_scale"] {
-            let worst = packed_against_sequences(&Fixture::load(name), &device, "flex");
+            let case = Fixture::load(name);
+            let worst = packed_against_sequences_from_views(&case, &device, "flex");
             assert!(worst <= PACKED_VS_SEQUENCES, "{name}: {worst:.3e}");
         }
     }
@@ -552,39 +316,25 @@ mod flex {
     #[test]
     fn packed_steps_on_flex_match_fla_and_transformers() {
         let _serial = serial();
-        check_steps(&Device::flex(), "flex");
+        check_steps(&Burn::new(Device::flex()), "flex").all_ran();
+    }
+
+    #[test]
+    fn packed_steps_on_flex_from_views_match_fla_and_transformers() {
+        let _serial = serial();
+        check_steps_from_views(&Device::flex(), "flex");
     }
 
     #[test]
     fn tracked_packed_steps_on_flex_take_the_reference_gradients() {
         let _serial = serial();
-        check_step_gradients(&Device::flex(), "flex");
+        check_step_gradients(&Burn::new(Device::flex()), "flex").all_ran();
     }
 
-    /// The default scale is `1 / sqrt(Dk)`: giving it explicitly changes nothing.
     #[test]
     fn the_default_scale_is_one_over_the_root_of_dk() {
         let _serial = serial();
-        let case = Fixture::load("chunk_f32");
-        let device = Device::flex();
-        let dk = case.meta["dk"].as_u64().unwrap() as f32;
-        let run = |options: ChunkGatedDeltaOptions| {
-            let (out, state) = chunk_gated_delta_rule(
-                case.tensor("q", &device),
-                case.tensor("k", &device),
-                case.tensor("v", &device),
-                case.tensor("g", &device),
-                case.tensor("beta", &device),
-                Some(case.tensor("h0", &device)),
-                Some(case.cu_seqlens(&device)),
-                options,
-            );
-            (to_vec(out), to_vec(state.unwrap()))
-        };
-        let default = ChunkGatedDeltaOptions::default()
-            .with_qk_l2norm(true)
-            .with_final_state(true);
-        assert_eq!(run(default), run(default.with_scale(1.0 / dk.sqrt())));
+        packed::the_default_scale_is_one_over_the_root_of_dk(&Burn::new(Device::flex())).all_ran();
     }
 }
 
@@ -610,6 +360,9 @@ fn normal(seed: u64, len: usize) -> Vec<f32> {
 #[cfg(feature = "cubecl")]
 mod cube {
     use super::*;
+    use dash_conformance::gated_delta_packed::{
+        BF16_TC_VS_F64, CHUNK_F32, F32_VS_F64, F32_VS_FLA, run_chunk, run_step,
+    };
     use dash_ops::gated_delta::chunk::{
         chunk_gated_delta_rule_reference, chunk_gated_delta_rule_reference_backward, kernels_take,
         tensor_cores_take,
@@ -681,8 +434,8 @@ mod cube {
     }
 
     fn dims_of(case: &Fixture) -> ([usize; 5], usize) {
-        let q = &case.floats["q"].0;
-        let v = &case.floats["v"].0;
+        let q = case.tensor("q").shape;
+        let v = case.tensor("v").shape;
         ([q[0], q[1], q[2], q[3], v[3]], case.cu_seqlens.len() - 1)
     }
 
@@ -697,7 +450,8 @@ mod cube {
             let expected = expected_launches(&device, DType::F32, dims, seqs);
             println!("{name}: {dims:?}, {seqs} sequences, {expected} kernel launches");
             let res = launches(expected, 0, || {
-                run_chunk(&case, &device.clone().autodiff(), DType::F32)
+                let cube = Burn::new(device.clone().autodiff());
+                run_chunk(&cube, &case, dash_conformance::DType::F32).expect("a run")
             });
             check(&case, "cubecl", &res, "_f64", F32_VS_F64);
             if case.flag("fla") {
@@ -719,16 +473,27 @@ mod cube {
         let tc = expected_tc_launches(&device, DType::BF16, dims, seqs);
         let tol = if tc > 0 { BF16_TC_VS_F64 } else { BF16_VS_F64 };
         launches(expected, tc, || {
-            check_chunk_bf16(&device.clone().autodiff(), "cubecl-bf16", tol)
+            check_chunk_bf16(&Burn::new(device.clone().autodiff()), "cubecl-bf16", tol).all_ran()
         });
     }
 
     #[test]
     fn packed_chunks_on_cubecl_are_per_sequence_calls() {
         let _serial = serial();
+        let cube = Burn::new(common::cube_device().autodiff());
+        for name in ["chunk_f32", "chunk_f32_scale", "chunk_wide_k"] {
+            let worst = packed_against_sequences(&cube, &Fixture::load(name), "cubecl").all_ran();
+            assert!(worst <= PACKED_VS_SEQUENCES, "{name}: {worst:.3e}");
+        }
+    }
+
+    #[test]
+    fn packed_chunks_on_cubecl_from_views_are_per_sequence_calls() {
+        let _serial = serial();
         let device = common::cube_device().autodiff();
         for name in ["chunk_f32", "chunk_f32_scale", "chunk_wide_k"] {
-            let worst = packed_against_sequences(&Fixture::load(name), &device, "cubecl");
+            let case = Fixture::load(name);
+            let worst = packed_against_sequences_from_views(&case, &device, "cubecl");
             assert!(worst <= PACKED_VS_SEQUENCES, "{name}: {worst:.3e}");
         }
     }
@@ -910,8 +675,8 @@ mod cube {
     /// Whether the step's kernel takes the fixture's packed tokens on `device`. Under CUDA it
     /// takes every head it holds.
     fn step_takes(device: &Device, case: &Fixture) -> bool {
-        let q = &case.floats["q"].0;
-        let dv = case.floats["v"].0[2];
+        let q = case.tensor("q").shape;
+        let dv = case.tensor("v").shape[2];
         let int = cu_seqlens(&[0, 1], device).dtype();
         let seqs = case.cu_seqlens.len() - 1;
         let takes = kernel_takes(
@@ -935,20 +700,26 @@ mod cube {
             let kernel = step_takes(&device, &case);
             println!("{name}: the step's kernel takes it: {kernel}");
             let before = recurrent::probe::kernel_launches();
-            let res = run_step(&case, &device);
+            let res = run_step(&Burn::new(device.clone()), &case).expect("a run");
             let launched = recurrent::probe::kernel_launches() - before;
             assert_eq!(launched, usize::from(kernel), "{name}: {launched} launches");
             check(&case, "cubecl", &res, "_f64", STEP_VS_REF);
             check(&case, "cubecl", &res, "_fla", STEP_VS_REF);
         }
-        check_steps(&device, "cubecl");
+        check_steps(&Burn::new(device), "cubecl").all_ran();
+    }
+
+    #[test]
+    fn packed_steps_on_cubecl_from_views_match_fla_and_transformers() {
+        let _serial = serial();
+        check_steps_from_views(&common::cube_device(), "cubecl");
     }
 
     #[test]
     fn tracked_packed_steps_on_cubecl_take_the_reference_gradients() {
         let _serial = serial();
         let before = recurrent::probe::kernel_launches();
-        check_step_gradients(&common::cube_device(), "cubecl");
+        check_step_gradients(&Burn::new(common::cube_device()), "cubecl").all_ran();
         assert_eq!(
             recurrent::probe::kernel_launches(),
             before,

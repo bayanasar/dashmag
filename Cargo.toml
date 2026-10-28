@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dash-core", "crates/dash-image", "crates/dash-models", "crates/dash-burn", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli", "crates/dash-train", "crates/dash-ops", "crates/dash-lora", "crates/dash-contract"]
+members = ["crates/dash-core", "crates/dash-image", "crates/dash-models", "crates/dash-burn", "crates/dash-tract", "crates/dash-iree", "crates/dash-tensorrt", "crates/dash-edgetpu", "crates/dash-cli", "crates/dash-train", "crates/dash-ops", "crates/dash-lora", "crates/dash-contract", "crates/dash-conformance"]
 exclude = ["patches"]
 
 [workspace.package]
@@ -21,6 +21,9 @@ dash-tensorrt = { path = "crates/dash-tensorrt", version = "0.0.1" }
 dash-edgetpu = { path = "crates/dash-edgetpu", version = "0.0.1" }
 dash-ops = { path = "crates/dash-ops", version = "0.0.1", default-features = false }
 dash-contract = { path = "crates/dash-contract", version = "0.0.1" }
+# Test support, not published: no version, so that publishing a crate that tests with it
+# leaves it out.
+dash-conformance = { path = "crates/dash-conformance" }
 dash-lora = { path = "crates/dash-lora", version = "0.0.1" }
 # Pinned exactly: Burn changes its API and its record format between minor releases, and an
 # upgrade is its own change, checked against the same references.

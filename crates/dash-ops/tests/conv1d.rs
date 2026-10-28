@@ -1,24 +1,15 @@
-//! The causal depthwise conv1d against torch, from two recordings, each evaluated in float64
-//! from float32 inputs or from inputs rounded to bfloat16 (or float16) and stored as float32:
+//! The causal depthwise conv1d against torch: `dash_conformance::conv1d`'s tests (every kernel
+//! width with and without a bias and SiLU, decoding steps from a recorded state, a prefill
+//! followed by single steps) through the Burn adapter, on Flex and on a CubeCL device, any
+//! runtime (`DASH_OPS_DEVICE`). The adapter asserts that the kernels ran exactly where
+//! `kernels_take` says they take a case (always under CUDA); cases in a dtype the device does not
+//! have are left out.
 //!
-//! - `tests/fixtures/conv1d/general.safetensors`: torch's `conv1d` with `groups = C` on the input
-//!   left-padded by `K - 1` steps, then SiLU where asked: every kernel width from 1 to 8, with
-//!   and without a bias and SiLU, and decoding steps from a random state;
-//! - `tests/fixtures/conv1d/conv1d.safetensors`: transformers 5.15's torch fallbacks
-//!   `causal_conv1d_fn` and `causal_conv1d_update` (kernel width 4 and 3, no bias), whose
-//!   decoding state is `[B, C, W]` in the inputs' dtype: the tests transpose it to `[B, W, C]`
-//!   and widen it to f32.
-//!
-//! The reduced-precision cases also hold torch's own results in that dtype on CUDA, for
-//! comparison. Every sequence case also runs as a prefill followed by single decoding steps,
-//! against the same recorded outputs.
-//!
-//! Errors are stated as the largest absolute difference and as that difference over the largest
-//! magnitude of the reference, per output and gradient.
-//!
-//! The same checks run on Flex and on a CubeCL device, any runtime (`DASH_OPS_DEVICE`); each
-//! asserts that the kernels ran exactly where `kernels_take` says they take the case (always
-//! under CUDA), and skips the cases in a dtype the device does not have.
+//! What is dash-ops' own stays here: the decoding steps and the prefill from Burn's views (the
+//! recorded transformers state transposed in place, the prompt and each token sliced out of the
+//! sequence), which the adapter's contiguous inputs do not reach; a tracked step's gradients,
+//! through the reference Burn differentiates; the kernels against Flex's reference at a size the
+//! fixtures do not reach; and widths the kernels do not take.
 //!
 //!   cargo test --release -p dash-ops --test conv1d -- --nocapture
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test conv1d -- --nocapture
@@ -26,13 +17,13 @@
 
 mod common;
 
-use burn::tensor::{DType, Device, Tensor, TensorData};
+use burn::tensor::{DType, Device, Tensor};
+use common::adapter::{self, Burn, Watch, burn_dtype, launched};
+use dash_conformance::conv1d::{self, Case, Worst, torch_error};
+use dash_conformance::errors;
 use dash_ops::conv1d::{
-    Activation, CausalConv1dOptions, causal_conv1d, causal_conv1d_update, kernels_take, probe,
+    Activation, CausalConv1dOptions, causal_conv1d, causal_conv1d_update, probe,
 };
-use safetensors::SafeTensors;
-use serde_json::Value;
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 /// The tests read process-wide launch counters, so they run one at a time.
@@ -44,120 +35,6 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// A recording: its tensors, and the cases its metadata describes.
-#[derive(Clone, Copy)]
-struct Fixtures(&'static [u8]);
-
-const GENERAL: Fixtures = Fixtures(include_bytes!("fixtures/conv1d/general.safetensors"));
-const TRANSFORMERS: Fixtures = Fixtures(include_bytes!("fixtures/conv1d/conv1d.safetensors"));
-
-impl Fixtures {
-    fn cases(self) -> Vec<Case> {
-        let (_, metadata) = SafeTensors::read_metadata(self.0).expect("conv1d fixtures");
-        let cases = metadata.metadata().as_ref().expect("metadata")["cases"].clone();
-        let cases: BTreeMap<String, Value> = serde_json::from_str(&cases).expect("cases JSON");
-        cases
-            .into_iter()
-            .map(|(name, case)| Case::new(self, name, &case))
-            .collect()
-    }
-
-    fn has(self, name: &str) -> bool {
-        let tensors = SafeTensors::deserialize(self.0).expect("conv1d fixtures");
-        tensors.tensor(name).is_ok()
-    }
-
-    /// A recorded tensor: its values and shape.
-    fn recorded(self, name: &str) -> (Vec<f32>, Vec<usize>) {
-        let tensors = SafeTensors::deserialize(self.0).expect("conv1d fixtures");
-        let view = tensors
-            .tensor(name)
-            .unwrap_or_else(|_| panic!("no fixture {name}"));
-        let values = view
-            .data()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
-        (values, view.shape().to_vec())
-    }
-
-    fn load<const D: usize>(self, name: &str, device: &Device, dtype: DType) -> Tensor<D> {
-        let (values, shape) = self.recorded(name);
-        Tensor::from_data(
-            TensorData::new(values, shape).convert_dtype(dtype),
-            (device, dtype),
-        )
-    }
-}
-
-/// One recorded case.
-#[derive(Clone)]
-struct Case {
-    fixtures: Fixtures,
-    name: String,
-    step: bool,
-    dtype: DType,
-    bias: bool,
-    options: CausalConv1dOptions,
-    /// transformers' decoding state, `[B, C, W]` in the case's dtype.
-    transposed_state: bool,
-}
-
-impl Case {
-    fn new(fixtures: Fixtures, name: String, case: &Value) -> Self {
-        let dtype = match (case.get("dtype"), case.get("bf16")) {
-            (Some(dtype), _) => match dtype.as_str().unwrap() {
-                "f32" => DType::F32,
-                "bf16" => DType::BF16,
-                "f16" => DType::F16,
-                other => panic!("unknown dtype {other}"),
-            },
-            (None, Some(Value::Bool(true))) => DType::BF16,
-            (None, _) => DType::F32,
-        };
-        let activation = match case["silu"].as_bool().unwrap() {
-            true => Activation::Silu,
-            false => Activation::None,
-        };
-        Self {
-            fixtures,
-            step: case["kind"] == "step",
-            dtype,
-            bias: case.get("bias").and_then(Value::as_bool).unwrap_or(false),
-            options: CausalConv1dOptions::default().with_activation(activation),
-            transposed_state: case.get("dtype").is_none(),
-            name,
-        }
-    }
-
-    fn part(&self, part: &str) -> String {
-        format!("{}.{part}", self.name)
-    }
-
-    fn load<const D: usize>(&self, part: &str, device: &Device) -> Tensor<D> {
-        self.fixtures.load(&self.part(part), device, self.dtype)
-    }
-
-    fn bias(&self, device: &Device) -> Option<Tensor<1>> {
-        self.bias.then(|| self.load::<1>("bias", device))
-    }
-
-    /// The decoding state, `[B, W, C]` f32.
-    fn state(&self, device: &Device) -> Tensor<3> {
-        let state = self
-            .fixtures
-            .load::<3>(&self.part("state"), device, DType::F32);
-        match self.transposed_state {
-            true => state.swap_dims(1, 2),
-            false => state,
-        }
-    }
-
-    fn kernel_width(&self) -> usize {
-        self.fixtures.recorded(&self.part("weight")).1[1]
-    }
-}
-
 fn values<const D: usize>(tensor: Tensor<D>) -> Vec<f32> {
     tensor
         .into_data()
@@ -166,236 +43,75 @@ fn values<const D: usize>(tensor: Tensor<D>) -> Vec<f32> {
         .unwrap()
 }
 
-/// The largest absolute error and that error over the reference's largest magnitude.
-fn errors(actual: &[f32], expected: &[f32]) -> (f64, f64) {
-    assert_eq!(actual.len(), expected.len(), "lengths differ");
-    let mut abs = 0.0f64;
-    let mut scale = 0.0f64;
-    for (a, e) in actual.iter().zip(expected) {
-        assert!(a.is_finite(), "non-finite output {a}");
-        abs = abs.max((*a as f64 - *e as f64).abs());
-        scale = scale.max((*e as f64).abs());
-    }
-    (abs, abs / scale.max(f64::MIN_POSITIVE))
-}
-
-/// Bounds on the error over the largest magnitude, per dtype and part ("step": a decoding step,
-/// from a recorded state or after a prefill), each just above the largest measured over these
-/// cases on Flex and on CUDA (an RTX 5070 Ti), which are the same with and without fusion and
-/// autotune. In the comments, the largest measured on Flex / CUDA, then torch's own on CUDA in
-/// the same dtype over the same cases.
-///
-/// f32 is within about an ulp of the largest value for the output and the input gradient. The
-/// weight and bias gradients sum `B x T` products per weight, and err more where those sums
-/// cancel; the CUDA kernels sum runs of 64 steps, then the runs.
-///
-/// bf16 and f16 are the f32 result rounded once: half an ulp of the dtype at the largest
-/// magnitude, which is 2^-9 to 2^-8 of it in bf16. torch rounds between its steps too (the
-/// convolution's output before SiLU, SiLU's gradient before the convolution's backward), and errs
-/// more.
-///
-/// On the other CubeCL runtimes (`other`), measured on lavapipe through wgpu, where the kernels
-/// run, and on the CubeCL CPU runtime, where the reference does, three f32 parts err a little
-/// more: lavapipe's exponential (SiLU's) is its own, and the CPU runtime sums in other orders.
-fn bound(dtype: DType, part: &str, other: bool) -> f64 {
-    match (dtype, part) {
-        (DType::F32, "out") if other => 1.8e-7, // 1.74e-7 lavapipe / 1.41e-7 CPU runtime
-        (DType::F32, "step") if other => 2.2e-7, // 1.74e-7 / 2.18e-7
-        (DType::F32, "grad_bias") if other => 5.5e-7, // 3.58e-7 / 5.47e-7
-        (DType::F32, "out") => 1.4e-7,          // 1.36e-7 / 1.26e-7; torch 1.26e-7
-        (DType::F32, "step") => 1.8e-7,         // 1.72e-7 / 1.56e-7; torch 1.39e-7
-        (DType::F32, "grad_x") => 2.6e-7,       // 2.58e-7 / 2.07e-7; torch 2.04e-7
-        (DType::F32, "grad_weight") => 6.1e-7,  // 4.53e-7 / 6.01e-7; torch 4.22e-7
-        (DType::F32, "grad_bias") => 4.1e-7,    // 2.71e-7 / 4.09e-7; torch 3.41e-7
-        (DType::BF16, "out" | "step") => 3.7e-3, // 3.62e-3 on both; torch 5.05e-3, steps 3.65e-3
-        (DType::BF16, "grad_x") => 3.2e-3,      // 3.11e-3 on both; torch 4.26e-3
-        (DType::BF16, "grad_weight") => 3.4e-3, // 3.33e-3 on both; torch 4.90e-3
-        (DType::BF16, "grad_bias") => 3.4e-3,   // 3.31e-3 on both; torch 3.31e-3
-        (DType::F16, "out") => 2.7e-4,          // 2.67e-4 on both; torch 3.56e-4
-        (DType::F16, "step") => 3.2e-4,         // 3.20e-4 on both; torch 5.44e-4
-        (DType::F16, "grad_x") => 3.2e-4,       // 3.14e-4 on both; torch 3.24e-4
-        (DType::F16, "grad_weight") => 3.4e-4,  // 3.38e-4 on both; torch 3.80e-4
-        (DType::F16, "grad_bias") => 2.7e-4,    // 2.67e-4 on both; torch 2.68e-4
-        _ => panic!("no bound for {dtype:?} {part}"),
-    }
-}
-
-/// The largest error over the largest magnitude seen per dtype and part, for the summary each
-/// test prints, against the bounds of the device's kind (`other`: a CubeCL runtime but CUDA).
-struct Worst(BTreeMap<String, f64>, bool);
-
-/// Whether `device` is a CubeCL device but a CUDA one, whose bounds are [`bound`]'s `other`.
+/// Whether `device` is a CubeCL device but a CUDA one, held to the wider of the bounds.
 fn other_runtime(device: &Device) -> bool {
     common::runtime_of(device).is_some() && !common::on_cuda(device)
 }
 
-impl Worst {
-    fn on(device: &Device) -> Self {
-        Self(BTreeMap::new(), other_runtime(device))
-    }
-
-    /// Asserts `actual` against the recorded `part` of `case` and prints the error.
-    fn check(&mut self, label: &str, case: &Case, part: &str, actual: Vec<f32>) {
-        let (expected, _) = case.fixtures.recorded(&case.part(part));
-        self.check_against(label, case, part, part, &actual, &expected);
-    }
-
-    fn check_against(
-        &mut self,
-        label: &str,
-        case: &Case,
-        part: &str,
-        what: &str,
-        actual: &[f32],
-        expected: &[f32],
-    ) {
-        let (abs, rel) = errors(actual, expected);
-        let bound = bound(case.dtype, part, self.1);
-        println!(
-            "{label} {} {what}: max abs {abs:.3e}, rel {rel:.3e} (bound {bound:.1e})",
-            case.name
-        );
-        let key = format!("{:?} {part}", case.dtype);
-        let worst = self.0.entry(key).or_default();
-        *worst = worst.max(rel);
-        assert!(
-            rel <= bound,
-            "{label} {} {what}: error {rel:.3e} over the largest magnitude exceeds {bound:.1e}",
-            case.name
-        );
-    }
-
-    fn print(&self, label: &str) {
-        for (key, rel) in &self.0 {
-            println!("{label} worst {key}: rel {rel:.3e}");
-        }
-    }
-}
-
-/// torch's own error on the reduced-precision cases, from its recorded results.
-fn torch_error(case: &Case, part: &str) {
-    let torch = format!("torch_{part}");
-    if case.fixtures.has(&case.part(&torch)) {
-        let (theirs, _) = case.fixtures.recorded(&case.part(&torch));
-        let (truth, _) = case.fixtures.recorded(&case.part(part));
-        let (abs, rel) = errors(&theirs, &truth);
-        println!(
-            "  torch {:?} on CUDA {} {part}: max abs {abs:.3e}, rel {rel:.3e}",
-            case.dtype, case.name
-        );
-    }
-}
-
-/// Whether the kernels take a case of kernel width `k` in `dtype` for `x` `[B, T, C]` on `device`;
-/// under CUDA they take every width they hold.
+/// Whether the kernels take a case of kernel width `k` in `dtype` for `x` `[B, T, C]` on
+/// `device`; under CUDA they take every width they hold.
 fn takes(device: &Device, dtype: DType, k: usize, shape: [usize; 3]) -> bool {
-    let takes = kernels_take(device, dtype, k, shape, None);
-    if common::on_cuda(device) && k <= dash_ops::conv1d::MAX_KERNEL_WIDTH {
-        assert!(takes, "CUDA turned the kernels away for K = {k}, {shape:?}");
-    }
-    takes
+    adapter::conv1d_kernels_take(device, dtype, k, shape, None)
 }
 
-/// The cases of `fixtures` in a dtype `device` has, the sequences or the decoding steps.
+/// The cases in a dtype `device` has, the sequences or the decoding steps.
 fn cases_on(device: &Device, step: bool) -> Vec<Case> {
-    [GENERAL, TRANSFORMERS]
+    conv1d::cases()
         .into_iter()
-        .flat_map(Fixtures::cases)
-        .filter(|case| case.step == step && device.supports_dtype(case.dtype))
+        .filter(|case| case.step == step && device.supports_dtype(burn_dtype(case.dtype)))
         .collect()
 }
 
-/// Asserts that `count` grew past `before` when `kernels`, and did not otherwise.
-fn launched(kernels: bool, count: fn() -> usize, before: usize, what: &str) {
-    assert_eq!(
-        count() > before,
-        kernels,
-        "{what}: the kernel ran {} times, expected {}",
-        count() - before,
-        if kernels { "some" } else { "none" }
-    );
+/// The input `part` of `case` on `device`, in the case's dtype.
+fn load<const D: usize>(case: &Case, part: &str, device: &Device) -> Tensor<D> {
+    adapter::tensor(&case.input(part), device)
 }
 
-/// Every sequence case: the output and every gradient through `Autodiff`, whose written-out
-/// backward pass must run, and where the kernels take the case the forward and backward kernels.
-fn sequences(device: &Device, label: &str) {
-    let mut worst = Worst::on(device);
-    for case in cases_on(device, false) {
-        let dtype = case.dtype;
-        let x = case.load::<3>("x", device).require_grad();
-        let kernels = takes(device, dtype, case.kernel_width(), x.dims());
-        let weight = case.load::<2>("weight", device).require_grad();
-        let bias = case.bias(device).map(Tensor::require_grad);
-        let grad_out = case.load::<3>("grad_out", device);
+fn bias(case: &Case, device: &Device) -> Option<Tensor<1>> {
+    case.bias().map(|bias| adapter::tensor(&bias, device))
+}
 
-        let forward = probe::forward_launches();
-        let (out, _) = causal_conv1d(
-            x.clone(),
-            weight.clone(),
-            bias.clone(),
-            None,
-            None,
-            case.options,
-        );
-        assert_eq!(out.dtype(), dtype);
-        worst.check(label, &case, "out", values(out.clone()));
-        launched(kernels, probe::forward_launches, forward, &case.name);
-
-        let (runs, backward) = (probe::backward_runs(), probe::backward_launches());
-        let grads = (out * grad_out).sum().backward();
-        assert!(
-            probe::backward_runs() > runs,
-            "{}: the written-out backward pass did not run",
-            case.name
-        );
-        let grad_x = x.grad(&grads).expect("x gradient");
-        let grad_weight = weight.grad(&grads).expect("weight gradient");
-        assert_eq!((grad_x.dtype(), grad_weight.dtype()), (dtype, dtype));
-        worst.check(label, &case, "grad_x", values(grad_x));
-        worst.check(label, &case, "grad_weight", values(grad_weight));
-        // Read after the values: under fusion the kernels run when they are read.
-        launched(kernels, probe::backward_launches, backward, &case.name);
-        if let Some(bias) = bias {
-            let grad_bias = bias.grad(&grads).expect("bias gradient");
-            assert_eq!(grad_bias.dtype(), dtype);
-            worst.check(label, &case, "grad_bias", values(grad_bias));
-        }
-        for part in ["out", "grad_x", "grad_weight", "grad_bias"] {
-            torch_error(&case, part);
-        }
+/// The decoding state, `[B, W, C]` f32: transformers' `[B, C, W]` seen transposed, a view whose
+/// channels are not adjacent, as a caller holding transformers' cache hands it over.
+fn recorded_state(case: &Case, device: &Device) -> Tensor<3> {
+    let state = case.input("state").with_dtype(dash_conformance::DType::F32);
+    let state = adapter::tensor::<3>(&state, device);
+    match case.state_transposed() {
+        true => state.swap_dims(1, 2),
+        false => state,
     }
-    worst.print(label);
 }
 
 /// Every decoding case from a recorded state, on a device with gradients (where the step is
-/// taken as a constant) and on one without; where the kernels take the case, through the step
-/// kernel.
+/// taken as a constant) and on one without, the state as [`recorded_state`] gives it; where the
+/// kernels take the case, through the step kernel.
 fn steps(device: &Device, label: &str) {
-    let mut worst = Worst::on(device);
+    let mut worst = Worst::new(other_runtime(device));
     for case in cases_on(device, true) {
         for device in [device.clone(), device.clone().autodiff()] {
-            let x = case.load::<2>("x", &device);
+            let x = load::<2>(&case, "x", &device);
             let [b, c] = x.dims();
-            let kernels = takes(&device, case.dtype, case.kernel_width(), [b, 1, c]);
-            let weight = case.load::<2>("weight", &device);
+            let dtype = burn_dtype(case.dtype);
+            let kernels = takes(&device, dtype, case.kernel_width(), [b, 1, c]);
+            let weight = load::<2>(&case, "weight", &device);
             let launches = probe::update_launches();
             let (out, next) = causal_conv1d_update(
                 x,
                 weight,
-                case.bias(&device),
-                case.state(&device),
+                bias(&case, &device),
+                recorded_state(&case, &device),
                 case.options.into(),
             );
-            assert_eq!((out.dtype(), next.dtype()), (case.dtype, DType::F32));
-            let (expected, _) = case.fixtures.recorded(&case.part("out"));
+            assert_eq!((out.dtype(), next.dtype()), (dtype, DType::F32));
+            let expected = case.recorded("out");
             worst.check_against(label, &case, "step", "out", &values(out), &expected);
             launched(kernels, probe::update_launches, launches, &case.name);
             // The state only moves values: exact.
-            let next = match case.transposed_state {
+            let next = match case.state_transposed() {
                 true => next.swap_dims(1, 2),
                 false => next,
             };
-            let (expected, _) = case.fixtures.recorded(&case.part("new_state"));
+            let expected = case.recorded("new_state");
             assert_eq!(values(next), expected, "{label} {}: next state", case.name);
         }
         torch_error(&case, "out");
@@ -403,20 +119,21 @@ fn steps(device: &Device, label: &str) {
     worst.print(label);
 }
 
-/// Every sequence case as a prefill of `p` steps, then single steps to its end: the outputs are
-/// the recorded sequence's, and the final state holds its last inputs; where the kernels take
-/// the case, through the step kernel. Returns the largest difference between the steps' outputs
-/// and the sequence's own, computed on `device`.
+/// Every sequence case as a prefill of `p` steps, then single steps to its end, the prompt and
+/// each token sliced out of the sequence on the device: the outputs are the recorded sequence's,
+/// and the final state holds its last inputs; where the kernels take the case, through the step
+/// kernel. Returns the largest difference between the steps' outputs and the sequence's own,
+/// computed on `device`.
 fn prefill_then_steps(device: &Device, label: &str) -> f64 {
-    let mut worst = Worst::on(device);
+    let mut worst = Worst::new(other_runtime(device));
     let mut against_sequence = 0.0f64;
     for case in cases_on(device, false) {
         let k = case.kernel_width();
-        let x = case.load::<3>("x", device);
-        let weight = case.load::<2>("weight", device);
-        let bias = case.bias(device);
+        let x = load::<3>(&case, "x", device);
+        let weight = load::<2>(&case, "weight", device);
+        let bias = bias(&case, device);
         let [b, t, c] = x.dims();
-        let kernels = takes(device, case.dtype, k, [b, 1, c]);
+        let kernels = takes(device, burn_dtype(case.dtype), k, [b, 1, c]);
         let sequence = values(
             causal_conv1d(
                 x.clone(),
@@ -428,7 +145,7 @@ fn prefill_then_steps(device: &Device, label: &str) -> f64 {
             )
             .0,
         );
-        let (expected, _) = case.fixtures.recorded(&case.part("out"));
+        let expected = case.recorded("out");
         // The least state that works, transformers' (`S = K`), and a longer one, each after a
         // prefill of a different length: none, one step, and half the sequence.
         for (prefix, state_len) in [(0, k - 1), (1.min(t), k), (t / 2, k + 2)] {
@@ -474,7 +191,7 @@ fn prefill_then_steps(device: &Device, label: &str) -> f64 {
 
             // The final state is the last `state_len` inputs, zeros before the sequence. The
             // recorded inputs are values of the case's dtype, which the f32 state holds exactly.
-            let (inputs, _) = case.fixtures.recorded(&case.part("x"));
+            let inputs = case.recorded("x");
             let final_state = values(state);
             for bi in 0..b {
                 for s in 0..state_len {
@@ -499,12 +216,27 @@ fn prefill_then_steps(device: &Device, label: &str) -> f64 {
 #[test]
 fn sequence_on_flex_matches_torch() {
     let _serial = serial();
-    sequences(&Device::flex().autodiff(), "flex");
+    let device = Device::flex().autodiff();
+    let flex = Burn::new(device.clone()).watching(Watch::Launches);
+    conv1d::sequences(&flex, "flex", other_runtime(&device)).all_ran();
+}
+
+/// On a device with gradients (where the step is taken as a constant) and on one without.
+#[cfg(feature = "flex")]
+#[test]
+fn step_on_flex_matches_torch() {
+    let _serial = serial();
+    let device = Device::flex();
+    let (plain, autodiff) = (
+        Burn::new(device.clone()),
+        Burn::new(device.clone().autodiff()),
+    );
+    conv1d::steps(&[&plain, &autodiff], "flex", other_runtime(&device)).all_ran();
 }
 
 #[cfg(feature = "flex")]
 #[test]
-fn step_on_flex_matches_torch() {
+fn step_on_flex_from_views_matches_torch() {
     let _serial = serial();
     steps(&Device::flex(), "flex");
 }
@@ -512,6 +244,15 @@ fn step_on_flex_matches_torch() {
 #[cfg(feature = "flex")]
 #[test]
 fn prefill_then_steps_on_flex_equals_the_sequence() {
+    let _serial = serial();
+    let device = Device::flex();
+    let flex = Burn::new(device.clone());
+    conv1d::prefill_then_steps(&flex, "flex", other_runtime(&device)).all_ran();
+}
+
+#[cfg(feature = "flex")]
+#[test]
+fn prefill_then_steps_on_flex_from_views_equals_the_sequence() {
     let _serial = serial();
     prefill_then_steps(&Device::flex(), "flex");
 }
@@ -528,15 +269,14 @@ fn options_default_to_no_activation() {
 fn a_tracked_step_is_differentiable() {
     let _serial = serial();
     let device = Device::flex().autodiff();
-    let case = GENERAL
-        .cases()
+    let case = conv1d::cases()
         .into_iter()
         .find(|case| case.name == "step_k4_bias_linear_f32")
         .expect("case");
-    let x = case.load::<2>("x", &device).require_grad();
-    let state = case.state(&device).require_grad();
-    let weight = case.load::<2>("weight", &device).require_grad();
-    let bias = case.load::<1>("bias", &device).require_grad();
+    let x = load::<2>(&case, "x", &device).require_grad();
+    let state = recorded_state(&case, &device).require_grad();
+    let weight = load::<2>(&case, "weight", &device).require_grad();
+    let bias = load::<1>(&case, "bias", &device).require_grad();
     let [b, s, c] = state.dims();
     let k = case.kernel_width();
     let (out, _) = causal_conv1d_update(
@@ -569,8 +309,8 @@ fn a_tracked_step_is_differentiable() {
     // The weight's gradient: d out[b, c] / d weight[c, j] summed over the batch.
     let window = values(Tensor::cat(
         vec![
-            case.state(&device).slice([0..b, s + 1 - k..s, 0..c]),
-            case.load::<2>("x", &device).reshape([b, 1, c]),
+            recorded_state(&case, &device).slice([0..b, s + 1 - k..s, 0..c]),
+            load::<2>(&case, "x", &device).reshape([b, 1, c]),
         ],
         1,
     ));
@@ -591,6 +331,7 @@ fn a_tracked_step_is_differentiable() {
 #[cfg(feature = "cubecl")]
 mod cube {
     use super::*;
+    use burn::tensor::TensorData;
 
     fn device() -> Device {
         common::cube_device()
@@ -600,11 +341,20 @@ mod cube {
     fn sequence_on_cubecl_matches_torch() {
         let _serial = serial();
         println!("{}", common::describe(&device()));
-        sequences(&device().autodiff(), "cubecl");
+        let cube = Burn::new(device().autodiff()).watching(Watch::Launches);
+        conv1d::sequences(&cube, "cubecl", other_runtime(&device())).all_ran();
     }
 
     #[test]
     fn step_on_cubecl_matches_torch() {
+        let _serial = serial();
+        let (plain, autodiff) = (Burn::new(device()), Burn::new(device().autodiff()));
+        conv1d::steps(&[&plain, &autodiff], "cubecl", other_runtime(&device())).all_ran();
+    }
+
+    /// The step kernel reads transformers' state through its strides, or a copy of it.
+    #[test]
+    fn step_on_cubecl_from_views_matches_torch() {
         let _serial = serial();
         steps(&device(), "cubecl");
     }
@@ -613,6 +363,19 @@ mod cube {
     /// step kernels share their arithmetic.
     #[test]
     fn prefill_then_steps_on_cubecl_equals_the_sequence() {
+        let _serial = serial();
+        let cube = Burn::new(device());
+        let difference =
+            conv1d::prefill_then_steps(&cube, "cubecl", other_runtime(&device())).all_ran();
+        if takes(&device(), DType::F32, 4, [1, 1, 1]) {
+            assert_eq!(difference, 0.0);
+        }
+    }
+
+    /// The same from views, the forward and step kernels reading the prompt and each token
+    /// through the sequence's strides.
+    #[test]
+    fn prefill_then_steps_on_cubecl_from_views_equals_the_sequence() {
         let _serial = serial();
         let difference = prefill_then_steps(&device(), "cubecl");
         if takes(&device(), DType::F32, 4, [1, 1, 1]) {

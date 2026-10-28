@@ -1,0 +1,16 @@
+[package]
+name = "dash-conformance"
+description = "The operation-level tests of Dashmag's operations, written once for every implementation of them and run through a thin adapter: the recorded fixtures, the error measures and the bounds."
+readme = "README.md"
+# Test support, run from the repository: it reads the fixtures where `dash-ops` keeps them.
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dash-contract = { workspace = true }
+safetensors = "0.8"
+serde_json = "1"

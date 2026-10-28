@@ -1,27 +1,14 @@
 //! The recurrent gated delta rule's step, held to transformers 5.15's
-//! `torch_recurrent_gated_delta_rule`.
+//! `torch_recurrent_gated_delta_rule`: `dash_conformance::gated_delta_recurrent`'s tests (single
+//! steps in f32 and from bf16 inputs, decoding from the chunked rule's state after a prompt, the
+//! gradients of a tracked step) through the Burn adapter, on Flex and on a CubeCL device, any
+//! runtime (`tests/common`), the kernel where the device has what it asks and the reference
+//! elsewhere; on the CubeCL device each held to the kernel's launches.
 //!
-//! The fixtures in `tests/fixtures/gated_delta_recurrent/` were recorded on the CPU with
-//! transformers' torch code, in fp32 but where bf16 is named (with fla installed, the
-//! module-level `torch_chunk_gated_delta_rule` routes to fla's kernel; what is recorded is the
-//! torch code behind it):
-//!
-//! - `steps_f32`: one step from a random state, Dk 16 / Dv 24 with and without the l2 norm of
-//!   `q` and `k`, and Qwen3.5-0.8B's head, Dk = Dv = 128, with it;
-//! - `step_bf16`: `q`, `k`, `v` and `beta` in bf16 and `g` in f32, as Qwen3.5 computes them,
-//!   with torch's own result on them and its fp32 result on the same values upcast;
-//! - `step_grad`: torch autograd gradients through one step;
-//! - `prefill_decode`: `torch_chunk_gated_delta_rule` over a 100-token prompt with
-//!   `output_final_state=True`, then `torch_recurrent_gated_delta_rule` token by token over 16
-//!   more from that state.
-//!
-//! Errors are reported as the largest absolute difference and as that over the largest absolute
-//! reference value ("relative"), and the relative one is asserted just above the largest measured
-//! (in brackets below) on Flex; on CUDA with and without fusion and autotune; under wgpu on
-//! lavapipe and on OpenGL over D3D12; and on CubeCL's CPU runtime.
-//!
-//! With a CubeCL runtime's feature the same checks run on that runtime's device
-//! (`tests/common`), the kernel where the device has what it asks and the reference elsewhere.
+//! What is dash-ops' own stays here: decoding from the chunked rule's state with each token's
+//! inputs sliced out of the recorded sequences on the device, an untracked step on an autodiff
+//! device, and the kernel against the reference at decoding sizes, with ragged and wider heads,
+//! strided inputs, a state inside a larger buffer and a state the caller still holds.
 //!
 //!   cargo test --release -p dash-ops --test gated_delta_recurrent
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test gated_delta_recurrent
@@ -30,139 +17,26 @@
 
 mod common;
 
-use burn::tensor::{DType, Device, Tensor, TensorData, bf16};
+use burn::tensor::{Device, Tensor};
+use common::adapter::{self, Burn};
+use dash_conformance::gated_delta_recurrent::{
+    F32_OUT, F32_STATE, Fixture, assert_close, check_bf16_step, check_f32_steps, check_gradients,
+    check_prefill_then_decode,
+};
 use dash_ops::gated_delta::recurrent::{GatedDeltaStepOptions, gated_delta_step};
-use safetensors::{Dtype, SafeTensors};
-use std::path::Path;
-
-/// fp32 output, against torch or the reference [4.7e-7].
-const F32_OUT: f32 = 8e-7;
-/// fp32 new state, against torch or the reference [2.6e-7, on lavapipe; 1.9e-7 on CUDA].
-const F32_STATE: f32 = 4e-7;
-/// bf16 inputs against torch's own bf16 path, which l2-normalises `q` and `k` in bf16 where this
-/// computes in f32: output [6.9e-3], state [3.4e-3].
-const BF16_VS_TORCH_BF16: [f32; 2] = [8e-3, 4e-3];
-/// bf16 inputs against torch in fp32 on the same values upcast: the output differs by its
-/// rounding to bf16, at most half a bf16 ulp, 2^-8 [2.9e-3]; the state [1.1e-7].
-const BF16_VS_UPCAST: [f32; 2] = [4e-3, 4e-7];
-/// Gradients through the reference against torch autograd [1.3e-6].
-const GRAD: f32 = 2e-6;
-
-/// One recorded safetensors file.
-struct Fixture(Vec<u8>);
-
-impl Fixture {
-    fn open(file: &str) -> Self {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/gated_delta_recurrent")
-            .join(file);
-        Self(std::fs::read(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display())))
-    }
-
-    /// A recorded tensor in its recorded dtype (f32 or bf16).
-    fn data(&self, name: &str) -> TensorData {
-        let file = SafeTensors::deserialize(&self.0).expect("a safetensors file");
-        let view = file
-            .tensor(name)
-            .unwrap_or_else(|err| panic!("{name}: {err}"));
-        let shape = view.shape().to_vec();
-        match view.dtype() {
-            Dtype::F32 => TensorData::new(
-                view.data()
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                    .collect::<Vec<_>>(),
-                shape,
-            ),
-            Dtype::BF16 => TensorData::new(
-                view.data()
-                    .chunks_exact(2)
-                    .map(|b| bf16::from_bits(u16::from_le_bytes(b.try_into().unwrap())))
-                    .collect::<Vec<_>>(),
-                shape,
-            ),
-            other => panic!("{name}: unexpected dtype {other:?}"),
-        }
-    }
-
-    /// A recorded tensor on `device`, in its recorded dtype.
-    fn tensor<const D: usize>(&self, name: &str, device: &Device) -> Tensor<D> {
-        let data = self.data(name);
-        let dtype = data.dtype();
-        Tensor::from_data(data, (device, dtype))
-    }
-}
-
-/// The largest absolute difference, and that over the largest absolute expected value.
-fn errors(actual: &TensorData, expected: &TensorData) -> (f32, f32) {
-    assert_eq!(actual.shape(), expected.shape(), "shapes differ");
-    let (mut max_abs, mut max_ref) = (0f32, 0f32);
-    for (a, e) in actual.iter::<f32>().zip(expected.iter::<f32>()) {
-        assert!(a.is_finite(), "non-finite output {a}");
-        max_abs = max_abs.max((a - e).abs());
-        max_ref = max_ref.max(e.abs());
-    }
-    (max_abs, max_abs / max_ref.max(f32::MIN_POSITIVE))
-}
-
-/// Prints the errors of `actual` against `expected` and asserts the relative one.
-fn assert_close<const D: usize>(
-    what: &str,
-    actual: Tensor<D>,
-    expected: &TensorData,
-    rel_tol: f32,
-) {
-    let actual = actual.into_data();
-    let (abs, rel) = errors(&actual, expected);
-    println!("{what}: max abs {abs:.3e}, relative {rel:.3e} (tolerance {rel_tol:.0e})");
-    assert!(
-        rel <= rel_tol,
-        "{what}: relative error {rel:.3e} above {rel_tol:.0e}"
-    );
-}
-
-/// Runs one recorded fp32 step on `device` and holds output and state to torch.
-fn check_f32_step(fixture: &Fixture, case: &str, use_qk_l2norm: bool, device: &Device) {
-    let name = |tensor: &str| format!("{case}.{tensor}");
-    let (out, state) = gated_delta_step(
-        fixture.tensor(&name("q"), device),
-        fixture.tensor(&name("k"), device),
-        fixture.tensor(&name("v"), device),
-        fixture.tensor(&name("g"), device),
-        fixture.tensor(&name("beta"), device),
-        fixture.tensor(&name("state"), device),
-        None,
-        GatedDeltaStepOptions::default().with_qk_l2norm(use_qk_l2norm),
-    );
-    assert_eq!(out.dtype(), DType::F32);
-    assert_eq!(state.dtype(), DType::F32);
-    assert_close(&name("out"), out, &fixture.data(&name("out")), F32_OUT);
-    assert_close(
-        &name("new_state"),
-        state,
-        &fixture.data(&name("new_state")),
-        F32_STATE,
-    );
-}
-
-fn check_f32_steps(device: &Device) {
-    let fixture = Fixture::open("steps_f32.safetensors");
-    check_f32_step(&fixture, "step_small", false, device);
-    check_f32_step(&fixture, "step_small_l2", true, device);
-    check_f32_step(&fixture, "step_head128", true, device);
-}
 
 /// Continues token by token from the state torch's chunked rule left after the prompt, slicing
-/// each token's inputs out of the recorded `[B, T, H, D]` tensors on the device, and threading
-/// the state through by value.
-fn check_prefill_then_decode(device: &Device) {
+/// each token's inputs out of the recorded `[B, T, H, D]` tensors on the device (views of a batch
+/// of two whose rows are a whole sequence apart), and threading the state through by value.
+fn check_prefill_then_decode_from_views(device: &Device) {
     let fixture = Fixture::open("prefill_decode.safetensors");
     let name = |tensor: &str| format!("prefill_decode.{tensor}");
-    let [q, k, v]: [Tensor<4>; 3] = ["q", "k", "v"].map(|n| fixture.tensor(&name(n), device));
-    let [g, beta]: [Tensor<3>; 2] = ["g", "beta"].map(|n| fixture.tensor(&name(n), device));
+    let load = |n: &str| fixture.data(&name(n));
+    let [q, k, v]: [Tensor<4>; 3] = ["q", "k", "v"].map(|n| adapter::tensor(&load(n), device));
+    let [g, beta]: [Tensor<3>; 2] = ["g", "beta"].map(|n| adapter::tensor(&load(n), device));
     let [b, tokens, h, dk] = q.dims();
     let dv = v.dims()[3];
-    let mut state: Tensor<4> = fixture.tensor(&name("prefill_state"), device);
+    let mut state: Tensor<4> = adapter::tensor(&load("prefill_state"), device);
     let mut outs = Vec::with_capacity(tokens);
     for t in 0..tokens {
         let token = |x: &Tensor<4>, d: usize| x.clone().narrow(1, t, 1).reshape([b, h, d]);
@@ -181,104 +55,16 @@ fn check_prefill_then_decode(device: &Device) {
     }
     assert_close(
         &name("out"),
-        Tensor::stack::<4>(outs, 1),
-        &fixture.data(&name("out")),
+        &adapter::host(Tensor::stack::<4>(outs, 1)),
+        &load("out"),
         F32_OUT,
     );
     assert_close(
         &name("final_state"),
-        state,
-        &fixture.data(&name("final_state")),
+        &adapter::host(state),
+        &load("final_state"),
         F32_STATE,
     );
-}
-
-/// bf16 `q`, `k`, `v`, `beta` and f32 `g`: the output comes back in bf16. Held to torch's own
-/// bf16 path (which l2-normalises in bf16, where this computes in f32) and to torch in fp32 on
-/// the same values upcast (the arithmetic this step does, up to the output's rounding to bf16).
-fn check_bf16_step(device: &Device) {
-    let fixture = Fixture::open("step_bf16.safetensors");
-    let name = |tensor: &str| format!("step_bf16.{tensor}");
-    let q: Tensor<3> = fixture.tensor(&name("q"), device);
-    assert_eq!(q.dtype(), DType::BF16);
-    let (out, state) = gated_delta_step(
-        q,
-        fixture.tensor(&name("k"), device),
-        fixture.tensor(&name("v"), device),
-        fixture.tensor(&name("g"), device),
-        fixture.tensor(&name("beta"), device),
-        fixture.tensor(&name("state"), device),
-        None,
-        GatedDeltaStepOptions::default().with_qk_l2norm(true),
-    );
-    assert_eq!(out.dtype(), DType::BF16);
-    assert_eq!(state.dtype(), DType::F32);
-    let out = out.into_data();
-    let state = state.into_data();
-    for (what, data, tol) in [
-        ("out_torch_bf16", &out, BF16_VS_TORCH_BF16[0]),
-        ("new_state_torch_bf16", &state, BF16_VS_TORCH_BF16[1]),
-        ("out_f32_upcast", &out, BF16_VS_UPCAST[0]),
-        ("new_state_f32_upcast", &state, BF16_VS_UPCAST[1]),
-    ] {
-        let (abs, rel) = errors(data, &fixture.data(&name(what)));
-        println!(
-            "step_bf16 against {what}: max abs {abs:.3e}, relative {rel:.3e} (tolerance {tol:.0e})"
-        );
-        assert!(
-            rel <= tol,
-            "step_bf16 against {what}: relative error {rel:.3e} above {tol:.0e}"
-        );
-    }
-}
-
-/// With tracked inputs the step runs the reference on the autodiff backend: its gradients are
-/// torch's.
-fn check_gradients(device: &Device) {
-    let fixture = Fixture::open("step_grad.safetensors");
-    let name = |tensor: &str| format!("step_grad.{tensor}");
-    let [q, k, v]: [Tensor<3>; 3] =
-        ["q", "k", "v"].map(|n| fixture.tensor(&name(n), device).require_grad());
-    let [g, beta]: [Tensor<2>; 2] =
-        ["g", "beta"].map(|n| fixture.tensor(&name(n), device).require_grad());
-    let state: Tensor<4> = fixture.tensor(&name("state"), device).require_grad();
-    let (out, new_state) = gated_delta_step(
-        q.clone(),
-        k.clone(),
-        v.clone(),
-        g.clone(),
-        beta.clone(),
-        state.clone(),
-        None,
-        GatedDeltaStepOptions::default().with_qk_l2norm(true),
-    );
-    let w_out: Tensor<3> = fixture.tensor(&name("w_out"), device);
-    let w_state: Tensor<4> = fixture.tensor(&name("w_state"), device);
-    let loss = (out.clone() * w_out).sum() + (new_state.clone() * w_state).sum();
-    let grads = loss.backward();
-    assert_close(
-        "step_grad out",
-        out.detach(),
-        &fixture.data(&name("out")),
-        F32_OUT,
-    );
-    assert_close(
-        "step_grad new_state",
-        new_state.detach(),
-        &fixture.data(&name("new_state")),
-        F32_STATE,
-    );
-    fn check<const D: usize>(fixture: &Fixture, input: &str, grad: Tensor<D>) {
-        let expected = fixture.data(&format!("step_grad.grad_{input}"));
-        assert_close(&format!("step_grad grad_{input}"), grad, &expected, GRAD);
-    }
-    for (input, x) in [("q", q), ("k", k), ("v", v)] {
-        check(&fixture, input, x.grad(&grads).unwrap());
-    }
-    for (input, x) in [("g", g), ("beta", beta)] {
-        check(&fixture, input, x.grad(&grads).unwrap());
-    }
-    check(&fixture, "state", state.grad(&grads).unwrap());
 }
 
 /// On an autodiff device a step whose inputs are not tracked gives untracked outputs equal to
@@ -287,13 +73,15 @@ fn check_untracked_autodiff(device: &Device) {
     let fixture = Fixture::open("steps_f32.safetensors");
     let run = |device: &Device| {
         let name = |tensor: &str| format!("step_small_l2.{tensor}");
+        let load3 = |tensor: &str| adapter::tensor::<3>(&fixture.data(&name(tensor)), device);
+        let load2 = |tensor: &str| adapter::tensor::<2>(&fixture.data(&name(tensor)), device);
         gated_delta_step(
-            fixture.tensor(&name("q"), device),
-            fixture.tensor(&name("k"), device),
-            fixture.tensor(&name("v"), device),
-            fixture.tensor(&name("g"), device),
-            fixture.tensor(&name("beta"), device),
-            fixture.tensor(&name("state"), device),
+            load3("q"),
+            load3("k"),
+            load3("v"),
+            load2("g"),
+            load2("beta"),
+            adapter::tensor::<4>(&fixture.data(&name("state")), device),
             None,
             GatedDeltaStepOptions::default().with_qk_l2norm(true),
         )
@@ -311,25 +99,33 @@ fn check_untracked_autodiff(device: &Device) {
 #[cfg(feature = "flex")]
 #[test]
 fn step_matches_torch_on_flex() {
-    check_f32_steps(&Device::flex());
+    check_f32_steps(&Burn::new(Device::flex())).all_ran();
 }
 
 #[cfg(feature = "flex")]
 #[test]
 fn prefill_with_the_chunked_rule_then_decode_on_flex() {
-    check_prefill_then_decode(&Device::flex());
+    check_prefill_then_decode(&Burn::new(Device::flex())).all_ran();
+}
+
+#[cfg(feature = "flex")]
+#[test]
+fn prefill_with_the_chunked_rule_then_decode_from_views_on_flex() {
+    check_prefill_then_decode_from_views(&Device::flex());
 }
 
 #[cfg(feature = "flex")]
 #[test]
 fn bf16_inputs_on_flex() {
-    check_bf16_step(&Device::flex());
+    check_bf16_step(&Burn::new(Device::flex())).all_ran();
 }
 
+/// With tracked inputs the step runs the reference on the autodiff backend: its gradients are
+/// torch's.
 #[cfg(feature = "flex")]
 #[test]
 fn tracked_inputs_take_the_reference_and_its_gradients_on_flex() {
-    check_gradients(&Device::flex().autodiff());
+    check_gradients(&Burn::new(Device::flex().autodiff())).all_ran();
 }
 
 #[cfg(feature = "flex")]
@@ -342,8 +138,21 @@ fn untracked_inputs_on_an_autodiff_device_on_flex() {
 #[cfg(feature = "cubecl")]
 mod cube {
     use super::*;
+    use burn::tensor::{DType, TensorData};
     use dash_ops::gated_delta::recurrent::{gated_delta_step_reference, kernel_takes, probe};
     use std::sync::{Mutex, MutexGuard};
+
+    /// The largest absolute difference, and that over the largest absolute expected value.
+    fn errors(actual: &TensorData, expected: &TensorData) -> (f32, f32) {
+        assert_eq!(actual.shape(), expected.shape(), "shapes differ");
+        let (mut max_abs, mut max_ref) = (0f32, 0f32);
+        for (a, e) in actual.iter::<f32>().zip(expected.iter::<f32>()) {
+            assert!(a.is_finite(), "non-finite output {a}");
+            max_abs = max_abs.max((a - e).abs());
+            max_ref = max_ref.max(e.abs());
+        }
+        (max_abs, max_abs / max_ref.max(f32::MIN_POSITIVE))
+    }
 
     /// bf16 output of the kernel against the reference's: both round nearly equal f32 values to
     /// bf16 on their own, so they may differ by one bf16 ulp, 2^-7 [9.3e-4].
@@ -412,7 +221,9 @@ mod cube {
         let kernel = [[1, 2, 16, 24], [1, 2, 128, 128]]
             .iter()
             .all(|&dims| takes(&device, DType::F32, dims));
-        launches_kernel(kernel, 3, || check_f32_steps(&device));
+        launches_kernel(kernel, 3, || {
+            check_f32_steps(&Burn::new(device.clone())).all_ran()
+        });
     }
 
     #[test]
@@ -420,7 +231,17 @@ mod cube {
         let _turn = serial();
         let device = device();
         let kernel = takes(&device, DType::F32, [1, 2, 128, 128]);
-        launches_kernel(kernel, 16, || check_prefill_then_decode(&device));
+        launches_kernel(kernel, 16, || {
+            check_prefill_then_decode(&Burn::new(device.clone())).all_ran()
+        });
+    }
+
+    #[test]
+    fn prefill_with_the_chunked_rule_then_decode_from_views_on_cubecl() {
+        let _turn = serial();
+        let device = device();
+        let kernel = takes(&device, DType::F32, [1, 2, 128, 128]);
+        launches_kernel(kernel, 16, || check_prefill_then_decode_from_views(&device));
     }
 
     #[test]
@@ -429,7 +250,9 @@ mod cube {
         let device = device();
         if has(&device, DType::BF16) {
             let kernel = takes(&device, DType::BF16, [1, 2, 128, 128]);
-            launches_kernel(kernel, 1, || check_bf16_step(&device));
+            launches_kernel(kernel, 1, || {
+                check_bf16_step(&Burn::new(device.clone())).all_ran()
+            });
         }
     }
 
@@ -437,7 +260,7 @@ mod cube {
     fn tracked_inputs_take_the_reference_and_its_gradients_on_cubecl() {
         let _turn = serial();
         let before = probe::kernel_launches();
-        check_gradients(&device().autodiff());
+        check_gradients(&Burn::new(device().autodiff())).all_ran();
         assert_eq!(
             probe::kernel_launches(),
             before,

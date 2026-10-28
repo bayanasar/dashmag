@@ -2314,6 +2314,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dash-conformance"
+version = "0.0.1"
+dependencies = [
+ "dash-contract",
+ "safetensors 0.8.0",
+ "serde_json",
+]
+
+[[package]]
 name = "dash-contract"
 version = "0.0.1"
 
@@ -2375,6 +2384,7 @@ dependencies = [
  "burn",
  "burn-cubecl",
  "cubecl",
+ "dash-conformance",
  "dash-contract",
  "safetensors 0.8.0",
  "serde_json",

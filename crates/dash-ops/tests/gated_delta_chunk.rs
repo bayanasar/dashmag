@@ -1,13 +1,12 @@
-//! The chunked gated delta rule against transformers' `torch_chunk_gated_delta_rule`.
+//! The chunked gated delta rule against transformers' `torch_chunk_gated_delta_rule`:
+//! `dash_conformance::gated_delta_chunk`'s tests (f32 against torch at f32 and at f64, bf16
+//! inputs against f64) through the Burn adapter, on Flex and on a CubeCL device, any runtime
+//! (`tests/common`), the kernels where the device has what they ask and the reference elsewhere;
+//! on the CubeCL device each case held to the kernels' expected launches.
 //!
-//! The fixtures in `tests/fixtures/gated_delta_chunk/` hold inputs, the gradients fed back
-//! (`d_out`, `d_state`), and what torch computed from them: the output, the final state and the
-//! gradient of every input, at f32 (`out`, `dq`, ...), and with the function's f32 casts turned into
-//! f64 (`out_f64`, ...; stored rounded to f32). The bf16 case holds bf16 inputs (as f32 values),
-//! torch's own bf16 results (`out_torch_bf16`, ...) and the f64 results from the same inputs.
-//!
-//! With a CubeCL runtime's feature the same checks run on that runtime's device
-//! (`tests/common`), the kernels where the device has what they ask and the reference elsewhere.
+//! What is dash-ops' own stays here: the forward without autodiff and through autodiff without
+//! a gradient, the kernels against the reference on the same device, and heads wider than the
+//! kernels take.
 //!
 //!   cargo test --release -p dash-ops --test gated_delta_chunk -- --nocapture
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-ops --features cuda --test gated_delta_chunk
@@ -15,10 +14,11 @@
 
 mod common;
 
-use burn::tensor::{DType, Device, Tensor, TensorData};
-use dash_ops::gated_delta::chunk::{ChunkGatedDeltaOptions, chunk_gated_delta_rule, probe};
-use safetensors::{Dtype, SafeTensors};
-use std::collections::HashMap;
+use burn::tensor::{DType, Device, Tensor};
+use common::adapter::{self, Burn};
+use dash_conformance::errors_f32 as errors;
+use dash_conformance::gated_delta_chunk::{self as cases, BF16_TOL, Case, F32_TOL};
+use dash_ops::gated_delta::chunk::{ChunkGatedDeltaOptions, chunk_gated_delta_rule};
 use std::sync::{Mutex, MutexGuard};
 
 /// One test at a time, so that the counters each test reads (written-out backward runs, kernel
@@ -28,182 +28,12 @@ fn serial() -> MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-struct Case {
-    name: &'static str,
-    meta: HashMap<String, serde_json::Value>,
-    tensors: HashMap<String, (Vec<usize>, Vec<f32>)>,
-}
-
-impl Case {
-    fn load(name: &'static str) -> Self {
-        let path = format!(
-            "{}/tests/fixtures/gated_delta_chunk/{name}.safetensors",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        let (_, metadata) = SafeTensors::read_metadata(&bytes).unwrap();
-        let meta = metadata
-            .metadata()
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::from_str(v).unwrap()))
-            .collect();
-        let st = SafeTensors::deserialize(&bytes).unwrap();
-        let tensors = st
-            .tensors()
-            .into_iter()
-            .map(|(name, view)| {
-                assert_eq!(view.dtype(), Dtype::F32, "{name}");
-                let data = view
-                    .data()
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
-                (name, (view.shape().to_vec(), data))
-            })
-            .collect();
-        Self {
-            name,
-            meta,
-            tensors,
-        }
-    }
-
-    fn flag(&self, key: &str) -> bool {
-        self.meta[key].as_bool().unwrap()
-    }
-
-    fn get(&self, key: &str) -> &[f32] {
-        &self.tensors[key].1
-    }
-
-    fn tensor<const D: usize>(&self, key: &str, device: &Device) -> Tensor<D> {
-        let (shape, data) = &self.tensors[key];
-        Tensor::from_data(TensorData::new(data.clone(), shape.clone()), device)
-    }
-}
-
-/// What one run of the operation gave: output, final state, and gradients, as f32 vectors.
-type Results = HashMap<&'static str, Vec<f32>>;
-
 fn to_vec<const D: usize>(t: Tensor<D>) -> Vec<f32> {
     t.cast(DType::F32)
         .into_data()
         .try_into_vec::<f32>()
         .unwrap()
 }
-
-/// Runs the case's forward and backward on `device` with inputs in `dtype`.
-fn run(case: &Case, device: &Device, dtype: DType) -> Results {
-    let leaf3 = |key: &str| case.tensor::<3>(key, device).cast(dtype).require_grad();
-    let leaf4 = |key: &str| case.tensor::<4>(key, device).cast(dtype).require_grad();
-    let (q, k, v) = (leaf4("q"), leaf4("k"), leaf4("v"));
-    let (g, beta) = (leaf3("g"), leaf3("beta"));
-    let h0 = case
-        .flag("initial_state")
-        .then(|| case.tensor::<4>("h0", device).require_grad());
-    let state_grad = case.flag("final_state_grad");
-    let runs = probe::backward_runs();
-    let options = ChunkGatedDeltaOptions {
-        qk_l2norm: case.flag("l2norm"),
-        output_final_state: state_grad,
-        ..Default::default()
-    };
-    let (out, state) = chunk_gated_delta_rule(
-        q.clone(),
-        k.clone(),
-        v.clone(),
-        g.clone(),
-        beta.clone(),
-        h0.clone(),
-        None,
-        options,
-    );
-    let mut loss = (out.clone().cast(DType::F32) * case.tensor::<4>("d_out", device)).sum();
-    if state_grad {
-        let state = state.clone().unwrap();
-        assert_eq!(state.dtype(), DType::F32);
-        loss = loss + (state * case.tensor::<4>("d_state", device)).sum();
-    }
-    let grads = loss.backward();
-    assert!(
-        probe::backward_runs() > runs,
-        "the written-out backward did not run"
-    );
-    assert_eq!(out.dtype(), dtype);
-    let mut res = Results::new();
-    res.insert("out", to_vec(out));
-    if let Some(state) = state {
-        res.insert("state", to_vec(state));
-    }
-    res.insert("dq", to_vec(q.grad(&grads).unwrap()));
-    res.insert("dk", to_vec(k.grad(&grads).unwrap()));
-    res.insert("dv", to_vec(v.grad(&grads).unwrap()));
-    res.insert("dg", to_vec(g.grad(&grads).unwrap()));
-    res.insert("dbeta", to_vec(beta.grad(&grads).unwrap()));
-    if let Some(h0) = h0 {
-        res.insert("dh0", to_vec(h0.grad(&grads).unwrap()));
-    }
-    res
-}
-
-/// Max abs error, and max abs error relative to the reference's max abs value.
-fn errors(actual: &[f32], expected: &[f32]) -> (f32, f32) {
-    assert_eq!(actual.len(), expected.len());
-    let mut max_err = 0f32;
-    let mut scale = 0f32;
-    for (a, e) in actual.iter().zip(expected) {
-        assert!(a.is_finite(), "non-finite value {a}");
-        max_err = max_err.max((a - e).abs());
-        scale = scale.max(e.abs());
-    }
-    (max_err, max_err / scale)
-}
-
-/// Compares every result with the reference `<name><suffix>`, printing the errors, and asserts
-/// the relative error is at most `tol`.
-fn check(case: &Case, label: &str, res: &Results, suffix: &str, tol: f32) {
-    let mut keys: Vec<_> = res.keys().copied().collect();
-    keys.sort();
-    let mut failed = Vec::new();
-    for key in keys {
-        let (abs, rel) = errors(&res[key], case.get(&format!("{key}{suffix}")));
-        println!(
-            "{:20} {label:12} {key:6} vs {:13} max abs {abs:.3e} rel {rel:.3e}",
-            case.name,
-            format!("torch{suffix}")
-        );
-        if rel > tol {
-            failed.push(format!("{key} {rel:.3e}"));
-        }
-    }
-    assert!(
-        failed.is_empty(),
-        "{} {label}: relative errors above {tol:.1e}: {failed:?}",
-        case.name
-    );
-}
-
-const F32_CASES: [&str; 3] = ["f32_l2norm_state", "f32_plain", "f32_short"];
-
-/// fp32 against torch at fp32 (and at f64): the requirement is 1e-5 relative; the measured errors
-/// are at most 1.2e-6, on Flex, on CUDA, and through the reference on lavapipe, on OpenGL over
-/// D3D12 and on CubeCL's CPU runtime (printed with --nocapture).
-const F32_TOL: f32 = 2e-6;
-
-/// bf16 inputs, against the f64 reference from the same inputs, where the reference or the f32
-/// kernels run: they compute in f32 and round once, to the outputs' dtype, so the error is about
-/// one bf16 rounding of the largest values (2^-9 relative): measured at most 2.5e-3. torch's own
-/// bf16 path, which normalises queries and keys in bf16, is further off (up to 8.1e-3, printed
-/// beside it).
-const BF16_TOL: f32 = 3e-3;
-
-/// The same where the kernels on tensor cores run, whose products take bf16 operands (the state,
-/// `W`, `U`, `T`, `V'` and the backward's operands rounded to bf16, as fla's are): measured at
-/// most 6.12e-3 (the output; the queries' gradient 5.34e-3), on CUDA in every build.
-#[cfg(feature = "cubecl")]
-const BF16_TC_TOL: f32 = 6.5e-3;
 
 /// f16 inputs: the kernels against the f32 reference from the same inputs. f16 rounds to within
 /// 2^-11 relative: measured at most 4.2e-4 through the reference on lavapipe and on CubeCL's CPU
@@ -214,46 +44,18 @@ const F16_VS_REFERENCE: f32 = 5e-4;
 const F16_TC_VS_REFERENCE: f32 = 8e-4;
 
 #[cfg(feature = "flex")]
-fn check_f32_cases(device: &Device, label: &str) {
-    for name in F32_CASES {
-        let case = Case::load(name);
-        let res = run(&case, device, DType::F32);
-        check(&case, label, &res, "", F32_TOL);
-        check(&case, label, &res, "_f64", F32_TOL);
-    }
-}
-
-fn check_bf16_case(device: &Device, label: &str, tol: f32) {
-    let case = Case::load("bf16_l2norm_state");
-    let res = run(&case, device, DType::BF16);
-    check(&case, label, &res, "_f64", tol);
-    // For the record: torch's own bf16 path against the same f64 reference.
-    let mut keys: Vec<_> = res.keys().copied().collect();
-    keys.sort();
-    for key in keys {
-        let (abs, rel) = errors(
-            case.get(&format!("{key}_torch_bf16")),
-            case.get(&format!("{key}_f64")),
-        );
-        println!(
-            "{:20} {:12} {key:6} vs torch_f64     max abs {abs:.3e} rel {rel:.3e}",
-            case.name, "torch-bf16"
-        );
-    }
-}
-
-#[cfg(feature = "flex")]
 #[test]
 fn fp32_on_flex_matches_torch() {
     let _serial = serial();
-    check_f32_cases(&Device::flex().autodiff(), "flex");
+    cases::check_f32_cases(&Burn::new(Device::flex().autodiff()), "flex").all_ran();
 }
 
 #[cfg(feature = "flex")]
 #[test]
 fn bf16_on_flex_matches_torch() {
     let _serial = serial();
-    check_bf16_case(&Device::flex().autodiff(), "flex-bf16", BF16_TOL);
+    let flex = Burn::new(Device::flex().autodiff());
+    cases::check_bf16_case(&flex, "flex-bf16", BF16_TOL).all_ran();
 }
 
 /// Without autodiff, and through Autodiff without a gradient, the output and the final state are
@@ -264,8 +66,8 @@ fn forward_without_gradients_on_flex() {
     let _serial = serial();
     let case = Case::load("f32_l2norm_state");
     for device in [Device::flex(), Device::flex().autodiff()] {
-        let t4 = |key: &str| case.tensor::<4>(key, &device);
-        let t3 = |key: &str| case.tensor::<3>(key, &device);
+        let t4 = |key: &str| adapter::cast_tensor::<4>(&case.tensor(key), &device);
+        let t3 = |key: &str| adapter::cast_tensor::<3>(&case.tensor(key), &device);
         let options = ChunkGatedDeltaOptions::default()
             .with_qk_l2norm(true)
             .with_final_state(true);
@@ -279,9 +81,9 @@ fn forward_without_gradients_on_flex() {
             None,
             options,
         );
-        let (_, rel) = errors(&to_vec(out), case.get("out"));
+        let (_, rel) = errors(&to_vec(out), &case.get("out"));
         assert!(rel <= F32_TOL);
-        let (_, rel) = errors(&to_vec(state.unwrap()), case.get("state"));
+        let (_, rel) = errors(&to_vec(state.unwrap()), &case.get("state"));
         assert!(rel <= F32_TOL);
     }
 }
@@ -352,9 +154,13 @@ fn seeded(
 #[cfg(feature = "cubecl")]
 mod cube {
     use super::*;
+    use burn::tensor::TensorData;
+    use dash_conformance::gated_delta_chunk::{
+        BF16_TC_TOL, F32_CASES, check, check_bf16_case, run,
+    };
     use dash_ops::gated_delta::chunk::{
         chunk_gated_delta_rule_reference, chunk_gated_delta_rule_reference_backward, kernels_take,
-        tensor_cores_take,
+        probe, tensor_cores_take,
     };
 
     /// How many kernel launches a forward and a backward pass over `[B, T, H, Dk, Dv]` in `dtype`
@@ -429,21 +235,22 @@ mod cube {
         };
         for &name in names {
             let case = Case::load(name);
-            let (q, v) = (&case.tensors["q"].0, &case.tensors["v"].0);
+            let (q, v) = (case.shape("q"), case.shape("v"));
             let dims = [q[0], q[1], q[2], q[3], v[3]];
             let expected = expected_launches(device, dtype, dims);
             let tc = expected_tc_launches(device, dtype, dims);
             println!(
                 "{name}: {dims:?} {dtype:?}, {expected} kernel launches, {tc} on tensor cores"
             );
-            let ad = device.clone().autodiff();
+            let ad = Burn::new(device.clone().autodiff());
             if dtype == DType::F32 {
-                let res = launches_kernels(expected, tc, || run(&case, &ad, dtype));
+                let dtype = adapter::contract_dtype(dtype);
+                let res = launches_kernels(expected, tc, || run(&ad, &case, dtype).expect("a run"));
                 check(&case, label, &res, "", F32_TOL);
                 check(&case, label, &res, "_f64", F32_TOL);
             } else {
                 let tol = if tc > 0 { BF16_TC_TOL } else { BF16_TOL };
-                launches_kernels(expected, tc, || check_bf16_case(&ad, label, tol));
+                launches_kernels(expected, tc, || check_bf16_case(&ad, label, tol).all_ran());
             }
         }
     }

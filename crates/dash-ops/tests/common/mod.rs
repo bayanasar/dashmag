@@ -9,6 +9,8 @@
 
 #![allow(dead_code)]
 
+pub mod adapter;
+
 use burn::tensor::Device;
 
 /// The CubeCL runtimes, in the order a device is chosen when `DASH_OPS_DEVICE` names none:

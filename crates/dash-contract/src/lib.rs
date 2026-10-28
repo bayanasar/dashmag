@@ -5,8 +5,8 @@
 //! masks and states mean and what each of its options does; and it holds the options themselves,
 //! as plain data with their defaults. `dash-ops` implements the operations on Burn, and
 //! re-exports these types where it has always had them; an implementation on another framework
-//! implements the same contract with the same types. The crate depends on nothing, so that any
-//! implementation can take it.
+//! implements the same contract with the same types, and `dash-conformance` runs the same tests
+//! on both. The crate depends on nothing, so that any implementation can take it.
 //!
 //! - [`gated_delta`]: the gated delta rule of Gated DeltaNet, chunked for training and
 //!   recurrent for decoding, over a batch or packed variable-length sequences.
@@ -97,3 +97,16 @@ pub mod lora;
 pub mod loss;
 pub mod lowrank;
 pub mod sample;
+
+/// The float dtypes of the conventions, for what implementations share beside the operations
+/// (the conformance tests' calls, which give each tensor's dtype); each implementation computes in
+/// its own framework's dtypes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DType {
+    /// IEEE single precision.
+    F32,
+    /// bfloat16: f32's exponent, eight bits of significand.
+    BF16,
+    /// IEEE half precision.
+    F16,
+}
