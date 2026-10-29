@@ -27,6 +27,9 @@
 //! - [`gated_delta_recurrent`]: the step against transformers, from bf16 inputs, its gradients,
 //!   and decoding from the state the chunked rule leaves after a prompt: calls of
 //!   [`Adapter::gated_delta_step`], alone and, in `check_gradients`, with gradients.
+//! - [`logprob`]: the chosen-token log-probability and the entropy against PyTorch, with and
+//!   without masked token ids, in chunks of every kind, without a gradient and for no rows:
+//!   calls of [`Adapter::chosen_logprob`], with the gradient and alone.
 //!
 //! # The adapter
 //!
@@ -39,8 +42,8 @@
 //!   f32), so that converting them loses nothing. The operation's floating inputs come in the dtype
 //!   the case runs in, those the contract allows in f32 beside it (the gated delta rule's `g`
 //!   and `beta`) in f32 where the recording has them so, and states in f32. Packed sequences'
-//!   boundaries come as `i64` offsets, which the implementation takes in an int dtype of its own;
-//!   the options are the contract's types.
+//!   boundaries and token ids come as `i64` values, masked token ids as `u32`, which the
+//!   implementation takes in int dtypes of its own; the options are the contract's types.
 //! - **Gradients.** A call with `grad` set asks for the gradients of the inputs, which the
 //!   adapter computes through its implementation's autodiff. `grad` holds the cotangents, f32
 //!   values the shape of the outputs they belong to: the gradients asked for are those of the
@@ -99,6 +102,7 @@
 use dash_contract::conv1d::{CausalConv1dOptions, CausalConv1dStepOptions};
 use dash_contract::gated_delta::chunk::ChunkGatedDeltaOptions;
 use dash_contract::gated_delta::recurrent::GatedDeltaStepOptions;
+use dash_contract::logprob::LogprobOptions;
 use std::cell::{Cell, RefCell};
 
 pub use dash_contract::DType;
@@ -109,6 +113,7 @@ mod fixtures;
 pub mod gated_delta_chunk;
 pub mod gated_delta_packed;
 pub mod gated_delta_recurrent;
+pub mod logprob;
 
 /// A tensor on the host: its shape, its values as f32 in row-major order, and its dtype, the
 /// dtype the implementation is to give it (an input) or gave it (an output). The values are
@@ -188,6 +193,10 @@ pub trait Adapter {
     /// step's definition when [`GatedDeltaStep::grad`] asks for them; an implementation that
     /// gives a step no gradient returns [`Unsupported`] for those calls.
     fn gated_delta_step(&self, call: &GatedDeltaStep) -> Result<GatedDeltaStepOut, Unsupported>;
+
+    /// `chosen_logprob` ([`dash_contract::logprob`]), with `hidden`'s gradient when
+    /// [`ChosenLogprob::grad`] asks for it.
+    fn chosen_logprob(&self, call: &ChosenLogprob) -> Result<ChosenLogprobOut, Unsupported>;
 }
 
 /// One call of `causal_conv1d`.
@@ -388,6 +397,35 @@ pub struct GatedDeltaStepGrads {
     pub state: HostTensor,
 }
 
+/// One call of `chosen_logprob`.
+#[derive(Clone, Debug)]
+pub struct ChosenLogprob {
+    /// `[n, D]`, in the case's dtype.
+    pub hidden: HostTensor,
+    /// The output weight, `[V, D]`, in `hidden`'s dtype; frozen, it takes no gradient.
+    pub weight: HostTensor,
+    /// The target ids, `[n]`.
+    pub targets: Vec<i64>,
+    /// The token ids taken out of the softmax.
+    pub masked: Vec<u32>,
+    /// The chunking.
+    pub options: LogprobOptions,
+    /// The cotangent of the log-probabilities, `[n]` f32, if the call asks for `hidden`'s
+    /// gradient: that of `sum(logprob * grad)`. The entropy carries none.
+    pub grad: Option<HostTensor>,
+}
+
+/// What a [`ChosenLogprob`] call gave.
+#[derive(Clone, Debug)]
+pub struct ChosenLogprobOut {
+    /// The log-probabilities of the targets, `[n]`, f32.
+    pub logprob: HostTensor,
+    /// The entropies, `[n]`, f32.
+    pub entropy: HostTensor,
+    /// `hidden`'s gradient, `[n, D]`, if asked for.
+    pub grad_hidden: Option<HostTensor>,
+}
+
 /// What a test body ran: how many calls the adapter ran, each call it did not run, the dtypes
 /// whose cases it left out, and what the body measured for its caller to bound. A body goes on
 /// past a call the adapter does not run and past a dtype the device does not have; this is how
@@ -530,6 +568,11 @@ impl Adapter for Counted<'_> {
     fn gated_delta_step(&self, call: &GatedDeltaStep) -> Result<GatedDeltaStepOut, Unsupported> {
         let result = self.adapter.gated_delta_step(call);
         self.tally.note("gated_delta_step", result)
+    }
+
+    fn chosen_logprob(&self, call: &ChosenLogprob) -> Result<ChosenLogprobOut, Unsupported> {
+        let result = self.adapter.chosen_logprob(call);
+        self.tally.note("chosen_logprob", result)
     }
 }
 

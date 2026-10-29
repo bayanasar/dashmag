@@ -6,18 +6,20 @@
 //! What the bodies cannot ask of every implementation, which of dash-ops' kernels a call ran, is
 //! checked here around the calls: a decoding step of conv1d always (its kernel ran exactly where
 //! `kernels_take` says it takes the step), the chunked gated delta rule's written-out backward pass
-//! always, and conv1d over sequences where a test asks for it ([`Watch`]).
+//! always, the log-probability's chunk kernel and written-out backward pass always, and conv1d
+//! over sequences where a test asks for it ([`Watch`]).
 
 use super::{on_cuda, runtime_of};
 use burn::tensor::{DType, Device, Int, Tensor, TensorData};
 use dash_conformance::{
-    Adapter, ChunkGatedDelta, ChunkGatedDeltaGrads, ChunkGatedDeltaOut, Conv1d, Conv1dGrads,
-    Conv1dOut, Conv1dStep, Conv1dStepOut, GatedDeltaStep, GatedDeltaStepGrads, GatedDeltaStepOut,
-    HostTensor, Unsupported,
+    Adapter, ChosenLogprob, ChosenLogprobOut, ChunkGatedDelta, ChunkGatedDeltaGrads,
+    ChunkGatedDeltaOut, Conv1d, Conv1dGrads, Conv1dOut, Conv1dStep, Conv1dStepOut, GatedDeltaStep,
+    GatedDeltaStepGrads, GatedDeltaStepOut, HostTensor, Unsupported,
 };
 use dash_ops::conv1d::{self, causal_conv1d, causal_conv1d_update};
 use dash_ops::gated_delta::chunk::{self, chunk_gated_delta_rule};
 use dash_ops::gated_delta::recurrent::gated_delta_step;
+use dash_ops::logprob::{self, LogprobOptions, VocabChunk, chosen_logprob};
 use std::cell::Cell;
 
 /// What the adapter checks of dash-ops' kernels around each call of conv1d over sequences.
@@ -176,6 +178,42 @@ pub fn launched(kernels: bool, count: fn() -> usize, before: usize, what: &str) 
         "{what}: the kernel ran {} times, expected {}",
         count() - before,
         if kernels { "some" } else { "none" }
+    );
+}
+
+/// The log-probability's chunk kernel launches in one pass over a vocabulary of `v` tokens for
+/// `n` rows: one per chunk of the vocabulary in each block of rows, the blocks of equal size but
+/// for the last.
+pub fn logprob_pass_launches(n: usize, v: usize, options: LogprobOptions) -> usize {
+    let block = n.div_ceil(n.div_ceil(options.row_chunk).max(1)).max(1);
+    (0..n)
+        .step_by(block)
+        .map(|r0| v.div_ceil(options.vocab_chunk_for(block.min(n - r0))))
+        .sum()
+}
+
+/// Asserts that since `before` the chunk kernel ran one pass's launches for `n` rows over `v`
+/// tokens in `dtypes` if `kernels_take` says the kernels take them on `device`, and never
+/// otherwise; under CUDA they must take them.
+pub fn assert_logprob_launches(
+    device: &Device,
+    dtypes: [DType; 3],
+    [n, v]: [usize; 2],
+    options: LogprobOptions,
+    before: usize,
+) {
+    let takes = logprob::kernels_take(device, dtypes, n, options);
+    if on_cuda(device) {
+        assert!(takes, "CUDA turned the chunk kernel away");
+    }
+    let want = match takes && n > 0 {
+        true => logprob_pass_launches(n, v, options),
+        false => 0,
+    };
+    let ran = logprob::probe::kernel_launches() - before;
+    assert_eq!(
+        ran, want,
+        "the chunk kernel ran {ran} times, expected {want}"
     );
 }
 
@@ -464,6 +502,45 @@ impl Adapter for Burn {
             out,
             state: new_state,
             grads,
+        })
+    }
+
+    fn chosen_logprob(&self, call: &ChosenLogprob) -> Result<ChosenLogprobOut, Unsupported> {
+        let device = self.device_for(call.grad.is_some());
+        let hidden = cast_tensor::<2>(&call.hidden, &device);
+        let hidden = match call.grad {
+            Some(_) => hidden.require_grad(),
+            None => hidden,
+        };
+        let weight = cast_tensor::<2>(&call.weight, &device);
+        let [v, _] = weight.dims();
+        let n = call.targets.len();
+        let targets =
+            Tensor::<1, Int>::from_data(TensorData::new(call.targets.clone(), [n]), &device);
+        let dtypes = [hidden.dtype(), weight.dtype(), targets.dtype()];
+        let (launches, runs) = (
+            logprob::probe::kernel_launches(),
+            logprob::probe::backward_runs(),
+        );
+        let out = chosen_logprob(hidden.clone(), weight, targets, &call.masked, call.options);
+        let (logprob, entropy) = (host(out.logprob.clone()), host(out.entropy));
+        let grad_hidden = call.grad.as_ref().map(|upstream| {
+            let grads = (out.logprob * tensor::<1>(upstream, &device))
+                .sum()
+                .backward();
+            host(hidden.grad(&grads).expect("hidden has a gradient"))
+        });
+        // Read after the values: under fusion the kernels run when their results are read.
+        assert_logprob_launches(&device, dtypes, [n, v], call.options, launches);
+        assert_eq!(
+            logprob::probe::backward_runs() > runs,
+            call.grad.is_some(),
+            "the written-out backward ran where a gradient was asked for, and only there"
+        );
+        Ok(ChosenLogprobOut {
+            logprob,
+            entropy,
+            grad_hidden,
         })
     }
 }

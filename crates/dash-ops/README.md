@@ -143,6 +143,6 @@ host-side cost of each unfused operation.
 `CUBECL_CUDA_TF32=0` keeps f32 matmuls in IEEE f32 (the workspace's patched cubecl-cuda); the f32
 tolerances assume it. The fixtures in `tests/fixtures/` were recorded once from PyTorch and
 transformers on seeded inputs; nothing in the repository runs Python. The operation-level tests
-of conv1d and the gated delta rule are `dash-conformance`'s, for every implementation of the
-operations to run; the tests here run them through a Burn adapter (`tests/common/adapter.rs`) and
-keep what is about this crate alone.
+of conv1d, the gated delta rule and the chosen-token log-probability are `dash-conformance`'s,
+for every implementation of the operations to run; the tests here run them through a Burn adapter
+(`tests/common/adapter.rs`) and keep what is about this crate alone.
