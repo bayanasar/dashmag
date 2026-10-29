@@ -53,7 +53,8 @@
 //!   a state in f32, each gradient in its input's dtype), and the values to the recordings.
 //! - **What it does not take.** [`Adapter::has`] says whether the device stores and computes in
 //!   a dtype; the tests skip the cases in a dtype it does not have (some silently, as dash-ops'
-//!   tests always have, some printing `skipped: <device> has no <dtype>`). A call with an option
+//!   tests always have, some printing `skipped: <device> has no <dtype>`), and the outcome names
+//!   the dtype ([`Outcome::lacking`]). A call with an option
 //!   or an input the implementation does not have returns [`Unsupported`] with the reason,
 //!   rather than a result computed some other way: an implementation whose operations return a
 //!   `Result` turns its refusal into it, one that panics checks before it calls. Any other failure
@@ -66,12 +67,15 @@
 //!
 //! # What ran
 //!
-//! A body goes on past a call the adapter does not run, and passes without it; so every body
-//! returns an [`Outcome`]: how many calls the adapter ran, each call it did not run with its
-//! reason, and what the body measured for its caller to bound. The caller asserts on it: an
-//! implementation that runs every case, as dash-ops does, asserts [`Outcome::all_ran`]; one that
-//! does not yet checks that what it skipped is what it means to skip. A body whose calls were all
-//! skipped has compared nothing, and its outcome says so.
+//! A body goes on past a call the adapter does not run, and past the cases in a dtype the device
+//! does not have, and passes without them; so every body returns an [`Outcome`]: how many calls
+//! the adapter ran, each call it did not run with its reason, the dtypes whose cases it left out,
+//! and what the body measured for its caller to bound. The caller asserts on it: an
+//! implementation that runs every case in every dtype asserts [`Outcome::all_ran`]; one whose
+//! devices lack dtypes, as some of dash-ops' do, names those it expects a device to lack with
+//! [`Outcome::all_ran_without`]; one that does not run every call yet checks that what it skipped
+//! is what it means to skip. A body whose calls were all skipped has compared nothing, and its
+//! outcome says so.
 //!
 //! # Running them
 //!
@@ -384,9 +388,10 @@ pub struct GatedDeltaStepGrads {
     pub state: HostTensor,
 }
 
-/// What a test body ran: how many calls the adapter ran, each call it did not run, and what the
-/// body measured for its caller to bound. A body goes on past a call the adapter does not run;
-/// this is how its caller knows what was left out.
+/// What a test body ran: how many calls the adapter ran, each call it did not run, the dtypes
+/// whose cases it left out, and what the body measured for its caller to bound. A body goes on
+/// past a call the adapter does not run and past a dtype the device does not have; this is how
+/// its caller knows what was left out.
 #[derive(Clone, Debug, PartialEq)]
 #[must_use = "a body passes over the calls the adapter does not run: assert what ran"]
 pub struct Outcome<T = ()> {
@@ -398,17 +403,31 @@ pub struct Outcome<T = ()> {
     /// The calls it did not run, each `<operation>: <reason>`, in order. A case that needed one
     /// of them was not compared.
     pub skipped: Vec<String>,
+    /// The dtypes the device does not have ([`Adapter::has`]) that the body asked about, each
+    /// once, in the order it asked: its cases in them were not compared.
+    pub lacking: Vec<DType>,
 }
 
 impl<T> Outcome<T> {
-    /// The value, once it is asserted that the adapter ran every call, and some: for an
-    /// implementation that runs every case.
+    /// The value, once it is asserted that the adapter ran every call, and some, and that the
+    /// device had every dtype asked about: for an implementation that runs every case.
     ///
     /// # Panics
     ///
-    /// If a call was skipped, or none ran.
+    /// If a call was skipped, none ran, or a dtype was lacking.
     #[track_caller]
     pub fn all_ran(self) -> T {
+        self.all_ran_without(&[])
+    }
+
+    /// The same, for a device expected to lack `dtypes`: their cases may have been left out,
+    /// those in any other dtype not, and a body whose cases were all in them ran nothing.
+    ///
+    /// # Panics
+    ///
+    /// If a call was skipped, a dtype not in `dtypes` was lacking, or none ran though none was.
+    #[track_caller]
+    pub fn all_ran_without(self, dtypes: &[DType]) -> T {
         assert!(
             self.skipped.is_empty(),
             "{} calls skipped, {} ran: {:?}",
@@ -416,7 +435,16 @@ impl<T> Outcome<T> {
             self.ran,
             self.skipped
         );
-        assert!(self.ran > 0, "no call ran");
+        assert!(self.ran > 0 || !self.lacking.is_empty(), "no call ran");
+        let unexpected: Vec<_> = self
+            .lacking
+            .iter()
+            .filter(|dtype| !dtypes.contains(dtype))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "the cases in {unexpected:?} were left out: the device has no {unexpected:?}"
+        );
         self.value
     }
 }
@@ -426,6 +454,7 @@ impl<T> Outcome<T> {
 struct Tally {
     ran: Cell<usize>,
     skipped: RefCell<Vec<String>>,
+    lacking: RefCell<Vec<DType>>,
 }
 
 impl Tally {
@@ -443,6 +472,7 @@ impl Tally {
             value,
             ran: self.ran.get(),
             skipped: self.skipped.take(),
+            lacking: self.lacking.take(),
         }
     }
 
@@ -471,7 +501,12 @@ impl Adapter for Counted<'_> {
     }
 
     fn has(&self, dtype: DType) -> bool {
-        self.adapter.has(dtype)
+        let has = self.adapter.has(dtype);
+        let mut lacking = self.tally.lacking.borrow_mut();
+        if !has && !lacking.contains(&dtype) {
+            lacking.push(dtype);
+        }
+        has
     }
 
     fn causal_conv1d(&self, call: &Conv1d) -> Result<Conv1dOut, Unsupported> {

@@ -8,7 +8,7 @@
 //! `kernels_take` says it takes the step), the chunked gated delta rule's written-out backward pass
 //! always, and conv1d over sequences where a test asks for it ([`Watch`]).
 
-use super::on_cuda;
+use super::{on_cuda, runtime_of};
 use burn::tensor::{DType, Device, Int, Tensor, TensorData};
 use dash_conformance::{
     Adapter, ChunkGatedDelta, ChunkGatedDeltaGrads, ChunkGatedDeltaOut, Conv1d, Conv1dGrads,
@@ -73,6 +73,20 @@ impl Burn {
     /// Of the conv1d calls watched so far, how many ran and how many the kernels took.
     pub fn taken(&self) -> [usize; 2] {
         self.taken.get()
+    }
+
+    /// The contract's dtypes the device does not have, whose cases the conformance bodies leave
+    /// out there; Flex and CUDA have every one.
+    pub fn lacking(&self) -> Vec<dash_conformance::DType> {
+        use dash_conformance::DType::{BF16, F16, F32};
+        let lacking: Vec<_> = [F32, BF16, F16]
+            .into_iter()
+            .filter(|&dtype| !self.device.supports_dtype(burn_dtype(dtype)))
+            .collect();
+        if on_cuda(&self.device) || runtime_of(&self.device).is_none() {
+            assert!(lacking.is_empty(), "{:?} has no {lacking:?}", self.device);
+        }
+        lacking
     }
 
     /// `offsets` as `cu_seqlens` on `device`.

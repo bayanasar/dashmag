@@ -11,8 +11,8 @@ operation: it receives the inputs as f32 values on the host with the dtype each 
 in, runs the operation and the backward pass the test asks for through the implementation's own
 autodiff, and returns the results read back to the host as f32. The crate documentation
 (`src/lib.rs`) says exactly what an adapter receives and returns, and how it skips a case its
-implementation does not take. Each test body returns what ran and what it skipped, for the
-implementation's test to assert. `dash-ops` runs these tests on Flex and on every CubeCL device
+implementation does not take. Each test body returns what ran, what it skipped and which dtypes the
+device lacked, for the implementation's test to assert. `dash-ops` runs these tests on Flex and on every CubeCL device
 (`crates/dash-ops/tests/common/adapter.rs`) and asserts that every call ran; its own tests keep
 what is about it alone: which of its kernels ran, its kernels against its reference, routing by
 what the device has, one autodiff graph across calls and inputs read through their strides.

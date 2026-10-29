@@ -33,7 +33,7 @@ fn serial() -> MutexGuard<'static, ()> {
 /// Every case against torch through `adapter`, which watches the kernels, and how many of the
 /// cases they took.
 fn fixtures(adapter: &Burn, label: &str) {
-    conv1d_state::fixtures(adapter, label).all_ran();
+    conv1d_state::fixtures(adapter, label).all_ran_without(&adapter.lacking());
     let [taken, ran] = adapter.taken();
     println!("{label}: the kernels took {taken} of {ran} cases");
 }

@@ -342,14 +342,16 @@ mod cube {
         let _serial = serial();
         println!("{}", common::describe(&device()));
         let cube = Burn::new(device().autodiff()).watching(Watch::Launches);
-        conv1d::sequences(&cube, "cubecl", other_runtime(&device())).all_ran();
+        conv1d::sequences(&cube, "cubecl", other_runtime(&device()))
+            .all_ran_without(&cube.lacking());
     }
 
     #[test]
     fn step_on_cubecl_matches_torch() {
         let _serial = serial();
         let (plain, autodiff) = (Burn::new(device()), Burn::new(device().autodiff()));
-        conv1d::steps(&[&plain, &autodiff], "cubecl", other_runtime(&device())).all_ran();
+        conv1d::steps(&[&plain, &autodiff], "cubecl", other_runtime(&device()))
+            .all_ran_without(&plain.lacking());
     }
 
     /// The step kernel reads transformers' state through its strides, or a copy of it.
@@ -365,8 +367,8 @@ mod cube {
     fn prefill_then_steps_on_cubecl_equals_the_sequence() {
         let _serial = serial();
         let cube = Burn::new(device());
-        let difference =
-            conv1d::prefill_then_steps(&cube, "cubecl", other_runtime(&device())).all_ran();
+        let difference = conv1d::prefill_then_steps(&cube, "cubecl", other_runtime(&device()))
+            .all_ran_without(&cube.lacking());
         if takes(&device(), DType::F32, 4, [1, 1, 1]) {
             assert_eq!(difference, 0.0);
         }
