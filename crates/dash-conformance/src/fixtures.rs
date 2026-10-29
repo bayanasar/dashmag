@@ -20,10 +20,12 @@ enum Values {
     Float(DType, Vec<f32>),
     /// Integers.
     Int(Vec<i64>),
+    /// Booleans, stored as u8.
+    Bool(Vec<bool>),
 }
 
-/// A safetensors file of recordings, read whole: its tensors (f32, bf16 and i64) and its
-/// metadata.
+/// A safetensors file of recordings, read whole: its tensors (f32, bf16, i64 and booleans as u8)
+/// and its metadata.
 #[derive(Clone, Debug)]
 pub(crate) struct File {
     name: String,
@@ -36,7 +38,7 @@ impl File {
     ///
     /// # Panics
     ///
-    /// If it cannot be read, or holds a tensor in a dtype other than f32, bf16 and i64.
+    /// If it cannot be read, or holds a tensor in a dtype other than f32, bf16, i64 and u8.
     pub(crate) fn read(relative: &str) -> Self {
         let path = path(relative);
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -73,6 +75,7 @@ impl File {
                             .map(|b| i64::from_le_bytes(*b))
                             .collect(),
                     ),
+                    Dtype::U8 => Values::Bool(data.iter().map(|&b| b != 0).collect()),
                     other => panic!("{relative}: {name} is {other:?}"),
                 };
                 (name, (view.shape().to_vec(), values))
@@ -110,13 +113,15 @@ impl File {
     ///
     /// # Panics
     ///
-    /// If there is none of that name, or it holds integers.
+    /// If there is none of that name, or it does not hold floats.
     pub(crate) fn tensor(&self, name: &str) -> HostTensor {
         match self.get(name) {
             (shape, Values::Float(dtype, values)) => {
                 HostTensor::new(*dtype, shape.clone(), values.clone())
             }
-            (_, Values::Int(_)) => panic!("{}: {name} holds integers", self.name),
+            (_, Values::Int(_) | Values::Bool(_)) => {
+                panic!("{}: {name} holds no floats", self.name)
+            }
         }
     }
 
@@ -124,11 +129,25 @@ impl File {
     ///
     /// # Panics
     ///
-    /// If there is none of that name, or it holds floats.
+    /// If there is none of that name, or it does not hold integers.
     pub(crate) fn ints(&self, name: &str) -> Vec<i64> {
         match self.get(name) {
             (_, Values::Int(values)) => values.clone(),
-            (_, Values::Float(..)) => panic!("{}: {name} holds floats", self.name),
+            (_, Values::Float(..) | Values::Bool(_)) => {
+                panic!("{}: {name} holds no integers", self.name)
+            }
+        }
+    }
+
+    /// A recorded boolean tensor: its shape and values.
+    ///
+    /// # Panics
+    ///
+    /// If there is none of that name, or it does not hold booleans.
+    pub(crate) fn bools(&self, name: &str) -> (Vec<usize>, Vec<bool>) {
+        match self.get(name) {
+            (shape, Values::Bool(values)) => (shape.clone(), values.clone()),
+            _ => panic!("{}: {name} holds no booleans", self.name),
         }
     }
 }

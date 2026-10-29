@@ -1,7 +1,9 @@
-//! Causal attention with grouped key-value heads (`dash_ops::attention`): the reference and its
-//! written-out backward pass against torch's math SDPA in fp32, the CubeCL kernels against the
-//! same records in bf16 and f16 and against the reference at shapes with several blocks, and
-//! decoding against the reference. `tests/attention_masks.rs` covers the other masks.
+//! Causal attention with grouped key-value heads (`dash_ops::attention`): the CubeCL kernels
+//! against the reference at shapes with several blocks and reading head-major inputs in place, and
+//! decoding against the reference and against attention with one query.
+//! `dash_conformance::attention`'s tests (the reference and its written-out backward pass against
+//! torch's records, the kernels against them in bf16 and f16) run in `tests/attention_masks.rs`,
+//! with the other masks.
 //!
 //! With a CubeCL runtime's feature the kernel tests run on that runtime's device
 //! (`tests/common`): the kernels where the device has what they ask, the reference elsewhere,
@@ -12,12 +14,9 @@
 //!   DASH_OPS_DEVICE=wgpu:vulkan cargo test --release -p dash-ops --features wgpu --test attention
 //!   DASH_OPS_DEVICE=cpu cargo test --release -p dash-ops --features cpu --test attention
 //!
-//! The records (`tests/fixtures/attention/*.safetensors`) hold inputs drawn from a normal
-//! distribution and rounded to bf16, so that the same inputs feed f32 and bf16 runs, and
-//! torch's output, log-sum-exp and gradients computed from them in fp32. They are in torch's
-//! order, the heads before the time (`[B, H, T, D]`, `[B, H, T]`); [`record`] swaps the two into
-//! the module's `[B, T, H, D]` and `[B, T, H]`. Errors are reported as the largest absolute
-//! difference and that difference over the largest reference magnitude.
+//! The inputs are drawn in torch's order, the heads before the time (`[B, H, T, D]`), as the
+//! records hold them, and swapped into the module's `[B, T, H, D]`. Errors are reported as the
+//! largest absolute difference and that difference over the largest reference magnitude.
 
 mod common;
 
@@ -28,7 +27,6 @@ use dash_ops::attention::causal_attention_backward;
 use dash_ops::attention::{
     AttentionMask, AttentionOptions, attention_decode, attention_with_lse, causal_attention, probe,
 };
-use safetensors::{Dtype, SafeTensors};
 use std::sync::Mutex;
 
 /// The probe counters are global: tests that read them run one at a time.
@@ -86,17 +84,6 @@ impl Host {
     }
 }
 
-/// One record: inputs, the scale, and torch's results.
-struct Record {
-    name: &'static str,
-    q: Host,
-    k: Host,
-    v: Host,
-    grad: Host,
-    scale: f32,
-    expected: Results,
-}
-
 /// What a run produces: the output, the log-sum-exp and the three input gradients.
 struct Results {
     o: Host,
@@ -104,60 +91,6 @@ struct Results {
     dq: Host,
     dk: Host,
     dv: Host,
-}
-
-/// Tensor `name` of a record, its heads and time swapped into the module's layout.
-fn read(tensors: &SafeTensors, name: &str) -> Host {
-    let view = tensors.tensor(name).expect("tensor in record");
-    let bytes = view.data();
-    let values = match view.dtype() {
-        Dtype::F32 => bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect(),
-        Dtype::BF16 => bytes
-            .chunks_exact(2)
-            .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
-            .collect(),
-        other => panic!("unexpected dtype {other:?}"),
-    };
-    Host {
-        values,
-        shape: view.shape().to_vec(),
-    }
-    .swap_1_2()
-}
-
-fn record(name: &'static str) -> Record {
-    let path = format!(
-        "{}/tests/fixtures/attention/{name}.safetensors",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let (_, metadata) = SafeTensors::read_metadata(&bytes).expect("metadata");
-    let scale = metadata
-        .metadata()
-        .as_ref()
-        .and_then(|m| m.get("scale"))
-        .expect("scale in metadata")
-        .parse::<f32>()
-        .expect("scale");
-    let tensors = SafeTensors::deserialize(&bytes).expect("safetensors");
-    Record {
-        name,
-        q: read(&tensors, "q"),
-        k: read(&tensors, "k"),
-        v: read(&tensors, "v"),
-        grad: read(&tensors, "do"),
-        scale,
-        expected: Results {
-            o: read(&tensors, "o"),
-            lse: read(&tensors, "lse"),
-            dq: read(&tensors, "dq"),
-            dk: read(&tensors, "dk"),
-            dv: read(&tensors, "dv"),
-        },
-    }
 }
 
 /// The causal forward with its log-sum-exp, then the backward of `sum(o * grad)`, on `device` (an
@@ -231,71 +164,13 @@ fn check(label: &str, actual: &Results, expected: &Results, tolerance: [f32; 5])
     }
 }
 
-/// Tolerances on the error relative to the largest reference magnitude, in the order o, lse,
-/// dq, dk, dv, each just above the largest error measured over every case and every build that
-/// uses it: Flex; `cuda`, with `fusion`, `autotune` or both (an RTX 5070 Ti, CUDA 13); `wgpu` on
-/// lavapipe and `cpu`, where the reference runs. In f32 the reference agrees with torch to
-/// rounding. In bf16 the error is the output's own rounding (8 significant bits) plus the
-/// probabilities' rounding to bf16 before the value product; the log-sum-exp is accumulated in
-/// f32 throughout.
-const F32_TOLERANCE: [f32; 5] = [3e-7, 1.1e-7, 4.5e-7, 3.5e-7, 3.5e-7];
-/// The reference run on a CubeCL device in f32, against torch: just above the largest error
-/// over the four CUDA builds (`cuda`, with `fusion`, each with and without Burn's `autotune`),
-/// lavapipe and CubeCL's CPU runtime. Its products and reductions are Burn's CubeCL kernels,
-/// which autotune and the runtime pick differently: dq is 4.2e-7 relative on CUDA and 8.1e-7 on
-/// lavapipe, dk 3.3e-7 and 4.4e-7; the rest moves less. Flex takes no part in those features, so
-/// `F32_TOLERANCE` holds for every build. With autotune Burn's kernels change from run to run, so
-/// the bounds are then a few roundings, as in `attention_masks.rs`.
+/// The kernels in bf16 against the reference, at shapes with several blocks: the bound on the
+/// records (`dash_conformance::attention::BF16`).
 #[cfg(feature = "cubecl")]
-const CUBE_F32_TOLERANCE: [f32; 5] = if cfg!(feature = "autotune") {
-    [1e-6, 2e-7, 1e-6, 1e-6, 1e-6]
-} else {
-    [3.2e-7, 1.1e-7, 8.5e-7, 4.6e-7, 3.8e-7]
-};
-/// The kernels in bf16 and f16, the query gradient summed in a fixed order or with atomics: just
-/// above the largest of both over repeated runs of each CUDA build. With atomics the query
-/// gradient's sum comes in whatever order the kernels run; its largest errors are where few key
-/// blocks add up, and the same in every run.
-#[cfg(feature = "cubecl")]
-const BF16_TOLERANCE: [f32; 5] = [3.4e-3, 2.5e-7, 4.7e-3, 4e-3, 4.2e-3];
-#[cfg(feature = "cubecl")]
-const F16_TOLERANCE: [f32; 5] = [4.6e-4, 1.7e-7, 4.7e-4, 3.6e-4, 4e-4];
+const BF16_TOLERANCE: [f32; 5] = dash_conformance::attention::BF16.causal;
 /// Decoding in bf16 against the f32 reference.
 #[cfg(feature = "cubecl")]
 const DECODE_BF16_TOLERANCE: f32 = 2.9e-3;
-
-const RECORDS: [&str; 2] = ["gqa8x2_d256_t40", "gqa6x2_d64_tq24_tk56"];
-
-#[cfg(feature = "flex")]
-#[test]
-fn reference_and_its_backward_match_torch_on_flex() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let device = Device::flex().autodiff();
-    for name in RECORDS {
-        let r = record(name);
-        let runs = probe::backward_runs();
-        let actual = run(
-            &device,
-            &r.q,
-            &r.k,
-            &r.v,
-            &r.grad,
-            r.scale,
-            DType::F32,
-            true,
-        );
-        assert!(
-            probe::backward_runs() > runs,
-            "the written-out backward did not run"
-        );
-        check(
-            &format!("flex f32 {}", r.name),
-            &actual,
-            &r.expected,
-            F32_TOLERANCE,
-        );
-    }
-}
 
 /// Deterministic values in about [-2, 2], rounded to bf16 so that every dtype reads the same.
 fn host(shape: &[usize], seed: u64) -> Host {
@@ -479,100 +354,6 @@ mod cube {
             "the kernels made {launched} launches, expected {expected}"
         );
         result
-    }
-
-    #[test]
-    fn kernels_match_torch_in_bf16_and_f16() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let device = device();
-        println!("{}", common::describe(&device));
-        for name in RECORDS {
-            let r = record(name);
-            let [_, tq, hq, d] = [r.q.shape[0], r.q.shape[1], r.q.shape[2], r.q.shape[3]];
-            let [b, tk, hkv, _] = [r.k.shape[0], r.k.shape[1], r.k.shape[2], r.k.shape[3]];
-            for (dtype, label, tolerance) in [
-                (DType::BF16, "bf16", BF16_TOLERANCE),
-                (DType::F16, "f16", F16_TOLERANCE),
-            ] {
-                if !has(&device, dtype) {
-                    continue;
-                }
-                for deterministic in [true, false] {
-                    let expected = expected_launches(&device, dtype, [b, tq, tk, hq, hkv, d]);
-                    let backward = kernels_take(&device, dtype, [b, tq, tk, hq, hkv, d])[1];
-                    let (runs, copies) = (probe::backward_runs(), probe::input_copies());
-                    let atomics = probe::atomic_runs();
-                    let actual = launches_kernels(expected, || {
-                        run(
-                            &device,
-                            &r.q,
-                            &r.k,
-                            &r.v,
-                            &r.grad,
-                            r.scale,
-                            dtype,
-                            deterministic,
-                        )
-                    });
-                    assert!(
-                        probe::backward_runs() > runs,
-                        "the written-out backward did not run"
-                    );
-                    assert_eq!(
-                        probe::input_copies(),
-                        copies,
-                        "contiguous inputs were copied"
-                    );
-                    assert_eq!(
-                        probe::atomic_runs() - atomics,
-                        usize::from(backward && !deterministic),
-                        "the query gradient was not summed the way asked"
-                    );
-                    check(
-                        &format!("cube {label} deterministic {deterministic} {}", r.name),
-                        &actual,
-                        &r.expected,
-                        tolerance,
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn f32_runs_the_reference() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let device = device();
-        for name in RECORDS {
-            let r = record(name);
-            let dims = [
-                r.q.shape[0],
-                r.q.shape[1],
-                r.k.shape[1],
-                r.q.shape[2],
-                r.k.shape[2],
-                r.q.shape[3],
-            ];
-            assert_eq!(expected_launches(&device, DType::F32, dims), 0);
-            let actual = launches_kernels(0, || {
-                run(
-                    &device,
-                    &r.q,
-                    &r.k,
-                    &r.v,
-                    &r.grad,
-                    r.scale,
-                    DType::F32,
-                    true,
-                )
-            });
-            check(
-                &format!("cube f32 {}", r.name),
-                &actual,
-                &r.expected,
-                CUBE_F32_TOLERANCE,
-            );
-        }
     }
 
     /// Makes the backward's products split each key block's sweep between two cubes, or keep it

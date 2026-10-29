@@ -19,8 +19,9 @@ what the device has, one autodiff graph across calls and inputs read through the
 
 Covered so far: causal depthwise conv1d (widths, bias, activation, initial and final states with
 their gradients, packed sequences, the decoding step), the gated delta rule (chunked, packed,
-initial states and their gradients, the step) and the chosen-token log-probability (masked ids,
-chunking, its gradient).
+initial states and their gradients, the step), the chosen-token log-probability (masked ids,
+chunking, its gradient) and attention (every mask, grouped heads, queries that see no key, the
+gradients, decoding).
 
 The fixtures stay where `dash-ops` keeps them, `crates/dash-ops/tests/fixtures`, read from this
 crate's place in the repository; the crate is not published.

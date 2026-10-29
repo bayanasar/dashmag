@@ -2,14 +2,17 @@
 //! sliding window, a window without causality, key padding with and without causality, and
 //! packed variable-length sequences, with grouped key-value heads and queries that see no key.
 //!
-//! - The reference and its written-out backward pass against torch's
-//!   `scaled_dot_product_attention` in float64 with an explicit boolean mask (records in
-//!   `tests/fixtures/attention/`; packed sequences recorded as one call per sequence).
-//! - On a CubeCL device (`tests/common`): the kernels in bf16 and f16 against the same records,
-//!   and against the reference on Flex at shapes spanning several tiles and sequences, sequence
-//!   boundaries and window edges inside tiles; decoding with per-sequence cache lengths and a
-//!   window. Where the device lacks what the kernels ask the reference runs, and each test
-//!   asserts which ran.
+//! - `dash_conformance::attention`'s tests, run through `common::adapter`: the reference and its
+//!   written-out backward pass on Flex against torch's records of every mask (and of causal
+//!   attention, `tests/attention.rs`'s), with and without gradients; on a CubeCL device the
+//!   kernels against them in bf16 and f16, the query gradient summed in a fixed order and with
+//!   atomics, and the reference in f32; decoding against attention with one query on Flex. Each
+//!   call also proves which code ran: the kernels' launches against `kernels_take`, the
+//!   written-out backward, how the query gradient was summed, and no input copied.
+//! - On a CubeCL device (`tests/common`): the kernels against the reference on Flex at shapes
+//!   spanning several tiles and sequences, sequence boundaries and window edges inside tiles;
+//!   decoding with per-sequence cache lengths and a window. Where the device lacks what the
+//!   kernels ask the reference runs, and each test asserts which ran.
 //! - Causal attention over a sequence in two segments, as training against a key-value cache
 //!   runs it: the second segment's queries against both segments' keys (`Tq < Tk`) give the
 //!   whole sequence's rows, and the two backward passes' key and value gradients add up to the
@@ -20,21 +23,22 @@
 //!   DASH_OPS_DEVICE=wgpu:vulkan cargo test --release -p dash-ops --features wgpu --test attention_masks
 //!   DASH_OPS_DEVICE=cpu cargo test --release -p dash-ops --features cpu --test attention_masks
 //!
-//! The records hold inputs drawn from a normal distribution and rounded to bf16, so that the
-//! same inputs feed f32, bf16 and f16 runs, in torch's order (`[B, H, T, D]`), which [`read`]
-//! swaps into the module's `[B, T, H, D]`. A query that sees no key is recorded as the module
-//! defines it: zeros, a log-sum-exp of `-inf`, a zero query gradient. Errors are the largest
-//! absolute difference and that over the largest reference magnitude; log-sum-exps of `-inf`
-//! must be `-inf` exactly, and their rows' outputs and query gradients exactly zero.
+//! Inputs are drawn from a normal distribution and rounded to bf16, so that the same inputs feed
+//! f32, bf16 and f16 runs, in torch's order (`[B, H, T, D]`), swapped into the module's
+//! `[B, T, H, D]`. A query that sees no key gives zeros, a log-sum-exp of `-inf`, a zero query
+//! gradient. Errors are the largest absolute difference and that over the largest reference
+//! magnitude; log-sum-exps of `-inf` must be `-inf` exactly, and their rows' outputs and query
+//! gradients exactly zero.
 
 mod common;
 
 use burn::backend::{DType, FloatDType, bf16};
 use burn::tensor::{Bool, Device, Int, Tensor, TensorData};
+use common::adapter::Burn;
+use dash_conformance::attention::{self as conformance, FLEX_F32};
 use dash_ops::attention::{
     AttentionMask, AttentionOptions, attention_decode, attention_with_lse, probe,
 };
-use safetensors::{Dtype, SafeTensors};
 use std::sync::{Mutex, MutexGuard};
 
 /// The probe counters are global: tests that read them run one at a time.
@@ -109,25 +113,6 @@ impl Host {
             shape: self.shape.clone(),
         }
     }
-
-    /// Dimensions 1 and 2 swapped, the values moved with them: `[B, H, T, ...]` to
-    /// `[B, T, H, ...]` and back.
-    fn swap_1_2(&self) -> Self {
-        let [b, n1, n2] = [self.shape[0], self.shape[1], self.shape[2]];
-        let inner: usize = self.shape[3..].iter().product();
-        let mut values = Vec::with_capacity(self.values.len());
-        for i in 0..b {
-            for j in 0..n2 {
-                for k in 0..n1 {
-                    let at = ((i * n1 + k) * n2 + j) * inner;
-                    values.extend_from_slice(&self.values[at..at + inner]);
-                }
-            }
-        }
-        let mut shape = self.shape.clone();
-        shape.swap(1, 2);
-        Self { values, shape }
-    }
 }
 
 /// The mask of a call, on the host.
@@ -193,113 +178,6 @@ struct Results {
     dk: Host,
     dv: Host,
 }
-
-/// Tensor `name` of a record, its heads and time swapped into the module's layout.
-fn read(tensors: &SafeTensors, name: &str) -> Host {
-    let view = tensors.tensor(name).expect("tensor in record");
-    let bytes = view.data();
-    let values = match view.dtype() {
-        Dtype::F32 => bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect(),
-        Dtype::BF16 => bytes
-            .chunks_exact(2)
-            .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
-            .collect(),
-        other => panic!("unexpected dtype {other:?}"),
-    };
-    Host {
-        values,
-        shape: view.shape().to_vec(),
-    }
-    .swap_1_2()
-}
-
-/// The record `name`: its inputs, mask, options and torch's results.
-fn record(name: &str) -> (Case, Results) {
-    let path = format!(
-        "{}/tests/fixtures/attention/{name}.safetensors",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let (_, metadata) = SafeTensors::read_metadata(&bytes).expect("metadata");
-    let metadata = metadata.metadata().clone().expect("metadata");
-    let meta = |key: &str| {
-        metadata
-            .get(key)
-            .unwrap_or_else(|| panic!("{key} in metadata"))
-    };
-    let tensors = SafeTensors::deserialize(&bytes).expect("safetensors");
-    let reach = |key: &str| meta(key).parse::<i64>().expect(key);
-    let q = read(&tensors, "q");
-    // The records' scale is `1 / sqrt(D)`: leave it to the default, so that the default is
-    // held to torch too.
-    let scale = meta("scale").parse::<f32>().expect("scale");
-    let d = q.shape[3];
-    let mut options = AttentionOptions::default().with_causal(meta("causal") == "true");
-    if scale != (1.0 / (d as f64).sqrt()) as f32 {
-        options = options.with_scale(scale);
-    }
-    let (left, right) = (reach("window_left"), reach("window_right"));
-    if left >= 0 || right >= 0 {
-        let side = |r: i64| if r < 0 { usize::MAX } else { r as usize };
-        options = options.with_window(side(left), side(right));
-    }
-    let mask = match meta("kind").as_str() {
-        "none" => Mask::None,
-        "padding" => {
-            let view = tensors.tensor("key_padding").expect("key_padding");
-            assert_eq!(view.dtype(), Dtype::U8);
-            let shape = view.shape();
-            Mask::KeyPadding(
-                view.data().iter().map(|&x| x != 0).collect(),
-                [shape[0], shape[1]],
-            )
-        }
-        "packed" => {
-            let offsets = |key: &str| {
-                let view = tensors.tensor(key).expect("offsets");
-                assert_eq!(view.dtype(), Dtype::I64);
-                view.data()
-                    .chunks_exact(8)
-                    .map(|b| i64::from_le_bytes(b.try_into().unwrap()) as i32)
-                    .collect()
-            };
-            Mask::Packed(offsets("cu_seqlens_q"), offsets("cu_seqlens_k"))
-        }
-        other => panic!("unknown mask kind {other}"),
-    };
-    let case = Case {
-        name: name.to_string(),
-        q,
-        k: read(&tensors, "k"),
-        v: read(&tensors, "v"),
-        grad: read(&tensors, "do"),
-        mask,
-        options,
-    };
-    let expected = Results {
-        o: read(&tensors, "o"),
-        lse: read(&tensors, "lse"),
-        dq: read(&tensors, "dq"),
-        dk: read(&tensors, "dk"),
-        dv: read(&tensors, "dv"),
-    };
-    (case, expected)
-}
-
-/// The records, one per mask kind (the generator's comments say what each holds).
-const RECORDS: [&str; 8] = [
-    "none_b2_gqa2x1_d64_tq19_tk33",
-    "causal_b2_gqa4x2_d64_tq17_tk41",
-    "causal_window9_gqa3x1_d64_t40",
-    "window6x4_b2_gqa2x1_d64_tq24_tk37",
-    "padding_b3_gqa2x1_d64_t29",
-    "padding_causal_b2_gqa2x1_d64_t26",
-    "packed_causal_gqa2x1_d64",
-    "packed_cross_causal_window5_gqa2x1_d64",
-];
 
 /// The forward with its log-sum-exp, then the backward of `sum(o * grad)`, on `device` (an
 /// autodiff device) with inputs and the output gradient in `dtype`.
@@ -409,30 +287,6 @@ fn format_errors(errors: [f32; 5]) -> String {
     errors.map(|e| format!("{e:.3e}")).join(", ")
 }
 
-/// Tolerances on the error relative to the largest reference magnitude, in the order o, lse,
-/// dq, dk, dv, each just above the largest error measured over every record and every build
-/// that uses it (an RTX 5070 Ti, CUDA 13; lavapipe and OpenGL over D3D12 through wgpu; CubeCL's
-/// CPU runtime). In f32 the reference agrees with torch's float64 to f32 rounding.
-const F32_TOLERANCE: [f32; 5] = [3.2e-7, 1.2e-7, 3.2e-7, 4.1e-7, 3.5e-7];
-/// The reference run on a CubeCL device in f32, against torch: its products and reductions are
-/// Burn's CubeCL kernels; on OpenGL its log-sum-exp reaches 1.33e-7. With autotune those kernels
-/// change from run to run (the value gradient reached 4.0e-7 in one of two runs), so the bounds are
-/// then a few roundings, as for checkpointing.
-#[cfg(feature = "cubecl")]
-const CUBE_F32_TOLERANCE: [f32; 5] = if cfg!(feature = "autotune") {
-    [1e-6, 2e-7, 1e-6, 1e-6, 1e-6]
-} else {
-    [5.5e-7, 1.4e-7, 4.3e-7, 4.1e-7, 3.4e-7]
-};
-/// In bf16 the error is the output's own rounding (8 significant bits) plus the probabilities'
-/// rounding to bf16 before the value product; the log-sum-exp is accumulated in f32 throughout.
-/// The query gradient is summed over the key blocks in a fixed order, or with atomics in whatever
-/// order the kernels run: its bounds here and below are just above the largest of both over
-/// repeated runs of each CUDA build, where the largest errors came out the same in every run.
-#[cfg(feature = "cubecl")]
-const BF16_TOLERANCE: [f32; 5] = [3.2e-3, 1.2e-7, 4.3e-3, 4.4e-3, 3.6e-3];
-#[cfg(feature = "cubecl")]
-const F16_TOLERANCE: [f32; 5] = [3.9e-4, 1.2e-7, 7.4e-4, 6.9e-4, 6.4e-4];
 /// Decoding in bf16 and in f16 against the f32 reference.
 #[cfg(feature = "cubecl")]
 const DECODE_BF16_TOLERANCE: f32 = 2.2e-3;
@@ -463,29 +317,21 @@ const SEGMENTS_F16_TOLERANCE: [f32; 5] = [5.2e-4, 2.3e-7, 5.3e-4, 7.1e-4, 6.4e-4
 #[cfg(feature = "flex")]
 const SEGMENTS_F32_TOLERANCE: [f32; 5] = [1.9e-7, 9e-8, 2.6e-7, 6.1e-7, 7.6e-7];
 
+/// The reference and its written-out backward pass against torch's records, causal and of every
+/// mask.
 #[cfg(feature = "flex")]
 #[test]
 fn reference_and_its_backward_match_torch_for_every_mask_on_flex() {
     let _serial = serial();
-    let device = Device::flex().autodiff();
-    let mut empty = 0;
-    for name in RECORDS {
-        let (case, expected) = record(name);
-        let runs = probe::backward_runs();
-        let actual = run(&device, &case, DType::F32);
-        assert!(
-            probe::backward_runs() > runs,
-            "the written-out backward did not run"
-        );
-        check(
-            &format!("flex f32 {name}"),
-            &actual,
-            &expected,
-            F32_TOLERANCE,
-        );
-        empty += check_empty_rows(name, &actual, &expected);
-    }
-    assert!(empty > 0, "no record has a query that sees no key");
+    let flex = Burn::new(Device::flex());
+    conformance::matches_torch(
+        &flex,
+        "flex f32",
+        dash_conformance::DType::F32,
+        true,
+        FLEX_F32,
+    )
+    .all_ran();
 }
 
 /// Without autodiff, and through Autodiff without a gradient, the output and log-sum-exp are
@@ -493,24 +339,12 @@ fn reference_and_its_backward_match_torch_for_every_mask_on_flex() {
 #[cfg(feature = "flex")]
 #[test]
 fn forward_without_gradients_on_flex() {
-    for name in [
-        "padding_causal_b2_gqa2x1_d64_t26",
-        "packed_causal_gqa2x1_d64",
+    let _serial = serial();
+    for (device, label) in [
+        (Device::flex(), "flex"),
+        (Device::flex().autodiff(), "flex autodiff"),
     ] {
-        let (case, expected) = record(name);
-        for device in [Device::flex(), Device::flex().autodiff()] {
-            let (o, lse) = attention_with_lse(
-                case.q.on::<4>(&device, DType::F32),
-                case.k.on::<4>(&device, DType::F32),
-                case.v.on::<4>(&device, DType::F32),
-                case.mask.on(&device),
-                case.options,
-            );
-            let (_, rel) = errors(&Host::from_tensor(o), &expected.o);
-            assert!(rel <= F32_TOLERANCE[0], "{name}: o {rel:.3e}");
-            let (_, rel) = errors(&Host::from_tensor(lse), &expected.lse);
-            assert!(rel <= F32_TOLERANCE[1], "{name}: lse {rel:.3e}");
-        }
+        conformance::without_gradients(&Burn::new(device), label, FLEX_F32).all_ran();
     }
 }
 
@@ -815,45 +649,25 @@ mod cube {
         result
     }
 
+    /// The kernels against torch's records, causal and of every mask, in bf16 and f16, the query
+    /// gradient summed in a fixed order and with atomics.
     #[test]
     fn kernels_match_torch_for_every_mask_in_bf16_and_f16() {
         let _serial = serial();
-        let device = device();
-        println!("{}", common::describe(&device));
-        for (dtype, label, tolerance) in [
-            (DType::BF16, "bf16", BF16_TOLERANCE),
-            (DType::F16, "f16", F16_TOLERANCE),
+        let cube = Burn::new(common::cube_device());
+        println!("{}", common::describe(&device()));
+        for (dtype, label, bounds) in [
+            (dash_conformance::DType::BF16, "bf16", conformance::BF16),
+            (dash_conformance::DType::F16, "f16", conformance::F16),
         ] {
-            if !has(&device, dtype) {
-                continue;
-            }
             let mut worst = [0.0f32; 5];
-            for name in RECORDS {
-                let (mut case, expected) = record(name);
-                for deterministic in [true, false] {
-                    case.options = case.options.with_deterministic(deterministic);
-                    let launches = expected_launches(&device, dtype, case.dims());
-                    let backward = kernels_take(&device, dtype, case.dims())[1];
-                    let (runs, atomics) = (probe::backward_runs(), probe::atomic_runs());
-                    let actual = launches_kernels(launches, || run(&device, &case, dtype));
-                    assert!(
-                        probe::backward_runs() > runs,
-                        "the written-out backward did not run"
-                    );
-                    assert_eq!(
-                        probe::atomic_runs() - atomics,
-                        usize::from(backward && !deterministic),
-                        "the query gradient was not summed the way asked"
-                    );
-                    let errors = check(
-                        &format!("cube {label} deterministic {deterministic} {name}"),
-                        &actual,
-                        &expected,
-                        tolerance,
-                    );
-                    for (w, e) in worst.iter_mut().zip(errors) {
-                        *w = w.max(e);
-                    }
+            for deterministic in [true, false] {
+                let label = format!("cube {label} deterministic {deterministic}");
+                let [_, masks] =
+                    conformance::matches_torch(&cube, &label, dtype, deterministic, bounds)
+                        .all_ran_without(&cube.lacking());
+                for (w, e) in worst.iter_mut().zip(masks) {
+                    *w = w.max(e);
                 }
             }
             println!(
@@ -863,21 +677,50 @@ mod cube {
         }
     }
 
+    /// In f32 the reference runs, and holds to torch's records within Burn's kernels' rounding.
     #[test]
     fn f32_runs_the_reference_for_every_mask() {
         let _serial = serial();
         let device = device();
-        for name in RECORDS {
-            let (case, expected) = record(name);
-            assert_eq!(expected_launches(&device, DType::F32, case.dims()), 0);
-            let actual = launches_kernels(0, || run(&device, &case, DType::F32));
-            check(
-                &format!("cube f32 {name}"),
-                &actual,
-                &expected,
-                CUBE_F32_TOLERANCE,
-            );
+        for record in conformance::records() {
+            let (q, k) = (&record.q.shape, &record.k.shape);
+            let dims = [q[0], q[1], k[1], q[2], k[2], q[3]];
+            assert_eq!(kernels_take(&device, DType::F32, dims), [false, false]);
         }
+        let bounds = match cfg!(feature = "autotune") {
+            true => conformance::AUTOTUNE_F32,
+            false => conformance::CUBE_F32,
+        };
+        let cube = Burn::new(common::cube_device());
+        conformance::matches_torch(
+            &cube,
+            "cube f32",
+            dash_conformance::DType::F32,
+            true,
+            bounds,
+        )
+        .all_ran();
+    }
+
+    /// Without gradients the output and log-sum-exp are those of the gradient run.
+    #[test]
+    fn forward_without_gradients_on_cubecl() {
+        let _serial = serial();
+        let bounds = match cfg!(feature = "autotune") {
+            true => conformance::AUTOTUNE_F32,
+            false => conformance::CUBE_F32,
+        };
+        let cube = Burn::new(common::cube_device());
+        conformance::without_gradients(&cube, "cube", bounds).all_ran();
+    }
+
+    /// Decoding in f32 is attention with one query, the reference decoding as the reference
+    /// attends.
+    #[test]
+    fn decode_is_attention_with_one_query_on_cubecl() {
+        let _serial = serial();
+        let cube = Burn::new(common::cube_device());
+        conformance::decoding_is_attention_with_one_query(&cube, "cube", [0.0, 1e-6]).all_ran();
     }
 
     /// Makes the backward's products split each key block's sweep between two cubes, or keep it
@@ -1192,78 +1035,18 @@ mod cube {
     }
 }
 
-/// Decoding without lengths is attention with one query after every key, the window included;
-/// with lengths, attention over each sequence's own keys.
+/// Decoding without lengths is attention with one query after every key, the window included,
+/// to the bit; with lengths, attention over each sequence's own keys.
 #[cfg(feature = "flex")]
 #[test]
 fn decode_is_attention_with_one_query_on_flex() {
-    let device = Device::flex();
-    let [b, s, hq, hkv, d] = [3, 50, 4, 2, 64];
-    let q = host(&[b, 1, hq, d], 400);
-    let k = host(&[b, s, hkv, d], 401);
-    let v = host(&[b, s, hkv, d], 402);
-    for options in [
-        AttentionOptions::default(),
-        AttentionOptions::default().with_window(7, 0),
-    ] {
-        let step = Host::from_tensor(attention_decode(
-            Tensor::<4>::from_data(TensorData::new(q.values.clone(), [b, 1, hq, d]), &device)
-                .reshape([b, hq, d]),
-            k.on::<4>(&device, DType::F32),
-            v.on::<4>(&device, DType::F32),
-            None,
-            options,
-        ));
-        let (full, _) = attention_with_lse(
-            q.on::<4>(&device, DType::F32),
-            k.on::<4>(&device, DType::F32),
-            v.on::<4>(&device, DType::F32),
-            AttentionMask::None,
-            options.with_causal(true),
-        );
-        let full = Host::from_tensor(full.reshape([b, hq, d]));
-        let (abs, _) = errors(&step, &full);
-        assert!(
-            abs == 0.0,
-            "{options:?}: decode and attention differ by {abs}"
-        );
-    }
-
-    // Sequence b holding `lengths[b]` keys: attention over the first `lengths[b]` keys alone.
-    let lengths = [50, 17, 1];
-    let lengths_t = Tensor::<1, Int>::from_data(TensorData::new(lengths.to_vec(), [b]), &device);
-    let options = AttentionOptions::default().with_window(9, 0);
-    let step = Host::from_tensor(attention_decode(
-        q.on::<4>(&device, DType::F32).reshape([b, hq, d]),
-        k.on::<4>(&device, DType::F32),
-        v.on::<4>(&device, DType::F32),
-        Some(lengths_t),
-        options,
-    ));
-    for (bi, len) in lengths.into_iter().enumerate() {
-        let one = |h: &Host, t: usize, heads: usize| {
-            h.on::<4>(&device, DType::F32)
-                .slice([bi..bi + 1, 0..t, 0..heads, 0..d])
-        };
-        let (full, _) = attention_with_lse(
-            one(&q, 1, hq),
-            one(&k, len as usize, hkv),
-            one(&v, len as usize, hkv),
-            AttentionMask::None,
-            options,
-        );
-        let full = Host::from_tensor(full.reshape([hq * d]));
-        let got = &step.values[bi * hq * d..(bi + 1) * hq * d];
-        let diff = got
-            .iter()
-            .zip(&full.values)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            diff <= 1e-6,
-            "sequence {bi} of {len} keys: decode differs by {diff}"
-        );
-    }
+    let _serial = serial();
+    conformance::decoding_is_attention_with_one_query(
+        &Burn::new(Device::flex()),
+        "flex",
+        [0.0, 1e-6],
+    )
+    .all_ran();
 }
 
 /// A decoding step with cache lengths that requires gradients runs the reference through

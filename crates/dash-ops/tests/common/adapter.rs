@@ -6,16 +6,21 @@
 //! What the bodies cannot ask of every implementation, which of dash-ops' kernels a call ran, is
 //! checked here around the calls: a decoding step of conv1d always (its kernel ran exactly where
 //! `kernels_take` says it takes the step), the chunked gated delta rule's written-out backward pass
-//! always, the log-probability's chunk kernel and written-out backward pass always, and conv1d
-//! over sequences where a test asks for it ([`Watch`]).
+//! always, the log-probability's chunk kernel and written-out backward pass always, attention's
+//! kernels, its written-out backward pass, how it summed the query gradient and that it copied no
+//! input always, decoding's kernels always, and conv1d over sequences where a test asks for it
+//! ([`Watch`]).
 
 use super::{on_cuda, runtime_of};
-use burn::tensor::{DType, Device, Int, Tensor, TensorData};
+use burn::tensor::{Bool, DType, Device, Int, Tensor, TensorData};
 use dash_conformance::{
-    Adapter, ChosenLogprob, ChosenLogprobOut, ChunkGatedDelta, ChunkGatedDeltaGrads,
-    ChunkGatedDeltaOut, Conv1d, Conv1dGrads, Conv1dOut, Conv1dStep, Conv1dStepOut, GatedDeltaStep,
-    GatedDeltaStepGrads, GatedDeltaStepOut, HostTensor, Unsupported,
+    Adapter, Attention, AttentionDecode, AttentionGrads, AttentionOut, ChosenLogprob,
+    ChosenLogprobOut, ChunkGatedDelta, ChunkGatedDeltaGrads, ChunkGatedDeltaOut, Conv1d,
+    Conv1dGrads, Conv1dOut, Conv1dStep, Conv1dStepOut, GatedDeltaStep, GatedDeltaStepGrads,
+    GatedDeltaStepOut, HostTensor, Unsupported,
 };
+use dash_contract::attention::AttentionMask as HostMask;
+use dash_ops::attention::{self, AttentionMask, attention_decode, attention_with_lse};
 use dash_ops::conv1d::{self, causal_conv1d, causal_conv1d_update};
 use dash_ops::gated_delta::chunk::{self, chunk_gated_delta_rule};
 use dash_ops::gated_delta::recurrent::gated_delta_step;
@@ -215,6 +220,48 @@ pub fn assert_logprob_launches(
         ran, want,
         "the chunk kernel ran {ran} times, expected {want}"
     );
+}
+
+/// Whether attention's kernels take a forward and a backward pass over `dims` (`[B, Tq, Tk, Hq,
+/// Hkv, D]`) in `dtype` on `device`. Under CUDA they take every bf16 and f16 call with a head
+/// dimension of 64, 128 or 256, whatever the mask: cards of compute capability 8.0 and later have
+/// all they ask.
+pub fn attention_kernels_take(device: &Device, dtype: DType, dims: [usize; 6]) -> [bool; 2] {
+    let taken = attention::kernels_take(device, dtype, dims);
+    if on_cuda(device) {
+        let takes = matches!(dtype, DType::BF16 | DType::F16) && matches!(dims[5], 64 | 128 | 256);
+        assert_eq!(
+            taken,
+            [takes, takes],
+            "CUDA turned the kernels away for {dims:?} {dtype:?}"
+        );
+    }
+    taken
+}
+
+/// Asserts that `f` launched exactly `expected` of attention's kernels, and one more for each
+/// backward pass whose products split and whose query gradient is the fixed-order one (its key and
+/// value gradients are rounded from accumulators by a kernel the atomic way runs anyway): under
+/// fusion the kernels run when their results are read, so `f` reads them. The passes in one `f`
+/// take their query gradient the same way.
+pub fn attention_launches<R>(expected: usize, f: impl FnOnce() -> R) -> R {
+    use attention::probe;
+    let before = probe::kernel_launches();
+    let (splits, atomics) = (probe::split_runs(), probe::atomic_runs());
+    let result = f();
+    let launched = probe::kernel_launches() - before;
+    let split = probe::split_runs() - splits;
+    let expected = expected
+        + if probe::atomic_runs() == atomics {
+            split
+        } else {
+            0
+        };
+    assert_eq!(
+        launched, expected,
+        "the kernels made {launched} launches, expected {expected}"
+    );
+    result
 }
 
 /// What conv1d's counters showed of one call: whether the kernels ran (forward, backward, those
@@ -542,5 +589,107 @@ impl Adapter for Burn {
             entropy,
             grad_hidden,
         })
+    }
+
+    fn attention(&self, call: &Attention) -> Result<AttentionOut, Unsupported> {
+        use attention::probe;
+        let grad = call.grad.is_some();
+        let device = self.device_for(grad);
+        let leaf = |host: &HostTensor| {
+            let tensor = cast_tensor::<4>(host, &device);
+            if grad {
+                tensor.detach().require_grad()
+            } else {
+                tensor
+            }
+        };
+        let (q, k, v) = (leaf(&call.q), leaf(&call.k), leaf(&call.v));
+        let ([b, tq, hq, d], [_, tk, hkv, _]) = (q.dims(), k.dims());
+        let dtype = q.dtype();
+        let mask = match &call.mask {
+            HostMask::None => AttentionMask::None,
+            HostMask::KeyPadding(padding) => {
+                AttentionMask::KeyPadding(Tensor::<2, Bool>::from_data(
+                    TensorData::new(padding.values.clone(), padding.shape.clone()),
+                    &device,
+                ))
+            }
+            HostMask::Packed {
+                cu_seqlens_q,
+                cu_seqlens_k,
+            } => AttentionMask::Packed {
+                cu_seqlens_q: self.offsets(cu_seqlens_q, &device),
+                cu_seqlens_k: self.offsets(cu_seqlens_k, &device),
+            },
+        };
+        let [forward, backward] = attention_kernels_take(&device, dtype, [b, tq, tk, hq, hkv, d]);
+        let expected = usize::from(forward) + 3 * usize::from(backward && grad);
+        let (runs, copies, atomics) = (
+            probe::backward_runs(),
+            probe::input_copies(),
+            probe::atomic_runs(),
+        );
+        let out = attention_launches(expected, || {
+            let (o, lse) = attention_with_lse(q.clone(), k.clone(), v.clone(), mask, call.options);
+            let grads = call.grad.as_ref().map(|grad| {
+                let grad = grad.clone().with_dtype(contract_dtype(dtype));
+                (o.clone() * cast_tensor::<4>(&grad, &device))
+                    .sum()
+                    .backward()
+            });
+            AttentionOut {
+                out: host(o),
+                lse: host(lse),
+                grads: grads.map(|grads| AttentionGrads {
+                    q: host(q.grad(&grads).expect("query gradient")),
+                    k: host(k.grad(&grads).expect("key gradient")),
+                    v: host(v.grad(&grads).expect("value gradient")),
+                }),
+            }
+        });
+        assert_eq!(
+            probe::backward_runs() > runs,
+            grad,
+            "the written-out backward ran where gradients were asked for, and only there"
+        );
+        assert_eq!(
+            probe::atomic_runs() - atomics,
+            usize::from(grad && backward && !call.options.deterministic),
+            "the query gradient was not summed the way asked"
+        );
+        assert_eq!(
+            probe::input_copies(),
+            copies,
+            "contiguous inputs were copied"
+        );
+        Ok(out)
+    }
+
+    fn attention_decode(&self, call: &AttentionDecode) -> Result<HostTensor, Unsupported> {
+        let device = &self.device;
+        let q = cast_tensor::<3>(&call.q, device);
+        let (k, v) = (
+            cast_tensor::<4>(&call.k, device),
+            cast_tensor::<4>(&call.v, device),
+        );
+        let ([b, hq, d], [_, s, hkv, _]) = (q.dims(), k.dims());
+        let dtype = q.dtype();
+        let takes = attention::decode_kernels_take(device, dtype, [b, s, hq, hkv, d]);
+        if on_cuda(device) {
+            let kernels = matches!(dtype, DType::BF16 | DType::F16)
+                && matches!(d, 64 | 128 | 256)
+                && hq / hkv <= 16;
+            assert_eq!(
+                takes, kernels,
+                "CUDA's decoding kernels for {dtype:?}, D = {d}"
+            );
+        }
+        let lengths = call
+            .lengths
+            .as_ref()
+            .map(|lengths| self.offsets(lengths, device));
+        Ok(attention_launches(2 * usize::from(takes), || {
+            host(attention_decode(q, k, v, lengths, call.options))
+        }))
     }
 }

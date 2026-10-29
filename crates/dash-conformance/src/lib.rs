@@ -10,6 +10,10 @@
 //! the device, routing by what the device has, one autodiff graph through calls that feed each
 //! other, Burn's views as inputs) stays in its own tests.
 //!
+//! - [`attention`]: attention against torch with every mask, in the dtype and within the bounds
+//!   the caller gives, with and without gradients; and decoding against attention with one query:
+//!   calls of [`Adapter::attention`], with gradients and alone, and of
+//!   [`Adapter::attention_decode`].
 //! - [`conv1d`]: causal depthwise conv1d against torch: every kernel width with and without a
 //!   bias and SiLU, the decoding step, and a prefill followed by decoding steps. It calls
 //!   [`Adapter::causal_conv1d`], with gradients and alone, and [`Adapter::causal_conv1d_update`].
@@ -42,8 +46,9 @@
 //!   f32), so that converting them loses nothing. The operation's floating inputs come in the dtype
 //!   the case runs in, those the contract allows in f32 beside it (the gated delta rule's `g`
 //!   and `beta`) in f32 where the recording has them so, and states in f32. Packed sequences'
-//!   boundaries and token ids come as `i64` values, masked token ids as `u32`, which the
-//!   implementation takes in int dtypes of its own; the options are the contract's types.
+//!   boundaries, cache lengths and token ids come as `i64` values, masked token ids as `u32`, and
+//!   a key-padding mask as booleans ([`KeyPadding`]), which the implementation takes in dtypes of
+//!   its own; the options are the contract's types.
 //! - **Gradients.** A call with `grad` set asks for the gradients of the inputs, which the
 //!   adapter computes through its implementation's autodiff. `grad` holds the cotangents, f32
 //!   values the shape of the outputs they belong to: the gradients asked for are those of the
@@ -99,6 +104,7 @@
 //! }
 //! ```
 
+use dash_contract::attention::{AttentionMask, AttentionOptions};
 use dash_contract::conv1d::{CausalConv1dOptions, CausalConv1dStepOptions};
 use dash_contract::gated_delta::chunk::ChunkGatedDeltaOptions;
 use dash_contract::gated_delta::recurrent::GatedDeltaStepOptions;
@@ -107,6 +113,7 @@ use std::cell::{Cell, RefCell};
 
 pub use dash_contract::DType;
 
+pub mod attention;
 pub mod conv1d;
 pub mod conv1d_state;
 mod fixtures;
@@ -197,6 +204,14 @@ pub trait Adapter {
     /// `chosen_logprob` ([`dash_contract::logprob`]), with `hidden`'s gradient when
     /// [`ChosenLogprob::grad`] asks for it.
     fn chosen_logprob(&self, call: &ChosenLogprob) -> Result<ChosenLogprobOut, Unsupported>;
+
+    /// Attention with its log-sum-exp ([`dash_contract::attention`]), with the gradients of the
+    /// queries, keys and values when [`Attention::grad`] asks for them.
+    fn attention(&self, call: &Attention) -> Result<AttentionOut, Unsupported>;
+
+    /// A decoding step of attention against a key-value cache, without gradients: the output,
+    /// `[B, Hq, D]`.
+    fn attention_decode(&self, call: &AttentionDecode) -> Result<HostTensor, Unsupported>;
 }
 
 /// One call of `causal_conv1d`.
@@ -426,6 +441,70 @@ pub struct ChosenLogprobOut {
     pub grad_hidden: Option<HostTensor>,
 }
 
+/// A key-padding mask on the host: `[B, Tk]`, `true` where a key is left out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPadding {
+    /// `[B, Tk]`.
+    pub shape: Vec<usize>,
+    /// The values, row-major.
+    pub values: Vec<bool>,
+}
+
+/// One call of attention with its log-sum-exp.
+#[derive(Clone, Debug)]
+pub struct Attention {
+    /// The queries, `[B, Tq, Hq, D]`, in the case's dtype.
+    pub q: HostTensor,
+    /// The keys, `[B, Tk, Hkv, D]`, in the queries' dtype.
+    pub k: HostTensor,
+    /// The values, `[B, Tk, Hkv, D]`, in the queries' dtype.
+    pub v: HostTensor,
+    /// The mask: none, key padding, or the offsets `[S + 1]` of packed sequences (`B = 1`).
+    pub mask: AttentionMask<KeyPadding, Vec<i64>>,
+    /// The causality, the window, the scale and how the query gradient is summed.
+    pub options: AttentionOptions,
+    /// The output's cotangent, `[B, Tq, Hq, D]`, if the call asks for gradients: those of
+    /// `sum(out * grad)`, the cotangent rounded to the output's dtype.
+    pub grad: Option<HostTensor>,
+}
+
+/// What an [`Attention`] call gave.
+#[derive(Clone, Debug)]
+pub struct AttentionOut {
+    /// The output, `[B, Tq, Hq, D]`.
+    pub out: HostTensor,
+    /// The log-sum-exp, `[B, Tq, Hq]`.
+    pub lse: HostTensor,
+    /// The gradients, if asked for.
+    pub grads: Option<AttentionGrads>,
+}
+
+/// The gradients of an [`Attention`] call's inputs.
+#[derive(Clone, Debug)]
+pub struct AttentionGrads {
+    /// The queries'.
+    pub q: HostTensor,
+    /// The keys'.
+    pub k: HostTensor,
+    /// The values'.
+    pub v: HostTensor,
+}
+
+/// One decoding step of attention.
+#[derive(Clone, Debug)]
+pub struct AttentionDecode {
+    /// One query per sequence, `[B, Hq, D]`, in the case's dtype.
+    pub q: HostTensor,
+    /// The key cache, `[B, S, Hkv, D]`.
+    pub k: HostTensor,
+    /// The value cache, `[B, S, Hkv, D]`.
+    pub v: HostTensor,
+    /// How many keys of the cache each sequence holds, `[B]`, or none: all `S`.
+    pub lengths: Option<Vec<i64>>,
+    /// The scale and the window.
+    pub options: AttentionOptions,
+}
+
 /// What a test body ran: how many calls the adapter ran, each call it did not run, the dtypes
 /// whose cases it left out, and what the body measured for its caller to bound. A body goes on
 /// past a call the adapter does not run and past a dtype the device does not have; this is how
@@ -573,6 +652,16 @@ impl Adapter for Counted<'_> {
     fn chosen_logprob(&self, call: &ChosenLogprob) -> Result<ChosenLogprobOut, Unsupported> {
         let result = self.adapter.chosen_logprob(call);
         self.tally.note("chosen_logprob", result)
+    }
+
+    fn attention(&self, call: &Attention) -> Result<AttentionOut, Unsupported> {
+        let result = self.adapter.attention(call);
+        self.tally.note("attention", result)
+    }
+
+    fn attention_decode(&self, call: &AttentionDecode) -> Result<HostTensor, Unsupported> {
+        let result = self.adapter.attention_decode(call);
+        self.tally.note("attention_decode", result)
     }
 }
 
