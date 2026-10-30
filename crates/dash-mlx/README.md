@@ -1,8 +1,10 @@
 # dash-mlx
 
 dash-ops' and dash-lora's operations on MLX, for Apple silicon, with dash-contract's options and
-held to dash-ops' and dash-lora's test fixtures, through dash-conformance's tests where they
-exist. For now this crate is dashmag's path on Apple silicon: MLX already has arrays, autodiff,
+held to dash-ops' and dash-lora's test fixtures: conv1d and the gated delta rule through
+dash-conformance's tests; the log-probability and attention by their own tests until the adapter
+takes them and runs dash-conformance's bodies for them; the rest by their own tests until
+dash-conformance has bodies for them. For now this crate is dashmag's path on Apple silicon: MLX already has arrays, autodiff,
 matmul, a fused attention forward, rms_norm, RoPE and Metal, and this crate adds what dash-ops and
 dash-lora add to Burn. dashmag's Burn side still targets Metal as well, through dash-ops' and
 dash-lora's `metal` feature.
