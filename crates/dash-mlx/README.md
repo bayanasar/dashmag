@@ -1,11 +1,10 @@
 # dash-mlx
 
 dash-ops' and dash-lora's operations on MLX, for Apple silicon, with dash-contract's options and
-held to dash-ops' and dash-lora's test fixtures: conv1d and the gated delta rule through
-dash-conformance's tests; the log-probability and attention by their own tests until the adapter
-takes them and runs dash-conformance's bodies for them; the rest by their own tests until
-dash-conformance has bodies for them. For now this crate is dashmag's path on Apple silicon: MLX already has arrays, autodiff,
-matmul, a fused attention forward, rms_norm, RoPE and Metal, and this crate adds what dash-ops and
+held to dash-ops' and dash-lora's test fixtures: conv1d, the gated delta rule, the log-probability
+and attention through dash-conformance's tests; the rest by their own tests until
+dash-conformance has bodies for them. For now this crate is dashmag's path on Apple silicon: MLX
+already has arrays, autodiff, matmul, a fused attention forward, rms_norm, RoPE and Metal, and this crate adds what dash-ops and
 dash-lora add to Burn. dashmag's Burn side still targets Metal as well, through dash-ops' and
 dash-lora's `metal` feature.
 
@@ -76,15 +75,17 @@ Packed sequences give each sequence's values, to the bit, as a call on it alone.
 twice on the same inputs gives the same bits, in f32 and bf16, the chunked rule's forward and
 backward and the step, over one sequence and packed (`kernels_repeat_bit_for_bit`).
 
-The chosen tokens' log-probabilities (`tests/logprob.rs`, on dash-ops' `logprob` fixtures:
+The chosen tokens' log-probabilities (`tests/logprob.rs`: dash-conformance's `logprob` tests
+through the adapter, which also counts the passes over the vocabulary, on dash-ops' fixtures:
 `basic`, `peaked` with targets at p = 0.99 and logits up to 49, `wide`, each with and without its
-masked ids, with dash-ops' small chunks and the defaults), the largest over every comparison, to
-three figures and rounded up, with dash-ops' bounds:
+masked ids in dash-ops' small chunks, and `peaked` in one chunk, in tiny chunks, in uneven row
+blocks and in this crate's own), the largest over every comparison, to three figures and rounded
+up, with dash-ops' bounds:
 
 | | log-probability | entropy | gradient to `hidden` |
 |---|---|---|---|
-| f32, kernels | 8.82e-8 (2e-7) | 1.08e-6 (2e-6) | 3.95e-7 (1e-6) |
-| f32, the reference (MLX's operations) | 8.82e-8 (2e-7) | 9.91e-7 (2e-6) | 3.95e-7 (1e-6) |
+| f32, kernels | 8.82e-8 (2e-7) | 1.08e-6 (2e-6) | 4.61e-7 (1e-6) |
+| f32, the reference (MLX's operations) | 8.82e-8 (2e-7) | 9.91e-7 (2e-6) | 4.61e-7 (1e-6) |
 | bf16 inputs, the gradient rounded to bf16 | 8.82e-8 (2e-7) | 1.08e-6 (2e-6) | 3.29e-3 (4e-3) |
 
 The kernels are within 2.16e-7 of the reference at D 1024 over 20,000 tokens with masked ids and
@@ -214,7 +215,8 @@ case), three with the head trained. There each chunk's two products wait for eac
 (`src/loss.rs`); without that, MLX held every chunk's gradient of the logits at once, +5205 MiB in
 672 ms (one run).
 
-Attention (`tests/attention.rs`, on dash-ops' ten attention records: causal with grouped heads and
+Attention (`tests/attention.rs`: dash-conformance's `attention` tests through the adapter, on
+dash-ops' ten attention records: causal with grouped heads and
 `Tq != Tk`, no mask, a window with and without causality, key padding with and without causality,
 packed sequences, packed cross attention with a window), the output, the log-sum-exp and the
 three gradients of `sum(o * do)`, through the tile kernels and through MLX's operations, the
@@ -222,17 +224,19 @@ largest over every comparison:
 
 | | o | lse | dq | dk | dv |
 |---|---|---|---|---|---|
-| f32 | 3.27e-7 | 1.25e-7 | 3.74e-7 | 3.12e-7 | 2.41e-7 |
-| bf16 | 3.00e-3 | 1.25e-7 | 3.98e-3 | 4.15e-3 | 3.82e-3 |
+| f32, kernels | 3.27e-7 | 1.25e-7 | 3.74e-7 | 3.12e-7 | 2.41e-7 |
+| f32, the reference (MLX's operations) | 3.81e-7 | 1.89e-7 | 3.74e-7 | 2.94e-7 | 2.41e-7 |
+| bf16, either | 3.00e-3 | 1.89e-7 | 3.98e-3 | 4.15e-3 | 3.82e-3 |
 
-In bf16 within dash-ops' kernel bounds; in f32 within the bounds dash-ops gives its f32 runs when
-the kernels doing the sums differ from those its tighter bounds were measured on ("a few
-roundings": 1e-6, the log-sum-exp 2e-7), since MLX's matmuls sum in their own order. At sizes the
+In bf16 within dash-ops' kernel bounds, but for the mask records' log-sum-exp, computed in f32 from
+the same inputs in either dtype, which takes the f32 bound; in f32 within the bounds dash-ops gives
+its f32 runs under Burn's autotune (`AUTOTUNE_F32`, "a few roundings": 1e-6, the log-sum-exp 2e-7),
+since MLX's matmuls sum in their own order. At sizes the
 records do not reach (1300 queries and keys causal, 700 against 1300 in a window of 300, 1300
 against 1100 unmasked: several tiles to a block, the last partial), against plain attention in
 float64, within the same bounds: o 9.95e-7, lse 1.20e-7, dq 6.39e-7, dk 7.87e-7, dv 7.96e-7. A
-query that sees no key gives zeros, `-inf` and no gradient; decoding is the training path with one
-query, in bf16 within one rounding; two runs give the same bits.
+query that sees no key gives zeros, `-inf` and no gradient; decoding is attention with one query within
+3.58e-7, in bf16 within one rounding; two runs give the same bits.
 
 At 6144 tokens, 8 / 2 heads of 256, bf16, causal, against MLX's fused
 `scaled_dot_product_attention` (its backward pass MLX's own), the range over two runs:

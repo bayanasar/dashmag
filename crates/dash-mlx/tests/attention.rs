@@ -1,29 +1,36 @@
-//! Attention against dash-ops' fixtures, with dash-ops' bounds: the two causal records of its
-//! `attention` tests and the eight of its `attention_masks` tests (no mask with `Tq != Tk`, causal
-//! with `Tq < Tk`, causal within a window, a window alone, key padding with and without causality,
-//! packed sequences, packed cross attention with a window, grouped heads throughout). Each record
-//! holds inputs rounded to bf16 and torch's output, log-sum-exp and gradients of
-//! `sum(o * do)` from them in float64-exact f32, in torch's `[B, H, T, D]` order, swapped here
-//! into `[B, T, H, D]`. Runs in f32 and bf16; then several tiles against plain attention in
-//! float64, a query that sees no key, decoding against the training path, and two runs to the
-//! same bits.
+//! Attention: `dash_conformance`'s `attention` tests through dash-mlx's adapter (`tests/common`),
+//! on the GPU, through its tile kernels and through the reference built from MLX's operations:
+//! dash-ops' ten records against torch (causal with `Tq != Tk`, no mask, causal within a window, a
+//! window alone, key padding with and without causality, packed sequences, packed cross attention
+//! with a window, grouped heads throughout), the output, the log-sum-exp and the three gradients
+//! of `sum(o * do)`; the same without gradients; decoding against attention with one query. The
+//! adapter asserts that the blocked backward runs where gradients are asked for.
 //!
-//! Errors are the largest absolute difference and that over the largest reference magnitude,
-//! printed to three figures and rounded up; where the reference log-sum-exp is `-inf` the result
-//! must be `-inf` too. f32 needs `MLX_ENABLE_TF32=0`:
+//! The bounds are the caller's. f32 takes dash-ops' under Burn's autotune ("a few roundings"), since
+//! MLX's matmuls and reductions sum in their own order; bf16 its kernels', but for the log-sum-exp
+//! of the mask records, computed in f32 from the same inputs in either dtype, which takes the f32
+//! bound.
+//!
+//! What is dash-mlx's own stays here: a query before every key, decoding in bf16 and its gradients,
+//! two runs to the same bits, and several tiles against plain attention in float64.
+//!
+//! f32 needs `MLX_ENABLE_TF32=0`:
 //!
 //!   MLX_ENABLE_TF32=0 cargo test -p dash-mlx --test attention -- --nocapture
 #![cfg(target_os = "macos")]
 
+mod common;
+
+use common::{Mlx, Reference, host, require_ieee_f32_matmul};
+use dash_conformance::attention::{self as conformance, Bounds, Record};
+use dash_conformance::{Adapter, DType};
 use dash_mlx::attention::{
-    AttentionMask, AttentionOptions, Window, attention_decode, attention_with_lse,
-    attention_with_lse_reference, probe,
+    AttentionMask, AttentionOptions, Window, attention_decode, attention_with_lse, probe,
 };
 use mlx_rs::error::Result;
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::transforms::fallible_vjp;
 use mlx_rs::{Array, Dtype};
-use safetensors::{Dtype as StDtype, SafeTensors};
 use std::sync::{Mutex, MutexGuard};
 
 /// One test at a time: they read the probe counters, and share the GPU's default stream.
@@ -32,42 +39,11 @@ fn serial() -> MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-const FIXTURES: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../dash-ops/tests/fixtures/attention"
-);
-
-/// dash-ops' `attention` records (causal) and its `attention_masks` records.
-const CAUSAL_RECORDS: [&str; 2] = ["gqa8x2_d256_t40", "gqa6x2_d64_tq24_tk56"];
-const MASK_RECORDS: [&str; 8] = [
-    "none_b2_gqa2x1_d64_tq19_tk33",
-    "causal_b2_gqa4x2_d64_tq17_tk41",
-    "causal_window9_gqa3x1_d64_t40",
-    "window6x4_b2_gqa2x1_d64_tq24_tk37",
-    "padding_b3_gqa2x1_d64_t29",
-    "padding_causal_b2_gqa2x1_d64_t26",
-    "packed_causal_gqa2x1_d64",
-    "packed_cross_causal_window5_gqa2x1_d64",
-];
-
-/// dash-ops' bounds, in the order o, lse, dq, dk, dv. f32: those it gives its f32 runs when the
-/// kernels doing the sums differ from the ones its tighter bounds were measured on (with
-/// autotune: "a few roundings"), since MLX's matmuls and reductions sum in their own order
-/// (`attention.rs`, `attention_masks.rs`); bf16: its kernels'.
-const CAUSAL_F32: [f64; 5] = [1e-6, 2e-7, 1e-6, 1e-6, 1e-6];
-const MASK_F32: [f64; 5] = [1e-6, 2e-7, 1e-6, 1e-6, 1e-6];
-/// The log-sum-exp is computed in f32 from the same inputs in either dtype, so in bf16 its bound is
-/// the f32 one's where that is the larger.
-const CAUSAL_BF16: [f64; 5] = [3.4e-3, 2.5e-7, 4.7e-3, 4e-3, 4.2e-3];
-const MASK_BF16: [f64; 5] = [3.2e-3, 2e-7, 4.3e-3, 4.4e-3, 3.6e-3];
-
-fn require_ieee_f32_matmul() {
-    assert_eq!(
-        std::env::var("MLX_ENABLE_TF32").as_deref(),
-        Ok("0"),
-        "run with MLX_ENABLE_TF32=0: MLX's f32 matmuls run in TF32 otherwise, about 1e-3 off"
-    );
-}
+const F32: Bounds = conformance::AUTOTUNE_F32;
+const BF16: Bounds = Bounds {
+    masks: [3.2e-3, 2e-7, 4.3e-3, 4.4e-3, 3.6e-3],
+    ..conformance::BF16
+};
 
 /// `x` to three significant figures, rounded up: the form the README and PROGRESS quote.
 fn up3(x: f64) -> String {
@@ -83,233 +59,59 @@ fn up3(x: f64) -> String {
     format!("{:.2}e{e}", m / 100.0)
 }
 
-/// A record: its inputs, mask and options, and torch's `[o, lse, dq, dk, dv]`.
-struct Record {
-    name: &'static str,
-    q: Array,
-    k: Array,
-    v: Array,
-    grad: Array,
-    mask: AttentionMask,
-    options: AttentionOptions,
-    expected: [Array; 5],
-}
-
-/// Tensor `name`, as f32, heads and time swapped into `[B, T, H, ...]`.
-fn read(tensors: &SafeTensors, name: &str) -> Array {
-    let view = tensors.tensor(name).expect("tensor in record");
-    let shape: Vec<i32> = view.shape().iter().map(|&d| d as i32).collect();
-    let values: Vec<f32> = match view.dtype() {
-        StDtype::F32 => view
-            .data()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect(),
-        StDtype::BF16 => view
-            .data()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|b| f32::from_bits((u16::from_le_bytes(*b) as u32) << 16))
-            .collect(),
-        other => panic!("unexpected dtype {other:?}"),
-    };
-    Array::from_slice(&values, &shape).swap_axes(1, 2).unwrap()
-}
-
-fn record(name: &'static str) -> Record {
-    let path = format!("{FIXTURES}/{name}.safetensors");
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let (_, metadata) = SafeTensors::read_metadata(&bytes).expect("metadata");
-    let metadata = metadata.metadata().clone().expect("metadata");
-    let meta = |key: &str| metadata.get(key).cloned();
-    let tensors = SafeTensors::deserialize(&bytes).expect("safetensors");
-    let q = read(&tensors, "q");
-    let scale = meta("scale").expect("scale").parse::<f32>().unwrap();
-    let d = q.shape()[3];
-    // The causal records carry no `kind`: causal, no mask.
-    let causal = meta("causal").is_none_or(|c| c == "true");
-    let mut options = AttentionOptions::default().with_causal(causal);
-    if scale != (1.0 / (d as f64).sqrt()) as f32 {
-        options = options.with_scale(scale);
-    }
-    let reach = |key: &str| meta(key).map_or(-1, |x| x.parse::<i64>().unwrap());
-    let (left, right) = (reach("window_left"), reach("window_right"));
-    if left >= 0 || right >= 0 {
-        let side = |r: i64| if r < 0 { usize::MAX } else { r as usize };
-        options = options.with_window(side(left), side(right));
-    }
-    let mask = match meta("kind").as_deref() {
-        None | Some("none") => AttentionMask::None,
-        Some("padding") => {
-            let view = tensors.tensor("key_padding").expect("key_padding");
-            let shape: Vec<i32> = view.shape().iter().map(|&d| d as i32).collect();
-            let values: Vec<bool> = view.data().iter().map(|&x| x != 0).collect();
-            AttentionMask::KeyPadding(Array::from_slice(&values, &shape))
-        }
-        Some("packed") => {
-            let offsets = |key: &str| {
-                let view = tensors.tensor(key).expect("offsets");
-                let values: Vec<i64> = view
-                    .data()
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .map(|b| i64::from_le_bytes(*b))
-                    .collect();
-                Array::from_slice(&values, &[values.len() as i32])
-            };
-            AttentionMask::Packed {
-                cu_seqlens_q: offsets("cu_seqlens_q"),
-                cu_seqlens_k: offsets("cu_seqlens_k"),
-            }
-        }
-        Some(other) => panic!("unknown mask kind {other}"),
-    };
-    Record {
-        name,
-        q,
-        k: read(&tensors, "k"),
-        v: read(&tensors, "v"),
-        grad: read(&tensors, "do"),
-        mask,
-        options,
-        expected: ["o", "lse", "dq", "dk", "dv"].map(|n| read(&tensors, n)),
-    }
-}
-
 fn values(a: &Array) -> Vec<f32> {
     let a = a.as_dtype(Dtype::Float32).unwrap().contiguous().unwrap();
     a.as_slice::<f32>().to_vec()
 }
 
-type Op = fn(&Array, &Array, &Array, &AttentionMask, AttentionOptions) -> Result<(Array, Array)>;
-
-/// The tile kernels and the reference built from MLX's operations.
-const PATHS: [(&str, Op); 2] = [
-    ("kernels", attention_with_lse),
-    ("reference", attention_with_lse_reference),
-];
-
-/// The forward with its log-sum-exp, then the backward of `sum(o * grad)`, in `dtype`:
-/// `[o, lse, dq, dk, dv]`.
-fn run(r: &Record, dtype: Dtype) -> Result<[Array; 5]> {
-    run_on(attention_with_lse, r, dtype)
-}
-
-fn run_on(op: Op, r: &Record, dtype: Dtype) -> Result<[Array; 5]> {
-    let primals = [&r.q, &r.k, &r.v].map(|x| x.as_dtype(dtype).unwrap());
-    let grad = r.grad.as_dtype(dtype)?;
-    let mut lse = None;
-    let f = |a: &[Array]| -> Result<Vec<Array>> {
-        let (o, l) = op(&a[0], &a[1], &a[2], &r.mask, r.options)?;
-        lse = Some(l);
-        Ok(vec![o])
-    };
-    let (outputs, grads) = fallible_vjp(f, &primals, std::slice::from_ref(&grad))?;
-    assert_eq!(outputs[0].dtype(), dtype);
-    let lse = lse.expect("ran");
-    assert_eq!(lse.dtype(), Dtype::Float32);
-    for g in &grads {
-        assert_eq!(g.dtype(), dtype);
-    }
-    Ok([
-        outputs[0].clone(),
-        lse,
-        grads[0].clone(),
-        grads[1].clone(),
-        grads[2].clone(),
-    ])
-}
-
-/// The largest absolute difference and that over the largest reference magnitude, over the
-/// entries where the reference is finite; where it is `-inf` the result must be `-inf` too.
-fn errors(what: &str, actual: &Array, expected: &Array) -> (f64, f64) {
-    assert_eq!(actual.shape(), expected.shape(), "{what}: shapes");
-    let (a, e) = (values(actual), values(expected));
-    let (mut max_abs, mut max_ref) = (0.0f64, 0.0f64);
-    for (i, (a, e)) in a.iter().zip(&e).enumerate() {
-        if *e == f32::NEG_INFINITY {
-            assert_eq!(
-                *a,
-                f32::NEG_INFINITY,
-                "{what}[{i}]: {a} where -inf is expected"
+/// Every record in `dtype`, the query gradient summed either way (the same pass here), through the
+/// kernels and the reference; the largest errors over the two, printed as the README quotes them.
+fn matches_torch(dtype: DType, bounds: Bounds) {
+    let adapters: [(&dyn Adapter, &str); 2] = [(&Mlx, "kernels"), (&Reference, "reference")];
+    for (adapter, path) in adapters {
+        for deterministic in [true, false] {
+            let label = format!("{path} {dtype:?} deterministic {deterministic}");
+            let worst =
+                conformance::matches_torch(adapter, &label, dtype, deterministic, bounds).all_ran();
+            let largest: [String; 5] =
+                std::array::from_fn(|i| up3(worst[0][i].max(worst[1][i]) as f64));
+            println!(
+                "{label}: largest o {}, lse {}, dq {}, dk {}, dv {}",
+                largest[0], largest[1], largest[2], largest[3], largest[4]
             );
-            continue;
         }
-        assert!(a.is_finite(), "{what}[{i}]: non-finite {a}");
-        max_abs = max_abs.max((*a as f64 - *e as f64).abs());
-        max_ref = max_ref.max((*e as f64).abs());
-    }
-    (max_abs, max_abs / max_ref.max(f64::MIN_POSITIVE))
-}
-
-fn check(
-    label: &str,
-    actual: &[Array; 5],
-    expected: &[Array; 5],
-    bounds: [f64; 5],
-    worst: &mut [f64; 5],
-) {
-    for (i, name) in ["o", "lse", "dq", "dk", "dv"].iter().enumerate() {
-        let (abs, rel) = errors(&format!("{label} {name}"), &actual[i], &expected[i]);
-        println!(
-            "{label:52} {name:3} max abs {abs:9.3e}  relative {}",
-            up3(rel)
-        );
-        assert!(
-            rel <= bounds[i],
-            "{label} {name}: {rel:.3e} above {:.1e}",
-            bounds[i]
-        );
-        worst[i] = worst[i].max(rel);
     }
 }
 
 #[test]
-fn matches_torch_for_every_mask() -> Result<()> {
+fn matches_torch_in_f32() {
     let _serial = serial();
     require_ieee_f32_matmul();
-    for ((path, op), (dtype, causal_bounds, mask_bounds)) in PATHS.into_iter().flat_map(|p| {
-        [
-            (p, (Dtype::Float32, CAUSAL_F32, MASK_F32)),
-            (p, (Dtype::Bfloat16, CAUSAL_BF16, MASK_BF16)),
-        ]
-    }) {
-        let mut worst = [0.0; 5];
-        for (names, bounds) in [
-            (&CAUSAL_RECORDS[..], causal_bounds),
-            (&MASK_RECORDS[..], mask_bounds),
-        ] {
-            for &name in names {
-                let r = record(name);
-                let runs = probe::backward_runs();
-                let actual = run_on(op, &r, dtype)?;
-                assert!(
-                    probe::backward_runs() > runs,
-                    "{name}: the blocked backward did not run"
-                );
-                check(
-                    &format!("{path} {dtype:?} {}", r.name),
-                    &actual,
-                    &r.expected,
-                    bounds,
-                    &mut worst,
-                );
-            }
-        }
-        println!(
-            "{path} {dtype:?}: largest o {}, lse {}, dq {}, dk {}, dv {}",
-            up3(worst[0]),
-            up3(worst[1]),
-            up3(worst[2]),
-            up3(worst[3]),
-            up3(worst[4])
-        );
-    }
-    Ok(())
+    matches_torch(DType::F32, F32);
+}
+
+#[test]
+fn matches_torch_in_bf16() {
+    let _serial = serial();
+    matches_torch(DType::BF16, BF16);
+}
+
+#[test]
+fn without_gradients() {
+    let _serial = serial();
+    require_ieee_f32_matmul();
+    conformance::without_gradients(&Mlx, "kernels", F32).all_ran();
+    conformance::without_gradients(&Reference, "reference", F32).all_ran();
+}
+
+#[test]
+fn decoding_is_attention_with_one_query() {
+    let _serial = serial();
+    require_ieee_f32_matmul();
+    // dash-ops' bounds are 0 and 1e-6: there decoding and attention run the same kernels. Here a
+    // kernel of its own decodes and sums in its own order (measured 2.98e-7 and 3.58e-7), so both
+    // take the second, a few roundings.
+    conformance::decoding_is_attention_with_one_query(&Mlx, "kernels", [1e-6, 1e-6]).all_ran();
 }
 
 /// A query that sees no key: zeros out, `-inf` log-sum-exp, no gradient from it.
@@ -356,12 +158,12 @@ fn a_query_that_sees_no_key() -> Result<()> {
     Ok(())
 }
 
-/// Decoding against the training path with one query: in f32 within f32's rounding; in bf16, on
-/// inputs rounded to bf16, the f32 result rounded once (within one bf16 unit of each value). A
-/// full cache, per-sequence lengths (one sequence holding no key) and a window's left side; and its
+/// What the shared body leaves out of decoding. In bf16, on inputs rounded to bf16, the f32 result
+/// rounded once: within one bf16 unit of each value of the training path with one query. A full
+/// cache, per-sequence lengths (one sequence holding no key) and a window's left side; and its
 /// gradients to the query and the cache.
 #[test]
-fn decoding_is_attention_with_one_query() -> Result<()> {
+fn decoding_in_bf16_and_its_gradients() -> Result<()> {
     let _serial = serial();
     require_ieee_f32_matmul();
     let normal = |shape: &[i32], seed: u64| -> Result<Array> {
@@ -379,57 +181,42 @@ fn decoding_is_attention_with_one_query() -> Result<()> {
             Some(left) => AttentionOptions::default().with_window(left, 0),
             None => AttentionOptions::default(),
         };
-        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
-            let cast = |x: &Array| x.as_dtype(dtype).unwrap();
-            let got = attention_decode(
-                &cast(&q),
-                &cast(&k),
-                &cast(&v),
-                Some(&Array::from_slice(&lengths, &[b])),
-                options,
+        let cast = |x: &Array| x.as_dtype(Dtype::Bfloat16).unwrap();
+        let got = attention_decode(
+            &cast(&q),
+            &cast(&k),
+            &cast(&v),
+            Some(&Array::from_slice(&lengths, &[b])),
+            options,
+        )?;
+        // The training path, one sequence at a time, the query after its last key.
+        for (row, &len) in lengths.iter().enumerate() {
+            let got_row = values(&got.try_index((row as i32, .., ..))?);
+            if len == 0 {
+                assert!(got_row.iter().all(|&x| x == 0.0), "{label}: no key, zeros");
+                continue;
+            }
+            let slice = |x: &Array| {
+                x.try_index((row as i32..row as i32 + 1, 0..len, .., ..))
+                    .unwrap()
+            };
+            let one = q
+                .try_index((row as i32..row as i32 + 1, .., ..))?
+                .expand_dims(1)?;
+            let want = dash_mlx::attention::attention(
+                &one,
+                &slice(&k),
+                &slice(&v),
+                &AttentionMask::None,
+                options.with_causal(true),
             )?;
-            // The training path, one sequence at a time, the query after its last key.
-            for (row, &len) in lengths.iter().enumerate() {
-                let got_row = values(&got.try_index((row as i32, .., ..))?);
-                if len == 0 {
-                    assert!(
-                        got_row.iter().all(|&x| x == 0.0),
-                        "{label} {dtype:?}: no key, zeros"
-                    );
-                    continue;
-                }
-                let slice = |x: &Array| {
-                    x.try_index((row as i32..row as i32 + 1, 0..len, .., ..))
-                        .unwrap()
-                };
-                let one = q
-                    .try_index((row as i32..row as i32 + 1, .., ..))?
-                    .expand_dims(1)?;
-                let want = dash_mlx::attention::attention(
-                    &one,
-                    &slice(&k),
-                    &slice(&v),
-                    &AttentionMask::None,
-                    options.with_causal(true),
-                )?;
-                let want = want.reshape(&[hq, d])?;
-                let (abs, rel) = errors("decode", &Array::from_slice(&got_row, &[hq, d]), &want);
-                println!(
-                    "decode {label} {dtype:?} sequence {row}: max abs {abs:9.3e}  relative {}",
-                    up3(rel)
+            // Computed in f32 and rounded once: within one bf16 unit of each f32 value.
+            for (i, (g, w)) in got_row.iter().zip(values(&want)).enumerate() {
+                let unit = w.abs().max(f32::MIN_POSITIVE).log2().floor().exp2() / 128.0;
+                assert!(
+                    (g - w).abs() <= unit,
+                    "decode {label} bf16 {row}[{i}]: {g} against {w}"
                 );
-                if dtype == Dtype::Float32 {
-                    assert!(rel <= 3e-7, "decode {label} f32 {row}: {rel:.3e}");
-                    continue;
-                }
-                // Computed in f32 and rounded once: within one bf16 unit of each f32 value.
-                for (i, (g, w)) in got_row.iter().zip(values(&want)).enumerate() {
-                    let unit = w.abs().max(f32::MIN_POSITIVE).log2().floor().exp2() / 128.0;
-                    assert!(
-                        (g - w).abs() <= unit,
-                        "decode {label} bf16 {row}[{i}]: {g} against {w}"
-                    );
-                }
             }
         }
     }
@@ -461,21 +248,20 @@ fn decoding_is_attention_with_one_query() -> Result<()> {
 
 /// By default a run repeats bit for bit: the forward and backward passes, twice, in f32 and bf16.
 #[test]
-fn repeats_bit_for_bit() -> Result<()> {
+fn repeats_bit_for_bit() {
     let _serial = serial();
-    for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+    for dtype in [DType::F32, DType::BF16] {
         for name in ["gqa8x2_d256_t40", "padding_causal_b2_gqa2x1_d64_t26"] {
-            let r = record(name);
-            let bits = |x: [Array; 5]| {
-                x.map(|a| values(&a).iter().map(|f| f.to_bits()).collect::<Vec<_>>())
+            let record = Record::load(name);
+            let bits = || {
+                let out = Mlx.attention(&record.call(dtype, true, true)).unwrap();
+                let grads = out.grads.unwrap();
+                [out.out, out.lse, grads.q, grads.k, grads.v]
+                    .map(|x| x.values.iter().map(|f| f.to_bits()).collect::<Vec<_>>())
             };
-            assert!(
-                bits(run(&r, dtype)?) == bits(run(&r, dtype)?),
-                "{dtype:?} {name}: two runs differ"
-            );
+            assert!(bits() == bits(), "{dtype:?} {name}: two runs differ");
         }
     }
-    Ok(())
 }
 
 /// Attention as plain MLX operations, differentiated by MLX: the scores, the band as a
@@ -554,7 +340,7 @@ fn tiles_match_plain_attention_at_scale() -> Result<()> {
             AttentionOptions::default(),
         ),
     ];
-    let mut worst = [0.0; 5];
+    let mut worst = [0.0f32; 5];
     for (label, tq, tk, options) in cases {
         let (hq, hkv, d) = (4, 2, 64);
         let q = normal(&[1, tq, hq, d], 1)?;
@@ -617,15 +403,23 @@ fn tiles_match_plain_attention_at_scale() -> Result<()> {
             ])
         })();
         mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
-        check(label, &got, &want?, MASK_F32, &mut worst);
+        let errors = conformance::check(
+            label,
+            got.each_ref().map(host).each_ref(),
+            want?.each_ref().map(host).each_ref(),
+            F32.masks,
+        );
+        for (w, e) in worst.iter_mut().zip(errors) {
+            *w = w.max(e);
+        }
     }
     println!(
         "tiles against plain attention in float64: largest o {}, lse {}, dq {}, dk {}, dv {}",
-        up3(worst[0]),
-        up3(worst[1]),
-        up3(worst[2]),
-        up3(worst[3]),
-        up3(worst[4])
+        up3(worst[0] as f64),
+        up3(worst[1] as f64),
+        up3(worst[2] as f64),
+        up3(worst[3] as f64),
+        up3(worst[4] as f64)
     );
     Ok(())
 }

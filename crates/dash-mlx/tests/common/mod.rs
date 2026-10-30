@@ -7,18 +7,28 @@
 //! checked here around the calls: conv1d's forward and decoding kernels, the chunked gated delta
 //! rule's inverses' and scan's kernels and the step's kernel ran exactly where they take the call;
 //! so did conv1d's backward kernels over plain sequences, and the scan's backward kernel wherever
+//! gradients were asked for. The log-probability makes one pass over the vocabulary per block of
+//! rows, and one back where the gradient was asked for; attention's blocked backward runs where
 //! gradients were asked for.
+//!
+//! [`Reference`] is the same, but for the log-probability and attention, which it runs through the
+//! references built from MLX's operations, what the kernels are held to at scale.
 #![allow(dead_code)]
 
 use dash_conformance::{
-    Adapter, Attention, AttentionDecode, AttentionOut, ChosenLogprob, ChosenLogprobOut,
-    ChunkGatedDelta, ChunkGatedDeltaGrads, ChunkGatedDeltaOut, Conv1d, Conv1dGrads, Conv1dOut,
-    Conv1dStep, Conv1dStepOut, DType, GatedDeltaStep, GatedDeltaStepGrads, GatedDeltaStepOut,
-    HostTensor, Unsupported,
+    Adapter, Attention, AttentionDecode, AttentionGrads, AttentionOut, ChosenLogprob,
+    ChosenLogprobOut, ChunkGatedDelta, ChunkGatedDeltaGrads, ChunkGatedDeltaOut, Conv1d,
+    Conv1dGrads, Conv1dOut, Conv1dStep, Conv1dStepOut, DType, GatedDeltaStep, GatedDeltaStepGrads,
+    GatedDeltaStepOut, HostTensor, KeyPadding, Unsupported,
+};
+use dash_contract::attention::AttentionMask;
+use dash_mlx::attention::{
+    self, AttentionOptions, attention_decode, attention_with_lse, attention_with_lse_reference,
 };
 use dash_mlx::conv1d::{self, causal_conv1d, causal_conv1d_update};
 use dash_mlx::gated_delta::chunk::{self, chunk_gated_delta_rule};
 use dash_mlx::gated_delta::recurrent::{self, gated_delta_step};
+use dash_mlx::logprob::{self, LogprobOptions, chosen_logprob, chosen_logprob_reference};
 use mlx_rs::error::Exception;
 use mlx_rs::ops::zeros_dtype;
 use mlx_rs::transforms::fallible_vjp;
@@ -28,6 +38,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// MLX's GPU, as the conformance bodies drive it.
 pub struct Mlx;
+
+/// [`Mlx`], with the log-probability and attention through their references.
+pub struct Reference;
 
 /// MLX's dtype for the contract's.
 pub fn mlx_dtype(dtype: DType) -> Dtype {
@@ -183,6 +196,116 @@ fn launched(kernels: bool, count: impl Fn() -> usize, before: usize, what: &str)
 
 fn load(counter: &'static AtomicUsize) -> impl Fn() -> usize {
     || counter.load(Ordering::SeqCst)
+}
+
+/// The log-probability or its reference, as a call runs it.
+type LogprobOp = fn(
+    &Array,
+    &Array,
+    &Array,
+    &[u32],
+    LogprobOptions,
+) -> mlx_rs::error::Result<logprob::ChosenLogprob>;
+
+/// Runs `call` through `op`: the gradient to `hidden` alone, the weight frozen and the entropy
+/// carrying none; one pass over the vocabulary per block of rows, and one back for the gradient.
+fn run_chosen_logprob(
+    op: LogprobOp,
+    call: &ChosenLogprob,
+) -> Result<ChosenLogprobOut, Unsupported> {
+    let n = call.targets.len();
+    let weight = array(&call.weight);
+    let targets = Array::from_slice(&call.targets, &[n as i32]);
+    let before = [
+        logprob::probe::forward_passes(),
+        logprob::probe::backward_passes(),
+    ];
+    let f = |p: &[Array]| {
+        let out = op(&p[0], &weight, &targets, &call.masked, call.options)?;
+        Ok((out.logprob, Some(out.entropy)))
+    };
+    let cotangents = call.grad.as_ref().map(|d| (Some(d), None));
+    let out = (&[n as i32][..], Dtype::Float32);
+    let (logprob, entropy, grads) =
+        run("chosen_logprob", f, &[array(&call.hidden)], out, cotangents)?;
+    let out = ChosenLogprobOut {
+        logprob: host(&logprob),
+        entropy: host(&entropy.expect("the entropies")),
+        grad_hidden: grads.map(|grads| host(&grads[0])),
+    };
+    let blocks = n.div_ceil(call.options.row_chunk);
+    let what = format!("chosen_logprob {:?} {:?}", call.hidden.shape, call.options);
+    assert_eq!(
+        logprob::probe::forward_passes() - before[0],
+        blocks,
+        "{what}"
+    );
+    assert_eq!(
+        logprob::probe::backward_passes() - before[1],
+        if out.grad_hidden.is_some() { blocks } else { 0 },
+        "{what}"
+    );
+    Ok(out)
+}
+
+/// Attention or its reference, as a call runs it.
+type AttentionOp = fn(
+    &Array,
+    &Array,
+    &Array,
+    &attention::AttentionMask,
+    AttentionOptions,
+) -> mlx_rs::error::Result<(Array, Array)>;
+
+/// `mask` as dash-mlx takes it.
+fn attention_mask(mask: &AttentionMask<KeyPadding, Vec<i64>>) -> attention::AttentionMask {
+    match mask {
+        AttentionMask::None => AttentionMask::None,
+        AttentionMask::KeyPadding(padding) => {
+            let shape: Vec<i32> = padding.shape.iter().map(|&d| d as i32).collect();
+            AttentionMask::KeyPadding(Array::from_slice(&padding.values, &shape))
+        }
+        AttentionMask::Packed {
+            cu_seqlens_q,
+            cu_seqlens_k,
+        } => AttentionMask::Packed {
+            cu_seqlens_q: offsets(cu_seqlens_q),
+            cu_seqlens_k: offsets(cu_seqlens_k),
+        },
+    }
+}
+
+/// Runs `call` through `op`: the gradients of the output alone, the log-sum-exp carrying none; the
+/// blocked backward runs where they are asked for.
+fn run_attention(op: AttentionOp, call: &Attention) -> Result<AttentionOut, Unsupported> {
+    let primals = [&call.q, &call.k, &call.v].map(array);
+    let mask = attention_mask(&call.mask);
+    let before = attention::probe::backward_runs();
+    let f = |p: &[Array]| {
+        let (out, lse) = op(&p[0], &p[1], &p[2], &mask, call.options)?;
+        Ok((out, Some(lse)))
+    };
+    let cotangents = call.grad.as_ref().map(|d| (Some(d), None));
+    let out = (primals[0].shape(), primals[0].dtype());
+    let (out, lse, grads) = run("attention", f, &primals, out, cotangents)?;
+    let grads = grads.map(|grads| {
+        let [q, k, v] = <[Array; 3]>::try_from(grads)
+            .expect("three gradients")
+            .map(|grad| host(&grad));
+        AttentionGrads { q, k, v }
+    });
+    let out = AttentionOut {
+        out: host(&out),
+        lse: host(&lse.expect("the log-sum-exp")),
+        grads,
+    };
+    launched(
+        out.grads.is_some(),
+        attention::probe::backward_runs,
+        before,
+        &format!("attention {:?}", call.q.shape),
+    );
+    Ok(out)
 }
 
 impl Adapter for Mlx {
@@ -385,21 +508,65 @@ impl Adapter for Mlx {
         })
     }
 
-    fn chosen_logprob(&self, _: &ChosenLogprob) -> Result<ChosenLogprobOut, Unsupported> {
-        Err(Unsupported(
-            "chosen_logprob: not through this adapter yet".into(),
-        ))
+    fn chosen_logprob(&self, call: &ChosenLogprob) -> Result<ChosenLogprobOut, Unsupported> {
+        run_chosen_logprob(chosen_logprob, call)
     }
 
-    fn attention(&self, _: &Attention) -> Result<AttentionOut, Unsupported> {
-        Err(Unsupported(
-            "attention: not through this adapter yet".into(),
-        ))
+    fn attention(&self, call: &Attention) -> Result<AttentionOut, Unsupported> {
+        run_attention(attention_with_lse, call)
     }
 
-    fn attention_decode(&self, _: &AttentionDecode) -> Result<HostTensor, Unsupported> {
-        Err(Unsupported(
-            "attention_decode: not through this adapter yet".into(),
-        ))
+    fn attention_decode(&self, call: &AttentionDecode) -> Result<HostTensor, Unsupported> {
+        let lengths = call.lengths.as_deref().map(offsets);
+        let out = attention_decode(
+            &array(&call.q),
+            &array(&call.k),
+            &array(&call.v),
+            lengths.as_ref(),
+            call.options,
+        )
+        .map_err(refused("attention_decode"))?;
+        Ok(host(&out))
+    }
+}
+
+impl Adapter for Reference {
+    fn describe(&self) -> String {
+        "MLX on the Apple GPU, the log-probability and attention through their references".into()
+    }
+
+    fn has(&self, dtype: DType) -> bool {
+        Mlx.has(dtype)
+    }
+
+    fn causal_conv1d(&self, call: &Conv1d) -> Result<Conv1dOut, Unsupported> {
+        Mlx.causal_conv1d(call)
+    }
+
+    fn causal_conv1d_update(&self, call: &Conv1dStep) -> Result<Conv1dStepOut, Unsupported> {
+        Mlx.causal_conv1d_update(call)
+    }
+
+    fn chunk_gated_delta_rule(
+        &self,
+        call: &ChunkGatedDelta,
+    ) -> Result<ChunkGatedDeltaOut, Unsupported> {
+        Mlx.chunk_gated_delta_rule(call)
+    }
+
+    fn gated_delta_step(&self, call: &GatedDeltaStep) -> Result<GatedDeltaStepOut, Unsupported> {
+        Mlx.gated_delta_step(call)
+    }
+
+    fn chosen_logprob(&self, call: &ChosenLogprob) -> Result<ChosenLogprobOut, Unsupported> {
+        run_chosen_logprob(chosen_logprob_reference, call)
+    }
+
+    fn attention(&self, call: &Attention) -> Result<AttentionOut, Unsupported> {
+        run_attention(attention_with_lse_reference, call)
+    }
+
+    fn attention_decode(&self, call: &AttentionDecode) -> Result<HostTensor, Unsupported> {
+        Mlx.attention_decode(call)
     }
 }
