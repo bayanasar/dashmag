@@ -5,7 +5,7 @@
 //! Burn gives there: arrays, autodiff, matmul, a fused attention forward, rms_norm, RoPE, Metal.
 //! This crate adds the rest, with dash-ops' and dash-lora's contracts (arguments, shapes, dtypes,
 //! states in and out), so that an application can target either backend, and holds each operation
-//! to their test fixtures.
+//! to their tests.
 //!
 //! - [`attention`]: attention with grouped key-value heads and the masks models train with, whose
 //!   backward pass keeps no T x T scores, and decoding against a key-value cache.
