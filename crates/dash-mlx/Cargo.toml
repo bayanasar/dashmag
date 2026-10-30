@@ -17,11 +17,12 @@ publish = false
 # target without it. mlx-sys is named directly for its `DEP_MLX_LIB_DIR` (build.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 dash-contract = { workspace = true }
+dash-peft = { workspace = true }
+half = "2"
 mlx-rs = { workspace = true }
 mlx-sys = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 dash-conformance = { workspace = true }
-half = "2"
 safetensors = "0.8"
 serde_json = "1"

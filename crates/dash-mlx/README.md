@@ -20,6 +20,7 @@ dash-lora's `metal` feature.
 | `loss` | cross-entropy straight from the hidden states and the output weight: torch's reductions, ignore index and label smoothing, a z-loss and masked tokens, each row's log-probability and, if asked, its entropy, without the n x V logits; the gradients to the hidden states and the weight | `logprob`'s pass, one kernel a chunk for the gradient of the logits; the products MLX's matmuls |
 | `lowrank` | the low-rank product `base + scale · (x U) V` with its gradients, f32 throughout, the sum rounded once | dash-ops' `up` kernel for the sum with the base; the rest MLX's matmuls |
 | `lora` | LoRA's layer: a frozen base at its own precision, f32 adapters never folded into it, several by name over one base, the choice of one | through `lowrank` |
+| `peft` | PEFT's adapter files read into LoRA's layers and written out of them byte for byte, under a name, trainable or frozen | dash-peft's format and checks, shared with dash-lora; the factors f32 arrays |
 | `sample` | the next token drawn on the device, as dash-ops draws it: temperature, top-k, top-p and masked ids, the same Philox words and Gumbel variates, the token's log-probability under the model, the tempered distribution and the one drawn from | one kernel for the generator; the cuts and the draw MLX's operations |
 
 The operations build on three MLX functions: `checkpoint` and `custom_vjp`, which mlx-rs does not
@@ -288,7 +289,9 @@ bit-identical, the reference's one logit one bf16 unit apart: two correct bf16 p
 element to neighbouring values), the loss within 2.17e-7, and the gradients, which reach the
 trained adapter alone, within 5.09e-7 in f32 and in bf16 0.95 to 1.02 times as far from the exact
 gradients as PEFT's own; a choice of one adapter over a shared base gives, bit for bit, what a
-layer holding it alone gives.
+layer holding it alone gives. PEFT's files (`tests/peft.rs`, on dash-lora's `peft_*`
+fixtures) go into the layers and come back out byte for byte, a frozen adapter beside the trained
+default left out of MLX's trainable parameters.
 
 A LoRA'd layer at 6144 tokens of 1024, a frozen bf16 `[6144, 1024]` weight, rank 16, against
 mlx-lm's `LoRALinear` (`linear(x) + (scale * ((x @ lora_a) @ lora_b)).astype(x.dtype)`, which adds

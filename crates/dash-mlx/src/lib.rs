@@ -17,6 +17,7 @@
 //!   without the n x V logits.
 //! - [`lowrank`]: the low-rank product `base + scale · (x U) V` LoRA's layers use.
 //! - [`lora`]: LoRA's layer over a frozen base, several adapters by name, the choice of one.
+//! - [`peft`]: PEFT's adapter files ([`dash_peft`]) read into LoRA's layers and written out of them.
 //! - [`loss`]: cross-entropy from the hidden states and the output weight, with its reductions,
 //!   ignore index, label smoothing, z-loss and masked ids, without the n x V logits.
 //! - [`sample`]: the next token drawn on the device, as dash-ops draws it: temperature, top-k,
@@ -56,5 +57,7 @@ pub mod lora;
 pub mod loss;
 #[cfg(target_os = "macos")]
 pub mod lowrank;
+#[cfg(target_os = "macos")]
+pub mod peft;
 #[cfg(target_os = "macos")]
 pub mod sample;
