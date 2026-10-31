@@ -36,12 +36,13 @@ burn = { version = "=0.22.1", default-features = false, features = ["std"] }
 burn-cubecl = { version = "=0.22.1", default-features = false, features = ["std"] }
 cubecl = { version = "=0.11.1", default-features = false, features = ["std"] }
 # MLX from Rust, for dash-mlx on Apple silicon: mlx-rs and mlx-sys from bayanasar/mlx-rs's
-# `dashmag` branch, which is upstream main (oxiglade/mlx-rs) with three branches merged, each meant
-# as an upstream pull request: `feat/checkpoint-custom-vjp`, MLX's checkpoint and custom VJP in
-# mlx-rs; `feat/mlx-sys-prebuilt`, mlx-sys linking a prebuilt MLX (`MLX_SYS_PREBUILT`), since
-# building MLX needs Xcode's Metal compiler; and `feat/mlx-c-0.8.0`, MLX 0.32.4. Pinned to a
-# commit, as Burn is to a version, and an upgrade is its own change; when upstream releases them,
-# these go back to crates.io.
+# `dashmag` branch, which is upstream main (oxiglade/mlx-rs) with three branches merged:
+# `feat/checkpoint-custom-vjp`, MLX's checkpoint and custom VJP in mlx-rs
+# (https://github.com/oxiglade/mlx-rs/pull/422); `feat/mlx-sys-prebuilt`, mlx-sys linking a prebuilt
+# MLX (`MLX_SYS_PREBUILT`), since building MLX needs Xcode's Metal compiler
+# (https://github.com/oxiglade/mlx-rs/pull/424); and `feat/mlx-c-0.8.0`, MLX 0.32.4, not yet
+# proposed upstream. Pinned to a commit, as Burn is to a version, and an upgrade is its own change;
+# when upstream releases them, these go back to crates.io.
 mlx-rs = { git = "https://github.com/bayanasar/mlx-rs.git", rev = "954e5e6e6cfb611e6a3718604cac2a1f1ae42df4" }
 mlx-sys = { git = "https://github.com/bayanasar/mlx-rs.git", rev = "954e5e6e6cfb611e6a3718604cac2a1f1ae42df4" }
 

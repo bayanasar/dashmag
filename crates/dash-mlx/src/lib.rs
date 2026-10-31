@@ -28,7 +28,8 @@
 //!
 //! The operations build on three MLX functions: [`mlx_rs::transforms::checkpoint`] and
 //! [`mlx_rs::transforms::custom_vjp`], from the workspace's mlx-rs (bayanasar/mlx-rs's `dashmag`
-//! branch, which merges the pull request that adds them into upstream main), and
+//! branch, which merges the pull request that adds them,
+//! <https://github.com/oxiglade/mlx-rs/pull/422>, into upstream main), and
 //! [`mlx_rs::fast::MetalKernel`], which mlx-rs 0.33.0 wraps. `tests/hooks.rs` holds each of them
 //! to plain MLX operations. [`loss`] also calls MLX's `depends`, which mlx-sys binds and mlx-rs
 //! does not wrap, to order its backward pass's products.

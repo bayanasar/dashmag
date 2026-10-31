@@ -401,9 +401,11 @@ both ways: 24.9 and 77.3 ms with it on, 24.9 and 76.1 ms off).
 
 MLX runs on Apple silicon only; on other targets the crate is empty. mlx-rs and mlx-sys come from
 bayanasar/mlx-rs's `dashmag` branch, at the commit the workspace's `Cargo.toml` pins: upstream main
-(oxiglade/mlx-rs) with three branches merged, each meant as an upstream pull request:
-`feat/checkpoint-custom-vjp` adds `checkpoint` and `custom_vjp` to mlx-rs, `feat/mlx-sys-prebuilt`
-lets mlx-sys link a prebuilt MLX, and `feat/mlx-c-0.8.0` moves mlx-c to 0.8.0 and MLX to 0.32.4.
+(oxiglade/mlx-rs) with three branches merged: `feat/checkpoint-custom-vjp` adds `checkpoint` and
+`custom_vjp` to mlx-rs ([#422](https://github.com/oxiglade/mlx-rs/pull/422)),
+`feat/mlx-sys-prebuilt` lets mlx-sys link a prebuilt MLX
+([#424](https://github.com/oxiglade/mlx-rs/pull/424)), and `feat/mlx-c-0.8.0`, not yet proposed
+upstream, moves mlx-c to 0.8.0 and MLX to 0.32.4.
 When upstream releases them, the two crates go back to crates.io.
 
 It needs the Command Line Tools and cmake, and MLX 0.32.4, the version mlx-c pins there, either
