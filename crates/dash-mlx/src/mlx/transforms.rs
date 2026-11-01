@@ -4,12 +4,12 @@
 //!
 //! A closure MLX calls must not unwind through C++, so each trampoline catches a panic and returns
 //! a failure; `check` then unwinds with the panic, or returns the closure's error, back in Rust.
+//! A closure that MLX reaches again while it is running gets an error, not a second `&mut`.
 
 use super::array::{Array, new_array};
-use super::error::{
-    self, Exception, Result, check, resume_closure_panic, set_closure_error, set_closure_panic,
-};
+use super::error::{self, Exception, Result, check, set_closure_error, set_closure_panic};
 use super::sys;
+use std::cell::RefCell;
 use std::ffi::{c_int, c_void};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -94,12 +94,20 @@ fn guarded(body: impl FnOnce() -> Result<c_int>) -> c_int {
 }
 
 unsafe extern "C" fn drop_payload<F>(payload: *mut c_void) {
-    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: the box `Closure` or `custom_vjp` made, which MLX frees once.
+    // MLX frees a payload when the last array or function holding it goes, wherever that is, so a
+    // panic in its destructor has no call to reach, and left waiting it would unwind out of an
+    // unrelated one. The panic hook has reported it; it stops here.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the box `Closure::new` or `custom_vjp` made, which MLX frees once.
         drop(unsafe { Box::from_raw(payload as *mut F) });
-    })) {
-        set_closure_panic(panic);
-    }
+    }));
+}
+
+/// A payload to call, or an error if it is running already.
+fn borrow_payload<'a, F>(payload: &'a RefCell<F>) -> Result<std::cell::RefMut<'a, F>> {
+    payload
+        .try_borrow_mut()
+        .map_err(|_| Exception::custom("a function given to MLX called itself"))
 }
 
 unsafe extern "C" fn trampoline<F>(
@@ -111,9 +119,10 @@ where
     F: FnMut(&[Array]) -> Result<Vec<Array>>,
 {
     guarded(|| {
-        // SAFETY: the payload `Closure::new` boxed, which MLX does not call twice at once.
-        let f = unsafe { &mut *(payload as *mut F) };
-        let outputs = f(&arrays(inputs)?)?;
+        // SAFETY: the payload `Closure::new` boxed, alive while MLX can call this, and only ever
+        // shared: the cell is what hands out the function.
+        let mut f = borrow_payload(unsafe { &*(payload as *const RefCell<F>) })?;
+        let outputs = (*f)(&arrays(inputs)?)?;
         // SAFETY: mlx-c's handle for the result.
         Ok(unsafe { fill(ret, &outputs) })
     })
@@ -130,10 +139,11 @@ where
     G: FnMut(&[Array], &[Array], &[Array]) -> Result<Vec<Array>>,
 {
     guarded(|| {
-        // SAFETY: the payload `custom_vjp` boxed, which MLX does not call twice at once.
-        let vjp = unsafe { &mut *(payload as *mut G) };
+        // SAFETY: the payload `custom_vjp` boxed, alive while MLX can call this, and only ever
+        // shared: the cell is what hands out the function.
+        let mut vjp = borrow_payload(unsafe { &*(payload as *const RefCell<G>) })?;
         let primals = arrays(primals)?;
-        let grads = vjp(&primals, &arrays(cotangents)?, &arrays(outputs)?)?;
+        let grads = (*vjp)(&primals, &arrays(cotangents)?, &arrays(outputs)?)?;
         // MLX picks each gradient by its primal's position, past the end if there are too few.
         if grads.len() != primals.len() {
             return Err(Exception::custom(format!(
@@ -159,7 +169,7 @@ impl<'a> Closure<'a> {
         F: FnMut(&[Array]) -> Result<Vec<Array>> + 'a,
     {
         error::init();
-        let payload = Box::into_raw(Box::new(f)) as *mut c_void;
+        let payload = Box::into_raw(Box::new(RefCell::new(f))) as *mut c_void;
         // SAFETY: MLX keeps the payload until the last copy of the closure goes, then calls the
         // destructor; `'a` keeps what `F` borrows alive for this handle, and a transform given it
         // does not keep it past its own return unless `F` is `'static`.
@@ -167,7 +177,7 @@ impl<'a> Closure<'a> {
             sys::mlx_closure_new_func_payload(
                 Some(trampoline::<F>),
                 payload,
-                Some(drop_payload::<F>),
+                Some(drop_payload::<RefCell<F>>),
             )
         };
         Self {
@@ -194,10 +204,6 @@ impl Drop for Closure<'_> {
     fn drop(&mut self) {
         // SAFETY: this handle owns its reference, and is freed once.
         unsafe { sys::mlx_closure_free(self.raw) };
-        // The payload's destructor may have run, and panicked.
-        if !std::thread::panicking() {
-            resume_closure_panic();
-        }
     }
 }
 
@@ -385,13 +391,13 @@ where
     G: FnMut(&[Array], &[Array], &[Array]) -> Result<Vec<Array>> + 'static,
 {
     let forward = Closure::new(with_outputs(forward));
-    let payload = Box::into_raw(Box::new(vjp)) as *mut c_void;
+    let payload = Box::into_raw(Box::new(RefCell::new(vjp))) as *mut c_void;
     // SAFETY: MLX keeps the payload until the last copy goes, then calls the destructor.
     let backward = unsafe {
         sys::mlx_closure_custom_new_func_payload(
             Some(trampoline_custom::<G>),
             payload,
-            Some(drop_payload::<G>),
+            Some(drop_payload::<RefCell<G>>),
         )
     };
     // SAFETY: makes a new handle, which `Closure` frees.
@@ -410,9 +416,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{checkpoint, custom_vjp, fallible_vjp, value_and_grad_all};
+    use super::{Function, checkpoint, custom_vjp, fallible_vjp, value_and_grad_all};
     use crate::mlx::Array;
     use crate::mlx::error::Result;
+    use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
 
@@ -442,6 +449,45 @@ mod tests {
         assert!(checkpoint(nothing).unwrap().apply(&x).is_err());
         let backward = |_: &[Array], _: &[Array], _: &[Array]| -> Result<Vec<Array>> { Ok(vec![]) };
         assert!(custom_vjp(nothing, backward).unwrap().apply(&x).is_err());
+    }
+
+    #[test]
+    fn a_function_calling_itself_is_an_error() {
+        let slot: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
+        let inner = slot.clone();
+        let f = checkpoint(move |x: &[Array]| match inner.borrow().as_ref() {
+            Some(f) => f.apply(x),
+            None => Ok(x.to_vec()),
+        })
+        .unwrap();
+        *slot.borrow_mut() = Some(f);
+        let result = slot
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .apply(&[Array::from_f32(1.0)]);
+        assert!(result.unwrap_err().what().contains("called itself"));
+        // The function holds the slot and the slot the function.
+        slot.borrow_mut().take();
+    }
+
+    #[test]
+    fn a_panicking_destructor_stays_out_of_the_next_call() {
+        struct Panics;
+        impl Drop for Panics {
+            fn drop(&mut self) {
+                panic!("in the payload's destructor");
+            }
+        }
+        let held = Panics;
+        let f = checkpoint(move |x: &[Array]| {
+            let _held = &held;
+            Ok(x.to_vec())
+        })
+        .unwrap();
+        drop(f);
+        let sum = Array::from_f32(1.0).add(Array::from_f32(2.0)).unwrap();
+        assert_eq!(sum.as_slice::<f32>(), [3.0]);
     }
 
     #[test]

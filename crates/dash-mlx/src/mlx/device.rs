@@ -9,18 +9,21 @@ pub struct Device(sys::mlx_device);
 impl Device {
     /// The CPU.
     pub fn cpu() -> Self {
+        error::init();
         // SAFETY: makes a new handle from values.
         Self(unsafe { sys::mlx_device_new_type(sys::mlx_device_type__MLX_CPU, 0) })
     }
 
     /// The GPU.
     pub fn gpu() -> Self {
+        error::init();
         // SAFETY: makes a new handle from values.
         Self(unsafe { sys::mlx_device_new_type(sys::mlx_device_type__MLX_GPU, 0) })
     }
 
     /// Makes this the device operations run on from now on.
     pub fn set_default(device: &Device) {
+        error::init();
         // SAFETY: a valid handle.
         unsafe { sys::mlx_set_default_device(device.0) };
     }
@@ -54,6 +57,7 @@ impl Stream {
 
     /// The GPU's default stream.
     pub fn gpu() -> Self {
+        error::init();
         // SAFETY: makes a new handle.
         Self(unsafe { sys::mlx_default_gpu_stream_new() })
     }

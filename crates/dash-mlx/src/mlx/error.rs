@@ -82,7 +82,7 @@ pub(crate) fn set_closure_panic(payload: Box<dyn Any + Send>) {
 }
 
 /// Unwinds with a panic a closure caught, its payload the original. An error stays for [`check`].
-pub(crate) fn resume_closure_panic() {
+fn resume_closure_panic() {
     CLOSURE_FAILURE.with(|failure| match failure.take() {
         Some(ClosureFailure::Panic(payload)) => {
             // MLX recorded its own error when the closure reported failure; the panic is the cause.

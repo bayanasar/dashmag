@@ -52,10 +52,7 @@ mod macos {
         // and one way's libraries would shadow the other's on the linker's path.
         let out = PathBuf::from(env::var("OUT_DIR").unwrap());
         match env::var_os("MLX_SYS_PREBUILT") {
-            Some(prefix) => {
-                config.out_dir(out.join("prebuilt"));
-                link_prebuilt(config, Path::new(&prefix));
-            }
+            Some(prefix) => link_prebuilt(config, Path::new(&prefix), &out),
             None => {
                 config.out_dir(out.join("source"));
                 link_from_source(config);
@@ -67,8 +64,15 @@ mod macos {
     /// mlx-c against the installed MLX at `prefix`, and MLX's shared library. The prefix holds
     /// `lib/libmlx.dylib` with `lib/mlx.metallib` beside it, `include/` and `share/cmake/MLX/`, as
     /// the `mlx/` directory of the `mlx-metal` wheel does.
-    fn link_prebuilt(mut config: Config, prefix: &Path) {
+    fn link_prebuilt(mut config: Config, prefix: &Path, out: &Path) {
         let lib = prefix.join("lib");
+        let cmake_dir = prefix.join("share/cmake/MLX");
+        // What this reads from the prefix, so that an MLX replaced under the same path is noticed.
+        // The directories, not their files: Cargo goes by modification times, and a wheel's files
+        // keep the old ones they were packed with, where the directories they unpack into are new.
+        for dir in [&lib, &prefix.join("include/mlx"), &cmake_dir] {
+            println!("cargo:rerun-if-changed={}", dir.display());
+        }
         for file in ["libmlx.dylib", "mlx.metallib"] {
             assert!(
                 lib.join(file).is_file(),
@@ -76,12 +80,18 @@ mod macos {
                 lib.display()
             );
         }
-        let cmake_dir = prefix.join("share/cmake/MLX");
-        if let Some(found) = prebuilt_version(&cmake_dir).filter(|found| found != MLX_VERSION) {
+        let version = prebuilt_version(&cmake_dir);
+        if let Some(found) = version.as_deref().filter(|found| *found != MLX_VERSION) {
             println!(
                 "cargo:warning=MLX_SYS_PREBUILT holds MLX {found}, but mlx-c is written against MLX {MLX_VERSION}; mlx-c may not compile against it"
             );
         }
+        // A build directory per MLX version: make goes by modification times too, and would keep
+        // mlx-c's objects when another version's headers are older than they are.
+        config.out_dir(out.join(format!(
+            "prebuilt-{}",
+            version.as_deref().unwrap_or("unknown")
+        )));
         config.define("MLX_C_USE_SYSTEM_MLX", "ON");
         config.define("MLX_DIR", &cmake_dir);
         let dst = config.build();

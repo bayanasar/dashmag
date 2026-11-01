@@ -410,7 +410,7 @@ dictionaries name them.
 The layer replaced mlx-rs and mlx-sys without moving what the operations compute: on an Apple M6
 (32 GB) with a prebuilt MLX 0.32.4, `MLX_ENABLE_TF32=0 cargo test --locked -p dash-mlx -- --nocapture
 --test-threads=1` passes the same 88 tests as through mlx-rs, every one of the 2596 lines they print
-the same, and 6 of the layer's own beside them. The speed and memory figures above were measured
+the same, and 8 of the layer's own beside them. The speed and memory figures above were measured
 through mlx-rs on the MLX version each names, and have not been taken again.
 
 Dispatching an operation costs what it did. `examples/dispatch_bench.rs`, a thousand dependent adds

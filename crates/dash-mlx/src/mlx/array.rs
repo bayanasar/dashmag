@@ -132,18 +132,21 @@ impl Array {
 
     /// A boolean scalar.
     pub fn from_bool(value: bool) -> Self {
+        error::init();
         // SAFETY: makes a new handle from a value.
         Self(unsafe { sys::mlx_array_new_bool(value) })
     }
 
     /// An `i32` scalar.
     pub fn from_int(value: i32) -> Self {
+        error::init();
         // SAFETY: makes a new handle from a value.
         Self(unsafe { sys::mlx_array_new_int(value) })
     }
 
     /// An `f32` scalar.
     pub fn from_f32(value: f32) -> Self {
+        error::init();
         // SAFETY: makes a new handle from a value.
         Self(unsafe { sys::mlx_array_new_float32(value) })
     }
@@ -159,6 +162,7 @@ impl Array {
             "{} elements in shape {shape:?}",
             data.len()
         );
+        error::init();
         // SAFETY: mlx-c copies `data`, whose length the assertion holds to the shape.
         Self(unsafe {
             sys::mlx_array_new_data(

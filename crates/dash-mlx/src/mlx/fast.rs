@@ -178,9 +178,10 @@ impl MetalKernel {
     ///
     /// # Safety
     ///
-    /// For these inputs and this launch, the kernel reads and writes only inside its buffers,
-    /// writes no input, writes every output element unless `init_value` is set, and has no
-    /// conflicting accesses.
+    /// For these inputs and this launch, through all of its deferred execution, the kernel reads
+    /// and writes only inside its buffers, writes no input, writes every output element unless
+    /// `init_value` is set, writes only values valid for the output dtype (a 2 in a `Bool` output
+    /// makes [`Array::as_slice`] give an invalid `bool`), and has no conflicting accesses.
     pub unsafe fn apply(
         &self,
         inputs: &[impl AsRef<Array>],

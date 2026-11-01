@@ -78,7 +78,7 @@ pub(crate) struct Launch {
 ///
 /// [`MetalKernel::apply`]'s: for these inputs and this launch, the kernel reads and writes only
 /// inside its buffers, writes no input, writes every output element unless `init_value` is set,
-/// and has no conflicting accesses.
+/// writes only values valid for the output dtype, and has no conflicting accesses.
 pub(crate) unsafe fn launch(
     kernel: &MetalKernel,
     inputs: &[Array],
