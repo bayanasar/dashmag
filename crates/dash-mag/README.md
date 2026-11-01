@@ -15,6 +15,18 @@ Part of [Dashmag](https://github.com/bayanasar/dashmag). See the repository for 
 `src/arm/mlx.rs` is the side on macOS, over dash-mlx. Building it is dash-mlx's: a prebuilt MLX through
 `MLX_SYS_PREBUILT`, or MLX built from source. f32 results assume `MLX_ENABLE_TF32=0`.
 
+With a prebuilt MLX, an application's binaries find `libmlx.dylib` through an rpath only the application
+can add. This crate publishes the directory to its build script, unset where there is nothing to add:
+
+```rust,ignore
+fn main() {
+    println!("cargo:rerun-if-env-changed=DEP_DASH_MAG_LIB_DIR");
+    if let Ok(dir) = std::env::var("DEP_DASH_MAG_LIB_DIR") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+    }
+}
+```
+
 MLX's GPU has no f64. An array operation that reads or makes f64 runs on the CPU. The operations in
 `ops` take dash-contract's dtypes, f32, bf16 and f16, and the gateway refuses f64 for them on every
 side. MLX's `exp` in f64 has only f32's accuracy, so `exp`, `sigmoid`, `silu`
