@@ -1,8 +1,6 @@
 //! LoRA's layer: on the Burn side the same bits as dash-lora's, output and gradients, with a bf16
 //! and an f32 base; and on every side, PEFT's files through the layers and back byte for byte.
 
-#![cfg(not(target_os = "macos"))]
-
 mod common;
 
 use common::{bits, close, tensor};
@@ -177,7 +175,53 @@ fn dropout_is_refused_when_read() {
     let _ = PeftConfig::new(1, 1.0, &["m"]);
 }
 
+/// The MLX side against dash-mlx's layer.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_mlx_it_is_dash_mlx_s_layer_bit_for_bit() {
+    use dash_mlx::mlx::module::Module;
+    use dash_mlx::mlx::transforms::fallible_vjp;
+    use dash_mlx::mlx::{Array, Dtype};
+
+    let plain = |seed: u64, shape: &[i32], dtype: Dtype| {
+        let n = shape.iter().product::<i32>() as usize;
+        Array::from_slice(&common::values(seed, n), shape)
+            .as_dtype(dtype)
+            .unwrap()
+    };
+    let f32s = |a: &Array| -> Vec<u32> {
+        let a = a.as_dtype(Dtype::Float32).unwrap().contiguous().unwrap();
+        a.as_slice::<f32>().iter().map(|v| v.to_bits()).collect()
+    };
+    for (dtype, mlx) in [(DType::BF16, Dtype::Bfloat16), (DType::F32, Dtype::Float32)] {
+        let front = layer(dtype);
+        let x = tensor(4, &[3, 16], dtype);
+        let (outs, grads) = run(&front, &x, &tensor(5, &[3, 8], DType::F32));
+
+        let weight = plain(1, &[8, 16], mlx);
+        let (y, g) = fallible_vjp(
+            |p: &[Array]| {
+                let mut layer = dash_mlx::lora::LoraLinear::frozen(&weight)?
+                    .with_lora(dash_mlx::lora::Lora::new(&p[1], &p[2], 2.0)?)?;
+                Ok(vec![layer.forward(&p[0])?])
+            },
+            &[
+                plain(4, &[3, 16], mlx),
+                plain(2, &[4, 16], Dtype::Float32),
+                plain(3, &[8, 4], Dtype::Float32),
+            ],
+            &[plain(5, &[3, 8], Dtype::Float32).as_dtype(mlx).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(bits(&outs[0]), f32s(&y[0]), "output, {dtype:?}");
+        assert_eq!(bits(&grads[0]), f32s(&g[0]), "x, {dtype:?}");
+        assert_eq!(bits(&grads[1]), f32s(&g[1]), "a, {dtype:?}");
+        assert_eq!(bits(&grads[2]), f32s(&g[2]), "b, {dtype:?}");
+    }
+}
+
 /// The Burn side against dash-lora's layer.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn on_burn_it_is_dash_lora_s_layer_bit_for_bit() {
     use burn::tensor::{DType as BurnDType, Device, Tensor as Burn, TensorData};

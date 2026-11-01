@@ -1,8 +1,6 @@
 //! The array operations: what each computes, its axes, broadcasting and dtypes, and what it
 //! refuses. The expected values are worked out by hand, so the same file holds every side.
 
-#![cfg(not(target_os = "macos"))]
-
 mod common;
 
 use common::{bits, close, tensor};

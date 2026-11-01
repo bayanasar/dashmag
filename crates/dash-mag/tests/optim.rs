@@ -1,7 +1,5 @@
 //! Clipping and AdamW against their definitions, evaluated in f64.
 
-#![cfg(not(target_os = "macos"))]
-
 mod common;
 
 use common::{close, tensor};

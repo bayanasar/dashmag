@@ -12,8 +12,6 @@
 //!
 //! `DASH_MAG_RECORD=<path>` writes the recording instead of reading it.
 
-#![cfg(not(target_os = "macos"))]
-
 mod common;
 
 use common::{relative, tensor};
@@ -256,7 +254,7 @@ impl Model {
     }
 
     fn set_factors(&mut self, factors: &[Tensor]) -> Result<()> {
-        let mut at = factors.chunks_exact(2);
+        let mut at = factors.as_chunks::<2>().0.iter();
         for block in &mut self.blocks {
             for layer in block.layers_mut() {
                 let pair = at.next().expect("two factors per layer");
@@ -419,7 +417,7 @@ impl Model {
         let rope = self.rope.clone();
         let (_, mut grads) = vjp(
             |p| {
-                let mut at = p[..n].chunks_exact(2);
+                let mut at = p[..n].as_chunks::<2>().0.iter();
                 for layer in block.layers_mut() {
                     let pair = at.next().expect("two factors per layer");
                     layer.set_factors(pair[0].clone(), pair[1].clone())?;
@@ -583,6 +581,25 @@ fn one_step_from_one_source() {
         assert!(
             dash_ops::gated_delta::chunk::probe::kernel_launches() > 0,
             "the delta rule ran"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            dash_mlx::conv1d::probe::kernel_launches() > 0,
+            "the conv1d kernels ran"
+        );
+        assert!(
+            dash_mlx::attention::probe::tiles() > 0,
+            "the attention kernels ran"
+        );
+        assert!(
+            dash_mlx::logprob::probe::forward_passes() > 0,
+            "the logprob kernels ran"
+        );
+        assert!(
+            dash_mlx::gated_delta::chunk::scan_kernels_take(DELTA as i32, DELTA as i32),
+            "the delta rule's kernels take this shape"
         );
     }
 }

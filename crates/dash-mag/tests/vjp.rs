@@ -2,8 +2,6 @@
 //! differences, what a cotangent means, what a constant is, and that a stack run layer by layer
 //! gives what it gives whole.
 
-#![cfg(not(target_os = "macos"))]
-
 mod common;
 
 use common::{bits, close, relative, tensor, values};
@@ -183,8 +181,10 @@ fn it_agrees_with_central_differences() {
     let f64s = |t: &Tensor| -> Vec<f64> {
         t.to_bytes()
             .unwrap()
-            .chunks_exact(8)
-            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| f64::from_le_bytes(*b))
             .collect()
     };
     let numeric = (f64s(&value(&moved(1.0)))[0] - f64s(&value(&moved(-1.0)))[0]) / (2.0 * eps);
@@ -276,4 +276,50 @@ fn values_are_exact_in_bf16() {
     let v = values(7, 64);
     let back = tensor(7, &[64], DType::BF16).to_f32().unwrap();
     assert_eq!(v, back);
+}
+
+/// An output that is a constant, of any kind, takes its cotangent and no part; the next output
+/// still takes its own.
+#[test]
+fn a_constant_output_keeps_its_cotangent_from_the_next() {
+    let x = t(&[2.0, 3.0], &[2]);
+    let (c, d) = (t(&[100.0, 100.0], &[2]), t(&[1.0, 10.0], &[2]));
+    let (outs, grads) = vjp(
+        |p| {
+            let y = p[0].square()?;
+            Ok(vec![y.stop_gradient()?, y])
+        },
+        std::slice::from_ref(&x),
+        &[Some(c.clone()), Some(d.clone())],
+    )
+    .unwrap();
+    close(&outs[0], &[4.0, 9.0], 0.0);
+    close(&grads[0], &[4.0, 60.0], 0.0);
+
+    let (_, grads) = vjp(
+        |p| {
+            let y = p[0].square()?;
+            Ok(vec![y.gt(&Tensor::scalar(5.0, DType::F32)?)?, y])
+        },
+        std::slice::from_ref(&x),
+        &[Some(c), Some(d)],
+    )
+    .unwrap();
+    close(&grads[0], &[4.0, 60.0], 0.0);
+}
+
+/// One output returned twice takes both of its cotangents.
+#[test]
+fn an_output_returned_twice_takes_both_cotangents() {
+    let x = t(&[2.0, 3.0], &[2]);
+    let (_, grads) = vjp(
+        |p| {
+            let y = p[0].square()?;
+            Ok(vec![y.clone(), y])
+        },
+        std::slice::from_ref(&x),
+        &[Some(t(&[1.0, 10.0], &[2])), Some(t(&[2.0, 20.0], &[2]))],
+    )
+    .unwrap();
+    close(&grads[0], &[12.0, 180.0], 0.0);
 }

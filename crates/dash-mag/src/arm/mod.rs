@@ -8,8 +8,14 @@ use crate::ops::{
 };
 use crate::{DType, Result};
 
+#[cfg(not(target_os = "macos"))]
 mod burn;
+#[cfg(not(target_os = "macos"))]
 pub(crate) use self::burn::Burn as Selected;
+#[cfg(target_os = "macos")]
+mod mlx;
+#[cfg(target_os = "macos")]
+pub(crate) use self::mlx::Mlx as Selected;
 
 /// Operations of two arrays of one shape and one floating dtype.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

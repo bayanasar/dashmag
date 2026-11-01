@@ -74,8 +74,8 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// An element type of an [`Array`]'s host data: those MLX holds on the GPU. Sealed, since
-/// [`Array::try_as_slice`] trusts `DTYPE` and `data` for the size of what it reads.
+/// An element type of an [`Array`]'s host data. Sealed, since [`Array::try_as_slice`] trusts `DTYPE`
+/// and `data` for the size of what it reads.
 pub trait ArrayElement: Copy + sealed::Sealed {
     /// Its dtype.
     const DTYPE: Dtype;
@@ -112,8 +112,19 @@ array_elements! {
     i64 = Int64, mlx_array_data_int64;
     f16 = Float16, mlx_array_data_float16;
     f32 = Float32, mlx_array_data_float32;
+    f64 = Float64, mlx_array_data_float64;
     bf16 = Bfloat16, mlx_array_data_bfloat16;
 }
+
+/// An element type [`Array::from_slice`] takes: all but f64, which MLX computes on the CPU alone and
+/// which a float literal without a type would otherwise pick. [`Array::from_slice_f64`] names it.
+pub trait FromSliceElement: ArrayElement {}
+
+macro_rules! from_slice_elements {
+    ($($t:ty),*) => {$(impl FromSliceElement for $t {})*};
+}
+
+from_slice_elements!(bool, u8, u16, u32, u64, i8, i16, i32, i64, f16, f32, bf16);
 
 impl Array {
     /// The array behind a handle, whose one reference it takes over.
@@ -152,7 +163,16 @@ impl Array {
     }
 
     /// An array with a copy of `data`, row-major, of this shape. Panics unless the two agree.
-    pub fn from_slice<T: ArrayElement>(data: &[T], shape: &[i32]) -> Self {
+    pub fn from_slice<T: FromSliceElement>(data: &[T], shape: &[i32]) -> Self {
+        Self::from_data(data, shape)
+    }
+
+    /// [`Array::from_slice`] for f64, which only the CPU computes ([`with_cpu`](super::with_cpu)).
+    pub fn from_slice_f64(data: &[f64], shape: &[i32]) -> Self {
+        Self::from_data(data, shape)
+    }
+
+    fn from_data<T: ArrayElement>(data: &[T], shape: &[i32]) -> Self {
         let size = shape.iter().try_fold(1usize, |size, &d| {
             size.checked_mul(usize::try_from(d).ok()?)
         });

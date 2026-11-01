@@ -68,7 +68,8 @@ fn resolve(index: i32, size: i32) -> i32 {
     if index < 0 { size + index } else { index }
 }
 
-fn slice(a: &Array, starts: &[i32], stops: &[i32], strides: &[i32]) -> Result<Array> {
+/// The elements from `starts` to `stops`, by `strides`, one of each per axis.
+pub fn slice(a: &Array, starts: &[i32], stops: &[i32], strides: &[i32]) -> Result<Array> {
     // SAFETY: valid handles and the slices' elements, for the length of the call.
     op(|res, s| unsafe {
         sys::mlx_slice(

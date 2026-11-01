@@ -1,7 +1,5 @@
 //! Rotary embeddings against transformers' form, worked out in f64.
 
-#![cfg(not(target_os = "macos"))]
-
 mod common;
 
 use common::{close, relative, tensor};

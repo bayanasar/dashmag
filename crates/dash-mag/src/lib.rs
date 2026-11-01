@@ -48,10 +48,6 @@
 //! (dash-ops' patched cubecl-cuda, a `[patch]` a dependent workspace has to repeat) and
 //! `MLX_ENABLE_TF32=0` on MLX.
 
-// The macOS side is not written yet: until it is, the crate is empty there, as dash-mlx is off
-// macOS, and the workspace builds.
-#![cfg(not(target_os = "macos"))]
-
 mod arm;
 mod autodiff;
 pub mod lora;

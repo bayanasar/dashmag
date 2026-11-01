@@ -208,20 +208,28 @@ impl Tensor {
         let bytes = self.to_bytes()?;
         Ok(match self.dtype() {
             DType::F32 => bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect(),
             DType::BF16 => bytes
-                .chunks_exact(2)
-                .map(|b| half::bf16::from_le_bytes(b.try_into().unwrap()).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| half::bf16::from_le_bytes(*b).to_f32())
                 .collect(),
             DType::F16 => bytes
-                .chunks_exact(2)
-                .map(|b| half::f16::from_le_bytes(b.try_into().unwrap()).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| half::f16::from_le_bytes(*b).to_f32())
                 .collect(),
             DType::F64 => bytes
-                .chunks_exact(8)
-                .map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32)
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| f64::from_le_bytes(*b) as f32)
                 .collect(),
             _ => unreachable!("to_bytes refused it"),
         })

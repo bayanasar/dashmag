@@ -17,6 +17,6 @@ pub mod random;
 pub mod sys;
 pub mod transforms;
 
-pub use array::{Array, ArrayElement, Dtype};
-pub use device::{Device, Stream, synchronize};
+pub use array::{Array, ArrayElement, Dtype, FromSliceElement};
+pub use device::{Device, Stream, synchronize, version, with_cpu};
 pub use ops::stop_gradient;

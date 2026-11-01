@@ -106,6 +106,8 @@ binary! {
     le = mlx_less_equal;
     /// `x && y`.
     logical_and = mlx_logical_and;
+    /// `x || y`.
+    logical_or = mlx_logical_or;
     /// `x < y`.
     lt = mlx_less;
     /// The matrix product.
@@ -119,8 +121,12 @@ binary! {
 }
 
 reduce! {
+    /// The largest element.
+    max = mlx_max;
     /// The mean of the elements.
     mean = mlx_mean;
+    /// The smallest element.
+    min = mlx_min;
     /// The sum of the elements.
     sum = mlx_sum;
 }
@@ -132,6 +138,10 @@ reduce_axis! {
     logsumexp_axis = mlx_logsumexp_axis;
     /// The largest element along an axis.
     max_axis = mlx_max_axis;
+    /// The mean along an axis.
+    mean_axis = mlx_mean_axis;
+    /// The smallest element along an axis.
+    min_axis = mlx_min_axis;
     /// The sum along an axis.
     sum_axis = mlx_sum_axis;
 }
@@ -358,6 +368,12 @@ pub fn cumsum(
             s,
         )
     })
+}
+
+/// The same values under a new handle and a node of the graph of its own, sharing the data.
+pub fn copy(a: impl AsRef<Array>) -> Result<Array> {
+    // SAFETY: valid handles, for the length of the call.
+    op(|res, s| unsafe { sys::mlx_copy(res, a.as_ref().as_ptr(), s) })
 }
 
 /// A new axis of size 1 at `axis`.
