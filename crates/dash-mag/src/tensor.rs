@@ -136,6 +136,7 @@ impl Tensor {
         Self::from_bytes(&bytes, shape, DType::F64)
     }
 
+    /// An `i32` tensor, on every side.
     pub fn from_i32(values: &[i32], shape: &[usize]) -> Result<Self> {
         check_rank("from_i32", shape.len())?;
         if values.len() != elements(shape) {
@@ -281,9 +282,15 @@ impl Tensor {
 
     fn compare(&self, op: Compare, other: &Tensor) -> Result<Self> {
         let (a, b) = self.aligned(&format!("{op:?}"), other)?;
-        if !Selected::dtype(&a).is_floating() {
-            return refuse(format!("{op:?}: comparisons here are of floating tensors"));
+        if Selected::dtype(&a) != DType::Bool {
+            return Self::wrap(Selected::compare(op, &a, &b));
         }
+        if op != Compare::Eq {
+            return refuse(format!("{op:?}: booleans have no order"));
+        }
+        // Equality of booleans, as integers: each side stores them its own way.
+        let a = Selected::cast(&a, DType::I32)?;
+        let b = Selected::cast(&b, DType::I32)?;
         Self::wrap(Selected::compare(op, &a, &b))
     }
 
@@ -435,6 +442,9 @@ impl Tensor {
             full
         };
         let dtype = DType::promote(lhs.dtype(), rhs.dtype());
+        if !dtype.is_floating() {
+            return refuse(format!("matmul: {dtype:?} is not floating"));
+        }
         let lhs = lhs.as_dtype(dtype)?.broadcast_to(&with(&sa))?;
         let rhs = rhs.as_dtype(dtype)?.broadcast_to(&with(&sb))?;
         let mut out = Self::wrap(Selected::matmul(&lhs.0, &rhs.0))?;
@@ -447,7 +457,7 @@ impl Tensor {
         Ok(out)
     }
 
-    /// `a` where this boolean tensor is true, else `b`.
+    /// `a` where this boolean tensor is true, else `b`, of any kind, in the dtype they meet in.
     pub fn select(&self, a: &Tensor, b: &Tensor) -> Result<Self> {
         if self.dtype() != DType::Bool {
             return refuse(format!("select: a condition of {:?}", self.dtype()));
@@ -745,7 +755,7 @@ impl Tensor {
             .mul_scalar(1.0 / (n - ddof) as f64)
     }
 
-    /// The position of the largest element along `axis`, integer.
+    /// The position of the largest element along `axis`, `i32`.
     pub fn argmax(&self, axis: isize, keep: bool) -> Result<Self> {
         if !self.dtype().is_floating() {
             return refuse(format!("argmax: {:?} is not floating", self.dtype()));

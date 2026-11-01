@@ -23,6 +23,14 @@
 //! gateway can check, it refuses before either side runs. The options of [`ops`] are
 //! dash-contract's, the same on both sides, and so are their layouts and their dtypes.
 //!
+//! A [`Tensor`] stays on the thread that made it, on every side: an unevaluated MLX array can hold
+//! closures that are not `Send`. Hand values between threads, not tensors:
+//!
+//! ```compile_fail
+//! fn send<T: Send>(_: T) {}
+//! send(dash_mag::Tensor::zeros(&[1], dash_mag::DType::F32).unwrap());
+//! ```
+//!
 //! # Gradients
 //!
 //! [`vjp`] is the only way to a gradient: `vjp(f, primals, cotangents)` runs `f` on `primals` and

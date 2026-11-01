@@ -5,12 +5,13 @@
 //! has for the length of one call: each operation is a function generic over the rank, and
 //! [`ranked!`] picks the instance. Rank 0 has no Burn tensor of its own: it is held as `[1]`.
 
+use std::marker::PhantomData;
 use std::sync::OnceLock;
 
 use burn::backend::Dispatch;
 use burn::backend::tensor::FloatTensor;
 use burn::tensor::activation::{sigmoid, silu, softplus};
-use burn::tensor::{Bool, DType as BurnDType, Device, Int, Tensor, TensorData};
+use burn::tensor::{Bool, DType as BurnDType, Device, Int, IntDType, Tensor, TensorData};
 use dash_ops::attention::{AttentionMask, attention, attention_decode};
 use dash_ops::conv1d::{causal_conv1d, causal_conv1d_update};
 use dash_ops::gated_delta::chunk::chunk_gated_delta_rule;
@@ -46,6 +47,9 @@ pub(crate) struct Array {
     kind: Kind,
     /// Rank 0, held as `[1]`.
     scalar: bool,
+    /// Not `Send`, as MLX's arrays are not: code that moves a tensor between threads would compile
+    /// here and not on macOS.
+    one_thread: PhantomData<*const ()>,
 }
 
 /// `$f::<R>($args)` with `R` this array's Burn rank.
@@ -121,7 +125,12 @@ fn held(shape: &[usize]) -> Vec<usize> {
 
 impl Array {
     fn new(raw: Raw, kind: Kind, scalar: bool) -> Self {
-        Self { raw, kind, scalar }
+        Self {
+            raw,
+            kind,
+            scalar,
+            one_thread: PhantomData,
+        }
     }
 
     fn float(raw: Raw) -> Self {
@@ -168,7 +177,9 @@ fn from_data_float<const D: usize>(data: TensorData, dtype: BurnDType) -> Raw {
 }
 
 fn from_data_int<const D: usize>(data: TensorData) -> Raw {
-    Tensor::<D, Int>::from_data(data, device()).into_dispatch()
+    Tensor::<D, Int>::from_data(data, device())
+        .cast(IntDType::I32)
+        .into_dispatch()
 }
 
 fn from_data_bool<const D: usize>(data: TensorData) -> Raw {
@@ -199,12 +210,24 @@ fn bool_to_float<const D: usize>(a: &Array, dtype: BurnDType) -> Raw {
     a.b::<D>().float().cast(dtype).into_dispatch()
 }
 
-fn float_to_int<const D: usize>(a: &Array) -> Raw {
-    a.t::<D>().int().into_dispatch()
+fn int_dtype(dtype: DType) -> IntDType {
+    if dtype == DType::I64 {
+        IntDType::I64
+    } else {
+        IntDType::I32
+    }
 }
 
-fn bool_to_int<const D: usize>(a: &Array) -> Raw {
-    a.b::<D>().int().into_dispatch()
+fn int_to_int<const D: usize>(a: &Array, dtype: DType) -> Raw {
+    a.i::<D>().cast(int_dtype(dtype)).into_dispatch()
+}
+
+fn float_to_int<const D: usize>(a: &Array, dtype: DType) -> Raw {
+    a.t::<D>().int().cast(int_dtype(dtype)).into_dispatch()
+}
+
+fn bool_to_int<const D: usize>(a: &Array, dtype: DType) -> Raw {
+    a.b::<D>().int().cast(int_dtype(dtype)).into_dispatch()
 }
 
 fn int_to_bool<const D: usize>(a: &Array) -> Raw {
@@ -232,8 +255,13 @@ fn binary<const D: usize>(op: Binary, a: &Array, b: &Array) -> Raw {
     .into_dispatch()
 }
 
-fn compare<const D: usize>(op: Compare, a: &Array, b: &Array) -> Raw {
-    let (x, y) = (a.t::<D>(), b.t::<D>());
+fn compare<const D: usize, K: Kindly + burn::tensor::kind::Ordered>(
+    op: Compare,
+    a: &Array,
+    b: &Array,
+) -> Raw {
+    let x = Tensor::<D, K>::from_dispatch(a.raw.clone());
+    let y = Tensor::<D, K>::from_dispatch(b.raw.clone());
     match op {
         Compare::Gt => x.greater(y),
         Compare::Ge => x.greater_equal(y),
@@ -285,9 +313,12 @@ fn matmul<const D: usize>(a: &Array, b: &Array) -> Raw {
     a.t::<D>().matmul(b.t::<D>()).into_dispatch()
 }
 
-fn select<const D: usize>(condition: &Array, a: &Array, b: &Array) -> Raw {
-    b.t::<D>()
-        .mask_where(condition.b::<D>(), a.t::<D>())
+fn select<const D: usize, K: Kindly>(condition: &Array, a: &Array, b: &Array) -> Raw {
+    Tensor::<D, K>::from_dispatch(b.raw.clone())
+        .mask_where(
+            condition.b::<D>(),
+            Tensor::<D, K>::from_dispatch(a.raw.clone()),
+        )
         .into_dispatch()
 }
 
@@ -365,7 +396,7 @@ fn reduce_axis<const D: usize>(op: Reduce, a: &Array, axis: usize) -> Raw {
 }
 
 fn argmax_axis<const D: usize>(a: &Array, axis: usize) -> Raw {
-    a.t::<D>().argmax(axis).into_dispatch()
+    a.t::<D>().argmax(axis).cast(IntDType::I32).into_dispatch()
 }
 
 fn sort_axis<const D: usize>(a: &Array, axis: usize) -> Raw {
@@ -377,7 +408,8 @@ fn leaf<const D: usize>(a: &Array) -> Raw {
     a.t::<D>().inner().autodiff().require_grad().into_dispatch()
 }
 
-/// `sum(out * cotangent)`, in f32, the cotangent rounded to the output's dtype.
+/// `sum(out * cotangent)`, taken in the output's dtype with the cotangent rounded to it, and cast
+/// to f32 so that outputs of different dtypes add up.
 fn inner_product<const D: usize>(out: &Array, cotangent: &Array) -> Tensor<1> {
     let o = out.t::<D>();
     let c = cotangent.t::<D>().inner().cast(o.dtype());
@@ -513,9 +545,15 @@ impl Arm for Burn {
             (Kind::Float, DType::Bool) => (ranked!(rank, float_to_bool; a), Kind::Bool),
             (Kind::Int, DType::Bool) => (ranked!(rank, int_to_bool; a), Kind::Bool),
             (Kind::Bool, DType::Bool) => (a.raw.clone(), Kind::Bool),
-            (Kind::Float, DType::I32 | DType::I64) => (ranked!(rank, float_to_int; a), Kind::Int),
-            (Kind::Bool, DType::I32 | DType::I64) => (ranked!(rank, bool_to_int; a), Kind::Int),
-            (Kind::Int, DType::I32 | DType::I64) => (a.raw.clone(), Kind::Int),
+            (Kind::Float, d @ (DType::I32 | DType::I64)) => {
+                (ranked!(rank, float_to_int; a, d), Kind::Int)
+            }
+            (Kind::Bool, d @ (DType::I32 | DType::I64)) => {
+                (ranked!(rank, bool_to_int; a, d), Kind::Int)
+            }
+            (Kind::Int, d @ (DType::I32 | DType::I64)) => {
+                (ranked!(rank, int_to_int; a, d), Kind::Int)
+            }
             (Kind::Float, d) => (ranked!(rank, cast_float; a, burn_dtype(d)?), Kind::Float),
             (Kind::Int, d) => (ranked!(rank, int_to_float; a, burn_dtype(d)?), Kind::Float),
             (Kind::Bool, d) => (ranked!(rank, bool_to_float; a, burn_dtype(d)?), Kind::Float),
@@ -536,7 +574,11 @@ impl Arm for Burn {
     }
 
     fn compare(op: Compare, a: &Array, b: &Array) -> Result<Array> {
-        let raw = ranked!(a.rank(), compare; op, a, b);
+        let raw = match a.kind {
+            Kind::Float => ranked!(a.rank(), compare, burn::tensor::Float; op, a, b),
+            Kind::Int => ranked!(a.rank(), compare, Int; op, a, b),
+            Kind::Bool => return refuse("compare: booleans reach here as integers"),
+        };
         Ok(Array::new(raw, Kind::Bool, a.scalar))
     }
 
@@ -560,8 +602,8 @@ impl Arm for Burn {
     }
 
     fn select(condition: &Array, a: &Array, b: &Array) -> Result<Array> {
-        let raw = ranked!(a.rank(), select; condition, a, b);
-        Ok(Array::new(raw, Kind::Float, a.scalar))
+        let raw = kinded!(a.kind, a.rank(), select; condition, a, b);
+        Ok(Array::new(raw, a.kind, a.scalar))
     }
 
     fn reshape(a: &Array, shape: &[usize]) -> Result<Array> {
@@ -862,7 +904,11 @@ impl Arm for Burn {
     fn sample(logits: &Array, options: &SampleOptions) -> Result<Drawn<Array>> {
         let out = sample(logits.t::<2>(), options);
         Ok(Drawn {
-            tokens: Array::new(out.tokens.into_dispatch(), Kind::Int, false),
+            tokens: Array::new(
+                out.tokens.cast(IntDType::I32).into_dispatch(),
+                Kind::Int,
+                false,
+            ),
             logprob: wrap(out.logprob),
             tempered_logprob: wrap(out.tempered_logprob),
             sampling_logprob: wrap(out.sampling_logprob),

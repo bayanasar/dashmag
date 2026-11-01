@@ -259,7 +259,7 @@ pub fn chosen_logprob(
 /// What [`sample`] returns, `[B]` each.
 #[derive(Clone, Debug)]
 pub struct Sampled {
-    /// The token drawn for each row, integer.
+    /// The token drawn for each row, `i32`.
     pub tokens: Tensor,
     /// Its log-probability under the model, at temperature 1. f32.
     pub logprob: Tensor,

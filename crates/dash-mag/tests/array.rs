@@ -310,3 +310,88 @@ fn rms_norm_is_computed_in_f32_and_rounded_once() {
         .unwrap();
     assert_eq!(bits(&bf), bits(&want));
 }
+
+/// The same code runs on every side: `where(done, pad, token)` over token ids, as a generation loop
+/// writes it, and over booleans.
+#[test]
+fn selection_takes_every_kind() {
+    let done = Tensor::from_bool(&[true, false, true], &[3]).unwrap();
+    let pad = Tensor::from_i32(&[7, 7, 7], &[3]).unwrap();
+    let tokens = Tensor::from_i32(&[1, 2, 3], &[3]).unwrap();
+    let picked = done.select(&pad, &tokens).unwrap();
+    assert_eq!(picked.dtype(), DType::I32);
+    assert_eq!(picked.to_i32().unwrap(), [7, 2, 7]);
+    // A scalar's broadcast too.
+    let one = Tensor::from_i32(&[9], &[1]).unwrap();
+    assert_eq!(
+        done.select(&one, &tokens).unwrap().to_i32().unwrap(),
+        [9, 2, 9]
+    );
+    let yes = Tensor::from_bool(&[true, true, true], &[3]).unwrap();
+    let no = Tensor::from_bool(&[false, false, false], &[3]).unwrap();
+    let flags = done.select(&no, &yes).unwrap();
+    assert_eq!(flags.dtype(), DType::Bool);
+    assert_eq!(flags.to_bool().unwrap(), [false, true, false]);
+    // Kinds meet as dtypes do.
+    let values = t(&[0.5, 0.5, 0.5], &[3]);
+    let mixed = done.select(&values, &tokens).unwrap();
+    assert_eq!(mixed.dtype(), DType::F32);
+    close(&mixed, &[0.5, 2.0, 0.5], 0.0);
+}
+
+#[test]
+fn integers_compare_and_booleans_are_equal_or_not() {
+    let tokens = Tensor::from_i32(&[1, 2, 3], &[3]).unwrap();
+    let eos = Tensor::from_i32(&[2], &[1]).unwrap();
+    assert_eq!(
+        tokens.eq(&eos).unwrap().to_bool().unwrap(),
+        [false, true, false]
+    );
+    assert_eq!(
+        tokens.gt(&eos).unwrap().to_bool().unwrap(),
+        [false, false, true]
+    );
+    assert_eq!(
+        tokens.le(&eos).unwrap().to_bool().unwrap(),
+        [true, true, false]
+    );
+    let a = Tensor::from_bool(&[true, false], &[2]).unwrap();
+    let b = Tensor::from_bool(&[true, true], &[2]).unwrap();
+    assert_eq!(a.eq(&b).unwrap().to_bool().unwrap(), [true, false]);
+    assert!(a.gt(&b).is_err(), "booleans have no order");
+}
+
+#[test]
+fn integers_have_one_width_until_asked_for_another() {
+    let i = Tensor::from_i32(&[3, -2], &[2]).unwrap();
+    assert_eq!(i.dtype(), DType::I32);
+    let wide = i.as_dtype(DType::I64).unwrap();
+    assert_eq!(wide.dtype(), DType::I64);
+    assert_eq!(wide.to_i32().unwrap(), [3, -2]);
+    let narrow = wide.as_dtype(DType::I32).unwrap();
+    assert_eq!(narrow.dtype(), DType::I32);
+    assert_eq!(narrow.to_i32().unwrap(), [3, -2]);
+    let from_float = t(&[3.5], &[1]);
+    assert_eq!(from_float.as_dtype(DType::I64).unwrap().dtype(), DType::I64);
+    assert_eq!(from_float.as_dtype(DType::I32).unwrap().dtype(), DType::I32);
+    let from_bool = Tensor::from_bool(&[true], &[1]).unwrap();
+    assert_eq!(from_bool.as_dtype(DType::I64).unwrap().dtype(), DType::I64);
+    assert_eq!(from_bool.as_dtype(DType::I32).unwrap().dtype(), DType::I32);
+    assert_eq!(
+        t(&[1.0, 2.0], &[1, 2]).argmax(1, false).unwrap().dtype(),
+        DType::I32
+    );
+}
+
+#[test]
+fn matmul_of_integers_is_refused_here() {
+    let i = Tensor::from_i32(&[1, 2, 3, 4], &[2, 2]).unwrap();
+    assert!(i.matmul(&i).is_err());
+    assert!(
+        Tensor::from_bool(&[true], &[1, 1])
+            .unwrap()
+            .matmul(&t(&[1.0], &[1, 1]))
+            .is_ok(),
+        "a boolean beside a float meets it as a float"
+    );
+}

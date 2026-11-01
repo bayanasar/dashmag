@@ -390,6 +390,7 @@ fn chosen_logprob_and_sampling() {
             masked: vec![47],
         };
         let got = sample(&front(44, &[4, v], dtype), &options).unwrap();
+        assert_eq!(got.tokens.dtype(), DType::I32);
         let want = dash_ops::sample::sample(plain(44, [4, v], burn), &options);
         assert_eq!(
             got.tokens.to_i32().unwrap(),

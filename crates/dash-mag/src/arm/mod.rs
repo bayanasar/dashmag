@@ -22,7 +22,7 @@ pub(crate) enum Binary {
     Minimum,
 }
 
-/// Comparisons of two arrays of one shape and one dtype, to booleans.
+/// Comparisons of two arrays of one shape and one dtype, floating or integer, to booleans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Compare {
     Gt,
@@ -104,6 +104,7 @@ pub(crate) trait Arm {
     /// Asks for these arrays to be computed now, where the side computes lazily.
     fn eval(arrays: &[&Self::Array]) -> Result<()>;
 
+    /// To any dtype of any kind, an integer to the width asked for.
     fn cast(a: &Self::Array, dtype: DType) -> Result<Self::Array>;
     fn stop_gradient(a: &Self::Array) -> Result<Self::Array>;
 
@@ -112,9 +113,9 @@ pub(crate) trait Arm {
     fn logical(op: Logical, a: &Self::Array, b: &Self::Array) -> Result<Self::Array>;
     fn logical_not(a: &Self::Array) -> Result<Self::Array>;
     fn unary(op: Unary, a: &Self::Array) -> Result<Self::Array>;
-    /// Both of rank 2 or more, with one batch shape and one dtype.
+    /// Both of rank 2 or more, with one batch shape and one floating dtype.
     fn matmul(a: &Self::Array, b: &Self::Array) -> Result<Self::Array>;
-    /// `a` where `condition`, else `b`: one shape, `a` and `b` one dtype.
+    /// `a` where `condition`, else `b`: one shape, `a` and `b` one dtype, of any kind.
     fn select(condition: &Self::Array, a: &Self::Array, b: &Self::Array) -> Result<Self::Array>;
 
     /// A new shape of the same number of elements, of rank 0 to 6.
@@ -132,7 +133,7 @@ pub(crate) trait Arm {
 
     /// Over the whole array, to rank 0, or over `axis`, kept with a length of 1.
     fn reduce(op: Reduce, a: &Self::Array, axis: Option<usize>) -> Result<Self::Array>;
-    /// Integer, with `axis` kept with a length of 1.
+    /// `i32`, with `axis` kept with a length of 1.
     fn argmax(a: &Self::Array, axis: usize) -> Result<Self::Array>;
     fn sort(a: &Self::Array, axis: usize) -> Result<Self::Array>;
 

@@ -1,5 +1,7 @@
 //! Gradient clipping and AdamW, written once over [`Tensor`], as a training step takes them beside
-//! the operations. The arithmetic is torch's, so the two sides differ only in their roundings.
+//! the operations. The arithmetic is torch's on f32 parameters, LoRA's factors, so the two sides
+//! differ only in their roundings. A scalar here is rounded to the tensor's dtype, so on bf16
+//! parameters, where torch keeps its scalars in f32, it is not torch's to the bit.
 
 use std::collections::HashMap;
 
@@ -13,7 +15,8 @@ const EPS: f64 = 1e-6;
 
 /// Clips `grads` by their total norm, in place, and returns that norm as it was before clipping,
 /// as [`dash_contract::clip`] defines it: the total in f32 over the gradients that have elements,
-/// the coefficient as torch evaluates it, and each gradient multiplied in its own dtype.
+/// the coefficient as torch evaluates it, and each gradient multiplied in its own dtype. The total
+/// is read back to the host on every call, where torch returns a tensor.
 pub fn clip_grad_norm(grads: &mut [Tensor], options: &ClipGradNormOptions) -> Result<f32> {
     let mut partials = Vec::with_capacity(grads.len());
     for grad in grads.iter().filter(|g| g.size() > 0) {
@@ -108,7 +111,7 @@ impl AdamW {
         let v = v.mul_scalar(b2)?.add(&g.square()?.mul_scalar(1.0 - b2)?)?;
         let denominator = v
             .sqrt()?
-            .mul_scalar(1.0 / (1.0 - b2.powi(t)).sqrt())?
+            .div(&Tensor::scalar((1.0 - b2.powi(t)).sqrt(), p.dtype())?)?
             .add_scalar(self.eps)?;
         let step = lr / (1.0 - b1.powi(t));
         let p = p.sub(&m.div(&denominator)?.mul_scalar(step)?)?;
