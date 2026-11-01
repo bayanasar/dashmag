@@ -1,4 +1,4 @@
-//! Clipping and AdamW against their definitions, evaluated in f64.
+//! Clipping and AdamW against their definitions, evaluated in f64, and AdamW's state through a resume.
 
 mod common;
 
@@ -106,4 +106,103 @@ fn adamw_follows_torch_s_steps() {
     }
     assert_eq!(opt.step, 3);
     assert_eq!(opt.state().count(), 2);
+}
+
+/// One optimiser's next `steps` steps on both parameters, which it hands back.
+fn adamw_steps(optimiser: &mut AdamW, params: &mut [(&str, Tensor)], seed: u64, steps: u64) {
+    for s in 0..steps {
+        optimiser.begin_step();
+        for (i, (name, p)) in params.iter_mut().enumerate() {
+            let g = tensor(seed + 2 * s + i as u64, &p.shape(), DType::F32);
+            *p = optimiser.update(name, p, &g, 1e-2).unwrap();
+        }
+    }
+}
+
+/// A run stopped and resumed from what it wrote continues to the bit, through bytes as a checkpoint
+/// holds them, each moment in its parameter's dtype.
+#[test]
+fn adamw_resumes_from_its_named_state() {
+    let params = || {
+        vec![
+            ("b", tensor(11, &[4], DType::BF16)),
+            ("a", tensor(12, &[3, 2], DType::F32)),
+        ]
+    };
+    let mut first = AdamW::new((0.9, 0.999), 1e-5, 0.01);
+    let mut p = params();
+    adamw_steps(&mut first, &mut p, 100, 3);
+
+    let held: Vec<_> = first
+        .named_state()
+        .map(|(name, m, v)| {
+            (
+                name.to_string(),
+                m.to_bytes().unwrap(),
+                v.to_bytes().unwrap(),
+                m.shape(),
+                m.dtype(),
+            )
+        })
+        .collect();
+    let names: Vec<&str> = held.iter().map(|h| h.0.as_str()).collect();
+    assert_eq!(names, ["a", "b"], "in order of name");
+    assert_eq!(held[0].4, DType::F32);
+    assert_eq!(held[1].4, DType::BF16);
+
+    let mut second = AdamW::new((0.9, 0.999), 1e-5, 0.01);
+    second.step = first.step;
+    for (name, m, v, shape, dtype) in &held {
+        let m = Tensor::from_bytes(m, shape, *dtype).unwrap();
+        let v = Tensor::from_bytes(v, shape, *dtype).unwrap();
+        second.set_state(name, m, v).unwrap();
+    }
+    let mut q = p.clone();
+    adamw_steps(&mut first, &mut p, 200, 2);
+    adamw_steps(&mut second, &mut q, 200, 2);
+    for ((_, a), (_, b)) in p.iter().zip(&q) {
+        assert_eq!(a.to_bytes().unwrap(), b.to_bytes().unwrap());
+    }
+    for (a, b) in first.named_state().zip(second.named_state()) {
+        assert_eq!(a.1.to_bytes().unwrap(), b.1.to_bytes().unwrap());
+        assert_eq!(a.2.to_bytes().unwrap(), b.2.to_bytes().unwrap());
+    }
+}
+
+/// Moments that do not fit are refused: by themselves when set, against the parameter when used, where
+/// they would otherwise broadcast or change its dtype. The state stays as it was.
+#[test]
+fn adamw_refuses_moments_that_do_not_fit() {
+    let mut optimiser = AdamW::new((0.9, 0.999), 1e-5, 0.0);
+    let zeros = |shape: &[usize], dtype| Tensor::zeros(shape, dtype).unwrap();
+    assert!(
+        optimiser
+            .set_state("a", zeros(&[2], DType::F32), zeros(&[3], DType::F32))
+            .is_err()
+    );
+    assert!(
+        optimiser
+            .set_state("a", zeros(&[2], DType::F32), zeros(&[2], DType::BF16))
+            .is_err()
+    );
+    let integers = Tensor::from_i32(&[0, 0], &[2]).unwrap();
+    assert!(
+        optimiser
+            .set_state("a", integers.clone(), integers)
+            .is_err()
+    );
+    assert_eq!(optimiser.named_state().count(), 0);
+
+    optimiser.begin_step();
+    let (p, g) = (t(&[1.0, 2.0, 3.0], &[3]), t(&[0.1, 0.2, 0.3], &[3]));
+    optimiser
+        .set_state("short", zeros(&[1], DType::F32), zeros(&[1], DType::F32))
+        .unwrap();
+    assert!(optimiser.update("short", &p, &g, 1e-2).is_err());
+    optimiser
+        .set_state("bf16", zeros(&[3], DType::BF16), zeros(&[3], DType::BF16))
+        .unwrap();
+    assert!(optimiser.update("bf16", &p, &g, 1e-2).is_err());
+    assert_eq!(optimiser.named_state().count(), 2);
+    assert!(optimiser.update("new", &p, &g, 1e-2).is_ok());
 }
