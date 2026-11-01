@@ -10,10 +10,12 @@ use dash_mlx::mlx::ops::{
     stop_gradient,
 };
 use dash_mlx::mlx::transforms::fallible_vjp;
-use dash_mlx::mlx::{Array, Dtype, memory, nn, transforms, version, with_cpu};
+use dash_mlx::mlx::{Array, Dtype, fast, memory, nn, transforms, version, with_cpu};
 use half::{bf16, f16};
 
-use super::{Arm, Binary, Compare, Drawn, Logical, Mask, Reduce, Unary, VjpFn, VjpOut};
+use super::{
+    Arm, Binary, Compare, Drawn, Logical, Mask, Memory, Reduce, RopeAt, Unary, VjpFn, VjpOut,
+};
 use crate::ops::{
     AttentionOptions, CausalConv1dOptions, CausalConv1dStepOptions, ChunkGatedDeltaOptions,
     GatedDeltaStepOptions, LogprobOptions, LowRankOptions, SampleOptions,
@@ -49,6 +51,16 @@ fn on<T>(arrays: &[&Array], f: impl FnOnce() -> T) -> T {
     } else {
         f()
     }
+}
+
+/// `a` to read on the host: itself when its data is row-contiguous, so that the read waits for `a`
+/// alone. A `contiguous` node would be scheduled behind all that is queued after `a`, which is what a
+/// pipelined decoder has just queued.
+fn readable(a: &Array) -> std::result::Result<Array, Exception> {
+    if a.is_row_contiguous()? {
+        return Ok(a.clone());
+    }
+    on(&[a], || a.contiguous())
 }
 
 /// Refuses f64 where the operation has Metal kernels, which stay on the GPU.
@@ -105,6 +117,9 @@ pub(crate) struct Mlx;
 
 impl Arm for Mlx {
     type Array = Array;
+
+    const HAS_ROPE: bool = true;
+    const LORA_AS_ROWS: bool = false;
 
     fn describe() -> String {
         format!("MLX {}, Metal", version().unwrap_or_default())
@@ -211,7 +226,7 @@ impl Arm for Mlx {
         if a.size() == 0 {
             return Ok(Vec::new());
         }
-        let a = on(&[a], || a.contiguous())?;
+        let a = readable(a)?;
         Ok(match a.dtype() {
             Dtype::Float16 => a
                 .try_as_slice::<f16>()?
@@ -241,7 +256,7 @@ impl Arm for Mlx {
         if a.size() == 0 {
             return Ok(Vec::new());
         }
-        let a = a.as_dtype(Dtype::Int32)?.contiguous()?;
+        let a = readable(&a.as_dtype(Dtype::Int32)?)?;
         Ok(a.try_as_slice::<i32>()?.to_vec())
     }
 
@@ -249,12 +264,32 @@ impl Arm for Mlx {
         if a.size() == 0 {
             return Ok(Vec::new());
         }
-        let a = a.contiguous()?;
+        let a = readable(a)?;
         Ok(a.try_as_slice::<bool>()?.to_vec())
     }
 
     fn eval(arrays: &[&Array]) -> Result<()> {
         Ok(transforms::eval(arrays.iter().copied())?)
+    }
+
+    fn eval_async(arrays: &[&Array]) -> Result<()> {
+        Ok(transforms::async_eval(arrays.iter().copied())?)
+    }
+
+    fn memory() -> Option<Memory> {
+        Some(Memory {
+            active: memory::active_memory().ok()?,
+            peak: memory::peak_memory().ok()?,
+            cache: memory::cache_memory().ok()?,
+        })
+    }
+
+    fn reset_peak_memory() {
+        let _ = memory::reset_peak_memory();
+    }
+
+    fn set_cache_limit(bytes: usize) {
+        let _ = memory::set_cache_limit(bytes);
     }
 
     fn cast(a: &Array, dtype: DType) -> Result<Array> {
@@ -356,6 +391,31 @@ impl Arm for Mlx {
         let strides = vec![1; a.ndim()];
         (starts[axis], stops[axis]) = (start as i32, end as i32);
         Ok(on(&[a], || slice(a, &starts, &stops, &strides))?)
+    }
+
+    fn put_along_axis(a: &Array, indices: &Array, values: &Array, axis: usize) -> Result<Array> {
+        Ok(on(&[a, values], || {
+            a.put_along_axis(indices, values, axis as i32)
+        })?)
+    }
+
+    fn rms_norm(x: &Array, weight: Option<&Array>, eps: f32) -> Option<Result<Array>> {
+        if x.dtype() == Dtype::Float64 || weight.is_some_and(|w| w.dtype() == Dtype::Float64) {
+            return None;
+        }
+        Some(fast::rms_norm(x, weight, eps).map_err(Error::from))
+    }
+
+    fn logsumexp(a: &Array, axis: usize) -> Option<Result<Array>> {
+        Some(on(&[a], || a.logsumexp_axis(axis as i32, true)).map_err(Error::from))
+    }
+
+    fn rope(x: &Array, dim: usize, base: f32, at: RopeAt<&Array>) -> Result<Array> {
+        let dim = dim as i32;
+        Ok(match at {
+            RopeAt::Start(start) => fast::rope(x, dim, false, base, 1.0, start as i32),
+            RopeAt::Rows(positions) => fast::rope_dynamic(x, dim, false, base, 1.0, positions),
+        }?)
     }
 
     fn reduce(op: Reduce, a: &Array, axis: Option<usize>) -> Result<Array> {

@@ -1,24 +1,38 @@
-//! Rotary position embeddings, computed on the host once and applied on either side alike.
+//! Rotary position embeddings: transformers' form on every side. A side with its own (MLX's `fast`
+//! functions) rotates with that; otherwise the rotation is computed on the host once and applied
+//! from tables, written once here.
 
 use std::ops::Range;
 
+use crate::arm::{Arm, RopeAt, Selected};
 use crate::tensor::Tensor;
 use crate::{DType, Result, refuse};
 
 /// The rotation of positions `0..len` over the first `dim` features of a head: transformers' form,
-/// `x cos + rotate_half(x) sin`, the frequencies `1 / base^(2i / dim)` in f32, each angle's sine and
-/// cosine rounded once to f32 and once to `dtype`. The features after `dim` pass unchanged.
+/// `x cos + rotate_half(x) sin`, the frequencies `1 / base^(2i / dim)` in f32. From tables, each
+/// angle's sine and cosine are rounded once to f32 and once to `dtype`. The features after `dim` pass
+/// unchanged.
 #[derive(Clone, Debug)]
 pub struct Rope {
-    cos: Tensor,
-    sin: Tensor,
+    /// The cosines and sines `[len, dim]`, on a side without its own rotation.
+    tables: Option<(Tensor, Tensor)>,
     dim: usize,
+    base: f32,
+    len: usize,
 }
 
 impl Rope {
     pub fn new(dim: usize, base: f32, len: usize, dtype: DType) -> Result<Self> {
         if dim == 0 || !dim.is_multiple_of(2) {
             return refuse(format!("Rope: {dim} features; an even number is rotated"));
+        }
+        if Selected::HAS_ROPE {
+            return Ok(Self {
+                tables: None,
+                dim,
+                base,
+                len,
+            });
         }
         let half = dim / 2;
         let frequencies: Vec<f32> = (0..half)
@@ -34,22 +48,26 @@ impl Rope {
             }
         }
         Ok(Self {
-            cos: Tensor::from_f32(&cos, &[len, dim])?.as_dtype(dtype)?,
-            sin: Tensor::from_f32(&sin, &[len, dim])?.as_dtype(dtype)?,
+            tables: Some((
+                Tensor::from_f32(&cos, &[len, dim])?.as_dtype(dtype)?,
+                Tensor::from_f32(&sin, &[len, dim])?.as_dtype(dtype)?,
+            )),
             dim,
+            base,
+            len,
         })
     }
 
     /// The last position this holds, plus one.
     pub fn len(&self) -> usize {
-        self.cos.shape()[0]
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    fn rotate(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    fn check_features(&self, x: &Tensor) -> Result<usize> {
         let d = *x.shape().last().unwrap_or(&0);
         if d < self.dim {
             return refuse(format!(
@@ -58,6 +76,11 @@ impl Rope {
                 x.shape()
             ));
         }
+        Ok(d)
+    }
+
+    fn rotate(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let d = self.check_features(x)?;
         let half = self.dim / 2;
         let turned = x.slice(-1, 0..self.dim)?;
         let first = turned.slice(-1, 0..half)?;
@@ -79,6 +102,14 @@ impl Rope {
                 self.len()
             ));
         }
+        let Some((cos, sin)) = &self.tables else {
+            // The side's own takes `[B, H, T, D]`.
+            self.check_features(x)?;
+            let turned = x.swap_axes(1, 2)?;
+            let at = RopeAt::Start(positions.start);
+            let out = Tensor::wrap(Selected::rope(&turned.0, self.dim, self.base, at))?;
+            return out.swap_axes(1, 2);
+        };
         let table = |t: &Tensor| {
             t.slice(0, positions.clone())?.reshape(&[
                 1,
@@ -87,7 +118,7 @@ impl Rope {
                 self.dim as isize,
             ])
         };
-        self.rotate(x, &table(&self.cos)?, &table(&self.sin)?)
+        self.rotate(x, &table(cos)?, &table(sin)?)
     }
 
     /// `x` `[B, H, D]`, one token per sequence, at `positions` `[B]`.
@@ -99,10 +130,19 @@ impl Rope {
                 positions.shape()
             ));
         }
+        let Some((cos, sin)) = &self.tables else {
+            // The side's own takes `[B, H, 1, D]`.
+            self.check_features(x)?;
+            let (b, h, d) = (shape[0] as isize, shape[1] as isize, shape[2] as isize);
+            let turned = x.reshape(&[b, h, 1, d])?;
+            let at = RopeAt::Rows(&positions.0);
+            let out = Tensor::wrap(Selected::rope(&turned.0, self.dim, self.base, at))?;
+            return out.reshape(&[b, h, d]);
+        };
         let table = |t: &Tensor| {
             t.take(positions, 0)?
                 .reshape(&[shape[0] as isize, 1, self.dim as isize])
         };
-        self.rotate(x, &table(&self.cos)?, &table(&self.sin)?)
+        self.rotate(x, &table(cos)?, &table(sin)?)
     }
 }

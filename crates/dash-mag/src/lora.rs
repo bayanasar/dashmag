@@ -18,6 +18,7 @@ pub use dash_peft::{
     PeftError,
 };
 
+use crate::arm::{Arm, Selected};
 use crate::ops::{LowRankOptions, low_rank};
 use crate::tensor::Tensor;
 use crate::{DType, Result, refuse};
@@ -138,6 +139,21 @@ impl LoraLinear {
         Ok(())
     }
 
+    /// Replaces the frozen base, as a generator with an adapter folded into its weights holds it: of
+    /// the shape the layer has.
+    pub fn set_weight(&mut self, weight: Tensor) -> Result<()> {
+        if weight.shape() != self.weight.shape() || !weight.dtype().is_floating() {
+            return refuse(format!(
+                "set_weight: {:?} {:?} for {:?}",
+                weight.shape(),
+                weight.dtype(),
+                self.weight.shape()
+            ));
+        }
+        self.weight = weight;
+        Ok(())
+    }
+
     /// `x` `[.., in]` to `[.., out]`, at `x`'s dtype.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dtype = x.dtype();
@@ -146,7 +162,7 @@ impl LoraLinear {
             return base(x)?.as_dtype(dtype);
         };
         let shape = x.shape();
-        if shape.len() != 2 {
+        if shape.len() != 2 && Selected::LORA_AS_ROWS {
             // As rows, so that the base product and the low-rank one read the same tensor.
             let rows = x.reshape(&[-1, self.in_features() as isize])?;
             let y = self.forward(&rows)?;

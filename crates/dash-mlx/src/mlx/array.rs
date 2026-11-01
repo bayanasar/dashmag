@@ -240,6 +240,15 @@ impl Array {
         check(unsafe { sys::mlx_array_eval(self.0) })
     }
 
+    /// Whether the data is row-contiguous, evaluating the array: waiting for this array alone.
+    pub fn is_row_contiguous(&self) -> Result<bool> {
+        self.eval()?;
+        let mut contiguous = false;
+        // SAFETY: a valid handle.
+        check(unsafe { sys::_mlx_array_is_row_contiguous(&mut contiguous, self.0) })?;
+        Ok(contiguous)
+    }
+
     /// The elements, evaluating the array, or an error if the dtype is not `T`'s, the data is not
     /// row-contiguous ([`Array::contiguous`]) or the array is empty, which holds no data.
     pub fn try_as_slice<T: ArrayElement>(&self) -> Result<&[T]> {
@@ -250,11 +259,7 @@ impl Array {
                 self.dtype()
             )));
         }
-        self.eval()?;
-        let mut contiguous = false;
-        // SAFETY: a valid handle.
-        check(unsafe { sys::_mlx_array_is_row_contiguous(&mut contiguous, self.0) })?;
-        if !contiguous {
+        if !self.is_row_contiguous()? {
             return Err(Exception::custom(
                 "the array's data is not row-contiguous; call `contiguous` first",
             ));

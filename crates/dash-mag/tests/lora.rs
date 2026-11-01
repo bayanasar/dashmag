@@ -175,6 +175,23 @@ fn dropout_is_refused_when_read() {
     let _ = PeftConfig::new(1, 1.0, &["m"]);
 }
 
+/// A chosen base and rows of any rank.
+#[test]
+fn set_weight_replaces_the_base_and_refuses_another_shape() {
+    let mut layer = layer(DType::F32);
+    layer.set_adapter(None);
+    let x = tensor(4, &[3, 16], DType::F32);
+    let weight = tensor(6, &[8, 16], DType::F32);
+    layer.set_weight(weight.clone()).unwrap();
+    assert_eq!(
+        bits(&layer.forward(&x).unwrap()),
+        bits(&x.matmul(&weight.t().unwrap()).unwrap())
+    );
+    assert!(layer.set_weight(tensor(6, &[8, 15], DType::F32)).is_err());
+    let integers = Tensor::from_i32(&[0; 128], &[8, 16]).unwrap();
+    assert!(layer.set_weight(integers).is_err());
+}
+
 /// The MLX side against dash-mlx's layer.
 #[cfg(target_os = "macos")]
 #[test]
@@ -193,10 +210,17 @@ fn on_mlx_it_is_dash_mlx_s_layer_bit_for_bit() {
         let a = a.as_dtype(Dtype::Float32).unwrap().contiguous().unwrap();
         a.as_slice::<f32>().iter().map(|v| v.to_bits()).collect()
     };
-    for (dtype, mlx) in [(DType::BF16, Dtype::Bfloat16), (DType::F32, Dtype::Float32)] {
+    let rows: [(&[usize], &[i32]); 2] = [(&[3], &[3]), (&[1, 3], &[1, 3])];
+    for ((dtype, mlx), (lead, plain_lead)) in
+        [(DType::BF16, Dtype::Bfloat16), (DType::F32, Dtype::Float32)]
+            .into_iter()
+            .flat_map(|d| rows.iter().map(move |r| (d, *r)))
+    {
         let front = layer(dtype);
-        let x = tensor(4, &[3, 16], dtype);
-        let (outs, grads) = run(&front, &x, &tensor(5, &[3, 8], DType::F32));
+        let shape = |last: usize| [lead, &[last]].concat();
+        let plain_shape = |last: i32| [plain_lead, &[last]].concat();
+        let x = tensor(4, &shape(16), dtype);
+        let (outs, grads) = run(&front, &x, &tensor(5, &shape(8), DType::F32));
 
         let weight = plain(1, &[8, 16], mlx);
         let (y, g) = fallible_vjp(
@@ -206,11 +230,13 @@ fn on_mlx_it_is_dash_mlx_s_layer_bit_for_bit() {
                 Ok(vec![layer.forward(&p[0])?])
             },
             &[
-                plain(4, &[3, 16], mlx),
+                plain(4, &plain_shape(16), mlx),
                 plain(2, &[4, 16], Dtype::Float32),
                 plain(3, &[8, 4], Dtype::Float32),
             ],
-            &[plain(5, &[3, 8], Dtype::Float32).as_dtype(mlx).unwrap()],
+            &[plain(5, &plain_shape(8), Dtype::Float32)
+                .as_dtype(mlx)
+                .unwrap()],
         )
         .unwrap();
         assert_eq!(bits(&outs[0]), f32s(&y[0]), "output, {dtype:?}");

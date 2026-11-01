@@ -393,3 +393,124 @@ fn matmul_of_integers_is_refused_here() {
         "a boolean beside a float meets it as a float"
     );
 }
+
+#[test]
+fn put_along_axis_writes_at_the_indices_along_the_axis() {
+    let x = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    // One place a row.
+    let at = Tensor::from_i32(&[2, 0], &[2, 1]).unwrap();
+    let v = t(&[10.0, 20.0], &[2, 1]);
+    close(
+        &x.put_along_axis(&at, &v, 1).unwrap(),
+        &[1.0, 2.0, 10.0, 20.0, 5.0, 6.0],
+        0.0,
+    );
+    // The other axis, counted from the end.
+    let at = Tensor::from_i32(&[1, 0, 1], &[1, 3]).unwrap();
+    let v = t(&[7.0, 8.0, 9.0], &[1, 3]);
+    close(
+        &x.put_along_axis(&at, &v, -2).unwrap(),
+        &[1.0, 8.0, 3.0, 7.0, 5.0, 9.0],
+        0.0,
+    );
+    // Several places a row, and a third axis across which each row keeps its own.
+    let at = Tensor::from_i32(&[0, 2, 1, 2], &[2, 2]).unwrap();
+    let v = t(&[7.0, 8.0, 9.0, 10.0], &[2, 2]);
+    close(
+        &x.put_along_axis(&at, &v, 1).unwrap(),
+        &[7.0, 2.0, 8.0, 4.0, 9.0, 10.0],
+        0.0,
+    );
+    let cube = t(&[0.0; 12], &[2, 3, 2]);
+    let at = Tensor::from_i32(&[2, 2, 0, 0], &[2, 1, 2]).unwrap();
+    let v = t(&[1.0, 2.0, 3.0, 4.0], &[2, 1, 2]);
+    close(
+        &cube.put_along_axis(&at, &v, 1).unwrap(),
+        &[0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+        0.0,
+    );
+    // The values take the tensor's dtype.
+    let y = x.as_dtype(DType::BF16).unwrap().put_along_axis(
+        &Tensor::from_i32(&[0], &[1, 1]).unwrap(),
+        &t(&[1.5], &[1, 1]),
+        1,
+    );
+    assert!(y.is_err(), "a row short");
+    let at = Tensor::from_i32(&[0, 1], &[2, 1]).unwrap();
+    let y = x
+        .as_dtype(DType::BF16)
+        .unwrap()
+        .put_along_axis(&at, &t(&[1.5, 2.5], &[2, 1]), 1)
+        .unwrap();
+    assert_eq!(y.dtype(), DType::BF16);
+    close(&y, &[1.5, 2.0, 3.0, 4.0, 2.5, 6.0], 0.0);
+}
+
+#[test]
+fn put_along_axis_refuses_what_does_not_fit() {
+    let x = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+    let at = Tensor::from_i32(&[0, 1], &[2, 1]).unwrap();
+    let v = t(&[1.0, 2.0], &[2, 1]);
+    assert!(x.put_along_axis(&at, &v, 2).is_err(), "an axis it lacks");
+    assert!(x.put_along_axis(&v, &v, 1).is_err(), "floating indices");
+    assert!(at.put_along_axis(&at, &at, 1).is_err(), "an integer tensor");
+    let short = Tensor::from_i32(&[0], &[1, 1]).unwrap();
+    assert!(
+        x.put_along_axis(&short, &t(&[1.0], &[1, 1]), 1).is_err(),
+        "not this tensor's shape across the axis"
+    );
+    assert!(
+        x.put_along_axis(&at, &t(&[1.0, 2.0], &[1, 2]), 1).is_err(),
+        "values not the indices' shape"
+    );
+}
+
+#[test]
+fn logsumexp_axis_is_its_definition_and_does_not_overflow() {
+    let x = t(&[0.0, 1.0, 2.0, 3.0], &[2, 2]);
+    let want = [1.313_261_7, 3.313_261_7];
+    close(&x.logsumexp_axis(1, false).unwrap(), &want, 1e-6);
+    close(&x.logsumexp_axis(-1, false).unwrap(), &want, 1e-6);
+    assert_eq!(x.logsumexp_axis(1, false).unwrap().shape(), [2]);
+    assert_eq!(x.logsumexp_axis(1, true).unwrap().shape(), [2, 1]);
+    // exp(1000) overflows f32; 1000 + ln 2 does not.
+    let big = t(&[1000.0, 1000.0], &[2]);
+    close(&big.logsumexp_axis(0, false).unwrap(), &[1000.6931], 1e-6);
+    let i = Tensor::from_i32(&[1, 2], &[2]).unwrap();
+    assert!(i.logsumexp_axis(0, false).is_err());
+    assert!(x.logsumexp_axis(2, false).is_err());
+}
+
+#[test]
+fn eval_async_gives_what_eval_gives_and_memory_calls_ask_nothing_of_a_side() {
+    let x = t(&[1.0, 2.0], &[2]).square().unwrap();
+    dash_mag::eval_async(&[&x]).unwrap();
+    close(&x, &[1.0, 4.0], 0.0);
+    dash_mag::set_cache_limit(1 << 30);
+    dash_mag::reset_peak_memory();
+    // Each side says what it knows: MLX its allocator's figures, Burn none.
+    assert_eq!(dash_mag::memory().is_some(), cfg!(target_os = "macos"));
+}
+
+/// A read gives row order whatever the data's layout: a transposed tensor's and a slice's strides
+/// are the side's to undo.
+#[test]
+fn reads_are_in_row_order() {
+    let x = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let turned = x.t().unwrap();
+    assert_eq!(turned.to_f32().unwrap(), [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    let column = x.slice(1, 1..2).unwrap();
+    assert_eq!(column.to_f32().unwrap(), [2.0, 5.0]);
+    let i = Tensor::from_i32(&[1, 2, 3, 4], &[2, 2]).unwrap();
+    assert_eq!(i.t().unwrap().to_i32().unwrap(), [1, 3, 2, 4]);
+    let b = Tensor::from_bool(&[true, false, false, false], &[2, 2]).unwrap();
+    assert_eq!(
+        b.t().unwrap().to_bool().unwrap(),
+        [true, false, false, false]
+    );
+    let b = Tensor::from_bool(&[false, true, false, false], &[2, 2]).unwrap();
+    assert_eq!(
+        b.t().unwrap().to_bool().unwrap(),
+        [false, false, true, false]
+    );
+}

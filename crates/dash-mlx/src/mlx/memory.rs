@@ -34,3 +34,21 @@ pub fn reset_peak_memory() -> Result<()> {
     // SAFETY: no arguments.
     check(unsafe { sys::mlx_reset_peak_memory() })
 }
+
+/// The bytes MLX keeps cached for reuse.
+pub fn cache_memory() -> Result<usize> {
+    error::init();
+    let mut res = 0;
+    // SAFETY: writes the one result.
+    check(unsafe { sys::mlx_get_cache_memory(&mut res) })?;
+    Ok(res)
+}
+
+/// Sets how many bytes MLX may keep cached for reuse, and returns the limit before.
+pub fn set_cache_limit(limit: usize) -> Result<usize> {
+    error::init();
+    let mut res = 0;
+    // SAFETY: writes the one result.
+    check(unsafe { sys::mlx_set_cache_limit(&mut res, limit) })?;
+    Ok(res)
+}

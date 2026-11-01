@@ -57,7 +57,9 @@ pub mod rope;
 mod tensor;
 
 pub use autodiff::vjp;
-pub use tensor::{DType, Tensor, eval};
+pub use tensor::{
+    DType, Memory, Tensor, eval, eval_async, memory, reset_peak_memory, set_cache_limit,
+};
 
 /// What every fallible operation here returns.
 pub type Result<T> = std::result::Result<T, Error>;

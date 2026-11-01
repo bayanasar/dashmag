@@ -354,7 +354,7 @@ mod direct {
     use dash_mlx::mlx::ops::indexing::TryIndexOp;
     use dash_mlx::mlx::ops::{concatenate, select, sigmoid, zeros_like};
     use dash_mlx::mlx::transforms::{eval, fallible_vjp};
-    use dash_mlx::mlx::{Array, Dtype, nn};
+    use dash_mlx::mlx::{Array, Dtype, fast, nn};
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -401,56 +401,10 @@ mod direct {
         },
     }
 
-    /// A layer over `[B, T, in]` as rows, as dash-mag's runs it: the same matmul, whose batch shape moves
-    /// the low bits in bf16.
-    fn rows(layer: &mut LoraLinear, x: &Array) -> Result<Array> {
-        let (b, t, inp) = (x.dim(0), x.dim(1), x.dim(2));
-        let y = layer.forward(&x.reshape(&[-1, inp])?)?;
-        y.reshape(&[b, t, y.dim(-1)])
-    }
-
-    /// The rotation `tests/step.rs` takes from dash-mag's `Rope`, as tables on the host.
-    #[derive(Clone)]
-    struct Rope {
-        cos: Array,
-        sin: Array,
-        dim: i32,
-    }
-
-    impl Rope {
-        fn new(dim: usize, base: f32, len: usize, dtype: Dtype) -> Self {
-            let half = dim / 2;
-            let frequencies: Vec<f32> = (0..half)
-                .map(|i| 1.0 / base.powf((2 * i) as f32 / dim as f32))
-                .collect();
-            let (mut cos, mut sin) = (Vec::new(), Vec::new());
-            for position in 0..len {
-                for j in 0..dim {
-                    let angle = position as f32 * frequencies[j % half];
-                    cos.push((angle as f64).cos() as f32);
-                    sin.push((angle as f64).sin() as f32);
-                }
-            }
-            let shape = [len as i32, dim as i32];
-            Self {
-                cos: Array::from_slice(&cos, &shape).as_dtype(dtype).unwrap(),
-                sin: Array::from_slice(&sin, &shape).as_dtype(dtype).unwrap(),
-                dim: dim as i32,
-            }
-        }
-
-        fn apply(&self, x: &Array, t: i32) -> Result<Array> {
-            let d = x.dim(-1);
-            let (dim, half) = (self.dim, self.dim / 2);
-            let table = |a: &Array| a.try_index(0..t)?.reshape(&[1, t, 1, dim]);
-            let (cos, sin) = (table(&self.cos)?, table(&self.sin)?);
-            let turned = x.try_index((.., .., .., 0..dim))?;
-            let first = turned.try_index((.., .., .., 0..half))?;
-            let second = turned.try_index((.., .., .., half..dim))?;
-            let rotated = concatenate(&[second.negative()?, first], -1)?;
-            let out = turned.multiply(&cos)?.add(rotated.multiply(&sin)?)?;
-            concatenate(&[out, x.try_index((.., .., .., dim..d))?], -1)
-        }
+    /// The rotation `tests/step.rs` takes from dash-mag's `Rope`: MLX's own over `[B, T, H, D]`.
+    fn rope(x: &Array) -> Result<Array> {
+        let turned = x.swap_axes(1, 2)?;
+        fast::rope(&turned, (HEAD / 2) as i32, false, 10000.0, 1.0, 0)?.swap_axes(1, 2)
     }
 
     impl Block {
@@ -501,7 +455,7 @@ mod direct {
             }
         }
 
-        fn forward(&mut self, x: &Array, rope: &Rope) -> Result<Array> {
+        fn forward(&mut self, x: &Array) -> Result<Array> {
             let (b, t) = (x.dim(0), x.dim(1));
             let y = match self {
                 Block::Delta {
@@ -512,7 +466,7 @@ mod direct {
                     conv,
                 } => {
                     let options = CausalConv1dOptions::default().with_activation(Activation::Silu);
-                    let (c, _) = causal_conv1d(&rows(qkv, x)?, conv, None, None, None, options)?;
+                    let (c, _) = causal_conv1d(&qkv.forward(x)?, conv, None, None, None, options)?;
                     let d = (HEADS * DELTA) as i32;
                     let head = |p: Array| p.reshape(&[b, t, HEADS as i32, DELTA as i32]);
                     let (q, k, v) = (
@@ -520,8 +474,9 @@ mod direct {
                         head(c.try_index((.., .., d..2 * d))?)?,
                         head(c.try_index((.., .., 2 * d..))?)?,
                     );
-                    let g = nn::softplus(rows(decay, x)?.as_dtype(Dtype::Float32)?)?.negative()?;
-                    let beta = sigmoid(rows(gate, x)?.as_dtype(Dtype::Float32)?)?;
+                    let g =
+                        nn::softplus(decay.forward(x)?.as_dtype(Dtype::Float32)?)?.negative()?;
+                    let beta = sigmoid(gate.forward(x)?.as_dtype(Dtype::Float32)?)?;
                     let (h, _) = chunk_gated_delta_rule(
                         &q,
                         &k,
@@ -532,18 +487,18 @@ mod direct {
                         None,
                         ChunkGatedDeltaOptions::default(),
                     )?;
-                    rows(out, &h.reshape(&[b, t, d])?)?
+                    out.forward(&h.reshape(&[b, t, d])?)?
                 }
                 Block::Attention { q, k, v, out } => {
                     let heads = |p: Array, h: usize| p.reshape(&[b, t, h as i32, HEAD as i32]);
-                    let query = rope.apply(&heads(rows(q, x)?, QUERY_HEADS)?, t)?;
-                    let key = rope.apply(&heads(rows(k, x)?, KEY_HEADS)?, t)?;
-                    let value = heads(rows(v, x)?, KEY_HEADS)?;
+                    let query = rope(&heads(q.forward(x)?, QUERY_HEADS)?)?;
+                    let key = rope(&heads(k.forward(x)?, KEY_HEADS)?)?;
+                    let value = heads(v.forward(x)?, KEY_HEADS)?;
                     let options = AttentionOptions::default()
                         .with_causal(true)
                         .with_scale(1.0 / (HEAD as f32).sqrt());
                     let h = attention(&query, &key, &value, &AttentionMask::None, options)?;
-                    rows(out, &h.reshape(&[b, t, (QUERY_HEADS * HEAD) as i32])?)?
+                    out.forward(&h.reshape(&[b, t, (QUERY_HEADS * HEAD) as i32])?)?
                 }
             };
             x.add(&y)?.as_dtype(x.dtype())
@@ -554,7 +509,6 @@ mod direct {
     struct Model {
         embed: Array,
         blocks: Vec<Block>,
-        rope: Rope,
     }
 
     impl Model {
@@ -586,17 +540,10 @@ mod direct {
             let at = Array::from_slice(ids, &[ids.len() as i32]);
             let mut x = self.embed.take_axis(&at, 0)?.expand_dims(0)?;
             for block in &mut self.blocks {
-                x = block.forward(&x, &self.rope)?;
+                x = block.forward(&x)?;
             }
-            // dash-mag's `rms_norm`, in f32 and rounded once.
             let dtype = x.dtype();
-            let h = x.squeeze_axes(&[0])?.as_dtype(Dtype::Float32)?;
-            let scale = h
-                .square()?
-                .mean_axis(-1, true)?
-                .add(scalar(1e-6, Dtype::Float32))?
-                .sqrt()?;
-            let h = h.divide(&scale)?.as_dtype(dtype)?;
+            let h = fast::rms_norm(x.squeeze_axes(&[0])?, None, 1e-6)?.as_dtype(dtype)?;
             let targets = Array::from_slice(targets, &[targets.len() as i32]);
             chosen_logprob(&h, &self.embed, &targets, &[], LogprobOptions::default())?
                 .logprob
@@ -673,7 +620,6 @@ mod direct {
                 Block::attention(200, dtype),
                 Block::delta(300, dtype),
             ],
-            rope: Rope::new(HEAD / 2, 10000.0, 1024, dtype),
         };
         let mut optimiser = AdamW {
             betas: (0.9, 0.999),
