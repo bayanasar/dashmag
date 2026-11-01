@@ -19,7 +19,7 @@
 //! never differentiates it. An adapter's factors train unless frozen (`freeze_parameters`).
 //!
 //! **The choice of adapter.** dash-lora sets it across a whole module tree through Burn's module
-//! mapper; mlx-rs has no mapper over a module's own fields, so here it is a setting of each layer,
+//! mapper; nothing here maps over a module's own fields, so it is a setting of each layer,
 //! [`LoraLinear::set_adapter`], and [`set_adapter`] sets it on every layer a model hands over (its
 //! LoRA'd layers, by whatever path holds them). A layer that does not hold the chosen adapter runs
 //! its base alone; `None` runs every layer's base alone, as PEFT's `disable_adapter()` does. The
@@ -27,10 +27,9 @@
 //! may run one after the other on one model, each under its own choice.
 
 use crate::lowrank::{LowRankOptions, low_rank};
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::macros::ModuleParameters;
-use mlx_rs::module::{Module, Param, Parameter};
-use mlx_rs::{Array, Dtype};
+use crate::mlx::error::{Exception, Result};
+use crate::mlx::module::{Module, Param};
+use crate::mlx::{Array, Dtype};
 
 /// The name of the adapter PEFT's files and [`LoraLinear::with_lora`] use when none is given.
 pub use dash_contract::lora::DEFAULT_ADAPTER;
@@ -40,13 +39,11 @@ fn contract(message: String) -> Exception {
 }
 
 /// A low-rank adapter of a [`LoraLinear`], in PEFT's layout.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone)]
 pub struct Lora {
     /// `lora_A`: `[r, in]`, f32; trainable unless frozen.
-    #[param]
     pub a: Param<Array>,
     /// `lora_B`: `[out, r]`, f32; trainable unless frozen.
-    #[param]
     pub b: Param<Array>,
     /// The factor on the low-rank product: `lora_alpha / r`, or `lora_alpha / √r` with rsLoRA.
     pub scale: f64,
@@ -54,6 +51,8 @@ pub struct Lora {
     pub dropout: f32,
     training: bool,
 }
+
+crate::module_parameters!(Lora { a, b });
 
 impl Lora {
     /// An adapter from its factors, `a` `[r, in]` and `b` `[out, r]`, kept as f32 whatever their
@@ -102,8 +101,8 @@ impl Lora {
         let x = match (self.training, self.dropout > 0.0) {
             (true, true) => {
                 let keep = 1.0 - self.dropout;
-                let mask = mlx_rs::random::bernoulli(&Array::from_f32(keep), x.shape(), None)?;
-                mlx_rs::ops::select(
+                let mask = crate::mlx::random::bernoulli(&Array::from_f32(keep), x.shape(), None)?;
+                crate::mlx::ops::select(
                     &mask,
                     x.divide(Array::from_f32(keep).as_dtype(x.dtype())?)?,
                     Array::from_f32(0.0).as_dtype(x.dtype())?,
@@ -124,16 +123,16 @@ impl Lora {
 
 /// A linear layer with a frozen base weight and any number of named low-rank adapters, one of
 /// which (or none) each forward pass adds ([module](self)).
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone)]
 pub struct LoraLinear {
     /// `W` `[out, in]`: frozen, at its own precision.
-    #[param]
     pub weight: Param<Array>,
-    #[param]
     adapters: Vec<Lora>,
     names: Vec<String>,
     active: Option<String>,
 }
+
+crate::module_parameters!(LoraLinear { weight, adapters });
 
 impl LoraLinear {
     /// A layer over `weight` `[out, in]`, frozen, with no adapter yet; the chosen adapter is
@@ -147,7 +146,7 @@ impl LoraLinear {
             )));
         }
         let mut weight = Param::new(weight.clone());
-        weight.freeze(true);
+        weight.freeze();
         Ok(Self {
             weight,
             adapters: Vec::new(),

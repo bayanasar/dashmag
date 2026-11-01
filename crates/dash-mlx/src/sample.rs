@@ -44,10 +44,10 @@
 //! The tokens are `[B]` int32. Nothing is differentiable.
 
 use crate::kernel::{Launch, launch};
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::ops::indexing::{TryIndexOp, argmax_axis};
-use mlx_rs::ops::{concatenate, cumsum, full, select, sort_axis, sum_axis, zeros};
-use mlx_rs::{Array, Dtype};
+use crate::mlx::error::{Exception, Result};
+use crate::mlx::ops::indexing::{TryIndexOp, argmax_axis};
+use crate::mlx::ops::{concatenate, cumsum, full, select, sort_axis, sum_axis, zeros};
+use crate::mlx::{Array, Dtype};
 
 pub use dash_contract::sample::SampleOptions;
 
@@ -144,7 +144,7 @@ fn noise(seed: u64, offset: u64, [b, v]: [i32; 2], words: bool) -> Result<Array>
         grid: ((groups + 255) / 256 * 256, b, 1),
         thread_group: (256, 1, 1),
         outputs: vec![(vec![b, v], Dtype::Float32)],
-        template: vec![("WORDS".into(), mlx_rs::fast::TemplateArg::Bool(words))],
+        template: vec![("WORDS".into(), crate::mlx::fast::TemplateArg::Bool(words))],
         init_value: None,
     };
     let params = Array::from_slice(
@@ -239,7 +239,7 @@ fn pairs_cumsum(x: &Array) -> Result<Array> {
         let len = level.shape()[1];
         let left = level.reshape(&[b, len / 2, 2])?.try_index((.., .., 0))?;
         let right = prefix.add(&left)?;
-        prefix = mlx_rs::ops::stack(&[prefix, right], 2)?.reshape(&[b, len])?;
+        prefix = crate::mlx::ops::stack(&[prefix, right], 2)?.reshape(&[b, len])?;
     }
     prefix.add(&levels[0])?.try_index((.., 0..v))
 }

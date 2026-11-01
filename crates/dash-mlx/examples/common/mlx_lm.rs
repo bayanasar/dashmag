@@ -26,11 +26,11 @@
 //! DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 //! OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use mlx_rs::error::Result;
-use mlx_rs::fast::{
+use dash_mlx::mlx::error::Result;
+use dash_mlx::mlx::fast::{
     MetalKernel, MetalKernelApplyOptions, MetalKernelOptions, MetalKernelOutput, TemplateArg,
 };
-use mlx_rs::{Array, Dtype};
+use dash_mlx::mlx::{Array, Dtype};
 use std::cell::OnceCell;
 
 const SOURCE: &str = "
@@ -189,7 +189,8 @@ pub fn prepare(q: &Array, k: &Array, g: &Array) -> Result<[Array; 3]> {
     let inv_scale = 1.0 / dk.sqrt();
     // Python's scalars take the array's dtype; an f32 array here would promote bf16 to f32.
     let scalar = |x: f32| Array::from_f32(x).as_dtype(q.dtype());
-    let q = mlx_rs::fast::rms_norm(q, None, 1e-6)?.multiply(scalar(inv_scale * inv_scale)?)?;
-    let k = mlx_rs::fast::rms_norm(k, None, 1e-6)?.multiply(scalar(inv_scale)?)?;
+    let q =
+        dash_mlx::mlx::fast::rms_norm(q, None, 1e-6)?.multiply(scalar(inv_scale * inv_scale)?)?;
+    let k = dash_mlx::mlx::fast::rms_norm(k, None, 1e-6)?.multiply(scalar(inv_scale)?)?;
     Ok([q, k, g.exp()?.as_dtype(Dtype::Float32)?])
 }

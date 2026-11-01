@@ -53,12 +53,12 @@
 //! | 8192 | 127.9-130.1 ms, +1549 MiB | 585.2-620.1 ms, +1672 MiB |
 
 use crate::kernel::{Launch, launch};
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::fast::TemplateArg;
-use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::ops::{arange, concatenate, full, maximum, select, zeros};
-use mlx_rs::transforms::custom_vjp;
-use mlx_rs::{Array, Dtype};
+use crate::mlx::error::{Exception, Result};
+use crate::mlx::fast::TemplateArg;
+use crate::mlx::ops::indexing::TryIndexOp;
+use crate::mlx::ops::{arange, concatenate, full, maximum, select, zeros};
+use crate::mlx::transforms::custom_vjp;
+use crate::mlx::{Array, Dtype};
 use std::sync::atomic::Ordering;
 
 /// Vocabulary tokens per chunk when [`LogprobOptions::vocab_chunk`] is 0: the fastest and leanest

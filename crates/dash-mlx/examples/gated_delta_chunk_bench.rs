@@ -23,7 +23,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn main() -> mlx_rs::error::Result<()> {
+fn main() -> dash_mlx::mlx::error::Result<()> {
     bench::run()
 }
 
@@ -43,10 +43,10 @@ mod bench {
         ChunkGatedDeltaOptions, chunk_gated_delta_rule_autograd, chunk_gated_delta_rule_parts,
     };
     use dash_mlx::gated_delta::recurrent::{GatedDeltaStepOptions, gated_delta_step};
-    use mlx_rs::error::Result;
-    use mlx_rs::ops::swap_axes;
-    use mlx_rs::transforms::{eval, fallible_vjp};
-    use mlx_rs::{Array, Dtype};
+    use dash_mlx::mlx::error::Result;
+    use dash_mlx::mlx::ops::swap_axes;
+    use dash_mlx::mlx::transforms::{eval, fallible_vjp};
+    use dash_mlx::mlx::{Array, Dtype};
 
     const T: i32 = 6144;
     const H: i32 = 16;
@@ -79,10 +79,10 @@ mod bench {
         let k = normal(&[1, T, H, D], 1.0, bf16, 1)?;
         let v = normal(&[1, T, H, D], 1.0, bf16, 2)?;
         // The model's distributions: g = -softplus(x) * 0.4 <= 0, beta = sigmoid(x).
-        let g = mlx_rs::nn::softplus(normal(&[1, T, H], 1.0, Dtype::Float32, 3)?)?
+        let g = dash_mlx::mlx::nn::softplus(normal(&[1, T, H], 1.0, Dtype::Float32, 3)?)?
             .multiply(Array::from_f32(-0.4))?;
-        let beta =
-            mlx_rs::ops::sigmoid(normal(&[1, T, H], 1.0, Dtype::Float32, 4)?)?.as_dtype(bf16)?;
+        let beta = dash_mlx::mlx::ops::sigmoid(normal(&[1, T, H], 1.0, Dtype::Float32, 4)?)?
+            .as_dtype(bf16)?;
         let h0 = normal(&[1, H, D, D], 0.1, Dtype::Float32, 5)?;
         let d_out = normal(&[1, T, H, D], 1.0, bf16, 6)?;
         let d_state = normal(&[1, H, D, D], 1.0, Dtype::Float32, 7)?;

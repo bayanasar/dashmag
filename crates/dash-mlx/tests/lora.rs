@@ -17,11 +17,10 @@
 #![cfg(target_os = "macos")]
 
 use dash_mlx::lora::{DEFAULT_ADAPTER, Lora, LoraLinear, set_adapter};
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::macros::ModuleParameters;
-use mlx_rs::module::{Module, ModuleParameters};
-use mlx_rs::transforms::fallible_vjp;
-use mlx_rs::{Array, Dtype};
+use dash_mlx::mlx::error::{Exception, Result};
+use dash_mlx::mlx::module::{Module, ModuleParameters};
+use dash_mlx::mlx::transforms::fallible_vjp;
+use dash_mlx::mlx::{Array, Dtype};
 use safetensors::{Dtype as StDtype, SafeTensors};
 use std::collections::HashMap;
 
@@ -158,7 +157,7 @@ fn one_layer_matches_peft() -> Result<()> {
                 .multiply(gy.as_dtype(Dtype::Float32)?)?
                 .sum(None)
         };
-        let (_, grads) = mlx_rs::nn::value_and_grad(loss)(&mut layer, (&x, &gy))?;
+        let (_, grads) = dash_mlx::mlx::nn::value_and_grad(loss)(&mut layer, (&x, &gy))?;
         let mut names: Vec<_> = grads.keys().map(|k| k.to_string()).collect();
         names.sort();
         assert_eq!(
@@ -174,34 +173,37 @@ fn one_layer_matches_peft() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone)]
 struct Block {
-    #[param]
     q_proj: LoraLinear,
-    #[param]
     v_proj: LoraLinear,
-    #[param]
     o_proj: LoraLinear,
 }
+
+dash_mlx::module_parameters!(Block {
+    q_proj,
+    v_proj,
+    o_proj
+});
 
 impl Block {
     fn forward(&mut self, x: &Array) -> Result<Array> {
         let q = self.q_proj.forward(x)?;
         // torch's silu on bf16 computes in f32 and rounds once; so does this.
-        let s = mlx_rs::nn::silu(q.as_dtype(Dtype::Float32)?)?.as_dtype(q.dtype())?;
+        let s = dash_mlx::mlx::nn::silu(q.as_dtype(Dtype::Float32)?)?.as_dtype(q.dtype())?;
         let h = s.multiply(self.v_proj.forward(x)?)?;
         x.add(self.o_proj.forward(&h)?)
     }
 }
 
 /// The model's code knows nothing of adapters: each layer's forward pass, as without them.
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone)]
 struct Tiny {
-    #[param]
     layers: Vec<Block>,
-    #[param]
     head: LoraLinear,
 }
+
+dash_mlx::module_parameters!(Tiny { layers, head });
 
 impl Tiny {
     fn forward(&mut self, x: &Array) -> Result<Array> {
@@ -266,7 +268,7 @@ fn apply(model: &mut Tiny, dir: &str, name: &str, trainable: bool) -> Result<()>
         if let (Some(a), Some(b)) = (factors.get(&key("A")), factors.get(&key("B"))) {
             let mut lora = Lora::new(a, b, scale)?;
             if !trainable {
-                lora.freeze_parameters(true);
+                lora.freeze_parameters();
             }
             layer.insert_adapter(name, lora)?;
         }
@@ -292,12 +294,12 @@ fn both(f: &HashMap<String, Array>, prec: &str) -> Result<Tiny> {
 }
 
 fn kl_loss(logits: &Array, reference: &Array, targets: &Array) -> Result<Array> {
-    let logp = mlx_rs::nn::log_softmax(logits, 1)?;
+    let logp = dash_mlx::mlx::nn::log_softmax(logits, 1)?;
     let ce = logp
         .take_along_axis(targets.expand_dims(1)?, 1)?
         .mean(None)?
         .negative()?;
-    let refp = mlx_rs::nn::log_softmax(reference, 1)?;
+    let refp = dash_mlx::mlx::nn::log_softmax(reference, 1)?;
     let kl = logp
         .exp()?
         .multiply(logp.subtract(&refp)?)?
@@ -334,13 +336,13 @@ fn every_layer_switches_and_trains_against_the_reference_as_peft_does() -> Resul
         }
         // The reference's logits, then the policy's loss and its gradients.
         set_adapter(model.lora_layers(), Some(REFERENCE));
-        let reference = mlx_rs::stop_gradient(&model.forward(&x)?)?;
+        let reference = dash_mlx::mlx::stop_gradient(&model.forward(&x)?)?;
         set_adapter(model.lora_layers(), Some(DEFAULT_ADAPTER));
         let loss = |model: &mut Tiny,
                     (x, reference, targets): (&Array, &Array, &Array)|
          -> Result<Array> { kl_loss(&model.forward(x)?, reference, targets) };
         let (value, grads) =
-            mlx_rs::nn::value_and_grad(loss)(&mut model, (&x, &reference, &targets))?;
+            dash_mlx::mlx::nn::value_and_grad(loss)(&mut model, (&x, &reference, &targets))?;
         check(
             &format!("{prec} loss"),
             &value,

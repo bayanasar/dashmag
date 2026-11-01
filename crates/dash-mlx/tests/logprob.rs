@@ -19,9 +19,9 @@ use common::{Mlx, Reference, require_ieee_f32_matmul};
 use dash_conformance::logprob::{self as conformance, Case, SMALL_CHUNKS};
 use dash_conformance::{Adapter, DType};
 use dash_mlx::logprob::{ChosenLogprob, LogprobOptions, chosen_logprob, chosen_logprob_reference};
-use mlx_rs::error::Result;
-use mlx_rs::transforms::fallible_vjp;
-use mlx_rs::{Array, Dtype};
+use dash_mlx::mlx::error::Result;
+use dash_mlx::mlx::transforms::fallible_vjp;
+use dash_mlx::mlx::{Array, Dtype};
 use std::sync::{Mutex, MutexGuard};
 
 /// One test at a time: they read the probe counters, and share the GPU's default stream.
@@ -138,7 +138,7 @@ fn kernels_match_the_reference_at_scale() -> Result<()> {
     require_ieee_f32_matmul();
     let (n, d, v) = (700, 1024, 20_000);
     let normal = |shape: &[i32], seed: u64| -> Result<Array> {
-        mlx_rs::random::normal::<f32>(shape, None, None, &mlx_rs::random::key(seed)?)
+        dash_mlx::mlx::random::normal::<f32>(shape, None, None, &dash_mlx::mlx::random::key(seed)?)
     };
     let hidden = normal(&[n, d], 7)?;
     let weight = normal(&[v, d], 8)?.multiply(Array::from_f32(0.05))?;

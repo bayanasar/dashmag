@@ -13,7 +13,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn main() -> mlx_rs::error::Result<()> {
+fn main() -> dash_mlx::mlx::error::Result<()> {
     bench::run()
 }
 
@@ -26,11 +26,11 @@ mod common;
 mod bench {
     use crate::common::{measure, normal, report};
     use dash_mlx::logprob::{LogprobOptions, chosen_logprob, vocab_chunk};
-    use mlx_rs::error::Result;
-    use mlx_rs::ops::{ones, softmax_axis, sum_axis, zeros};
-    use mlx_rs::stop_gradient;
-    use mlx_rs::transforms::{eval, fallible_vjp};
-    use mlx_rs::{Array, Dtype};
+    use dash_mlx::mlx::error::Result;
+    use dash_mlx::mlx::ops::{ones, softmax_axis, sum_axis, zeros};
+    use dash_mlx::mlx::stop_gradient;
+    use dash_mlx::mlx::transforms::{eval, fallible_vjp};
+    use dash_mlx::mlx::{Array, Dtype};
 
     const D: i32 = 1024;
 

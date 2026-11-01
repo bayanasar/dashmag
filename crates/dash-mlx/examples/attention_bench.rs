@@ -11,7 +11,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn main() -> mlx_rs::error::Result<()> {
+fn main() -> dash_mlx::mlx::error::Result<()> {
     bench::run()
 }
 
@@ -23,10 +23,10 @@ mod common;
 mod bench {
     use crate::common::{measure, normal, report};
     use dash_mlx::attention::{AttentionOptions, attention_decode, causal_attention};
-    use mlx_rs::error::Result;
-    use mlx_rs::fast::{ScaledDotProductAttentionMask, scaled_dot_product_attention};
-    use mlx_rs::transforms::{eval, fallible_vjp};
-    use mlx_rs::{Array, Dtype};
+    use dash_mlx::mlx::error::Result;
+    use dash_mlx::mlx::fast::{ScaledDotProductAttentionMask, scaled_dot_product_attention};
+    use dash_mlx::mlx::transforms::{eval, fallible_vjp};
+    use dash_mlx::mlx::{Array, Dtype};
 
     pub fn run() -> Result<()> {
         let size = |name: &str, default: i32| {

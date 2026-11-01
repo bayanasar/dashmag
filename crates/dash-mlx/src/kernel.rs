@@ -3,11 +3,11 @@
 //! source each time it is made, which on a decoding step, every layer every token, is host time
 //! spent again and again.
 
-use mlx_rs::error::Result;
-use mlx_rs::fast::{
+use crate::mlx::error::Result;
+use crate::mlx::fast::{
     MetalKernel, MetalKernelApplyOptions, MetalKernelOptions, MetalKernelOutput, TemplateArg,
 };
-use mlx_rs::{Array, Dtype};
+use crate::mlx::{Array, Dtype};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -78,7 +78,7 @@ pub(crate) struct Launch {
 ///
 /// [`MetalKernel::apply`]'s: for these inputs and this launch, the kernel reads and writes only
 /// inside its buffers, writes no input, writes every output element unless `init_value` is set,
-/// and has no conflicting accesses.
+/// writes only values valid for the output dtype, and has no conflicting accesses.
 pub(crate) unsafe fn launch(
     kernel: &MetalKernel,
     inputs: &[Array],

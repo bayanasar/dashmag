@@ -6,16 +6,16 @@
 //! written out as f32. MLX makes arrays on no device, so the adapter's device is `()`:
 //! `adapter.apply(layers, &())`.
 
+use crate::mlx::module::ModuleParameters;
+use crate::mlx::{Array, Dtype};
 pub use dash_peft::{
     AdapterLayer, ApplyOptions, CONFIG_FILE, FactorDtype, HostTensor, LoraWeights,
     PEFT_FORMAT_VERSION, PeftAdapter, PeftConfig, PeftError, WEIGHTS_FILE,
 };
-use mlx_rs::module::ModuleParameters;
-use mlx_rs::{Array, Dtype};
 
 use crate::lora::{Lora, LoraLinear};
 
-fn mlx(e: mlx_rs::error::Exception) -> PeftError {
+fn mlx(e: crate::mlx::error::Exception) -> PeftError {
     PeftError::Invalid(e.what().to_string())
 }
 
@@ -44,7 +44,7 @@ impl AdapterLayer for LoraLinear {
             .map_err(mlx)?
             .with_dropout(dropout as f32);
         if !trainable {
-            lora.freeze_parameters(true);
+            lora.freeze_parameters();
         }
         Ok(lora)
     }

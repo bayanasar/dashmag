@@ -29,12 +29,12 @@
 //! too wide for a slice to fit, run the operations.
 
 use crate::kernel::{Launch, launch};
-use mlx_rs::error::Result;
-use mlx_rs::fast::TemplateArg;
-use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::ops::{addmm, stack, swap_axes, zeros_like};
-use mlx_rs::transforms::custom_vjp;
-use mlx_rs::{Array, Dtype};
+use crate::mlx::error::Result;
+use crate::mlx::fast::TemplateArg;
+use crate::mlx::ops::indexing::TryIndexOp;
+use crate::mlx::ops::{addmm, stack, swap_axes, zeros_like};
+use crate::mlx::transforms::custom_vjp;
+use crate::mlx::{Array, Dtype};
 
 use super::chunk::{CHUNK_SIZE, Path, counters};
 

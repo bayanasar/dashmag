@@ -9,18 +9,21 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-# Not published until an mlx-rs release carries the wrappers it calls: until then mlx-rs and
-# mlx-sys are git dependencies, which crates.io does not take (README).
 publish = false
+# Exposes the directory of a prebuilt MLX to dependents, as DEP_MLX_LIB_DIR (README).
+links = "mlx"
 
 # MLX runs on Apple silicon only. Elsewhere the crate is empty, so the workspace builds on every
-# target without it. mlx-sys is named directly for its `DEP_MLX_LIB_DIR` (build.rs).
+# target without it.
 [target.'cfg(target_os = "macos")'.dependencies]
 dash-contract = { workspace = true }
 dash-peft = { workspace = true }
 half = "2"
-mlx-rs = { workspace = true }
-mlx-sys = { workspace = true }
+
+# The bindings to mlx-c (`mlx-c/`), and mlx-c itself (build.rs).
+[target.'cfg(target_os = "macos")'.build-dependencies]
+bindgen = "0.73.2"
+cmake = "0.1"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 dash-conformance = { workspace = true }

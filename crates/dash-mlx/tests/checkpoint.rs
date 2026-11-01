@@ -9,27 +9,30 @@
 
 use dash_mlx::checkpoint;
 use dash_mlx::lora::{Lora, LoraLinear};
-use mlx_rs::error::Result;
-use mlx_rs::macros::ModuleParameters;
-use mlx_rs::module::{Module, ModuleParameters};
-use mlx_rs::transforms::fallible_vjp;
-use mlx_rs::{Array, Dtype};
+use dash_mlx::mlx::error::Result;
+use dash_mlx::mlx::module::{Module, ModuleParameters};
+use dash_mlx::mlx::transforms::fallible_vjp;
+use dash_mlx::mlx::{Array, Dtype};
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone)]
 struct Block {
-    #[param]
     up: LoraLinear,
-    #[param]
     gate: LoraLinear,
-    #[param]
     down: LoraLinear,
 }
+
+dash_mlx::module_parameters!(Block { up, gate, down });
 
 impl Block {
     fn new(d: i32, hidden: i32, dtype: Dtype, seed: u64) -> Result<Self> {
         let normal = |shape: &[i32], scale: f32, seed: u64| -> Result<Array> {
-            mlx_rs::random::normal::<f32>(shape, None, None, &mlx_rs::random::key(seed)?)?
-                .multiply(Array::from_f32(scale))
+            dash_mlx::mlx::random::normal::<f32>(
+                shape,
+                None,
+                None,
+                &dash_mlx::mlx::random::key(seed)?,
+            )?
+            .multiply(Array::from_f32(scale))
         };
         let layer = |out: i32, inp: i32, seed: u64| -> Result<LoraLinear> {
             LoraLinear::frozen(&normal(&[out, inp], 0.05, seed)?.as_dtype(dtype)?)?.with_lora(
@@ -49,16 +52,17 @@ impl Block {
 
     fn forward(&mut self, x: &Array) -> Result<Array> {
         let g = self.gate.forward(x)?;
-        let s = mlx_rs::nn::silu(g.as_dtype(Dtype::Float32)?)?.as_dtype(g.dtype())?;
+        let s = dash_mlx::mlx::nn::silu(g.as_dtype(Dtype::Float32)?)?.as_dtype(g.dtype())?;
         x.add(self.down.forward(&s.multiply(self.up.forward(x)?)?)?)
     }
 }
 
-#[derive(Debug, Clone, ModuleParameters)]
+#[derive(Debug, Clone)]
 struct Stack {
-    #[param]
     layers: Vec<Block>,
 }
+
+dash_mlx::module_parameters!(Stack { layers });
 
 fn bits(a: &Array) -> Vec<u32> {
     let a = a.as_dtype(Dtype::Float32).unwrap().contiguous().unwrap();
@@ -69,7 +73,6 @@ fn bits(a: &Array) -> Vec<u32> {
 fn by_key(stack: &Stack) -> std::collections::BTreeMap<String, Vec<u32>> {
     stack
         .parameters()
-        .flatten()
         .into_iter()
         .map(|(k, v)| (k.to_string(), bits(v)))
         .collect()
@@ -84,10 +87,20 @@ fn gives_plain_autodiff_s_gradients_bit_for_bit() -> Result<()> {
                 .map(|i| Block::new(d, hidden, dtype, 100 * i as u64))
                 .collect::<Result<_>>()?,
         };
-        let x = mlx_rs::random::normal::<f32>(&[n, d], None, None, &mlx_rs::random::key(7)?)?
-            .as_dtype(dtype)?;
-        let gy = mlx_rs::random::normal::<f32>(&[n, d], None, None, &mlx_rs::random::key(8)?)?
-            .as_dtype(dtype)?;
+        let x = dash_mlx::mlx::random::normal::<f32>(
+            &[n, d],
+            None,
+            None,
+            &dash_mlx::mlx::random::key(7)?,
+        )?
+        .as_dtype(dtype)?;
+        let gy = dash_mlx::mlx::random::normal::<f32>(
+            &[n, d],
+            None,
+            None,
+            &dash_mlx::mlx::random::key(8)?,
+        )?
+        .as_dtype(dtype)?;
 
         // Plain autodiff over the whole stack: the parameters' gradients, and the input's.
         let loss = |stack: &mut Stack, (x, gy): (&Array, &Array)| -> Result<Array> {
@@ -99,7 +112,7 @@ fn gives_plain_autodiff_s_gradients_bit_for_bit() -> Result<()> {
                 .multiply(gy.as_dtype(Dtype::Float32)?)?
                 .sum(None)
         };
-        let (_, plain) = mlx_rs::nn::value_and_grad(loss)(&mut stack, (&x, &gy))?;
+        let (_, plain) = dash_mlx::mlx::nn::value_and_grad(loss)(&mut stack, (&x, &gy))?;
         let dx_plain = fallible_vjp(
             |p: &[Array]| {
                 let mut stack = stack.clone();

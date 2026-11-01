@@ -14,10 +14,10 @@ mod common;
 use common::{Mlx, require_ieee_f32_matmul};
 use dash_conformance::gated_delta_chunk::{self, BF16_TOL};
 use dash_mlx::gated_delta::chunk::{ChunkGatedDeltaOptions, chunk_gated_delta_rule};
-use mlx_rs::error::Result;
-use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::transforms::fallible_vjp;
-use mlx_rs::{Array, Dtype};
+use dash_mlx::mlx::error::Result;
+use dash_mlx::mlx::ops::indexing::TryIndexOp;
+use dash_mlx::mlx::transforms::fallible_vjp;
+use dash_mlx::mlx::{Array, Dtype};
 use std::sync::{Mutex, MutexGuard};
 
 /// One test at a time: they read the kernel counters, and share the GPU's default stream.
@@ -62,17 +62,17 @@ fn bf16_matches_torch_at_f64() {
 /// `beta = sigmoid(x)`.
 fn workload(t: i32, h: i32, d: i32, dtype: Dtype) -> Vec<Array> {
     let normal = |shape: &[i32], scale: f32, seed: u64| {
-        let key = mlx_rs::random::key(seed).unwrap();
-        mlx_rs::random::normal::<f32>(shape, None, None, &key)
+        let key = dash_mlx::mlx::random::key(seed).unwrap();
+        dash_mlx::mlx::random::normal::<f32>(shape, None, None, &key)
             .unwrap()
             .multiply(Array::from_f32(scale))
             .unwrap()
     };
-    let g = mlx_rs::nn::softplus(normal(&[1, t, h], 1.0, 3))
+    let g = dash_mlx::mlx::nn::softplus(normal(&[1, t, h], 1.0, 3))
         .unwrap()
         .multiply(Array::from_f32(-0.4))
         .unwrap();
-    let beta = mlx_rs::ops::sigmoid(normal(&[1, t, h], 1.0, 4)).unwrap();
+    let beta = dash_mlx::mlx::ops::sigmoid(normal(&[1, t, h], 1.0, 4)).unwrap();
     vec![
         normal(&[1, t, h, d], 1.0, 0).as_dtype(dtype).unwrap(),
         normal(&[1, t, h, d], 1.0, 1).as_dtype(dtype).unwrap(),
@@ -155,7 +155,7 @@ fn kernels_repeat_bit_for_bit() -> Result<()> {
     let _serial = serial();
     use dash_mlx::gated_delta::chunk::counters;
     use dash_mlx::gated_delta::recurrent::{GatedDeltaStepOptions, gated_delta_step};
-    use mlx_rs::ops::broadcast_to;
+    use dash_mlx::mlx::ops::broadcast_to;
     use std::sync::atomic::Ordering;
     let bits = |arrays: &[Array]| -> Vec<Vec<u32>> {
         arrays
@@ -193,7 +193,7 @@ fn kernels_repeat_bit_for_bit() -> Result<()> {
                     Ok(vec![out, state.expect("asked for")])
                 };
                 let (outputs, grads) = fallible_vjp(rule, &primals, &cotangents)?;
-                Ok::<_, mlx_rs::error::Exception>(bits(&[outputs, grads].concat()))
+                Ok::<_, dash_mlx::mlx::error::Exception>(bits(&[outputs, grads].concat()))
             };
             let before = [
                 &counters::INVERSE_KERNEL,
@@ -235,7 +235,7 @@ fn kernels_repeat_bit_for_bit() -> Result<()> {
             let step = || {
                 let (out, next) =
                     gated_delta_step(&q, &k, &v, &g, &beta, &state, cu_seqlens, options)?;
-                Ok::<_, mlx_rs::error::Exception>(bits(&[out, next]))
+                Ok::<_, dash_mlx::mlx::error::Exception>(bits(&[out, next]))
             };
             assert!(
                 step()? == step()?,

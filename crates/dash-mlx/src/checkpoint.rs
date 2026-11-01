@@ -23,10 +23,10 @@
 //! repeated at several depths) gets one gradient per layer; the caller adds them, as plain autodiff
 //! would.
 
-use mlx_rs::Array;
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::module::{FlattenedModuleParam, ModuleParameters};
-use mlx_rs::transforms::{eval, fallible_vjp};
+use crate::mlx::Array;
+use crate::mlx::error::{Exception, Result};
+use crate::mlx::module::{FlattenedModuleParam, ModuleParameters};
+use crate::mlx::transforms::{eval, fallible_vjp};
 use std::rc::Rc;
 
 /// The layers' inputs [`forward`] kept, one per layer, for [`backward`].
@@ -54,11 +54,11 @@ where
     F: FnMut(&mut L, &Array) -> Result<Array>,
 {
     let mut inputs = Vec::with_capacity(layers.len());
-    let mut h = mlx_rs::stop_gradient(x)?;
+    let mut h = crate::mlx::stop_gradient(x)?;
     for layer in layers.iter_mut() {
         eval([&h])?;
         inputs.push(h.clone());
-        h = mlx_rs::stop_gradient(f(layer, &h)?)?;
+        h = crate::mlx::stop_gradient(f(layer, &h)?)?;
     }
     eval([&h])?;
     Ok((h, Saved { inputs }))
@@ -90,7 +90,6 @@ where
     for (i, layer) in layers.iter_mut().enumerate().rev() {
         let params: Vec<(Rc<str>, Array)> = layer
             .trainable_parameters()
-            .flatten()
             .into_iter()
             .map(|(k, v)| (k, v.clone()))
             .collect();
