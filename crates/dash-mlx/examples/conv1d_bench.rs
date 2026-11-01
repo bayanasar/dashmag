@@ -12,7 +12,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn main() -> mlx_rs::error::Result<()> {
+fn main() -> dash_mlx::mlx::error::Result<()> {
     bench::run()
 }
 
@@ -27,11 +27,11 @@ mod bench {
         Activation, CausalConv1dOptions, CausalConv1dStepOptions, causal_conv1d,
         causal_conv1d_update,
     };
-    use mlx_rs::error::Result;
-    use mlx_rs::ops::indexing::TryIndexOp;
-    use mlx_rs::ops::{concatenate, conv1d, expand_dims};
-    use mlx_rs::transforms::{eval, fallible_vjp};
-    use mlx_rs::{Array, Dtype};
+    use dash_mlx::mlx::error::Result;
+    use dash_mlx::mlx::ops::indexing::TryIndexOp;
+    use dash_mlx::mlx::ops::{concatenate, conv1d, expand_dims};
+    use dash_mlx::mlx::transforms::{eval, fallible_vjp};
+    use dash_mlx::mlx::{Array, Dtype};
 
     const T: i32 = 6144;
     const C: i32 = 6144;
@@ -53,7 +53,7 @@ mod bench {
     /// depthwise `conv1d` in that dtype, then SiLU.
     fn mlx_lm_conv(x: &Array, state: &Array, weight: &Array) -> Result<Array> {
         let input = concatenate(&[state.clone(), x.clone()], 1)?;
-        mlx_rs::nn::silu(conv1d(&input, expand_dims(weight, 2)?, 1, 0, 1, C)?)
+        dash_mlx::mlx::nn::silu(conv1d(&input, expand_dims(weight, 2)?, 1, 0, 1, C)?)
     }
 
     fn dash_mlx_step(token: &Array, state: &Array, weight: &Array) -> Result<[Array; 2]> {
@@ -66,7 +66,7 @@ mod bench {
     /// next state cut from the same concatenation.
     fn mlx_lm_step(token: &Array, state: &Array, weight: &Array) -> Result<[Array; 2]> {
         let input = concatenate(&[state.clone(), expand_dims(token, 1)?], 1)?;
-        let out = mlx_rs::nn::silu(conv1d(&input, expand_dims(weight, 2)?, 1, 0, 1, C)?)?;
+        let out = dash_mlx::mlx::nn::silu(conv1d(&input, expand_dims(weight, 2)?, 1, 0, 1, C)?)?;
         Ok([out, input.try_index((.., 1.., ..))?.contiguous()?])
     }
 

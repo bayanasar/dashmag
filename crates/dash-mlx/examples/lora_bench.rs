@@ -1,6 +1,6 @@
 //! A LoRA'd linear layer at the workload's shapes: 6144 tokens of 1024 in bf16 through a frozen
 //! bf16 `[6144, 1024]` weight with a rank-16 f32 adapter; forward, and forward and backward to
-//! the input and the factors. Against mlx-lm's `LoRALinear` (its forward pass written in mlx-rs:
+//! the input and the factors. Against mlx-lm's `LoRALinear` (its forward pass written out here:
 //! `linear(x) + (scale * ((x @ lora_a) @ lora_b)).astype(x.dtype)`, the factors f32), timed in
 //! the same process.
 //!
@@ -12,7 +12,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn main() -> mlx_rs::error::Result<()> {
+fn main() -> dash_mlx::mlx::error::Result<()> {
     bench::run()
 }
 
@@ -24,10 +24,10 @@ mod common;
 mod bench {
     use crate::common::{measure, normal, report};
     use dash_mlx::lora::{Lora, LoraLinear};
-    use mlx_rs::error::Result;
-    use mlx_rs::module::Module;
-    use mlx_rs::transforms::{eval, fallible_vjp};
-    use mlx_rs::{Array, Dtype};
+    use dash_mlx::mlx::error::Result;
+    use dash_mlx::mlx::module::Module;
+    use dash_mlx::mlx::transforms::{eval, fallible_vjp};
+    use dash_mlx::mlx::{Array, Dtype};
 
     const N: i32 = 6144;
     const IN: i32 = 1024;

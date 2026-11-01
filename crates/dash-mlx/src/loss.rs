@@ -38,12 +38,12 @@
 
 use crate::kernel::{Launch, launch};
 use crate::logprob::{State, Vocabulary};
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::fast::TemplateArg;
-use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::ops::{arange, broadcast_to, concatenate, select, zeros};
-use mlx_rs::transforms::custom_vjp;
-use mlx_rs::{Array, Dtype};
+use crate::mlx::error::{Exception, Result};
+use crate::mlx::fast::TemplateArg;
+use crate::mlx::ops::indexing::TryIndexOp;
+use crate::mlx::ops::{arange, broadcast_to, concatenate, select, zeros};
+use crate::mlx::transforms::custom_vjp;
+use crate::mlx::{Array, Dtype};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -430,25 +430,25 @@ impl Loss {
     }
 }
 
-/// `a`, evaluated only once `after` is: MLX's `depends`, which mlx-rs does not wrap. Evaluation
-/// order alone; the values are `a`'s.
+/// `a`, evaluated only once `after` is: MLX's `depends`. Evaluation order alone; the values are
+/// `a`'s.
 fn depends(a: &Array, after: &Array) -> Result<Array> {
     let (inputs, dependencies) = ([a.as_ptr()], [after.as_ptr()]);
     // SAFETY: both vectors are made from live arrays, whose handles mlx-c copies; `res` and `out`
     // are new handles mlx-c fills; each handle made here is freed once, `out` by the Array it
     // becomes.
     unsafe {
-        let inputs = mlx_sys::mlx_vector_array_new_data(inputs.as_ptr(), 1);
-        let dependencies = mlx_sys::mlx_vector_array_new_data(dependencies.as_ptr(), 1);
-        let mut res = mlx_sys::mlx_vector_array_new();
-        let mut status = mlx_sys::mlx_depends(&mut res, inputs, dependencies);
-        mlx_sys::mlx_vector_array_free(inputs);
-        mlx_sys::mlx_vector_array_free(dependencies);
-        let mut out = mlx_sys::mlx_array_new();
+        let inputs = crate::mlx::sys::mlx_vector_array_new_data(inputs.as_ptr(), 1);
+        let dependencies = crate::mlx::sys::mlx_vector_array_new_data(dependencies.as_ptr(), 1);
+        let mut res = crate::mlx::sys::mlx_vector_array_new();
+        let mut status = crate::mlx::sys::mlx_depends(&mut res, inputs, dependencies);
+        crate::mlx::sys::mlx_vector_array_free(inputs);
+        crate::mlx::sys::mlx_vector_array_free(dependencies);
+        let mut out = crate::mlx::sys::mlx_array_new();
         if status == 0 {
-            status = mlx_sys::mlx_vector_array_get(&mut out, res, 0);
+            status = crate::mlx::sys::mlx_vector_array_get(&mut out, res, 0);
         }
-        mlx_sys::mlx_vector_array_free(res);
+        crate::mlx::sys::mlx_vector_array_free(res);
         let out = Array::from_ptr(out);
         match status {
             0 => Ok(out),
@@ -570,7 +570,7 @@ fn checked(
                 },
             )?;
             let out = op.apply(&[hidden.clone(), weight.clone()])?;
-            let after = mlx_rs::stop_gradient(&out[0])?;
+            let after = crate::mlx::stop_gradient(&out[0])?;
             let zero = gate.apply(&[weight.clone(), after])?.remove(0);
             let gated = |x: &Array| x.add(&zero);
             (gated(&out[0])?, gated(&out[1])?, gated(&out[2])?)

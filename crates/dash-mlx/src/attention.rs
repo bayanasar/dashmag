@@ -41,7 +41,7 @@
 //!   Smaller command buffers help (+1598 MiB with `MLX_MAX_OPS_PER_BUFFER=2`, and faster), but MLX
 //!   reads that setting once per process.
 //! - When the caller needs neither the log-sum-exp nor dash-ops' bf16 bound, and the mask is none,
-//!   causal or key padding, MLX's fused attention (`mlx_rs::fast::scaled_dot_product_attention`)
+//!   causal or key padding, MLX's fused attention (`crate::mlx::fast::scaled_dot_product_attention`)
 //!   is the better call: its forward pass takes a quarter of the time and holds no tiles, its
 //!   backward pass about as long with a little less memory (measured, README). A window or packed
 //!   sequences it takes only as a materialised `Tq x Tk` mask.
@@ -58,14 +58,14 @@
 //!   of 32 or above 512).
 
 use crate::kernel::{Launch, launch};
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::fast::{ScaledDotProductAttentionMask, TemplateArg, scaled_dot_product_attention};
-use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::ops::{
+use crate::mlx::error::{Exception, Result};
+use crate::mlx::fast::{ScaledDotProductAttentionMask, TemplateArg, scaled_dot_product_attention};
+use crate::mlx::ops::indexing::TryIndexOp;
+use crate::mlx::ops::{
     arange, broadcast_to, concatenate, full, maximum, minimum, pad, select, sum_axis, zeros,
 };
-use mlx_rs::transforms::{custom_vjp, fallible_vjp};
-use mlx_rs::{Array, Dtype};
+use crate::mlx::transforms::{custom_vjp, fallible_vjp};
+use crate::mlx::{Array, Dtype};
 use std::sync::atomic::Ordering;
 
 /// Keys a block of the blocked passes takes.
@@ -670,7 +670,7 @@ fn blocked_backward(
             let mut dq_tile = dscores.matmul(&kb)?.multiply(&scale)?;
             if (q0, q1) != (b0, b1) {
                 let widths = [(0, 0), (0, 0), (0, 0), (q0 - b0, b1 - q1), (0, 0)];
-                dq_tile = pad(&dq_tile, &widths[..], None, None)?;
+                dq_tile = pad(&dq_tile, &widths[..])?;
             }
             dqs[block] = Some(add(dqs[block].take(), dq_tile)?);
         }
@@ -1050,7 +1050,7 @@ pub fn attention_decode(
         )?,
         None => zeros::<i32>(&[b])?,
     };
-    let range = mlx_rs::ops::stack(&[lo, hi], 1)?.as_dtype(Dtype::Int32)?;
+    let range = crate::mlx::ops::stack(&[lo, hi], 1)?.as_dtype(Dtype::Int32)?;
     let splits = ((s + 63) / 64).min((1024 + b * hkv - 1) / (b * hkv)).max(1);
     let scale = options.scale_for(d as usize);
     let lengths = cache_lengths.cloned();

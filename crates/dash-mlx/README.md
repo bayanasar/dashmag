@@ -22,10 +22,11 @@ dash-lora's `metal` feature.
 | `peft` | PEFT's adapter files read into LoRA's layers and written out of them byte for byte, under a name, trainable or frozen | dash-peft's format and checks, shared with dash-lora; the factors f32 arrays |
 | `sample` | the next token drawn on the device, as dash-ops draws it: temperature, top-k, top-p and masked ids, the same Philox words and Gumbel variates, the token's log-probability under the model, the tempered distribution and the one drawn from | one kernel for the generator; the cuts and the draw MLX's operations |
 
-The operations build on three MLX functions: `checkpoint` and `custom_vjp`, which mlx-rs does not
-wrap yet and the workspace's mlx-rs adds (below), and `MetalKernel`, which mlx-rs 0.33.0 wraps.
-`tests/hooks.rs` holds each to plain MLX operations. `loss` also calls MLX's `depends`, which
-mlx-sys binds and mlx-rs does not wrap, to order its backward pass's products.
+The operations build on `src/mlx`, a thin layer over Apple's mlx-c (below): arrays, MLX's errors,
+the operations they call, Rust closures for `vjp`, `custom_vjp` and `checkpoint`, Metal kernels, and
+parameters by their paths. `tests/hooks.rs` holds `checkpoint`, `custom_vjp` and `MetalKernel` to
+plain MLX operations. `loss` also calls MLX's `depends`, through the bindings, to order its
+backward pass's products.
 
 Part of [Dashmag](https://github.com/bayanasar/dashmag). See the repository for the full picture.
 
@@ -197,13 +198,13 @@ masked ids, targets out of range and an ignored row; two runs give the same bits
 the log-probability and its gradient are `logprob`'s within the test's bound of 1e-6.
 
 The loss at the workload's shapes, 3072 rows of 1024 against a bf16 head of 248,320 tokens, the mean;
-against mlx-rs's `losses::CrossEntropy` over the whole logits as mlx-lm's trainer forms its loss
-(the head's bf16 product cast to f32), the range over two runs:
+against cross-entropy over the whole logits as mlx-lm's trainer forms its loss (the head's bf16
+product cast to f32), then through mlx-rs's `losses::CrossEntropy`, the range over two runs:
 
 | | forward | forward + backward, frozen head | forward + backward, head trained |
 |---|---|---|---|
 | dash-mlx, chunks of 3072 | 127-131 ms, +1118 MiB | 425-432 ms, +1158 MiB | 574-575 ms, +2638 MiB |
-| mlx-rs's `CrossEntropy`, the whole logits | 126 ms, +4365 MiB | 453-454 ms, +12378 MiB | 618-626 ms, +12863 MiB |
+| cross-entropy over the whole logits | 126 ms, +4365 MiB | 453-454 ms, +12378 MiB | 618-626 ms, +12863 MiB |
 | dash-mlx with `MLX_ENABLE_TF32=0` | 353 ms, +1118 MiB | 1080 ms, +1158 MiB | 1420 ms, +2638 MiB |
 
     cargo run --release -p dash-mlx --example loss_bench
@@ -397,20 +398,44 @@ both ways: 24.9 and 77.3 ms with it on, 24.9 and 76.1 ms off).
 
     MLX_ENABLE_TF32=0 cargo test -p dash-mlx
 
+## On mlx-c
+
+dash-mlx calls Apple's mlx-c directly. `mlx-c/` holds version 0.8.0 as Apple publishes it
+(`mlx-c/VENDORED.md`); `build.rs` compiles it against MLX and generates the bindings from its
+headers with bindgen; `src/mlx` is the thin layer over those bindings, just what the operations here
+call. A struct says which of its fields hold parameters with
+`module_parameters!(Block { up, gate, down });`, and the paths are as PEFT's and torch's state
+dictionaries name them.
+
+The layer replaced mlx-rs and mlx-sys without moving what the operations compute: on an Apple M6
+(32 GB) with a prebuilt MLX 0.32.4, `MLX_ENABLE_TF32=0 cargo test --locked -p dash-mlx -- --nocapture
+--test-threads=1` passes the same 88 tests as through mlx-rs, every one of the 2596 lines they print
+the same, and 6 of the layer's own beside them. The speed and memory figures above were measured
+through mlx-rs on the MLX version each names, and have not been taken again.
+
+Dispatching an operation costs what it did. `examples/dispatch_bench.rs`, a thousand dependent adds
+on `[1024]` f32, each process the median of five after three warm-up runs, on the same M6, MLX 0.32.4
+prebuilt, built in release, twelve processes through each in turn over two batches, the median of
+those and their range, per add:
+
+| | through mlx-rs | through `src/mlx` |
+|---|---|---|
+| one evaluation | 1.42 µs (1.39-3.08) | 1.40 µs (1.38-3.08) |
+| each add evaluated | 99.5 µs (98.9-100.1) | 99.7 µs (98.6-101.5) |
+
+    cargo run --release -p dash-mlx --example dispatch_bench
+
+The first two processes, straight after the builds and one through each, took 3.08 µs an add, and
+the other twenty-two 1.38 to 1.45. What makes those two slower has not been looked into.
+
 ## Building
 
-MLX runs on Apple silicon only; on other targets the crate is empty. mlx-rs and mlx-sys come from
-bayanasar/mlx-rs's `dashmag` branch, at the commit the workspace's `Cargo.toml` pins: upstream main
-(oxiglade/mlx-rs) with three branches merged: `feat/checkpoint-custom-vjp` adds `checkpoint` and
-`custom_vjp` to mlx-rs ([#422](https://github.com/oxiglade/mlx-rs/pull/422)),
-`feat/mlx-sys-prebuilt` lets mlx-sys link a prebuilt MLX
-([#424](https://github.com/oxiglade/mlx-rs/pull/424)), and `feat/mlx-c-0.8.0`, not yet proposed
-upstream, moves mlx-c to 0.8.0 and MLX to 0.32.4.
-When upstream releases them, the two crates go back to crates.io.
+MLX runs on Apple silicon only; on other targets the crate is empty. `build.rs` needs the Command
+Line Tools, which hold the C++ compiler and libclang for the bindings, cmake, and MLX 0.32.4, the
+version mlx-c pins, either
 
-It needs the Command Line Tools and cmake, and MLX 0.32.4, the version mlx-c pins there, either
-
-- built from source by mlx-sys, which needs Xcode with its Metal toolchain; or
+- built from source, which mlx-c's CMake configuration fetches and which needs Xcode with its Metal
+  toolchain; `mlx.metallib` goes in `~/.mlx/lib/a26f2d584a14/`, or `MLX_METAL_PATH`; or
 - prebuilt: `MLX_SYS_PREBUILT` set to the prefix of an installed MLX 0.32.4, which needs neither.
   The `mlx/` directory of `mlx_metal-0.32.4-py3-none-macosx_26_0_arm64.whl` from PyPI (sha256
   `514df92d41a286895d2564b4b18f4da45096bd7a4a0c47e1042f345ad5a7f936`), a zip archive, is one:
@@ -423,11 +448,15 @@ MLX_SYS_PREBUILT=~/.local/opt/mlx-0.32.4 MLX_ENABLE_TF32=0 cargo test -p dash-ml
 
 ### Outside this workspace
 
-A workspace that takes dash-mlx from this repository, as a git dependency, gets the same mlx-rs
-and mlx-sys with it: they are git dependencies of this workspace, not a `[patch]`, which Cargo
-applies only in the workspace that declares it. A binary that links dash-mlx against a prebuilt
-MLX also needs an rpath to its `lib/`, which mlx-sys publishes as `DEP_MLX_LIB_DIR`; `build.rs`
-adds it to this crate's own tests, examples and benchmarks, and a dependent's build script adds it
-to its binaries the same way.
+A workspace that takes dash-mlx from this repository, as a git dependency, needs nothing more:
+mlx-c comes with the crate. A binary that links dash-mlx against a prebuilt MLX also needs an rpath
+to its `lib/`, which `build.rs` publishes as `DEP_MLX_LIB_DIR`, adding it to this crate's own tests,
+examples and benchmarks; a dependent's build script adds it to its binaries the same way:
+
+```rust
+if let Ok(dir) = std::env::var("DEP_MLX_LIB_DIR") {
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+}
+```
 
 Licensed under the Apache License, Version 2.0.

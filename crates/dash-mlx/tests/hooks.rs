@@ -1,18 +1,17 @@
-//! The three MLX functions the operations build on, `checkpoint` and `custom_vjp` from the
-//! workspace's mlx-rs (bayanasar/mlx-rs's `dashmag` branch) and `MetalKernel` from mlx-rs 0.33.0,
-//! each held to plain MLX operations: `checkpoint` gives the function's own outputs and gradients
+//! The three MLX functions the operations build on, `checkpoint`, `custom_vjp` and `MetalKernel`,
+//! through this crate's layer over mlx-c, each held to plain MLX operations: `checkpoint` gives the function's own outputs and gradients
 //! and calls it again in the backward pass; `custom_vjp` runs the backward pass it is given, and
 //! reports its errors and panics; `MetalKernel` computes what the operations it replaces do.
 //!
 //!   cargo test -p dash-mlx --test hooks
 #![cfg(target_os = "macos")]
 
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::fast::{
+use dash_mlx::mlx::error::{Exception, Result};
+use dash_mlx::mlx::fast::{
     MetalKernel, MetalKernelApplyOptions, MetalKernelOptions, MetalKernelOutput, TemplateArg,
 };
-use mlx_rs::transforms::{checkpoint, custom_vjp, eval, fallible_vjp};
-use mlx_rs::{Array, Dtype};
+use dash_mlx::mlx::transforms::{checkpoint, custom_vjp, eval, fallible_vjp};
+use dash_mlx::mlx::{Array, Dtype};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -24,8 +23,8 @@ fn serial() -> MutexGuard<'static, ()> {
 }
 
 fn normal(shape: &[i32], seed: u64) -> Array {
-    let key = mlx_rs::random::key(seed).unwrap();
-    mlx_rs::random::normal::<f32>(shape, None, None, &key).unwrap()
+    let key = dash_mlx::mlx::random::key(seed).unwrap();
+    dash_mlx::mlx::random::normal::<f32>(shape, None, None, &key).unwrap()
 }
 
 fn values(a: &Array) -> Vec<f32> {
@@ -108,7 +107,7 @@ fn checkpoint_calls_the_function_again_in_the_backward_pass() -> Result<()> {
 
 /// `x * y`, with a backward pass that is not its derivative, so that the test can tell it ran:
 /// `3 c` for `x`, and `c x + x y` for `y`, which reads the primals and the outputs it is handed.
-fn product_with_a_made_up_backward() -> Result<mlx_rs::transforms::Function> {
+fn product_with_a_made_up_backward() -> Result<dash_mlx::mlx::transforms::Function> {
     custom_vjp(
         |args: &[Array]| Ok(vec![args[0].multiply(&args[1])?]),
         |primals: &[Array], cotangents: &[Array], outputs: &[Array]| {

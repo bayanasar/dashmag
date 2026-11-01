@@ -18,10 +18,10 @@
 //! that have them, `x` read exactly when it is bf16.
 
 use crate::kernel::{Launch, launch};
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::fast::TemplateArg;
-use mlx_rs::transforms::custom_vjp;
-use mlx_rs::{Array, Dtype};
+use crate::mlx::error::{Exception, Result};
+use crate::mlx::fast::TemplateArg;
+use crate::mlx::transforms::custom_vjp;
+use crate::mlx::{Array, Dtype};
 
 /// dash-ops' `up`: one thread an output element, `base + scale · sum_j h[n, j] V[j, m]` in f32,
 /// the sum over the rank in order, rounded once to the base's dtype.

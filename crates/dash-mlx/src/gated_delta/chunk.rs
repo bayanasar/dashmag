@@ -32,14 +32,14 @@
 //! gradients that need every chunk's states are formed batched afterwards.
 
 use crate::kernel::{Launch, launch};
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::fast::TemplateArg;
-use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::ops::{
+use crate::mlx::error::{Exception, Result};
+use crate::mlx::fast::TemplateArg;
+use crate::mlx::ops::indexing::TryIndexOp;
+use crate::mlx::ops::{
     concatenate, cumsum, move_axis, ones, pad, select, swap_axes, tril, triu, zeros, zeros_like,
 };
-use mlx_rs::transforms::custom_vjp;
-use mlx_rs::{Array, Dtype};
+use crate::mlx::transforms::custom_vjp;
+use crate::mlx::{Array, Dtype};
 
 /// Tokens per chunk, as in transformers' `torch_chunk_gated_delta_rule`, fla and dash-ops.
 pub const CHUNK_SIZE: i32 = 64;
@@ -335,7 +335,7 @@ fn checked(
 /// backward: `x / sqrt(sum(x^2) + eps)` is `rms_norm(x)` with epsilon `eps / D`, over `sqrt(D)`.
 fn l2norm(x: &Array) -> Result<Array> {
     let d = *x.shape().last().expect("a last axis") as f32;
-    mlx_rs::fast::rms_norm(x, None, L2NORM_EPS / d)?.multiply(Array::from_f32(1.0 / d.sqrt()))
+    crate::mlx::fast::rms_norm(x, None, L2NORM_EPS / d)?.multiply(Array::from_f32(1.0 / d.sqrt()))
 }
 
 /// The rule from f32 parts. Returns the output in the queries' dtype and the final state.
@@ -370,11 +370,7 @@ fn rule(
         let x = x.as_dtype(Dtype::Float32)?;
         let mut widths = vec![(0, 0); x.ndim()];
         widths[1] = (0, pad_t);
-        let x = if pad_t > 0 {
-            pad(&x, &widths[..], None, None)?
-        } else {
-            x
-        };
+        let x = if pad_t > 0 { pad(&x, &widths[..])? } else { x };
         let x = swap_axes(&x, 1, 2)?;
         match depth {
             Some(depth) => x.reshape(&[b, h, n, c, depth]),

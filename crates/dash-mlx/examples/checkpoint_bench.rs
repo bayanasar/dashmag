@@ -12,7 +12,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn main() -> mlx_rs::error::Result<()> {
+fn main() -> dash_mlx::mlx::error::Result<()> {
     bench::run()
 }
 
@@ -25,26 +25,24 @@ mod bench {
     use crate::common::{measure, normal, report};
     use dash_mlx::checkpoint;
     use dash_mlx::lora::{Lora, LoraLinear};
-    use mlx_rs::error::Result;
-    use mlx_rs::macros::ModuleParameters;
-    use mlx_rs::module::Module;
-    use mlx_rs::transforms::{eval, fallible_vjp};
-    use mlx_rs::{Array, Dtype};
+    use dash_mlx::mlx::error::Result;
+    use dash_mlx::mlx::module::Module;
+    use dash_mlx::mlx::transforms::{eval, fallible_vjp};
+    use dash_mlx::mlx::{Array, Dtype};
 
     const N: i32 = 4096;
     const D: i32 = 1024;
     const HIDDEN: i32 = 3584;
     const DEPTH: usize = 8;
 
-    #[derive(Debug, Clone, ModuleParameters)]
+    #[derive(Debug, Clone)]
     struct Block {
-        #[param]
         up: LoraLinear,
-        #[param]
         gate: LoraLinear,
-        #[param]
         down: LoraLinear,
     }
+
+    dash_mlx::module_parameters!(Block { up, gate, down });
 
     impl Block {
         fn new(seed: u64) -> Result<Self> {
@@ -66,7 +64,7 @@ mod bench {
 
         fn forward(&mut self, x: &Array) -> Result<Array> {
             let g = self.gate.forward(x)?;
-            let s = mlx_rs::nn::silu(g.as_dtype(Dtype::Float32)?)?.as_dtype(g.dtype())?;
+            let s = dash_mlx::mlx::nn::silu(g.as_dtype(Dtype::Float32)?)?.as_dtype(g.dtype())?;
             x.add(self.down.forward(&s.multiply(self.up.forward(x)?)?)?)
         }
 

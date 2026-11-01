@@ -1,8 +1,8 @@
 //! The fused linear cross-entropy at the workload's shapes: 3072 rows of 1024 against a bf16 head
 //! of 248,320 tokens, the mean loss; forward, forward and backward with the gradient to the hidden
-//! states alone (a frozen head), and with the head's gradient too. Against mlx-rs's
-//! `losses::CrossEntropy` over the whole logits as mlx-lm's trainer forms its loss (the head's
-//! bf16 product cast to f32), timed in the same process. The f32 products run in TF32 where MLX's
+//! states alone (a frozen head), and with the head's gradient too. Against cross-entropy over the
+//! whole logits, the target's score below their log-sum-exp, as mlx-lm's trainer forms its loss (the
+//! head's bf16 product cast to f32), timed in the same process. The f32 products run in TF32 where MLX's
 //! default allows it; timed both ways:
 //!
 //!   cargo run --release -p dash-mlx --example loss_bench
@@ -14,7 +14,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn main() -> mlx_rs::error::Result<()> {
+fn main() -> dash_mlx::mlx::error::Result<()> {
     bench::run()
 }
 
@@ -28,12 +28,10 @@ mod bench {
     use crate::common::{measure, normal, report};
     use dash_mlx::logprob::vocab_chunk;
     use dash_mlx::loss::{CrossEntropyOptions, linear_cross_entropy};
-    use mlx_rs::builder::Builder;
-    use mlx_rs::error::Result;
-    use mlx_rs::losses::{CrossEntropyBuilder, LossReduction};
-    use mlx_rs::ops::ones;
-    use mlx_rs::transforms::{eval, fallible_vjp};
-    use mlx_rs::{Array, Dtype};
+    use dash_mlx::mlx::error::Result;
+    use dash_mlx::mlx::ops::ones;
+    use dash_mlx::mlx::transforms::{eval, fallible_vjp};
+    use dash_mlx::mlx::{Array, Dtype};
 
     const D: i32 = 1024;
 
@@ -103,18 +101,18 @@ mod bench {
         let fused: Loss = Box::new(|h, w| Ok(linear_cross_entropy(h, w, &targets, &options)?.loss));
         time(op, &name, &shape, fused, &hidden, &weight)?;
 
-        // mlx-rs's cross-entropy over the whole logits.
-        let ce = CrossEntropyBuilder::new()
-            .reduction(LossReduction::Mean)
-            .build()
-            .expect("the defaults");
+        // Cross-entropy over the whole logits: the target's score below the logits' log-sum-exp.
         let whole: Loss = Box::new(|h, w| {
             let logits = h.matmul(w.t())?.as_dtype(Dtype::Float32)?;
-            ce.apply(&logits, &targets)?.reshape(&[1])
+            let score = logits
+                .take_along_axis(targets.expand_dims(-1)?, -1)?
+                .squeeze_axes(&[-1])?;
+            let loss = logits.logsumexp_axis(-1, None)?.subtract(score)?;
+            loss.mean(None)?.reshape(&[1])
         });
         time(
             op,
-            "mlx-rs's CrossEntropy, the whole logits",
+            "cross-entropy over the whole logits",
             &shape,
             whole,
             &hidden,

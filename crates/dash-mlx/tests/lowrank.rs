@@ -10,9 +10,9 @@
 #![cfg(target_os = "macos")]
 
 use dash_mlx::lowrank::{LowRankOptions, low_rank};
-use mlx_rs::error::Result;
-use mlx_rs::transforms::fallible_vjp;
-use mlx_rs::{Array, Dtype};
+use dash_mlx::mlx::error::Result;
+use dash_mlx::mlx::transforms::fallible_vjp;
+use dash_mlx::mlx::{Array, Dtype};
 use safetensors::SafeTensors;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -170,15 +170,35 @@ fn matches_torch() -> Result<()> {
 /// By default a run repeats bit for bit.
 #[test]
 fn repeats_bit_for_bit() -> Result<()> {
-    let key = mlx_rs::random::key(3)?;
-    let x =
-        mlx_rs::random::normal::<f32>(&[64, 256], None, None, &key)?.as_dtype(Dtype::Bfloat16)?;
-    let a = mlx_rs::random::normal::<f32>(&[16, 256], None, None, &mlx_rs::random::key(4)?)?;
-    let b = mlx_rs::random::normal::<f32>(&[128, 16], None, None, &mlx_rs::random::key(5)?)?;
-    let base = mlx_rs::random::normal::<f32>(&[64, 128], None, None, &mlx_rs::random::key(6)?)?
+    let key = dash_mlx::mlx::random::key(3)?;
+    let x = dash_mlx::mlx::random::normal::<f32>(&[64, 256], None, None, &key)?
         .as_dtype(Dtype::Bfloat16)?;
-    let gy = mlx_rs::random::normal::<f32>(&[64, 128], None, None, &mlx_rs::random::key(7)?)?
-        .as_dtype(Dtype::Bfloat16)?;
+    let a = dash_mlx::mlx::random::normal::<f32>(
+        &[16, 256],
+        None,
+        None,
+        &dash_mlx::mlx::random::key(4)?,
+    )?;
+    let b = dash_mlx::mlx::random::normal::<f32>(
+        &[128, 16],
+        None,
+        None,
+        &dash_mlx::mlx::random::key(5)?,
+    )?;
+    let base = dash_mlx::mlx::random::normal::<f32>(
+        &[64, 128],
+        None,
+        None,
+        &dash_mlx::mlx::random::key(6)?,
+    )?
+    .as_dtype(Dtype::Bfloat16)?;
+    let gy = dash_mlx::mlx::random::normal::<f32>(
+        &[64, 128],
+        None,
+        None,
+        &dash_mlx::mlx::random::key(7)?,
+    )?
+    .as_dtype(Dtype::Bfloat16)?;
     let run = || -> Result<Vec<Vec<u32>>> {
         let f = |args: &[Array]| -> Result<Vec<Array>> {
             Ok(vec![low_rank(

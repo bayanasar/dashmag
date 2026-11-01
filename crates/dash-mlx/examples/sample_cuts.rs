@@ -17,15 +17,15 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn main() -> mlx_rs::error::Result<()> {
+fn main() -> dash_mlx::mlx::error::Result<()> {
     cuts::run()
 }
 
 #[cfg(target_os = "macos")]
 mod cuts {
+    use dash_mlx::mlx::error::Result;
+    use dash_mlx::mlx::{Array, Dtype};
     use dash_mlx::sample::{CutSum, SampleOptions, top_p_cut};
-    use mlx_rs::error::Result;
-    use mlx_rs::{Array, Dtype};
 
     const V: usize = 248_320;
     const BATCH: usize = 64;

@@ -17,7 +17,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn main() -> mlx_rs::error::Result<()> {
+fn main() -> dash_mlx::mlx::error::Result<()> {
     bench::run()
 }
 
@@ -34,10 +34,10 @@ mod bench {
     use crate::common::{measure, normal, report};
     use crate::mlx_lm;
     use dash_mlx::gated_delta::recurrent::{GatedDeltaStepOptions, gated_delta_step};
-    use mlx_rs::error::Result;
-    use mlx_rs::ops::{arange, swap_axes};
-    use mlx_rs::transforms::eval;
-    use mlx_rs::{Array, Dtype};
+    use dash_mlx::mlx::error::Result;
+    use dash_mlx::mlx::ops::{arange, swap_axes};
+    use dash_mlx::mlx::transforms::eval;
+    use dash_mlx::mlx::{Array, Dtype};
 
     const B: i32 = 32;
     const H: i32 = 16;
@@ -63,9 +63,9 @@ mod bench {
                 q: normal(&[rows, H, D], 1.0, bf16, 0)?,
                 k: normal(&[rows, H, D], 1.0, bf16, 1)?,
                 v: normal(&[rows, H, D], 1.0, bf16, 2)?,
-                g: mlx_rs::nn::softplus(normal(&[rows, H], 1.0, Dtype::Float32, 3)?)?
+                g: dash_mlx::mlx::nn::softplus(normal(&[rows, H], 1.0, Dtype::Float32, 3)?)?
                     .multiply(Array::from_f32(-0.4))?,
-                beta: mlx_rs::ops::sigmoid(normal(&[rows, H], 1.0, Dtype::Float32, 4)?)?
+                beta: dash_mlx::mlx::ops::sigmoid(normal(&[rows, H], 1.0, Dtype::Float32, 4)?)?
                     .as_dtype(bf16)?,
             })
         }

@@ -29,10 +29,10 @@ use dash_mlx::conv1d::{self, causal_conv1d, causal_conv1d_update};
 use dash_mlx::gated_delta::chunk::{self, chunk_gated_delta_rule};
 use dash_mlx::gated_delta::recurrent::{self, gated_delta_step};
 use dash_mlx::logprob::{self, LogprobOptions, chosen_logprob, chosen_logprob_reference};
-use mlx_rs::error::Exception;
-use mlx_rs::ops::zeros_dtype;
-use mlx_rs::transforms::fallible_vjp;
-use mlx_rs::{Array, Dtype};
+use dash_mlx::mlx::error::Exception;
+use dash_mlx::mlx::ops::zeros_dtype;
+use dash_mlx::mlx::transforms::fallible_vjp;
+use dash_mlx::mlx::{Array, Dtype};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -151,7 +151,7 @@ type Ran = (Array, Option<Array>, Option<Vec<Array>>);
 /// dtype given (the contract's: its inputs'), or the states', f32.
 fn run(
     op: &'static str,
-    f: impl Fn(&[Array]) -> mlx_rs::error::Result<(Array, Option<Array>)>,
+    f: impl Fn(&[Array]) -> dash_mlx::mlx::error::Result<(Array, Option<Array>)>,
     primals: &[Array],
     out: (&[i32], Dtype),
     cotangents: Option<(Option<&HostTensor>, Option<&HostTensor>)>,
@@ -162,7 +162,7 @@ fn run(
     };
     // The outputs, kept beside the VJP, and the loss's terms.
     let outputs = RefCell::new(None);
-    let terms = |p: &[Array]| -> mlx_rs::error::Result<Vec<Array>> {
+    let terms = |p: &[Array]| -> dash_mlx::mlx::error::Result<Vec<Array>> {
         let (out, states) = f(p)?;
         *outputs.borrow_mut() = Some((out.clone(), states.clone()));
         let mut terms = vec![out];
@@ -205,7 +205,7 @@ type LogprobOp = fn(
     &Array,
     &[u32],
     LogprobOptions,
-) -> mlx_rs::error::Result<logprob::ChosenLogprob>;
+) -> dash_mlx::mlx::error::Result<logprob::ChosenLogprob>;
 
 /// Runs `call` through `op`: the gradient to `hidden` alone, the weight frozen and the entropy
 /// carrying none; one pass over the vocabulary per block of rows, and one back for the gradient.
@@ -255,7 +255,7 @@ type AttentionOp = fn(
     &Array,
     &attention::AttentionMask,
     AttentionOptions,
-) -> mlx_rs::error::Result<(Array, Array)>;
+) -> dash_mlx::mlx::error::Result<(Array, Array)>;
 
 /// `mask` as dash-mlx takes it.
 fn attention_mask(mask: &AttentionMask<KeyPadding, Vec<i64>>) -> attention::AttentionMask {

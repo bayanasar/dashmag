@@ -40,12 +40,12 @@
 //! of bounds; each is built once per thread and kept.
 
 use crate::kernel::{Launch, launch};
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::fast::TemplateArg;
-use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::ops::{concatenate, sum_axis, zeros_dtype};
-use mlx_rs::transforms::{custom_vjp, fallible_vjp};
-use mlx_rs::{Array, Dtype};
+use crate::mlx::error::{Exception, Result};
+use crate::mlx::fast::TemplateArg;
+use crate::mlx::ops::indexing::TryIndexOp;
+use crate::mlx::ops::{concatenate, sum_axis, zeros_dtype};
+use crate::mlx::transforms::{custom_vjp, fallible_vjp};
+use crate::mlx::{Array, Dtype};
 use std::sync::atomic::Ordering;
 
 /// The widest kernel the Metal kernels take; wider ones run the reference.
@@ -708,7 +708,7 @@ pub mod reference {
     fn activate(y: Array, activation: Activation) -> Result<Array> {
         match activation {
             Activation::None => Ok(y),
-            Activation::Silu => y.multiply(mlx_rs::ops::sigmoid(&y)?),
+            Activation::Silu => y.multiply(crate::mlx::ops::sigmoid(&y)?),
             other => Err(contract(
                 "conv1d",
                 format!("activation {other:?} is not supported"),

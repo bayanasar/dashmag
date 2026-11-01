@@ -24,9 +24,9 @@ use dash_mlx::conv1d::{
     Activation, CausalConv1dOptions, CausalConv1dStepOptions, causal_conv1d, causal_conv1d_update,
     kernels_take, probe, reference,
 };
-use mlx_rs::error::Result;
-use mlx_rs::transforms::fallible_vjp;
-use mlx_rs::{Array, Dtype};
+use dash_mlx::mlx::error::Result;
+use dash_mlx::mlx::transforms::fallible_vjp;
+use dash_mlx::mlx::{Array, Dtype};
 use std::sync::{Mutex, MutexGuard};
 
 /// The bounds of the runtimes with an exponential and orders of summation of their own.
@@ -169,7 +169,7 @@ fn kernels_match_the_reference_at_scale() -> Result<()> {
             };
             let (outputs, grads) =
                 fallible_vjp(conv, &primals, &[grad.clone(), grad_final.clone()])?;
-            Ok::<_, mlx_rs::error::Exception>(
+            Ok::<_, dash_mlx::mlx::error::Exception>(
                 outputs.iter().chain(&grads).map(values).collect::<Vec<_>>(),
             )
         };
@@ -253,7 +253,7 @@ fn kernels_repeat_bit_for_bit() -> Result<()> {
                 };
                 let (outputs, grads) =
                     fallible_vjp(conv, &primals, &[grad.clone(), grad_final.clone()])?;
-                Ok::<_, mlx_rs::error::Exception>(bits(&[outputs, grads].concat()))
+                Ok::<_, dash_mlx::mlx::error::Exception>(bits(&[outputs, grads].concat()))
             };
             let before = probe::forward_launches();
             let first = run()?;
@@ -268,7 +268,7 @@ fn kernels_repeat_bit_for_bit() -> Result<()> {
         let step_options = CausalConv1dStepOptions::default().with_activation(Activation::Silu);
         let step = || {
             let (out, next) = causal_conv1d_update(&x, &weight, Some(&bias), &state, step_options)?;
-            Ok::<_, mlx_rs::error::Exception>(bits(&[out, next]))
+            Ok::<_, dash_mlx::mlx::error::Exception>(bits(&[out, next]))
         };
         assert!(step()? == step()?, "{dtype:?} step: two runs differ");
     }

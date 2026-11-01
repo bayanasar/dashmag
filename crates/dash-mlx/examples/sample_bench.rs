@@ -14,7 +14,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn main() -> mlx_rs::error::Result<()> {
+fn main() -> dash_mlx::mlx::error::Result<()> {
     bench::run()
 }
 
@@ -25,12 +25,12 @@ mod common;
 #[cfg(target_os = "macos")]
 mod bench {
     use crate::common::{measure, normal, report};
+    use dash_mlx::mlx::error::Result;
+    use dash_mlx::mlx::ops::indexing::TryIndexOp;
+    use dash_mlx::mlx::ops::{argpartition_axis, argsort_axis, cumsum, full, select, sort_axis};
+    use dash_mlx::mlx::transforms::eval;
+    use dash_mlx::mlx::{Array, Dtype};
     use dash_mlx::sample::{SampleOptions, sample};
-    use mlx_rs::error::Result;
-    use mlx_rs::ops::indexing::TryIndexOp;
-    use mlx_rs::ops::{argpartition_axis, argsort_axis, cumsum, full, select, sort_axis};
-    use mlx_rs::transforms::eval;
-    use mlx_rs::{Array, Dtype};
     use std::cell::Cell;
 
     /// mlx-lm's sampler on `logits` `[B, V]`: the token and its log-probability under the model.
@@ -39,7 +39,7 @@ mod bench {
         let logprobs = logits.subtract(logits.logsumexp_axis(-1, true)?)?;
         let inf = Array::from_f32(f32::NEG_INFINITY);
         if options.temperature == 0.0 {
-            let tokens = mlx_rs::ops::indexing::argmax_axis(&logprobs, -1, true)?;
+            let tokens = dash_mlx::mlx::ops::indexing::argmax_axis(&logprobs, -1, true)?;
             return Ok(vec![tokens.clone(), logprobs.take_along_axis(&tokens, -1)?]);
         }
         let mut masked = logprobs.clone();
@@ -62,9 +62,9 @@ mod bench {
             let keep = cumulative.gt(Array::from_f32(1.0 - options.top_p))?;
             masked = select(&keep, &masked, &inf)?;
         }
-        let key = mlx_rs::random::key(step)?;
+        let key = dash_mlx::mlx::random::key(step)?;
         let scaled = masked.multiply(Array::from_f32(1.0 / options.temperature))?;
-        let tokens = mlx_rs::random::categorical(&scaled, -1, None, &key)?.expand_dims(-1)?;
+        let tokens = dash_mlx::mlx::random::categorical(&scaled, -1, &key)?.expand_dims(-1)?;
         Ok(vec![tokens.clone(), logprobs.take_along_axis(&tokens, -1)?])
     }
 

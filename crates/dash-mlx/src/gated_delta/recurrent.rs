@@ -32,12 +32,12 @@
 
 use super::chunk::boundaries;
 use crate::kernel::{Launch, launch};
-use mlx_rs::error::{Exception, Result};
-use mlx_rs::fast::TemplateArg;
-use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::ops::{arange, concatenate};
-use mlx_rs::transforms::{custom_vjp, fallible_vjp};
-use mlx_rs::{Array, Dtype};
+use crate::mlx::error::{Exception, Result};
+use crate::mlx::fast::TemplateArg;
+use crate::mlx::ops::indexing::TryIndexOp;
+use crate::mlx::ops::{arange, concatenate};
+use crate::mlx::transforms::{custom_vjp, fallible_vjp};
+use crate::mlx::{Array, Dtype};
 
 /// The epsilon of transformers' (and fla's) l2 normalisation of `q` and `k`.
 const L2NORM_EPS: f32 = 1e-6;

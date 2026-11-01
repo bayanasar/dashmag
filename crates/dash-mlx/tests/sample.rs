@@ -20,8 +20,8 @@
 //!   cargo test -p dash-mlx --test sample -- --nocapture
 #![cfg(target_os = "macos")]
 
+use dash_mlx::mlx::{Array, Dtype};
 use dash_mlx::sample::{SampleOptions, Sampled, gumbel_variates, philox_words, sample};
-use mlx_rs::{Array, Dtype};
 use std::sync::{Mutex, MutexGuard};
 
 /// One test at a time: they share the GPU's default stream.
@@ -1180,7 +1180,7 @@ fn refuses_what_the_contract_rules_out() {
     }
     let flat = Array::from_slice(&[0.0f32; 3], &[3]);
     assert!(sample(&flat, &SampleOptions::default()).is_err());
-    let empty = mlx_rs::ops::zeros::<f32>(&[0, 5]).unwrap();
+    let empty = dash_mlx::mlx::ops::zeros::<f32>(&[0, 5]).unwrap();
     let out = sample(&empty, &SampleOptions::default()).unwrap();
     assert_eq!(out.tokens.shape(), [0]);
 }

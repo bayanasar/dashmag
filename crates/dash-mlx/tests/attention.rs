@@ -27,10 +27,10 @@ use dash_conformance::{Adapter, DType};
 use dash_mlx::attention::{
     AttentionMask, AttentionOptions, Window, attention_decode, attention_with_lse, probe,
 };
-use mlx_rs::error::Result;
-use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::transforms::fallible_vjp;
-use mlx_rs::{Array, Dtype};
+use dash_mlx::mlx::error::Result;
+use dash_mlx::mlx::ops::indexing::TryIndexOp;
+use dash_mlx::mlx::transforms::fallible_vjp;
+use dash_mlx::mlx::{Array, Dtype};
 use std::sync::{Mutex, MutexGuard};
 
 /// One test at a time: they read the probe counters, and share the GPU's default stream.
@@ -120,7 +120,7 @@ fn a_query_that_sees_no_key() -> Result<()> {
     let _serial = serial();
     // Causal with Tq > Tk: the first Tq - Tk queries sit before every key.
     let normal = |shape: &[i32], seed: u64| -> Result<Array> {
-        mlx_rs::random::normal::<f32>(shape, None, None, &mlx_rs::random::key(seed)?)
+        dash_mlx::mlx::random::normal::<f32>(shape, None, None, &dash_mlx::mlx::random::key(seed)?)
     };
     let (q, k, v) = (
         normal(&[1, 6, 2, 64], 1)?,
@@ -167,7 +167,7 @@ fn decoding_in_bf16_and_its_gradients() -> Result<()> {
     let _serial = serial();
     require_ieee_f32_matmul();
     let normal = |shape: &[i32], seed: u64| -> Result<Array> {
-        mlx_rs::random::normal::<f32>(shape, None, None, &mlx_rs::random::key(seed)?)
+        dash_mlx::mlx::random::normal::<f32>(shape, None, None, &dash_mlx::mlx::random::key(seed)?)
     };
     let (b, s, hq, hkv, d) = (3, 37, 8, 2, 256);
     // Inputs rounded to bf16, as dash-ops' records are, so that a bf16 run reads them exactly.
@@ -294,9 +294,9 @@ fn plain(q: &Array, k: &Array, v: &Array, options: AttentionOptions) -> Result<V
         }
     }
     let keep = Array::from_slice(&keep, &[tq, tk]);
-    let scores = mlx_rs::ops::select(&keep, &scores, Array::from_f32(f32::NEG_INFINITY))?;
+    let scores = dash_mlx::mlx::ops::select(&keep, &scores, Array::from_f32(f32::NEG_INFINITY))?;
     let lse = scores.logsumexp_axis(-1, None)?;
-    let p = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+    let p = dash_mlx::mlx::ops::softmax_axis(&scores, -1, None)?;
     let o = p.matmul(&vh)?;
     Ok(vec![
         o.reshape(&[b, hq, tq, d])?.swap_axes(1, 2)?,
@@ -313,7 +313,7 @@ fn tiles_match_plain_attention_at_scale() -> Result<()> {
     let _serial = serial();
     require_ieee_f32_matmul();
     let normal = |shape: &[i32], seed: u64| -> Result<Array> {
-        mlx_rs::random::normal::<f32>(shape, None, None, &mlx_rs::random::key(seed)?)
+        dash_mlx::mlx::random::normal::<f32>(shape, None, None, &dash_mlx::mlx::random::key(seed)?)
     };
     let causal = AttentionOptions {
         causal: true,
@@ -374,7 +374,7 @@ fn tiles_match_plain_attention_at_scale() -> Result<()> {
         })?;
         assert!(probe::tiles() > tiles);
         // The reference in float64, on the CPU (MLX's GPU has no float64), rounded to f32.
-        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        dash_mlx::mlx::Device::set_default(&dash_mlx::mlx::Device::cpu());
         let want = (|| -> Result<[Array; 5]> {
             let wide = |x: &Array| x.as_dtype(Dtype::Float64);
             let primals = [wide(&primals[0])?, wide(&primals[1])?, wide(&primals[2])?];
@@ -391,7 +391,7 @@ fn tiles_match_plain_attention_at_scale() -> Result<()> {
             )?;
             let narrow = |x: &Array| -> Result<Array> {
                 let x = x.as_dtype(Dtype::Float32)?;
-                mlx_rs::transforms::eval([&x])?;
+                dash_mlx::mlx::transforms::eval([&x])?;
                 Ok(x)
             };
             Ok([
@@ -402,7 +402,7 @@ fn tiles_match_plain_attention_at_scale() -> Result<()> {
                 narrow(&grads[2])?,
             ])
         })();
-        mlx_rs::Device::set_default(&mlx_rs::Device::gpu());
+        dash_mlx::mlx::Device::set_default(&dash_mlx::mlx::Device::gpu());
         let errors = conformance::check(
             label,
             got.each_ref().map(host).each_ref(),

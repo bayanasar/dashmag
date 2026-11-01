@@ -8,12 +8,12 @@
 #![cfg(target_os = "macos")]
 
 use dash_mlx::lora::{DEFAULT_ADAPTER, LoraLinear};
+use dash_mlx::mlx::Dtype;
+use dash_mlx::mlx::module::ModuleParameters;
 use dash_mlx::peft::{
     AdapterLayer, ApplyOptions, CONFIG_FILE, HostTensor, LoraWeights, PeftAdapter, PeftConfig,
     WEIGHTS_FILE,
 };
-use mlx_rs::Dtype;
-use mlx_rs::module::ModuleParameters;
 use std::path::PathBuf;
 
 fn fixture(dir: &str) -> PathBuf {
@@ -35,7 +35,7 @@ fn layers(adapter: &PeftAdapter) -> Vec<(String, LoraLinear)> {
         .modules()
         .map(|(path, w)| {
             let (out, inp) = (w.b.shape()[0] as i32, w.a.shape()[1] as i32);
-            let weight = mlx_rs::ops::zeros::<f32>(&[out, inp])
+            let weight = dash_mlx::mlx::ops::zeros::<f32>(&[out, inp])
                 .unwrap()
                 .as_dtype(Dtype::Bfloat16)
                 .unwrap();
@@ -97,7 +97,7 @@ fn a_frozen_adapter_beside_the_trained_default() {
         .apply_with(named.iter_mut().map(|(p, l)| (p.as_str(), l)), &(), &frozen)
         .unwrap();
     for (path, layer) in &named {
-        let trainable = layer.trainable_parameters().flatten();
+        let trainable = layer.trainable_parameters();
         let mut keys: Vec<&str> = trainable.keys().map(|k| &**k).collect();
         keys.sort();
         let expected: &[&str] = match adapter.module(path) {
