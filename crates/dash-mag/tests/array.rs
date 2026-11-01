@@ -596,3 +596,34 @@ fn rms_norm_refuses_what_is_not_floating_and_a_weight_not_of_its_features() {
     );
     assert!(x.rms_norm(Some(&t(&[2.0, 1.0], &[2])), 1e-6).is_ok());
 }
+
+/// What comes out is what `x` and the weight promote to, each pair on every side: a bf16 `x` with an
+/// f32 weight gives f32, unrounded, the same as casting `x` first.
+#[test]
+fn rms_norm_comes_out_in_what_x_and_the_weight_promote_to() {
+    let x = |dtype| tensor(81, &[3, 8], dtype);
+    let w = |dtype| tensor(82, &[8], dtype);
+    for (a, b, out) in [
+        (DType::BF16, DType::BF16, DType::BF16),
+        (DType::F32, DType::F32, DType::F32),
+        (DType::BF16, DType::F32, DType::F32),
+        (DType::F32, DType::BF16, DType::F32),
+        (DType::F16, DType::BF16, DType::F32),
+        (DType::F32, DType::F64, DType::F64),
+    ] {
+        let y = x(a).rms_norm(Some(&w(b)), 1e-6).unwrap();
+        assert_eq!(y.dtype(), out, "{a:?} with {b:?}");
+    }
+    assert_eq!(
+        x(DType::BF16).rms_norm(None, 1e-6).unwrap().dtype(),
+        DType::BF16
+    );
+
+    let weight = w(DType::F32);
+    let mixed = x(DType::BF16).rms_norm(Some(&weight), 1e-6).unwrap();
+    let cast = x(DType::BF16).as_dtype(DType::F32).unwrap();
+    assert_eq!(
+        bits(&mixed),
+        bits(&cast.rms_norm(Some(&weight), 1e-6).unwrap())
+    );
+}
