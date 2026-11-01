@@ -11,7 +11,9 @@ use std::sync::OnceLock;
 use burn::backend::Dispatch;
 use burn::backend::tensor::FloatTensor;
 use burn::tensor::activation::{sigmoid, silu, softplus};
-use burn::tensor::{Bool, DType as BurnDType, Device, Int, IntDType, Tensor, TensorData};
+use burn::tensor::{
+    Bool, DType as BurnDType, Device, IndexingUpdateOp, Int, IntDType, Tensor, TensorData,
+};
 use dash_ops::attention::{AttentionMask, attention, attention_decode};
 use dash_ops::conv1d::{causal_conv1d, causal_conv1d_update};
 use dash_ops::gated_delta::chunk::chunk_gated_delta_rule;
@@ -361,6 +363,18 @@ fn take_axis<const D: usize, K: Kindly>(raw: Raw, indices: &Array, axis: usize) 
         .into_dispatch()
 }
 
+fn put_axis<const D: usize>(a: &Array, indices: &Array, values: &Array, axis: usize) -> Raw {
+    let on = a.is_autodiff() || values.is_autodiff();
+    ad(a.t::<D>(), on)
+        .scatter(
+            axis,
+            ad(indices.i::<D>(), on),
+            ad(values.t::<D>(), on),
+            IndexingUpdateOp::Assign,
+        )
+        .into_dispatch()
+}
+
 fn narrow<const D: usize, K: Kindly>(raw: Raw, axis: usize, start: usize, end: usize) -> Raw {
     let t = Tensor::<D, K>::from_dispatch(raw);
     if start == end {
@@ -647,6 +661,12 @@ impl Arm for Burn {
     fn slice(a: &Array, axis: usize, start: usize, end: usize) -> Result<Array> {
         let raw = kinded!(a.kind, a.rank(), narrow; a.raw.clone(), axis, start, end);
         Ok(Array::new(raw, a.kind, false))
+    }
+
+    fn put_along_axis(a: &Array, indices: &Array, values: &Array, axis: usize) -> Result<Array> {
+        Ok(Array::float(
+            ranked!(a.rank(), put_axis; a, indices, values, axis),
+        ))
     }
 
     fn reduce(op: Reduce, a: &Array, axis: Option<usize>) -> Result<Array> {

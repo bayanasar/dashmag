@@ -323,3 +323,49 @@ fn an_output_returned_twice_takes_both_cotangents() {
     .unwrap();
     close(&grads[0], &[12.0, 180.0], 0.0);
 }
+
+/// What `put_along_axis` overwrites takes no gradient; what it writes takes the place's.
+#[test]
+fn put_along_axis_sends_the_written_places_gradient_to_the_values() {
+    let at = Tensor::from_i32(&[1], &[1, 1]).unwrap();
+    let (outs, grads) = vjp(
+        |p| Ok(vec![p[0].put_along_axis(&at, &p[1], 1)?]),
+        &[t(&[1.0, 2.0, 3.0], &[1, 3]), t(&[5.0], &[1, 1])],
+        &[Some(t(&[10.0, 20.0, 30.0], &[1, 3]))],
+    )
+    .unwrap();
+    close(&outs[0], &[1.0, 5.0, 3.0], 0.0);
+    close(&grads[0], &[10.0, 0.0, 30.0], 0.0);
+    close(&grads[1], &[20.0], 0.0);
+}
+
+/// The gradient of `logsumexp` is the softmax.
+#[test]
+fn logsumexp_axis_gives_the_softmax_as_its_gradient() {
+    let (_, grads) = vjp(
+        |p| Ok(vec![p[0].logsumexp_axis(0, false)?]),
+        &[t(&[0.0, 1.0], &[2])],
+        &[Some(t(&[1.0], &[]))],
+    )
+    .unwrap();
+    close(&grads[0], &[0.268_941_43, 0.731_058_6], 1e-6);
+}
+
+/// A row whose largest element is infinite has no gradient, and says so alike on every side. Beside
+/// it, a partly masked row and a finite one keep theirs.
+#[test]
+fn logsumexp_axis_gives_nan_along_an_infinite_row_only() {
+    let inf = f32::INFINITY;
+    let (y, grads) = vjp(
+        |p| Ok(vec![p[0].logsumexp_axis(1, false)?]),
+        &[t(&[-inf, -inf, inf, 1.0, -inf, 0.0, 0.0, 1.0], &[4, 2])],
+        &[Some(t(&[1.0; 4], &[4]))],
+    )
+    .unwrap();
+    assert_eq!(y[0].to_f32().unwrap()[..3], [-inf, inf, 0.0]);
+    let g = grads[0].to_f32().unwrap();
+    assert!(g[..4].iter().all(|v| v.is_nan()), "{g:?}");
+    assert_eq!(g[4..6], [0.0, 1.0], "{g:?}");
+    assert!((g[6] - 0.268_941_43).abs() < 1e-6, "{g:?}");
+    assert!((g[7] - 0.731_058_6).abs() < 1e-6, "{g:?}");
+}

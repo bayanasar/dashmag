@@ -477,13 +477,52 @@ fn a_wrong_rank_is_refused_here_rather_than_a_panic_below() {
     assert!(sample(&front(62, &[3], DType::F32), &SampleOptions::greedy()).is_err());
 }
 
-/// MLX's GPU has no f64, and the kernels stay on it.
+/// The norm and the rotation are MLX's own: its `fast` functions, one op each, so that a model's
+/// numbers are the ones mlx-lm's stack gives.
 #[test]
-fn f64_is_refused_by_the_operations_with_kernels() {
-    let x = front(63, &[2, 8, 3], DType::F64);
-    let w = front(64, &[3, 4], DType::F64);
-    let error = causal_conv1d(&x, &w, None, None, None, CausalConv1dOptions::default())
-        .err()
+fn rms_norm_and_rope_are_mlx_s_own() {
+    use dash_mag::rope::Rope;
+    use dash_mlx::mlx::fast;
+
+    for (dtype, mlx) in dtypes() {
+        let x = front(71, &[2, 5, 3, 8], dtype);
+        let plain_x = plain(71, &[2, 5, 3, 8], mlx);
+        let w = front(72, &[8], dtype);
+        let plain_w = plain(72, &[8], mlx);
+        same(
+            "rms_norm with a weight",
+            &x.rms_norm(Some(&w), 1e-6).unwrap(),
+            &fast::rms_norm(&plain_x, Some(&plain_w), 1e-6).unwrap(),
+        );
+        same(
+            "rms_norm without",
+            &x.rms_norm(None, 1e-6).unwrap(),
+            &fast::rms_norm(&plain_x, None, 1e-6).unwrap(),
+        );
+
+        let rope = Rope::new(4, 10000.0, 64, dtype).unwrap();
+        let turned = plain_x.swap_axes(1, 2).unwrap();
+        let want = fast::rope(&turned, 4, false, 10000.0, 1.0, 7).unwrap();
+        same(
+            "rope over a range",
+            &rope.apply_range(&x, 7..12).unwrap(),
+            &want.swap_axes(1, 2).unwrap(),
+        );
+        let token = front(73, &[2, 3, 8], dtype);
+        let positions = Tensor::from_i32(&[7, 40], &[2]).unwrap();
+        let want = fast::rope_dynamic(
+            plain(73, &[2, 3, 8], mlx).reshape(&[2, 3, 1, 8]).unwrap(),
+            4,
+            false,
+            10000.0,
+            1.0,
+            Array::from_slice(&[7i32, 40], &[2]),
+        )
         .unwrap();
-    assert!(error.0.contains("f64"), "{error}");
+        same(
+            "rope at rows",
+            &rope.apply_at(&token, &positions).unwrap(),
+            &want.reshape(&[2, 3, 8]).unwrap(),
+        );
+    }
 }

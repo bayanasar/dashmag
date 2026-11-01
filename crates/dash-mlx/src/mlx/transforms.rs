@@ -220,6 +220,13 @@ pub fn eval<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<()> {
     check(unsafe { sys::mlx_eval(outputs.as_ptr()) })
 }
 
+/// Starts evaluating the arrays and returns at once: reading one waits for it.
+pub fn async_eval<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<()> {
+    let outputs = VectorArray::from_arrays(outputs)?;
+    // SAFETY: a valid handle, for the length of the call.
+    check(unsafe { sys::mlx_async_eval(outputs.as_ptr()) })
+}
+
 /// `f`'s outputs at `primals`, and the product of `cotangents` with its Jacobian: one gradient per
 /// primal. An error or a panic in `f` reaches the caller.
 pub fn fallible_vjp<'a, F>(

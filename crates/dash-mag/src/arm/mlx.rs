@@ -1,7 +1,7 @@
 //! The side on MLX: dash-mlx's operations and MLX's arrays, on Metal.
 //!
 //! An array is MLX's own, at any rank. MLX's GPU has no f64, so an operation that reads or makes f64
-//! runs on the CPU ([`on`]); the operations with Metal kernels refuse it ([`no_f64`]).
+//! runs on the CPU ([`on`]); the gateway refuses it for the operations with Metal kernels.
 
 use dash_mlx::mlx::error::Exception;
 use dash_mlx::mlx::ops::indexing::{argmax_axis, slice};
@@ -10,10 +10,12 @@ use dash_mlx::mlx::ops::{
     stop_gradient,
 };
 use dash_mlx::mlx::transforms::fallible_vjp;
-use dash_mlx::mlx::{Array, Dtype, memory, nn, transforms, version, with_cpu};
+use dash_mlx::mlx::{Array, Dtype, fast, memory, nn, transforms, version, with_cpu};
 use half::{bf16, f16};
 
-use super::{Arm, Binary, Compare, Drawn, Logical, Mask, Reduce, Unary, VjpFn, VjpOut};
+use super::{
+    Arm, Binary, Compare, Drawn, Logical, Mask, Memory, Reduce, RopeAt, Unary, VjpFn, VjpOut,
+};
 use crate::ops::{
     AttentionOptions, CausalConv1dOptions, CausalConv1dStepOptions, ChunkGatedDeltaOptions,
     GatedDeltaStepOptions, LogprobOptions, LowRankOptions, SampleOptions,
@@ -51,12 +53,14 @@ fn on<T>(arrays: &[&Array], f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Refuses f64 where the operation has Metal kernels, which stay on the GPU.
-fn no_f64<'a>(op: &str, arrays: impl IntoIterator<Item = &'a Array>) -> Result<()> {
-    if arrays.into_iter().any(|a| a.dtype() == Dtype::Float64) {
-        return refuse(format!("{op}: f64 on MLX, whose GPU has none"));
+/// `a` to read on the host: itself when its data is row-contiguous, so that the read waits for `a`
+/// alone. A `contiguous` node would be scheduled behind all that is queued after `a`, which is what a
+/// pipelined decoder has just queued.
+fn readable(a: &Array) -> std::result::Result<Array, Exception> {
+    if a.is_row_contiguous()? {
+        return Ok(a.clone());
     }
-    Ok(())
+    on(&[a], || a.contiguous())
 }
 
 /// The output a cotangent is taken at, in the cotangent's dtype, so that MLX's cast of it on the way
@@ -105,6 +109,9 @@ pub(crate) struct Mlx;
 
 impl Arm for Mlx {
     type Array = Array;
+
+    const HAS_ROPE: bool = true;
+    const LORA_AS_ROWS: bool = false;
 
     fn describe() -> String {
         format!("MLX {}, Metal", version().unwrap_or_default())
@@ -211,7 +218,7 @@ impl Arm for Mlx {
         if a.size() == 0 {
             return Ok(Vec::new());
         }
-        let a = on(&[a], || a.contiguous())?;
+        let a = readable(a)?;
         Ok(match a.dtype() {
             Dtype::Float16 => a
                 .try_as_slice::<f16>()?
@@ -241,7 +248,7 @@ impl Arm for Mlx {
         if a.size() == 0 {
             return Ok(Vec::new());
         }
-        let a = a.as_dtype(Dtype::Int32)?.contiguous()?;
+        let a = readable(&a.as_dtype(Dtype::Int32)?)?;
         Ok(a.try_as_slice::<i32>()?.to_vec())
     }
 
@@ -249,12 +256,32 @@ impl Arm for Mlx {
         if a.size() == 0 {
             return Ok(Vec::new());
         }
-        let a = a.contiguous()?;
+        let a = readable(a)?;
         Ok(a.try_as_slice::<bool>()?.to_vec())
     }
 
     fn eval(arrays: &[&Array]) -> Result<()> {
         Ok(transforms::eval(arrays.iter().copied())?)
+    }
+
+    fn eval_async(arrays: &[&Array]) -> Result<()> {
+        Ok(transforms::async_eval(arrays.iter().copied())?)
+    }
+
+    fn memory() -> Option<Memory> {
+        Some(Memory {
+            active: memory::active_memory().ok()?,
+            peak: memory::peak_memory().ok()?,
+            cache: memory::cache_memory().ok()?,
+        })
+    }
+
+    fn reset_peak_memory() {
+        let _ = memory::reset_peak_memory();
+    }
+
+    fn set_cache_limit(bytes: usize) {
+        let _ = memory::set_cache_limit(bytes);
     }
 
     fn cast(a: &Array, dtype: DType) -> Result<Array> {
@@ -358,6 +385,35 @@ impl Arm for Mlx {
         Ok(on(&[a], || slice(a, &starts, &stops, &strides))?)
     }
 
+    fn put_along_axis(a: &Array, indices: &Array, values: &Array, axis: usize) -> Result<Array> {
+        Ok(on(&[a, values], || {
+            a.put_along_axis(indices, values, axis as i32)
+        })?)
+    }
+
+    fn rms_norm(x: &Array, weight: Option<&Array>, eps: f32) -> Option<Result<Array>> {
+        if x.dtype() == Dtype::Float64 || weight.is_some_and(|w| w.dtype() == Dtype::Float64) {
+            return None;
+        }
+        Some(fast::rms_norm(x, weight, eps).map_err(Error::from))
+    }
+
+    fn logsumexp(a: &Array, axis: usize) -> Option<Result<Array>> {
+        // Along four or more elements it takes SIMD's `exp`, which has f32's accuracy in f64.
+        if a.dtype() == Dtype::Float64 {
+            return None;
+        }
+        Some(a.logsumexp_axis(axis as i32, true).map_err(Error::from))
+    }
+
+    fn rope(x: &Array, dim: usize, base: f32, at: RopeAt<&Array>) -> Result<Array> {
+        let dim = dim as i32;
+        Ok(on(&[x], || match at {
+            RopeAt::Start(start) => fast::rope(x, dim, false, base, 1.0, start as i32),
+            RopeAt::Rows(positions) => fast::rope_dynamic(x, dim, false, base, 1.0, positions),
+        })?)
+    }
+
     fn reduce(op: Reduce, a: &Array, axis: Option<usize>) -> Result<Array> {
         Ok(on(&[a], || match (op, axis) {
             (Reduce::Sum, None) => a.sum(None),
@@ -442,7 +498,6 @@ impl Arm for Mlx {
         mask: Mask<&Array>,
         options: AttentionOptions,
     ) -> Result<Array> {
-        no_f64("attention", [query, key, value])?;
         let mask = match mask {
             Mask::None => dash_mlx::attention::AttentionMask::None,
             Mask::KeyPadding(m) => dash_mlx::attention::AttentionMask::KeyPadding(m.clone()),
@@ -466,7 +521,6 @@ impl Arm for Mlx {
         cache_lengths: Option<&Array>,
         options: AttentionOptions,
     ) -> Result<Array> {
-        no_f64("attention_decode", [query, key, value])?;
         Ok(dash_mlx::attention::attention_decode(
             query,
             key,
@@ -484,10 +538,6 @@ impl Arm for Mlx {
         cu_seqlens: Option<&Array>,
         options: CausalConv1dOptions,
     ) -> Result<(Array, Option<Array>)> {
-        no_f64(
-            "causal_conv1d",
-            [x, weight].into_iter().chain(bias).chain(initial_state),
-        )?;
         Ok(dash_mlx::conv1d::causal_conv1d(
             x,
             weight,
@@ -505,10 +555,6 @@ impl Arm for Mlx {
         state: &Array,
         options: CausalConv1dStepOptions,
     ) -> Result<(Array, Array)> {
-        no_f64(
-            "causal_conv1d_update",
-            [x, weight, state].into_iter().chain(bias),
-        )?;
         Ok(dash_mlx::conv1d::causal_conv1d_update(
             x, weight, bias, state, options,
         )?)
@@ -524,10 +570,6 @@ impl Arm for Mlx {
         cu_seqlens: Option<&Array>,
         options: ChunkGatedDeltaOptions,
     ) -> Result<(Array, Option<Array>)> {
-        no_f64(
-            "chunk_gated_delta_rule",
-            [q, k, v, g, beta].into_iter().chain(initial_state),
-        )?;
         Ok(dash_mlx::gated_delta::chunk::chunk_gated_delta_rule(
             q,
             k,
@@ -550,7 +592,6 @@ impl Arm for Mlx {
         cu_seqlens: Option<&Array>,
         options: GatedDeltaStepOptions,
     ) -> Result<(Array, Array)> {
-        no_f64("gated_delta_step", [q, k, v, g, beta, state])?;
         Ok(dash_mlx::gated_delta::recurrent::gated_delta_step(
             q, k, v, g, beta, state, cu_seqlens, options,
         )?)
@@ -563,13 +604,11 @@ impl Arm for Mlx {
         masked: &[u32],
         options: LogprobOptions,
     ) -> Result<(Array, Array)> {
-        no_f64("chosen_logprob", [hidden, weight])?;
         let out = dash_mlx::logprob::chosen_logprob(hidden, weight, targets, masked, options)?;
         Ok((out.logprob, out.entropy))
     }
 
     fn sample(logits: &Array, options: &SampleOptions) -> Result<Drawn<Array>> {
-        no_f64("sample", [logits])?;
         let out = dash_mlx::sample::sample(logits, options)?;
         Ok(Drawn {
             tokens: out.tokens,
@@ -586,7 +625,6 @@ impl Arm for Mlx {
         base: Option<&Array>,
         options: LowRankOptions,
     ) -> Result<Array> {
-        no_f64("low_rank", [x, u, v].into_iter().chain(base))?;
         Ok(dash_mlx::lowrank::low_rank(x, u, v, base, options)?)
     }
 }

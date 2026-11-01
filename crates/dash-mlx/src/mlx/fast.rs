@@ -19,6 +19,68 @@ pub fn rms_norm(x: impl AsRef<Array>, weight: Option<&Array>, eps: f32) -> Resul
     })
 }
 
+/// Rotary embeddings of `x` `[.., T, D]` over its first `dims` features, at positions `offset..`.
+pub fn rope(
+    x: impl AsRef<Array>,
+    dims: i32,
+    traditional: bool,
+    base: f32,
+    scale: f32,
+    offset: i32,
+) -> Result<Array> {
+    let base = sys::mlx_optional_float {
+        value: base,
+        has_value: true,
+    };
+    // SAFETY: a new empty handle, freed once, meaning no frequencies of its own.
+    let no_freqs = unsafe { Array::from_ptr(sys::mlx_array_new()) };
+    // SAFETY: valid handles, for the length of the call.
+    op(|res, s| unsafe {
+        sys::mlx_fast_rope(
+            res,
+            x.as_ref().as_ptr(),
+            dims,
+            traditional,
+            base,
+            scale,
+            offset,
+            no_freqs.as_ptr(),
+            s,
+        )
+    })
+}
+
+/// [`rope`] with each row at its own position, `offset` `[B]`.
+pub fn rope_dynamic(
+    x: impl AsRef<Array>,
+    dims: i32,
+    traditional: bool,
+    base: f32,
+    scale: f32,
+    offset: impl AsRef<Array>,
+) -> Result<Array> {
+    let base = sys::mlx_optional_float {
+        value: base,
+        has_value: true,
+    };
+    // SAFETY: a new empty handle, freed once, meaning no frequencies of its own.
+    let no_freqs = unsafe { Array::from_ptr(sys::mlx_array_new()) };
+    // SAFETY: valid handles, for the length of the call.
+    op(|res, s| unsafe {
+        sys::mlx_fast_rope_dynamic(
+            res,
+            x.as_ref().as_ptr(),
+            dims,
+            traditional,
+            base,
+            scale,
+            offset.as_ref().as_ptr(),
+            no_freqs.as_ptr(),
+            s,
+        )
+    })
+}
+
 /// The mask of [`scaled_dot_product_attention`].
 #[derive(Debug)]
 pub enum ScaledDotProductAttentionMask<'a> {

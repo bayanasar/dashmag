@@ -89,8 +89,35 @@ pub(crate) type VjpOut<A> = (Vec<A>, Vec<A>);
 /// The function a vector-Jacobian product runs.
 pub(crate) type VjpFn<'a, A> = &'a mut dyn FnMut(&[A]) -> Result<Vec<A>>;
 
+/// Where [`Arm::rope`] rotates.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum RopeAt<A> {
+    /// Positions from this one, on every row.
+    Start(usize),
+    /// One token a row, each at its own position, `[B]`, integer.
+    Rows(A),
+}
+
+/// What the device holds, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Memory {
+    /// In live arrays.
+    pub active: usize,
+    /// The most in live arrays since the peak was last reset.
+    pub peak: usize,
+    /// Kept cached for reuse.
+    pub cache: usize,
+}
+
 pub(crate) trait Arm {
     type Array: Clone;
+
+    /// Whether the side has [`Arm::rope`]; otherwise the gateway rotates with tables of its own.
+    const HAS_ROPE: bool = false;
+    /// Whether LoRA's products on a tensor of rank 3 or more take it as rows. On MLX they keep the
+    /// batch shape: the shape of a bf16 matmul moves its low bits, and the models' numbers are those
+    /// of the products as they are written.
+    const LORA_AS_ROWS: bool = true;
 
     fn describe() -> String;
     fn clear_cache();
@@ -109,6 +136,17 @@ pub(crate) trait Arm {
     fn to_bool(a: &Self::Array) -> Result<Vec<bool>>;
     /// Asks for these arrays to be computed now, where the side computes lazily.
     fn eval(arrays: &[&Self::Array]) -> Result<()>;
+    /// Asks for these arrays to be computed without waiting for them, where the side can.
+    fn eval_async(_: &[&Self::Array]) -> Result<()> {
+        Ok(())
+    }
+    /// What the device holds, where the side can say.
+    fn memory() -> Option<Memory> {
+        None
+    }
+    fn reset_peak_memory() {}
+    /// How much the side may keep cached for reuse, where it has such a limit.
+    fn set_cache_limit(_: usize) {}
 
     /// To any dtype of any kind, an integer to the width asked for.
     fn cast(a: &Self::Array, dtype: DType) -> Result<Self::Array>;
@@ -136,12 +174,36 @@ pub(crate) trait Arm {
     fn take(a: &Self::Array, indices: &Self::Array, axis: usize) -> Result<Self::Array>;
     /// `start..end` of `axis`.
     fn slice(a: &Self::Array, axis: usize, start: usize, end: usize) -> Result<Self::Array>;
+    /// `a` with `values` written at `indices` along `axis`: `a` floating, `values` of its dtype,
+    /// `indices` integer, those two of one shape, which is `a`'s but along `axis`.
+    fn put_along_axis(
+        a: &Self::Array,
+        indices: &Self::Array,
+        values: &Self::Array,
+        axis: usize,
+    ) -> Result<Self::Array>;
 
     /// Over the whole array, to rank 0, or over `axis`, kept with a length of 1.
     fn reduce(op: Reduce, a: &Self::Array, axis: Option<usize>) -> Result<Self::Array>;
     /// `i32`, with `axis` kept with a length of 1.
     fn argmax(a: &Self::Array, axis: usize) -> Result<Self::Array>;
     fn sort(a: &Self::Array, axis: usize) -> Result<Self::Array>;
+
+    /// The side's own form of [`crate::Tensor::rms_norm`], if it has one: `x` of rank 1 or more, the
+    /// result in the dtype `x` and `weight` meet in.
+    fn rms_norm(_: &Self::Array, _: Option<&Self::Array>, _: f32) -> Option<Result<Self::Array>> {
+        None
+    }
+    /// The side's own log of the sum of exponentials over `axis`, kept with a length of 1, if it has
+    /// one.
+    fn logsumexp(_: &Self::Array, _: usize) -> Option<Result<Self::Array>> {
+        None
+    }
+    /// Rotary embeddings of `x` `[.., T, D]` over its first `dim` features: transformers' form. Only
+    /// asked of a side with [`Arm::HAS_ROPE`].
+    fn rope(_: &Self::Array, _: usize, _: f32, _: RopeAt<&Self::Array>) -> Result<Self::Array> {
+        crate::refuse("rope: this side has none of its own")
+    }
 
     fn vjp(
         f: VjpFn<'_, Self::Array>,

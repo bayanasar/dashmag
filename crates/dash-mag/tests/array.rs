@@ -393,3 +393,206 @@ fn matmul_of_integers_is_refused_here() {
         "a boolean beside a float meets it as a float"
     );
 }
+
+#[test]
+fn put_along_axis_writes_at_the_indices_along_the_axis() {
+    let x = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    // One place a row.
+    let at = Tensor::from_i32(&[2, 0], &[2, 1]).unwrap();
+    let v = t(&[10.0, 20.0], &[2, 1]);
+    close(
+        &x.put_along_axis(&at, &v, 1).unwrap(),
+        &[1.0, 2.0, 10.0, 20.0, 5.0, 6.0],
+        0.0,
+    );
+    // The other axis, counted from the end.
+    let at = Tensor::from_i32(&[1, 0, 1], &[1, 3]).unwrap();
+    let v = t(&[7.0, 8.0, 9.0], &[1, 3]);
+    close(
+        &x.put_along_axis(&at, &v, -2).unwrap(),
+        &[1.0, 8.0, 3.0, 7.0, 5.0, 9.0],
+        0.0,
+    );
+    // Several places a row, and a third axis across which each row keeps its own.
+    let at = Tensor::from_i32(&[0, 2, 1, 2], &[2, 2]).unwrap();
+    let v = t(&[7.0, 8.0, 9.0, 10.0], &[2, 2]);
+    close(
+        &x.put_along_axis(&at, &v, 1).unwrap(),
+        &[7.0, 2.0, 8.0, 4.0, 9.0, 10.0],
+        0.0,
+    );
+    let cube = t(&[0.0; 12], &[2, 3, 2]);
+    let at = Tensor::from_i32(&[2, 2, 0, 0], &[2, 1, 2]).unwrap();
+    let v = t(&[1.0, 2.0, 3.0, 4.0], &[2, 1, 2]);
+    close(
+        &cube.put_along_axis(&at, &v, 1).unwrap(),
+        &[0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+        0.0,
+    );
+    // The values take the tensor's dtype.
+    let y = x.as_dtype(DType::BF16).unwrap().put_along_axis(
+        &Tensor::from_i32(&[0], &[1, 1]).unwrap(),
+        &t(&[1.5], &[1, 1]),
+        1,
+    );
+    assert!(y.is_err(), "a row short");
+    let at = Tensor::from_i32(&[0, 1], &[2, 1]).unwrap();
+    let y = x
+        .as_dtype(DType::BF16)
+        .unwrap()
+        .put_along_axis(&at, &t(&[1.5, 2.5], &[2, 1]), 1)
+        .unwrap();
+    assert_eq!(y.dtype(), DType::BF16);
+    close(&y, &[1.5, 2.0, 3.0, 4.0, 2.5, 6.0], 0.0);
+}
+
+#[test]
+fn put_along_axis_refuses_what_does_not_fit() {
+    let x = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+    let at = Tensor::from_i32(&[0, 1], &[2, 1]).unwrap();
+    let v = t(&[1.0, 2.0], &[2, 1]);
+    assert!(x.put_along_axis(&at, &v, 2).is_err(), "an axis it lacks");
+    assert!(x.put_along_axis(&v, &v, 1).is_err(), "floating indices");
+    assert!(at.put_along_axis(&at, &at, 1).is_err(), "an integer tensor");
+    let short = Tensor::from_i32(&[0], &[1, 1]).unwrap();
+    assert!(
+        x.put_along_axis(&short, &t(&[1.0], &[1, 1]), 1).is_err(),
+        "not this tensor's shape across the axis"
+    );
+    assert!(
+        x.put_along_axis(&at, &t(&[1.0, 2.0], &[1, 2]), 1).is_err(),
+        "values not the indices' shape"
+    );
+}
+
+#[test]
+fn logsumexp_axis_is_its_definition_and_does_not_overflow() {
+    let x = t(&[0.0, 1.0, 2.0, 3.0], &[2, 2]);
+    let want = [1.313_261_7, 3.313_261_7];
+    close(&x.logsumexp_axis(1, false).unwrap(), &want, 1e-6);
+    close(&x.logsumexp_axis(-1, false).unwrap(), &want, 1e-6);
+    assert_eq!(x.logsumexp_axis(1, false).unwrap().shape(), [2]);
+    assert_eq!(x.logsumexp_axis(1, true).unwrap().shape(), [2, 1]);
+    // exp(1000) overflows f32; 1000 + ln 2 does not.
+    let big = t(&[1000.0, 1000.0], &[2]);
+    close(&big.logsumexp_axis(0, false).unwrap(), &[1000.6931], 1e-6);
+    let i = Tensor::from_i32(&[1, 2], &[2]).unwrap();
+    assert!(i.logsumexp_axis(0, false).is_err());
+    assert!(x.logsumexp_axis(2, false).is_err());
+}
+
+#[test]
+fn eval_async_gives_what_eval_gives_and_memory_calls_ask_nothing_of_a_side() {
+    let x = t(&[1.0, 2.0], &[2]).square().unwrap();
+    dash_mag::eval_async(&[&x]).unwrap();
+    close(&x, &[1.0, 4.0], 0.0);
+    dash_mag::set_cache_limit(1 << 30);
+    dash_mag::reset_peak_memory();
+    // Each side says what it knows: MLX its allocator's figures, Burn none.
+    assert_eq!(dash_mag::memory().is_some(), cfg!(target_os = "macos"));
+}
+
+/// A read gives row order whatever the data's layout: a transposed tensor's and a slice's strides
+/// are the side's to undo.
+#[test]
+fn reads_are_in_row_order() {
+    let x = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let turned = x.t().unwrap();
+    assert_eq!(turned.to_f32().unwrap(), [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    let column = x.slice(1, 1..2).unwrap();
+    assert_eq!(column.to_f32().unwrap(), [2.0, 5.0]);
+    // Row-contiguous at an offset, which is read in place.
+    let row = x.slice(0, 1..2).unwrap();
+    assert_eq!(row.to_f32().unwrap(), [4.0, 5.0, 6.0]);
+    assert_eq!(row.to_bytes().unwrap().len(), 12);
+    let i = Tensor::from_i32(&[1, 2, 3, 4], &[2, 2]).unwrap();
+    assert_eq!(i.t().unwrap().to_i32().unwrap(), [1, 3, 2, 4]);
+    let b = Tensor::from_bool(&[true, false, false, false], &[2, 2]).unwrap();
+    assert_eq!(
+        b.t().unwrap().to_bool().unwrap(),
+        [true, false, false, false]
+    );
+    let b = Tensor::from_bool(&[false, true, false, false], &[2, 2]).unwrap();
+    assert_eq!(
+        b.t().unwrap().to_bool().unwrap(),
+        [false, false, true, false]
+    );
+}
+
+/// Where a row's largest element is infinite, it is the answer: an entirely masked row is `-inf`.
+#[test]
+fn logsumexp_axis_takes_the_largest_where_it_is_infinite() {
+    let inf = f32::INFINITY;
+    let x = t(&[-inf, -inf, inf, 1.0, -inf, 0.0], &[3, 2]);
+    assert_eq!(
+        x.logsumexp_axis(1, false).unwrap().to_f32().unwrap(),
+        [-inf, inf, 0.0]
+    );
+    // Long enough for a side's SIMD path, too.
+    let x = t(&[-inf; 8], &[8]);
+    assert_eq!(x.logsumexp_axis(0, false).unwrap().item().unwrap(), -inf);
+    let mut row = [1.0; 8];
+    row[5] = inf;
+    assert_eq!(
+        t(&row, &[8])
+            .logsumexp_axis(0, false)
+            .unwrap()
+            .item()
+            .unwrap(),
+        inf
+    );
+}
+
+/// f64 against the definition, at rows short and long: MLX's own is exact below four elements only.
+#[test]
+fn logsumexp_axis_is_exact_in_f64() {
+    let row = [0.1, 0.2, 0.47, -0.3, 0.84, 1.21, -0.08, 0.66];
+    for n in [2, 3, 4, 8] {
+        let x = Tensor::from_f64(&row[..n], &[n]).unwrap();
+        let y = x.logsumexp_axis(0, false).unwrap();
+        assert_eq!(y.dtype(), DType::F64);
+        let got = f64::from_le_bytes(y.to_bytes().unwrap().try_into().unwrap());
+        let want = row[..n].iter().map(|v| v.exp()).sum::<f64>().ln();
+        assert!(
+            (got - want).abs() <= 1e-15 * want.abs().max(1.0),
+            "{n}: {got} against {want}"
+        );
+    }
+}
+
+/// An empty tensor is refused, whichever axis is empty.
+#[test]
+fn logsumexp_axis_refuses_an_empty_tensor() {
+    for (shape, axis) in [(&[0, 2], 1), (&[0, 2], 0), (&[2, 0], 0), (&[2, 0], 1)] {
+        let empty = Tensor::zeros(shape, DType::F32).unwrap();
+        assert!(
+            empty.logsumexp_axis(axis, false).is_err(),
+            "{shape:?} along {axis}"
+        );
+    }
+}
+
+/// Refused before either side runs: one would refuse, the other would run them.
+#[test]
+fn rms_norm_refuses_what_is_not_floating_and_a_weight_not_of_its_features() {
+    let i = Tensor::from_i32(&[1, 2], &[2]).unwrap();
+    assert!(i.rms_norm(None, 1e-6).is_err(), "an integer x");
+    let x = t(&[3.0, 4.0], &[1, 2]);
+    assert!(x.rms_norm(Some(&i), 1e-6).is_err(), "an integer weight");
+    for shape in [&[1, 2][..], &[1][..], &[][..], &[3][..]] {
+        let n = shape.iter().product();
+        let w = Tensor::ones(&[n], DType::F32).unwrap();
+        let w = w
+            .reshape(&shape.iter().map(|&d| d as isize).collect::<Vec<_>>())
+            .unwrap();
+        assert!(x.rms_norm(Some(&w), 1e-6).is_err(), "a weight of {shape:?}");
+    }
+    assert!(
+        Tensor::scalar(2.0, DType::F32)
+            .unwrap()
+            .rms_norm(None, 1e-6)
+            .is_err(),
+        "no features"
+    );
+    assert!(x.rms_norm(Some(&t(&[2.0, 1.0], &[2])), 1e-6).is_ok());
+}

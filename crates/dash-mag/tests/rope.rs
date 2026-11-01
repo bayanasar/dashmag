@@ -54,3 +54,37 @@ fn it_refuses_what_it_does_not_hold() {
         "too narrow"
     );
 }
+
+/// `Rope` keeps f64 on every side. It rotates at f32's accuracy where it holds tables and better where
+/// it does not, so it is held to f32's.
+#[test]
+fn it_rotates_f64_as_it_does_f32() {
+    let rope = Rope::new(4, 10000.0, 8, DType::F64).unwrap();
+    let narrow = Rope::new(4, 10000.0, 8, DType::F32).unwrap();
+    let x = tensor(5, &[1, 2, 1, 6], DType::F64);
+    let y = rope.apply_range(&x, 3..5).unwrap();
+    assert_eq!(y.dtype(), DType::F64);
+    let want = narrow
+        .apply_range(&x.as_dtype(DType::F32).unwrap(), 3..5)
+        .unwrap();
+    close(&y, &want.to_f32().unwrap(), 1e-6);
+
+    let token = x.slice(1, 0..1).unwrap().squeeze(1).unwrap();
+    let at = Tensor::from_i32(&[3], &[1]).unwrap();
+    let one = rope.apply_at(&token, &at).unwrap();
+    assert_eq!(one.dtype(), DType::F64);
+    let row = want.slice(1, 0..1).unwrap().squeeze(1).unwrap();
+    close(&one, &row.to_f32().unwrap(), 1e-6);
+}
+
+/// A rotation is of one dtype, on the side with tables and on the side without.
+#[test]
+fn it_refuses_a_dtype_other_than_its_own() {
+    let rope = Rope::new(4, 10000.0, 8, DType::F32).unwrap();
+    let x = tensor(6, &[1, 2, 1, 6], DType::BF16);
+    assert!(rope.apply_range(&x, 3..5).is_err());
+    let token = x.slice(1, 0..1).unwrap().squeeze(1).unwrap();
+    let at = Tensor::from_i32(&[3], &[1]).unwrap();
+    assert!(rope.apply_at(&token, &at).is_err());
+    assert!(Rope::new(4, 10000.0, 8, DType::I32).is_err());
+}

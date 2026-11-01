@@ -4,6 +4,7 @@
 
 use std::ops::Range;
 
+pub use crate::arm::Memory;
 use crate::arm::{Arm, Binary, Compare, Logical, Reduce, Selected, Unary};
 use crate::{Result, refuse};
 
@@ -68,6 +69,29 @@ impl std::fmt::Debug for Tensor {
 pub fn eval(tensors: &[&Tensor]) -> Result<()> {
     let arrays: Vec<&A> = tensors.iter().map(|t| &t.0).collect();
     Selected::eval(&arrays)
+}
+
+/// Starts computing these tensors and returns at once, where the side can: reading one waits for it.
+/// A decoding loop queues each step before it reads the last, and a side that queues anyway needs
+/// nothing here.
+pub fn eval_async(tensors: &[&Tensor]) -> Result<()> {
+    let arrays: Vec<&A> = tensors.iter().map(|t| &t.0).collect();
+    Selected::eval_async(&arrays)
+}
+
+/// What the device holds, where the side can say.
+pub fn memory() -> Option<Memory> {
+    Selected::memory()
+}
+
+/// Starts [`Memory::peak`] again from now, where the side keeps one.
+pub fn reset_peak_memory() {
+    Selected::reset_peak_memory();
+}
+
+/// How many bytes the side may keep cached for reuse, where it has such a limit.
+pub fn set_cache_limit(bytes: usize) {
+    Selected::set_cache_limit(bytes);
 }
 
 fn elements(shape: &[usize]) -> usize {
@@ -674,6 +698,38 @@ impl Tensor {
         Self::wrap(Selected::slice(&self.0, axis, range.start, range.end))
     }
 
+    /// This tensor with `values` written at `indices` along `axis`: `indices` integer and `values` in
+    /// this tensor's dtype after rounding, those two of one shape, which is this tensor's but along
+    /// `axis`. Each place is written once: repeated indices leave which value lands to the side, and
+    /// an index out of range is the caller's to avoid, as not every side checks it.
+    pub fn put_along_axis(&self, indices: &Tensor, values: &Tensor, axis: isize) -> Result<Self> {
+        if !self.dtype().is_floating() {
+            return refuse(format!(
+                "put_along_axis: {:?} is not floating",
+                self.dtype()
+            ));
+        }
+        if !matches!(indices.dtype(), DType::I32 | DType::I64) {
+            return refuse(format!("put_along_axis: indices of {:?}", indices.dtype()));
+        }
+        let at = normal_axis("put_along_axis", axis, self.rank())?;
+        let (own, shape) = (self.shape(), indices.shape());
+        let fits = shape.len() == own.len()
+            && shape
+                .iter()
+                .zip(&own)
+                .enumerate()
+                .all(|(i, (a, b))| i == at || a == b);
+        if !fits || values.shape() != shape {
+            return refuse(format!(
+                "put_along_axis: {own:?} along {at}, indices {shape:?}, values {:?}",
+                values.shape()
+            ));
+        }
+        let values = values.as_dtype(self.dtype())?;
+        Self::wrap(Selected::put_along_axis(&self.0, &indices.0, &values.0, at))
+    }
+
     /// `before` and `after` more elements of `value` along `axis`.
     pub fn pad(&self, axis: isize, before: usize, after: usize, value: f64) -> Result<Self> {
         let shape = self.shape();
@@ -747,6 +803,33 @@ impl Tensor {
         self.reduce_axis(Reduce::Min, axis, keep)
     }
 
+    /// `ln(sum(exp(self)))` over `axis`, without overflowing where the sum would. Where the largest element
+    /// is infinite that is the answer, and the gradient along that row is NaN on every side. An empty
+    /// tensor is refused.
+    pub fn logsumexp_axis(&self, axis: isize, keep: bool) -> Result<Self> {
+        if !self.dtype().is_floating() {
+            return refuse(format!(
+                "logsumexp_axis: {:?} is not floating",
+                self.dtype()
+            ));
+        }
+        if self.size() == 0 {
+            return refuse(format!("logsumexp_axis: an empty {:?}", self.shape()));
+        }
+        let at = normal_axis("logsumexp_axis", axis, self.rank())?;
+        let kept = match Selected::logsumexp(&self.0, at) {
+            Some(kept) => Self::wrap(kept)?,
+            None => {
+                let top = self.max_axis(axis, true)?.stop_gradient()?;
+                let sum = top.add(&self.sub(&top)?.exp()?.sum_axis(axis, true)?.log()?)?;
+                // `inf - inf` would make it NaN.
+                let infinity = Self::scalar(f64::INFINITY, self.dtype())?;
+                top.abs()?.eq(&infinity)?.select(&top, &sum)?
+            }
+        };
+        if keep { Ok(kept) } else { kept.squeeze(axis) }
+    }
+
     /// The variance along `axis`, `ddof` the correction of the denominator, `n - ddof`.
     pub fn var_axis(&self, axis: isize, ddof: usize, keep: bool) -> Result<Self> {
         let at = normal_axis("var_axis", axis, self.rank())?;
@@ -786,10 +869,27 @@ impl Tensor {
         Self::wrap(Selected::sort(&self.0, at))
     }
 
-    /// RMSNorm over the last axis, in f32 and rounded once to this tensor's dtype:
-    /// `x / sqrt(mean(x^2) + eps) * weight`, the weight given as its factor.
+    /// RMSNorm over the last axis, rounded once to this tensor's dtype: `x / sqrt(mean(x^2) + eps) *
+    /// weight`, the weight given as its factor. In f32, or the side's own where it has one: MLX's `fast`
+    /// function, as mlx-lm's stack runs it, which differs from the f32 form in low bits.
     pub fn rms_norm(&self, weight: Option<&Tensor>, eps: f64) -> Result<Self> {
         let dtype = self.dtype();
+        let shape = self.shape();
+        let Some(features) = shape.last().filter(|_| dtype.is_floating()) else {
+            return refuse(format!("rms_norm: {dtype:?} of {shape:?}"));
+        };
+        if let Some(w) = weight
+            && (!w.dtype().is_floating() || w.shape() != [*features])
+        {
+            return refuse(format!(
+                "rms_norm: a weight of {:?} {:?} for {features} features",
+                w.dtype(),
+                w.shape()
+            ));
+        }
+        if let Some(own) = Selected::rms_norm(&self.0, weight.map(|w| &w.0), eps as f32) {
+            return Self::wrap(own)?.as_dtype(dtype);
+        }
         let x = self.as_dtype(DType::F32)?;
         let scale = x.square()?.mean_axis(-1, true)?.add_scalar(eps)?.sqrt()?;
         let mut y = x.div(&scale)?;
