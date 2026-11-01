@@ -1,0 +1,47 @@
+[package]
+name = "dash-mag"
+description = "The one crate an application names, the gateway to Dashmag: a tensor, its array operations, a vector-Jacobian product and the operations' entry points, on dash-ops and Burn or on dash-mlx and MLX, chosen at compile time."
+readme = "README.md"
+keywords = ["burn", "mlx", "cuda", "metal", "machine-learning"]
+categories = ["science"]
+# The recording the tests read stays in the repository, out of a published crate.
+exclude = ["tests/fixtures"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# dash-mlx is not published yet.
+publish = false
+
+[features]
+default = ["flex"]
+# Flex: every operation through dash-ops' reference, on the CPU. A device feature below takes
+# precedence over it.
+flex = ["burn/flex", "burn/simd", "burn/rayon", "dash-ops/flex"]
+# The RTX path: dash-ops' kernels on CUDA.
+cuda = ["burn/cuda", "dash-ops/cuda"]
+# Burn's lazy fusion and autotune, as dash-ops has them: each changes which kernels run and so
+# which low bits come out, and matmul-heavy work wants autotune.
+fusion = ["burn/fusion", "dash-ops/fusion"]
+autotune = ["burn/autotune", "dash-ops/autotune"]
+
+[dependencies]
+dash-contract = { workspace = true }
+dash-peft = { workspace = true }
+half = "2"
+
+# Linux and the rest: Burn and dash-ops. macOS: MLX, without Burn in the build.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+burn = { workspace = true, features = ["autodiff"] }
+dash-ops = { workspace = true, default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dash-mlx = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[target.'cfg(not(target_os = "macos"))'.dev-dependencies]
+burn = { workspace = true, features = ["autodiff"] }
+dash-lora = { path = "../dash-lora", default-features = false }

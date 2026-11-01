@@ -2396,6 +2396,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dash-mag"
+version = "0.0.1"
+dependencies = [
+ "burn",
+ "dash-contract",
+ "dash-lora",
+ "dash-mlx",
+ "dash-ops",
+ "dash-peft",
+ "half",
+ "serde_json",
+]
+
+[[package]]
 name = "dash-mlx"
 version = "0.0.1"
 dependencies = [
