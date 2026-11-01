@@ -13,6 +13,8 @@ repository.workspace = true
 rust-version.workspace = true
 # dash-mlx is not published yet.
 publish = false
+# For what `build.rs` publishes to a dependent: there is nothing of its own to link.
+links = "dash-mag"
 
 [features]
 default = ["flex"]
