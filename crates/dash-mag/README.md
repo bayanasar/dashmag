@@ -40,9 +40,10 @@ warm-up, twelve processes of each in turn over two batches, the median of those 
 
 A second run of eight processes each gave 2.393 against 2.306 in f32, and 2.489 against 2.492 in bf16.
 
-The gap is host time per operation. Both ways compute the same: the loss and the norm agree to the
-printed digit. Evaluating shows no gap beyond its own spread. The gateway's checks and handles take an
-add of one shape from 0.105 µs to 0.21 µs to build, and 0.275 µs beside a scalar; the update's 293
-binary operations, 168 of them beside a scalar, come to 42 µs by that, where the gap is 37 to 53 µs.
-Taking away the 168 `Broadcast` nodes the gateway adds for those scalars, or its `format!`, moved nothing
-measurable.
+Both ways compute the same: the loss and the norm agree to the printed digit. The update's gap is host
+time per operation. The gateway's checks and handles take an add of one shape from 0.105 µs to 0.21 µs
+to build, and 0.275 µs beside a scalar; the update's 293 binary operations, 168 of them beside a scalar,
+come to 42 µs by that, where the table's gap is 42 µs in bf16 and 53 µs in f32. Taking away the 168
+`Broadcast` nodes the gateway adds for those scalars, or its `format!`, moved nothing measurable.
+Evaluating shows no gap beyond its own spread: 101 µs of the bf16 step's 112 lie there, within ranges
+that overlap, and the second run's bf16 step shows no gap.
