@@ -499,6 +499,15 @@ fn rms_norm_and_rope_are_mlx_s_own() {
             &x.rms_norm(None, 1e-6).unwrap(),
             &fast::rms_norm(&plain_x, None, 1e-6).unwrap(),
         );
+        // Each with the other as its weight: what they promote to, as MLX gives it.
+        let (other, plain_other) = match dtype {
+            DType::F32 => (DType::BF16, Dtype::Bfloat16),
+            _ => (DType::F32, Dtype::Float32),
+        };
+        let got = x.rms_norm(Some(&front(72, &[8], other)), 1e-6).unwrap();
+        let want = fast::rms_norm(&plain_x, Some(&plain(72, &[8], plain_other)), 1e-6).unwrap();
+        assert_eq!(got.dtype(), DType::F32);
+        same("rms_norm with a weight of the other", &got, &want);
 
         let rope = Rope::new(4, 10000.0, 64, dtype).unwrap();
         let turned = plain_x.swap_axes(1, 2).unwrap();
