@@ -134,15 +134,17 @@ impl Rope {
         self.rotate(x, &table(cos)?, &table(sin)?)
     }
 
-    /// `x` `[B, H, D]`, one token per sequence, at `positions` `[B]`. A position past [`Rope::len`] is the
+    /// `x` `[B, H, D]`, one token per sequence, at `positions` `[B]`, integer. A position past [`Rope::len`] is the
     /// caller's to avoid: a check would cost a read of `positions`, which a pipelined decoder cannot wait
     /// for, and not every side stops there. Flex panics, CUDA can return garbage, and MLX, with no table,
     /// rotates as asked.
     pub fn apply_at(&self, x: &Tensor, positions: &Tensor) -> Result<Tensor> {
         let shape = x.shape();
-        if shape.len() != 3 || positions.shape() != [shape[0]] {
+        let integer = matches!(positions.dtype(), DType::I32 | DType::I64);
+        if !integer || shape.len() != 3 || positions.shape() != [shape[0]] {
             return refuse(format!(
-                "Rope: positions {:?} for {shape:?}",
+                "Rope: positions of {:?} {:?} for {shape:?}",
+                positions.dtype(),
                 positions.shape()
             ));
         }

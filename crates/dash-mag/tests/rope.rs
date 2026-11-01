@@ -88,3 +88,21 @@ fn it_refuses_a_dtype_other_than_its_own() {
     assert!(rope.apply_at(&token, &at).is_err());
     assert!(Rope::new(4, 10000.0, 8, DType::I32).is_err());
 }
+
+/// Positions are integers on every side, on the side with tables and on the side without.
+#[test]
+fn it_refuses_positions_that_are_not_integers() {
+    let rope = Rope::new(4, 10000.0, 8, DType::F32).unwrap();
+    let token = tensor(7, &[2, 1, 6], DType::F32);
+    let floats = Tensor::from_f32(&[1.0, 3.0], &[2]).unwrap();
+    assert!(rope.apply_at(&token, &floats).is_err());
+    let booleans = Tensor::from_bool(&[true, false], &[2]).unwrap();
+    assert!(rope.apply_at(&token, &booleans).is_err());
+
+    let narrow = Tensor::from_i32(&[1, 3], &[2]).unwrap();
+    let wide = narrow.as_dtype(DType::I64).unwrap();
+    assert_eq!(
+        rope.apply_at(&token, &wide).unwrap().to_f32().unwrap(),
+        rope.apply_at(&token, &narrow).unwrap().to_f32().unwrap()
+    );
+}
