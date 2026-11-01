@@ -105,6 +105,16 @@ fn check_rank(op: &str, rank: usize) -> Result<()> {
     Ok(())
 }
 
+/// A rank the gateway takes, and dimensions every side holds: MLX's are `i32`, where a larger one
+/// would wrap, and to -1 it means "infer this one".
+fn check_shape(op: &str, shape: &[usize]) -> Result<()> {
+    check_rank(op, shape.len())?;
+    if shape.iter().any(|&d| d > i32::MAX as usize) {
+        return refuse(format!("{op}: {shape:?}; dimensions go to {}", i32::MAX));
+    }
+    Ok(())
+}
+
 /// `axis` counted from the front, for a rank.
 fn normal_axis(op: &str, axis: isize, rank: usize) -> Result<usize> {
     let r = rank as isize;
@@ -137,7 +147,7 @@ impl Tensor {
 
     /// A tensor from little-endian bytes of a floating `dtype`, as a checkpoint holds them.
     pub fn from_bytes(bytes: &[u8], shape: &[usize], dtype: DType) -> Result<Self> {
-        check_rank("from_bytes", shape.len())?;
+        check_shape("from_bytes", shape)?;
         if !dtype.is_floating() {
             return refuse(format!("from_bytes: {dtype:?} is not floating"));
         }
@@ -162,7 +172,7 @@ impl Tensor {
 
     /// An `i32` tensor, on every side.
     pub fn from_i32(values: &[i32], shape: &[usize]) -> Result<Self> {
-        check_rank("from_i32", shape.len())?;
+        check_shape("from_i32", shape)?;
         if values.len() != elements(shape) {
             return refuse(format!("from_i32: {} values for {shape:?}", values.len()));
         }
@@ -170,7 +180,7 @@ impl Tensor {
     }
 
     pub fn from_bool(values: &[bool], shape: &[usize]) -> Result<Self> {
-        check_rank("from_bool", shape.len())?;
+        check_shape("from_bool", shape)?;
         if values.len() != elements(shape) {
             return refuse(format!("from_bool: {} values for {shape:?}", values.len()));
         }
@@ -178,7 +188,7 @@ impl Tensor {
     }
 
     pub fn full(shape: &[usize], value: f64, dtype: DType) -> Result<Self> {
-        check_rank("full", shape.len())?;
+        check_shape("full", shape)?;
         if !dtype.is_floating() {
             return refuse(format!("full: {dtype:?} is not floating"));
         }
@@ -517,8 +527,7 @@ impl Tensor {
         let known: usize = shape
             .iter()
             .filter(|&&d| d >= 0)
-            .map(|&d| d as usize)
-            .product();
+            .fold(1usize, |known, &d| known.saturating_mul(d as usize));
         let free = shape.iter().filter(|&&d| d < 0).count();
         if free > 1 || shape.iter().any(|&d| d < -1) {
             return refuse(format!("reshape: {shape:?}"));
@@ -533,6 +542,7 @@ impl Tensor {
                 }
             })
             .collect();
+        check_shape("reshape", &resolved)?;
         if elements(&resolved) != total {
             return refuse(format!(
                 "reshape: {total} elements as {shape:?}, from {:?}",
@@ -612,7 +622,7 @@ impl Tensor {
     }
 
     pub fn broadcast_to(&self, shape: &[usize]) -> Result<Self> {
-        check_rank("broadcast_to", shape.len())?;
+        check_shape("broadcast_to", shape)?;
         let own = self.shape();
         if own == shape {
             return Ok(self.clone());

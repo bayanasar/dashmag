@@ -596,3 +596,20 @@ fn rms_norm_refuses_what_is_not_floating_and_a_weight_not_of_its_features() {
     );
     assert!(x.rms_norm(Some(&t(&[2.0, 1.0], &[2])), 1e-6).is_ok());
 }
+
+/// A dimension past `i32::MAX` is refused on every side: MLX's shapes would wrap it. Each shape here
+/// is empty, so that nothing is allocated if it gets through.
+#[test]
+fn a_dimension_past_i32_is_refused() {
+    let past = i32::MAX as usize + 1;
+    let empty = Tensor::zeros(&[0, 2], DType::F32).unwrap();
+    assert!(Tensor::zeros(&[past, 0], DType::F32).is_err(), "full");
+    assert!(
+        Tensor::from_bytes(&[], &[past, 0], DType::F32).is_err(),
+        "from_bytes"
+    );
+    assert!(Tensor::from_i32(&[], &[past, 0]).is_err(), "from_i32");
+    assert!(Tensor::from_bool(&[], &[past, 0]).is_err(), "from_bool");
+    assert!(empty.reshape(&[past as isize, 0]).is_err(), "reshape");
+    assert!(empty.broadcast_to(&[past, 0, 2]).is_err(), "broadcast_to");
+}
