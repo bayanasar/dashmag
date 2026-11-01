@@ -8,7 +8,7 @@ use std::collections::HashMap;
 pub use dash_contract::clip::{ClipGradNormOptions, NonFinite, NormType};
 
 use crate::tensor::Tensor;
-use crate::{DType, Result};
+use crate::{DType, Result, refuse};
 
 /// Added to the total before the coefficient is taken from it, as torch adds it.
 const EPS: f64 = 1e-6;
@@ -94,6 +94,17 @@ impl AdamW {
 
     /// The parameter `name` after this step, from its value and its gradient, at learning rate `lr`.
     pub fn update(&mut self, name: &str, p: &Tensor, g: &Tensor, lr: f64) -> Result<Tensor> {
+        if let Some((m, _)) = self.state.get(name)
+            && (m.shape() != p.shape() || m.dtype() != p.dtype())
+        {
+            return refuse(format!(
+                "AdamW: moments of {:?} {:?} for {name}, of {:?} {:?}",
+                m.dtype(),
+                m.shape(),
+                p.dtype(),
+                p.shape()
+            ));
+        }
         let (b1, b2) = self.betas;
         let t = self.step.max(1) as i32;
         let (m, v) = match self.state.remove(name) {
@@ -122,5 +133,30 @@ impl AdamW {
     /// Every array this holds, to hand to [`crate::eval`] after a step.
     pub fn state(&self) -> impl Iterator<Item = &Tensor> {
         self.state.values().flat_map(|(m, v)| [m, v])
+    }
+
+    /// Each parameter's name and its two moments, in order of name: what a checkpoint keeps, beside
+    /// [`Self::step`].
+    pub fn named_state(&self) -> impl Iterator<Item = (&str, &Tensor, &Tensor)> {
+        let mut held: Vec<_> = self.state.iter().collect();
+        held.sort_by_key(|(name, _)| name.as_str());
+        held.into_iter().map(|(name, (m, v))| (name.as_str(), m, v))
+    }
+
+    /// Puts a parameter's moments back, as [`Self::named_state`] gave them, so that a resumed run
+    /// continues the one it left; [`Self::step`] goes back beside them. They are of one floating dtype and
+    /// shape, and [`Self::update`] holds them to the parameter's.
+    pub fn set_state(&mut self, name: &str, m: Tensor, v: Tensor) -> Result<()> {
+        if !m.dtype().is_floating() || m.dtype() != v.dtype() || m.shape() != v.shape() {
+            return refuse(format!(
+                "AdamW: moments of {:?} {:?} and {:?} {:?} for {name}",
+                m.dtype(),
+                m.shape(),
+                v.dtype(),
+                v.shape()
+            ));
+        }
+        self.state.insert(name.to_string(), (m, v));
+        Ok(())
     }
 }
