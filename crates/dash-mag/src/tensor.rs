@@ -869,9 +869,10 @@ impl Tensor {
         Self::wrap(Selected::sort(&self.0, at))
     }
 
-    /// RMSNorm over the last axis, rounded once to this tensor's dtype: `x / sqrt(mean(x^2) + eps) *
-    /// weight`, the weight given as its factor. In f32, or the side's own where it has one: MLX's `fast`
-    /// function, as mlx-lm's stack runs it, which differs from the f32 form in low bits.
+    /// RMSNorm over the last axis: `x / sqrt(mean(x^2) + eps) * weight`, the weight given as its factor.
+    /// It comes out in the dtype `x` and the weight promote to, rounded once: a bf16 `x` with an f32 weight
+    /// gives f32, as MLX's does. In f32, or the side's own where it has one: MLX's `fast` function, as
+    /// mlx-lm's stack runs it, which differs from the f32 form in low bits.
     pub fn rms_norm(&self, weight: Option<&Tensor>, eps: f64) -> Result<Self> {
         let dtype = self.dtype();
         let shape = self.shape();
@@ -887,8 +888,9 @@ impl Tensor {
                 w.shape()
             ));
         }
+        let out = weight.map_or(dtype, |w| DType::promote(dtype, w.dtype()));
         if let Some(own) = Selected::rms_norm(&self.0, weight.map(|w| &w.0), eps as f32) {
-            return Self::wrap(own)?.as_dtype(dtype);
+            return Self::wrap(own)?.as_dtype(out);
         }
         let x = self.as_dtype(DType::F32)?;
         let scale = x.square()?.mean_axis(-1, true)?.add_scalar(eps)?.sqrt()?;
@@ -896,6 +898,6 @@ impl Tensor {
         if let Some(weight) = weight {
             y = y.mul(&weight.as_dtype(DType::F32)?)?;
         }
-        y.as_dtype(dtype)
+        y.as_dtype(out)
     }
 }
