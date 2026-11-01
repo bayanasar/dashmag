@@ -1,6 +1,6 @@
 //! The operations' entry points. What each computes, its layouts, dtypes, masks and options are
 //! [`dash_contract`]'s, the same on both sides; this module checks the ranks and passes the call
-//! on, so that a wrong rank is a refusal here on every side rather than a panic on one.
+//! on, so that a wrong rank or dtype is a refusal here on every side rather than a panic on one.
 
 pub use dash_contract::attention::{AttentionOptions, Window};
 pub use dash_contract::conv1d::{Activation, CausalConv1dOptions, CausalConv1dStepOptions};
@@ -35,6 +35,20 @@ fn integer(op: &str, name: &str, t: &Tensor) -> Result<()> {
     Ok(())
 }
 
+/// The operations' inputs are dash-contract's dtypes, f32, bf16 and f16, on every side: the kernels
+/// have no f64, MLX's GPU has none, and an integer has no place here.
+fn contract_dtypes<'a>(
+    op: &str,
+    tensors: impl IntoIterator<Item = (&'a str, &'a Tensor)>,
+) -> Result<()> {
+    for (name, t) in tensors {
+        if !matches!(t.dtype(), DType::F32 | DType::BF16 | DType::F16) {
+            return refuse(format!("{op}: {name} of {:?}", t.dtype()));
+        }
+    }
+    Ok(())
+}
+
 fn option(t: Option<&Tensor>) -> Option<&crate::tensor::A> {
     t.map(|t| &t.0)
 }
@@ -51,6 +65,7 @@ pub fn attention(
     rank(op, "query", query, 4)?;
     rank(op, "key", key, 4)?;
     rank(op, "value", value, 4)?;
+    contract_dtypes(op, [("query", query), ("key", key), ("value", value)])?;
     let mask = match mask {
         AttentionMask::None => Mask::None,
         AttentionMask::KeyPadding(m) => {
@@ -89,6 +104,7 @@ pub fn attention_decode(
     rank(op, "query", query, 3)?;
     rank(op, "key", key, 4)?;
     rank(op, "value", value, 4)?;
+    contract_dtypes(op, [("query", query), ("key", key), ("value", value)])?;
     if let Some(lengths) = cache_lengths {
         integer(op, "cache_lengths", lengths)?;
     }
@@ -123,6 +139,13 @@ pub fn causal_conv1d(
     if let Some(offsets) = cu_seqlens {
         integer(op, "cu_seqlens", offsets)?;
     }
+    contract_dtypes(
+        op,
+        [("x", x), ("weight", weight)]
+            .into_iter()
+            .chain(bias.map(|t| ("bias", t)))
+            .chain(initial_state.map(|t| ("the initial state", t))),
+    )?;
     let (out, state) = Selected::causal_conv1d(
         &x.0,
         &weight.0,
@@ -149,6 +172,12 @@ pub fn causal_conv1d_update(
         rank(op, "bias", bias, 1)?;
     }
     rank(op, "state", state, 3)?;
+    contract_dtypes(
+        op,
+        [("x", x), ("weight", weight), ("state", state)]
+            .into_iter()
+            .chain(bias.map(|t| ("bias", t))),
+    )?;
     let (out, state) =
         Selected::causal_conv1d_update(&x.0, &weight.0, option(bias), &state.0, options)?;
     Ok((Tensor(out), Tensor(state)))
@@ -179,6 +208,12 @@ pub fn chunk_gated_delta_rule(
     if let Some(offsets) = cu_seqlens {
         integer(op, "cu_seqlens", offsets)?;
     }
+    contract_dtypes(
+        op,
+        [("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta)]
+            .into_iter()
+            .chain(initial_state.map(|t| ("the initial state", t))),
+    )?;
     let (out, state) = Selected::chunk_gated_delta_rule(
         &q.0,
         &k.0,
@@ -215,6 +250,17 @@ pub fn gated_delta_step(
     if let Some(offsets) = cu_seqlens {
         integer(op, "cu_seqlens", offsets)?;
     }
+    contract_dtypes(
+        op,
+        [
+            ("q", q),
+            ("k", k),
+            ("v", v),
+            ("g", g),
+            ("beta", beta),
+            ("state", state),
+        ],
+    )?;
     let (out, state) = Selected::gated_delta_step(
         &q.0,
         &k.0,
@@ -248,6 +294,7 @@ pub fn chosen_logprob(
     rank(op, "hidden", hidden, 2)?;
     rank(op, "weight", weight, 2)?;
     integer(op, "targets", targets)?;
+    contract_dtypes(op, [("hidden", hidden), ("weight", weight)])?;
     let (logprob, entropy) =
         Selected::chosen_logprob(&hidden.0, &weight.0, &targets.0, masked, options)?;
     Ok(ChosenLogprob {
@@ -272,6 +319,7 @@ pub struct Sampled {
 /// The next token of each row, drawn on the device: `logits` `[B, V]`.
 pub fn sample(logits: &Tensor, options: &SampleOptions) -> Result<Sampled> {
     rank("sample", "logits", logits, 2)?;
+    contract_dtypes("sample", [("logits", logits)])?;
     let drawn = Selected::sample(&logits.0, options)?;
     Ok(Sampled {
         tokens: Tensor(drawn.tokens),
@@ -299,5 +347,11 @@ pub fn low_rank(
     if let Some(base) = base {
         rank(op, "base", base, x.rank())?;
     }
+    contract_dtypes(
+        op,
+        [("x", x), ("u", u), ("v", v)]
+            .into_iter()
+            .chain(base.map(|t| ("base", t))),
+    )?;
     Tensor::wrap(Selected::low_rank(&x.0, &u.0, &v.0, option(base), options))
 }

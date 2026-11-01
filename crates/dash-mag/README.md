@@ -15,8 +15,9 @@ Part of [Dashmag](https://github.com/bayanasar/dashmag). See the repository for 
 `src/arm/mlx.rs` is the side on macOS, over dash-mlx. Building it is dash-mlx's: a prebuilt MLX through
 `MLX_SYS_PREBUILT`, or MLX built from source. f32 results assume `MLX_ENABLE_TF32=0`.
 
-MLX's GPU has no f64. An array operation that reads or makes f64 runs on the CPU, and the operations
-with Metal kernels refuse it. MLX's `exp` in f64 has only f32's accuracy, so `exp`, `sigmoid`, `silu`
+MLX's GPU has no f64. An array operation that reads or makes f64 runs on the CPU. The operations in
+`ops` take dash-contract's dtypes, f32, bf16 and f16, and the gateway refuses f64 for them on every
+side. MLX's `exp` in f64 has only f32's accuracy, so `exp`, `sigmoid`, `silu`
 and `softplus` take it from the host there; `log` and `sqrt` are exact.
 
 ## Speed on MLX
