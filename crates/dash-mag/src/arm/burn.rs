@@ -390,8 +390,13 @@ fn take_axis<const D: usize, K: Kindly>(raw: Raw, indices: &Array, axis: usize) 
 }
 
 fn put_axis<const D: usize>(a: &Array, indices: &Array, values: &Array, axis: usize) -> Raw {
+    put_axis_owned::<D>(a.clone(), indices, values, axis)
+}
+
+/// Burn's scatter writes in place when nothing else holds the buffer, and copies it otherwise.
+fn put_axis_owned<const D: usize>(a: Array, indices: &Array, values: &Array, axis: usize) -> Raw {
     let on = a.is_autodiff() || values.is_autodiff();
-    ad(a.t::<D>(), on)
+    ad(Tensor::<D>::from_dispatch(a.raw), on)
         .scatter(
             axis,
             ad(indices.i::<D>(), on),
@@ -696,6 +701,17 @@ impl Arm for Burn {
     fn put_along_axis(a: &Array, indices: &Array, values: &Array, axis: usize) -> Result<Array> {
         Ok(Array::float(
             ranked!(a.rank(), put_axis; a, indices, values, axis),
+        ))
+    }
+
+    fn put_along_axis_owned(
+        a: Array,
+        indices: &Array,
+        values: &Array,
+        axis: usize,
+    ) -> Result<Array> {
+        Ok(Array::float(
+            ranked!(a.rank(), put_axis_owned; a, indices, values, axis),
         ))
     }
 
