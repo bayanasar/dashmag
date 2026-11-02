@@ -713,6 +713,32 @@ impl Tensor {
     /// `axis`. Each place is written once: repeated indices leave which value lands to the side, and
     /// an index out of range is the caller's to avoid, as not every side checks it.
     pub fn put_along_axis(&self, indices: &Tensor, values: &Tensor, axis: isize) -> Result<Self> {
+        let (at, values) = self.put_checks(indices, values, axis)?;
+        Self::wrap(Selected::put_along_axis(&self.0, &indices.0, &values.0, at))
+    }
+
+    /// [`Tensor::put_along_axis`] on a tensor given up for it, as a cache written a row at a time
+    /// is: where nothing else holds its buffer (no clone of it, nor a slice), the side writes in
+    /// place instead of copying it first. The result is the same either way.
+    pub fn put_along_axis_owned(
+        self,
+        indices: &Tensor,
+        values: &Tensor,
+        axis: isize,
+    ) -> Result<Self> {
+        let (at, values) = self.put_checks(indices, values, axis)?;
+        Self::wrap(Selected::put_along_axis_owned(
+            self.0, &indices.0, &values.0, at,
+        ))
+    }
+
+    /// `put_along_axis`'s axis, and `values` in this tensor's dtype.
+    fn put_checks(
+        &self,
+        indices: &Tensor,
+        values: &Tensor,
+        axis: isize,
+    ) -> Result<(usize, Tensor)> {
         if !self.dtype().is_floating() {
             return refuse(format!(
                 "put_along_axis: {:?} is not floating",
@@ -736,8 +762,7 @@ impl Tensor {
                 values.shape()
             ));
         }
-        let values = values.as_dtype(self.dtype())?;
-        Self::wrap(Selected::put_along_axis(&self.0, &indices.0, &values.0, at))
+        Ok((at, values.as_dtype(self.dtype())?))
     }
 
     /// `before` and `after` more elements of `value` along `axis`.

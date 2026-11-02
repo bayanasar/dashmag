@@ -182,6 +182,17 @@ pub(crate) trait Arm {
         values: &Self::Array,
         axis: usize,
     ) -> Result<Self::Array>;
+    /// [`Arm::put_along_axis`] on an `a` its caller gives up. A side that computes at once copies
+    /// `a` for a write unless nothing else holds its buffer, and only an `a` given up can be that;
+    /// a lazy side frees its own reference before it computes, so the default is enough for it.
+    fn put_along_axis_owned(
+        a: Self::Array,
+        indices: &Self::Array,
+        values: &Self::Array,
+        axis: usize,
+    ) -> Result<Self::Array> {
+        Self::put_along_axis(&a, indices, values, axis)
+    }
 
     /// Over the whole array, to rank 0, or over `axis`, kept with a length of 1.
     fn reduce(op: Reduce, a: &Self::Array, axis: Option<usize>) -> Result<Self::Array>;

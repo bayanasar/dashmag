@@ -447,6 +447,34 @@ fn put_along_axis_writes_at_the_indices_along_the_axis() {
 }
 
 #[test]
+fn put_along_axis_owned_writes_as_put_along_axis_and_leaves_what_others_hold() {
+    let at = Tensor::from_i32(&[2, 0], &[2, 1]).unwrap();
+    let v = t(&[10.0, 20.0], &[2, 1]);
+    let written = [1.0, 2.0, 10.0, 20.0, 5.0, 6.0];
+    // Nothing else holds the buffer: the side may write in place.
+    let x = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    dash_mag::eval(&[&x]).unwrap();
+    close(&x.put_along_axis_owned(&at, &v, 1).unwrap(), &written, 0.0);
+    // A clone and a slice of it held: they keep what they had.
+    let x = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    dash_mag::eval(&[&x]).unwrap();
+    let (held, row) = (x.clone(), x.slice(0, 1..2).unwrap());
+    close(&x.put_along_axis_owned(&at, &v, 1).unwrap(), &written, 0.0);
+    close(&held, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 0.0);
+    close(&row, &[4.0, 5.0, 6.0], 0.0);
+    // Its refusals are put_along_axis's.
+    let x = t(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    assert!(
+        x.put_along_axis_owned(
+            &Tensor::from_i32(&[0], &[1, 1]).unwrap(),
+            &t(&[1.5], &[1, 1]),
+            1
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn put_along_axis_refuses_what_does_not_fit() {
     let x = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
     let at = Tensor::from_i32(&[0, 1], &[2, 1]).unwrap();
