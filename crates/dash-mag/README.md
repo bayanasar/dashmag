@@ -10,6 +10,26 @@ Part of [Dashmag](https://github.com/bayanasar/dashmag). See the repository for 
 > **Status:** pre-alpha. Both sides are written, and one training step of a small model with LoRA runs
 > from one source on each (`tests/step.rs`). No application has moved onto it yet.
 
+## On CUDA
+
+`--features cuda`. f32 results assume IEEE f32 products. cubecl-cuda as published runs f32 matmuls and
+convolutions in TF32 on compute capability 8.0 and later, each input rounded to 10 mantissa bits, and
+Burn has no setting for that yet. This repository patches it, but Cargo applies a `[patch]` only in the
+workspace that writes it, so an application repeats it, at the revision of dash-mag it pins:
+
+```toml
+[patch.crates-io]
+cubecl-cuda = { git = "https://github.com/bayanasar/dashmag", rev = "<that revision>" }
+```
+
+and runs with `CUBECL_CUDA_TF32=0`. A device that would still run them in TF32, because the patch is
+missing or the variable unset, refuses the first tensor, with an error that says this.
+`CUBECL_CUDA_TF32=1` accepts TF32. The check asks the device what the matmul kernels ask it, so a card
+before 8.0 needs neither.
+
+The numbers in `PROGRESS.md` are from this workspace's `Cargo.lock`. A new application resolves the rest
+of CubeCL to its latest patch release beside the patched cubecl-cuda 0.11.1.
+
 ## On MLX
 
 `src/arm/mlx.rs` is the side on macOS, over dash-mlx. Building it is dash-mlx's: a prebuilt MLX through

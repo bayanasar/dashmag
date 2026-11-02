@@ -80,6 +80,32 @@ macro_rules! kinded {
     };
 }
 
+/// Refuses every tensor on a device that would run f32 matmuls in TF32, far past the bounds this
+/// crate's results are held to, unless `CUBECL_CUDA_TF32=1` says that is wanted. All tensors start
+/// at the four constructors that ask this. An application's build has the published cubecl-cuda
+/// unless it repeats the workspace's patch, and nothing else would say so.
+#[cfg(feature = "cuda")]
+fn check_device() -> Result<()> {
+    static REFUSED: OnceLock<bool> = OnceLock::new();
+    let refused = *REFUSED.get_or_init(|| {
+        std::env::var("CUBECL_CUDA_TF32").as_deref() != Ok("1")
+            && dash_ops::f32_products_in_tf32(device())
+    });
+    if refused {
+        return refuse(
+            "this device would run f32 matmuls in TF32: set CUBECL_CUDA_TF32=0 with the patch of \
+             cubecl-cuda in your manifest (dash-mag's README, \"On CUDA\"), or CUBECL_CUDA_TF32=1 \
+             to accept TF32",
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn check_device() -> Result<()> {
+    Ok(())
+}
+
 fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
@@ -478,6 +504,7 @@ impl Arm for Burn {
     }
 
     fn from_bytes(bytes: &[u8], shape: &[usize], dtype: DType) -> Result<Array> {
+        check_device()?;
         let dtype = burn_dtype(dtype)?;
         let data = TensorData::from_bytes_vec(bytes.to_vec(), held(shape), dtype);
         let raw = ranked!(rank_of(shape), from_data_float; data, dtype);
@@ -485,18 +512,21 @@ impl Arm for Burn {
     }
 
     fn from_i32(values: &[i32], shape: &[usize]) -> Result<Array> {
+        check_device()?;
         let data = TensorData::new(values.to_vec(), held(shape));
         let raw = ranked!(rank_of(shape), from_data_int; data);
         Ok(Array::new(raw, Kind::Int, shape.is_empty()))
     }
 
     fn from_bool(values: &[bool], shape: &[usize]) -> Result<Array> {
+        check_device()?;
         let data = TensorData::new(values.to_vec(), held(shape));
         let raw = ranked!(rank_of(shape), from_data_bool; data);
         Ok(Array::new(raw, Kind::Bool, shape.is_empty()))
     }
 
     fn full(shape: &[usize], value: f64, dtype: DType) -> Result<Array> {
+        check_device()?;
         let dtype = burn_dtype(dtype)?;
         let raw = ranked!(rank_of(shape), full_float; &held(shape), value, dtype);
         Ok(Array::new(raw, Kind::Float, shape.is_empty()))

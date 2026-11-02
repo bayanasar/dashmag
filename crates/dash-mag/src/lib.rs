@@ -45,8 +45,9 @@
 //! operations are held to, not bit for bit. dash-ops and dash-mlx each hold their operations to
 //! the same recorded references (dash-conformance); this crate's tests hold its entry points to
 //! direct calls of them. f32 results assume IEEE f32 products: `CUBECL_CUDA_TF32=0` on CUDA
-//! (dash-ops' patched cubecl-cuda, a `[patch]` a dependent workspace has to repeat) and
-//! `MLX_ENABLE_TF32=0` on MLX.
+//! (dash-ops' patched cubecl-cuda, a `[patch]` a dependent workspace has to repeat; without them
+//! a device that would run f32 matmuls in TF32 refuses the first tensor) and `MLX_ENABLE_TF32=0`
+//! on MLX.
 
 mod arm;
 mod autodiff;

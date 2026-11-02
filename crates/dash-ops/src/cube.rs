@@ -17,10 +17,10 @@
 
 use burn::backend::DispatchDevice;
 use burn::backend::cubecl::dtype_to_storage_type;
-use burn::tensor::DType;
+use burn::tensor::{DType, Device};
 use cubecl::client::Client;
 use cubecl::features::{Plane, TypeUsage};
-use cubecl::ir::{AddressType, DeviceProperties, ElemType, IntKind};
+use cubecl::ir::{AddressType, DeviceProperties, ElemType, FloatKind, IntKind};
 
 /// What one kernel launch asks of the device.
 #[derive(Clone, Copy, Debug)]
@@ -144,6 +144,18 @@ impl Requirements {
             && int64
             && dtypes
     }
+}
+
+/// Whether Burn's f32 matmuls and convolutions on `device` run in TF32, on the tensor cores with
+/// 10 mantissa bits: cubek-matmul promotes them wherever the device supports the type, and this
+/// asks what it asks. On CUDA that is compute capability 8.0 and later, but for
+/// `CUBECL_CUDA_TF32=0` under this workspace's patched cubecl-cuda.
+pub fn f32_products_in_tf32(device: &Device) -> bool {
+    client(device.as_dispatch()).is_some_and(|client| {
+        client
+            .properties()
+            .supports_type(ElemType::Float(FloatKind::TF32))
+    })
 }
 
 /// The compute client of `device` when it is a CubeCL device, with or without autodiff.

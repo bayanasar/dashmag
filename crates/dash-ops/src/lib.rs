@@ -77,6 +77,8 @@ pub mod checkpoint;
 pub mod conv1d;
 #[cfg(feature = "cubecl")]
 pub(crate) mod cube;
+#[cfg(feature = "cubecl")]
+pub use cube::f32_products_in_tf32;
 pub mod gated_delta;
 pub mod logprob;
 pub mod loss;
