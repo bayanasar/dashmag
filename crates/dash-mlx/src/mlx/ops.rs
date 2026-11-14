@@ -250,6 +250,13 @@ impl Array {
             sys::mlx_transpose_axes(res, self.as_ptr(), axes.as_ptr(), axes.len(), s)
         })
     }
+
+    /// The same bytes read as `dtype`. Where `dtype`'s size differs from this array's, the last
+    /// axis takes the same bytes in elements of the new size.
+    pub fn view(&self, dtype: Dtype) -> Result<Array> {
+        // SAFETY: valid handles, for the length of the call.
+        op(|res, s| unsafe { sys::mlx_view(res, self.as_ptr(), dtype as sys::mlx_dtype, s) })
+    }
 }
 
 /// `x` with gradients stopped: the same values, a constant to differentiation.
@@ -554,4 +561,32 @@ pub fn zeros_dtype(shape: &[i32], dtype: Dtype) -> Result<Array> {
 pub fn zeros_like(a: impl AsRef<Array>) -> Result<Array> {
     let a = a.as_ref();
     zeros_dtype(a.shape(), a.dtype())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::mlx::{Array, Dtype};
+
+    #[test]
+    fn a_view_keeps_the_bytes() {
+        let words = [0, -1, i32::MIN, 0x0123_4567, -0x7654_3211, 0x3f80_0000];
+        let a = Array::from_slice(&words, &[2, 3]);
+
+        let u = a.view(Dtype::Uint32).unwrap();
+        assert_eq!((u.shape(), u.dtype()), (&[2, 3][..], Dtype::Uint32));
+        assert_eq!(u.as_slice::<u32>(), words.map(|w| w as u32));
+
+        let f = a.view(Dtype::Float32).unwrap();
+        let bits: Vec<u32> = f.as_slice::<f32>().iter().map(|x| x.to_bits()).collect();
+        assert_eq!(bits, words.map(|w| w as u32));
+
+        let b = a.view(Dtype::Uint8).unwrap();
+        assert_eq!(b.shape(), &[2, 12]);
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(b.as_slice::<u8>(), bytes);
+
+        let back = b.view(Dtype::Int32).unwrap();
+        assert_eq!(back.shape(), &[2, 3]);
+        assert_eq!(back.as_slice::<i32>(), words);
+    }
 }
