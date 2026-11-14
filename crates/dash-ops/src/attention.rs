@@ -34,8 +34,11 @@
 //! above, on a device with `mma.sync` m16n8k16 and `ldmatrix` for that dtype, planes of exactly
 //! 32 units (the tensor-core fragments and the plane shuffles are laid out for them), 256 units
 //! per cube, up to 97 KiB of shared memory per cube and, for the backward, atomic f32 additions
-//! in global memory: CUDA cards of compute capability 8.0 and later, where they always run;
-//! elsewhere the reference runs (`kernels_take` tells which).
+//! in global memory: CUDA cards of compute capability 8.0 and later, where they always run.
+//! Where those are missing, a device whose 16 x 16 x 16 MMA from that dtype into f32 has RDNA4's
+//! register layout (checked on the device the first time) runs a forward of its own on it, up
+//! to 33 KiB of shared memory and 128 units per cube: AMD's RDNA4 GPUs under ROCm. Its backward
+//! is the reference. Elsewhere the reference runs (`kernels_take` tells which).
 //!
 //! - Training: a FlashAttention-2 style forward that also writes each query's log-sum-exp, and a
 //!   backward that by default gives the same bits on every run: `delta = rowsum(dO * O)`; the
@@ -67,6 +70,9 @@
 //!   (flash-attn's `deterministic`). The output, the log-sum-exp and the key and value gradients
 //!   are the same bits from run to run, and the same in both ways (split, each key and value
 //!   gradient is two addends added to zero, in either order the same).
+//! - Training forward on RDNA4: the same sweep and the same masks, on the transposed products
+//!   (`S^T = K Q^T`, `O^T += V^T P^T`), whose 16 x 16 x 16 layout keeps the probabilities in
+//!   registers between the two, a lane per query; no T x T either (`wmma.rs`).
 //! - Decoding: the cache is split (flash-decoding), counted back from each sequence's last key so
 //!   that splits past its length or before its window cost nothing; each key and value row is
 //!   loaded once for all the query heads of its group; then the splits are merged by their
@@ -137,6 +143,8 @@ mod cube;
 #[cfg(feature = "cubecl")]
 mod kernels;
 mod reference;
+#[cfg(feature = "cubecl")]
+mod wmma;
 
 /// Counters tests read to tell which path ran, and a switch they set to run each. Not part of
 /// the API.

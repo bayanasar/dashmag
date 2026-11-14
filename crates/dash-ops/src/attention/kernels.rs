@@ -92,7 +92,7 @@ pub(crate) const BLOCK_KV: u32 = 32;
 /// 32 x 32 tiles of `P` and `dS`) with bits 1 and 2, which spreads eight consecutive 64-byte
 /// rows over eight bank groups as well.
 #[cube]
-fn swizzle(r: u32, c: u32, #[comptime] chunks: u32) -> u32 {
+pub(super) fn swizzle(r: u32, c: u32, #[comptime] chunks: u32) -> u32 {
     if comptime!(chunks >= 8) {
         r * chunks + (c ^ (r & 7))
     } else {
@@ -104,7 +104,7 @@ fn swizzle(r: u32, c: u32, #[comptime] chunks: u32) -> u32 {
 /// `base` and has rows `row_stride` vectors apart, into the swizzled tile `dst`, all threads of
 /// the cube taking part. Rows at or past `limit` are written as zeros.
 #[cube]
-fn load_rows<E: Float>(
+pub(super) fn load_rows<E: Float>(
     src: &Tensor<Vector<E, V8>>,
     dst: &mut [Vector<E, V8>],
     base: usize,
@@ -431,7 +431,7 @@ fn aligned_bounds(row: u32, tq: u32, tk: u32, left: i32, right: i32) -> (i32, i3
 /// before that position to `right` after it, within its sequence. `left` and `right` are at most
 /// `tq + tk + 1`, which stands for no bound, so that nothing below leaves `i32`.
 #[cube]
-fn row_bounds(
+pub(super) fn row_bounds(
     row: u32,
     tq: u32,
     tk: u32,
@@ -664,7 +664,7 @@ fn block_bounds(
 /// The padding flags of keys `[k0, k0 + keys)` of batch element `b`, as `fetch_rows()` reads a
 /// tile: thread `UNIT_POS < keys` reads that key's flag (1 past `limit`).
 #[cube]
-fn fetch_padding(
+pub(super) fn fetch_padding(
     key_mask: &Tensor<i32>,
     base: usize,
     stride: u32,

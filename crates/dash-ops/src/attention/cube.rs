@@ -1,7 +1,8 @@
 //! The CubeCL backend, for every CubeCL runtime: launches the kernels of `kernels.rs` for the
 //! inputs they take (bf16 or f16, head dimension 64, 128 or 256) on a device with what they ask
-//! (the [`Requirements`] of each pass, `mma.sync` m16n8k16 and `ldmatrix` for the dtype), and
-//! runs the reference for the rest.
+//! (the [`Requirements`] of each pass, `mma.sync` m16n8k16 and `ldmatrix` for the dtype); the
+//! forward of `wmma.rs` on a device without those whose 16 x 16 x 16 MMA has the register layout
+//! that kernel is written for ([`wmma_layout`]); and the reference for the rest.
 //!
 //! Inputs are read through their strides, in place where the kernels can (see [`readable`]).
 //! Every tensor the kernels write is allocated contiguous, in the layout the module
@@ -12,6 +13,7 @@ use super::kernels::{
     BLOCK_KV, BLOCK_Q, backward_kernel, decode_merge_kernel, decode_split_kernel, delta_kernel,
     dq_kernel, finish_kernel, forward_kernel,
 };
+use super::wmma::{WMMA_BLOCK_KV, WMMA_BLOCK_Q, forward_wmma_kernel, layout_kernel};
 use super::{
     AttentionBackend, AttentionMaskPrimitive, AttentionOptions, CacheLengths, MaskShape, Reach,
     check_decode_shapes, check_shapes, probe, reference,
@@ -30,6 +32,7 @@ use cubecl::ir::features::AtomicUsage;
 use cubecl::ir::features::MmaConfig;
 use cubecl::ir::{AddressType, DeviceProperties, ElemType, FloatKind, Type};
 use cubecl::prelude::*;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 /// Elements per 16-byte vector: the kernels' unit of every load, so strides count in it.
@@ -174,6 +177,92 @@ fn tensor_cores(properties: &DeviceProperties, dtype: DType) -> bool {
         && properties.features.matmul.ldmatrix.contains(&elem)
 }
 
+/// What the forward of `wmma.rs` asks: 128 units per cube (four waves of 32), a cube per 64
+/// queries of each query head (and batch element), the key tile and the transposed value tile
+/// (32 keys each), the waves' spans and the padding flags in shared memory, eight tensors,
+/// 16-byte vectors and planes of 32.
+fn wmma_forward_requirements([_, tq, _, hq, _, d]: [usize; 6]) -> Requirements {
+    let (rows, bkv) = (WMMA_BLOCK_Q as usize, WMMA_BLOCK_KV as usize);
+    Requirements {
+        shared_bytes: 2 * bkv * d * 2 + 4 * (2 * rows / 16 + bkv),
+        vector_size: VECTOR,
+        plane_width: Some(PLANE),
+        ..Requirements::new((2 * rows as u32, 1), (tq.div_ceil(rows), hq), 8)
+    }
+}
+
+/// Whether the device has a 16 x 16 x 16 MMA from `dtype` into f32.
+fn mma_16x16x16(properties: &DeviceProperties, dtype: DType) -> bool {
+    let elem = dtype_to_elem_type(dtype);
+    properties.features.matmul.mma.contains(&MmaConfig {
+        a_type: elem,
+        b_type: elem,
+        cd_type: ElemType::Float(FloatKind::F32),
+        m: 16,
+        n: 16,
+        k: 16,
+    })
+}
+
+/// The row and column of element `e` of lane `lane` that `forward_wmma_kernel()` is written for,
+/// of A (`ident` 0), B (1) and the accumulator (2): see `wmma.rs`.
+fn wmma_expected(ident: usize, lane: u32, e: u32) -> (u32, u32) {
+    let (index, half) = (lane % 16, 8 * (lane / 16) + e);
+    match ident {
+        0 => (index, half),
+        _ => (half, index),
+    }
+}
+
+/// Whether the 16 x 16 x 16 MMA's register layout, as `position_of_nth` gives it on the device
+/// `client` serves, is the one `forward_wmma_kernel()` is written for (RDNA4's; RDNA3's differs).
+/// Read from the device once per process, by [`layout_kernel`], the first time a device with
+/// that MMA meets the forward: the one GPU of a process with it decides for any other.
+fn wmma_layout(client: &Client, dtype: DType) -> bool {
+    static LAYOUT: OnceLock<bool> = OnceLock::new();
+    *LAYOUT.get_or_init(|| {
+        let n = 32 * 3 * 8 * 2;
+        let pos = client.empty(4 * n);
+        // SAFETY: one plane of 32 units; lane `l` writes elements `48 l..48 l + 48` of `n`.
+        unsafe {
+            layout_kernel::launch_unchecked(
+                client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(PLANE),
+                BufferArg::from_raw_parts(pos.clone(), n),
+                dtype_to_storage_type(dtype),
+            );
+        }
+        let Ok(bytes) = client.read_one(pos) else {
+            return false;
+        };
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        (0..32u32).all(|lane| {
+            (0..3).all(|ident| {
+                (0..8u32).all(|e| {
+                    let at = (((lane as usize * 3 + ident) * 8) + e as usize) * 2;
+                    (words[at], words[at + 1]) == wmma_expected(ident, lane, e)
+                })
+            })
+        })
+    })
+}
+
+/// Whether the forward runs on `wmma.rs`'s kernel: the device lacks what `kernels.rs`'
+/// forward asks, and has a 16 x 16 x 16 MMA in the layout that kernel is written for, with
+/// what else it asks.
+fn forward_on_wmma(client: &Client, dtype: DType, dims: [usize; 6]) -> bool {
+    let properties = client.properties();
+    let types = [dtype, DType::F32, DType::I32];
+    !(tensor_cores(properties, dtype) && forward_requirements(dims).met_on(client, &types))
+        && mma_16x16x16(properties, dtype)
+        && wmma_forward_requirements(dims).met_on(client, &types)
+        && wmma_layout(client, dtype)
+}
+
 /// Whether the device adds to f32 in global memory atomically, as the backward sums `dQ`.
 fn float_atomics(properties: &DeviceProperties) -> bool {
     properties
@@ -206,8 +295,9 @@ pub(super) fn kernels_take(
         && tq + tk < 1 << 29
         && (b * tq.next_multiple_of(BLOCK_KV as usize).max(tk) * hq.max(hkv) * d) < 1 << 32
         && b <= properties.hardware.max_cube_count.2 as usize
-        && tensor_cores(properties, dtype)
-        && requirements.met_on(client, &[dtype, DType::F32, DType::I32])
+        && (tensor_cores(properties, dtype)
+            && requirements.met_on(client, &[dtype, DType::F32, DType::I32])
+            || !backward && forward_on_wmma(client, dtype, dims))
 }
 
 /// What the decoding kernels ask for `[B, S, Hq, Hkv, D]` in `splits` splits: 128 units per
@@ -426,6 +516,52 @@ fn forward(
     let [k_sb, k_sh, k_st] = sequence_strides(&key);
     let [v_sb, v_sh, v_st] = sequence_strides(&value);
     let [m_sb, m_st] = mask.key_strides;
+    if forward_on_wmma(&client, query.dtype, [b, tq, tk, hq, hkv, d]) {
+        let dtype = dtype_to_storage_type(query.dtype);
+        let q_blocks = tq.div_ceil(WMMA_BLOCK_Q as usize);
+        launched();
+        // SAFETY: as below; the cube count and units are those `wmma_forward_requirements`
+        // checked, and the kernel bounds every index as `forward_kernel` does.
+        unsafe {
+            forward_wmma_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(q_blocks as u32, hq as u32, b as u32),
+                CubeDim::new_1d(2 * WMMA_BLOCK_Q),
+                query.into_tensor_arg(),
+                key.into_tensor_arg(),
+                value.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                lse.clone().into_tensor_arg(),
+                mask.keys.clone().into_tensor_arg(),
+                mask.cu_q.clone().into_tensor_arg(),
+                mask.cu_k.clone().into_tensor_arg(),
+                q_blocks as u32,
+                tq as u32,
+                tk as u32,
+                (hq / hkv) as u32,
+                q_sb,
+                q_sh,
+                q_st,
+                k_sb,
+                k_sh,
+                k_st,
+                v_sb,
+                v_sh,
+                v_st,
+                m_sb,
+                m_st,
+                mask.seqs,
+                mask.left,
+                mask.right,
+                scale,
+                d as u32,
+                mask.padded,
+                mask.packed,
+                dtype,
+            );
+        }
+        return (output, lse);
+    }
     let (block_q, bkv) = forward_tiles(d);
     let q_blocks = tq.div_ceil(block_q as usize);
     let cube_count = CubeCount::Static(q_blocks as u32, hq as u32, b as u32);
