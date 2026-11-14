@@ -16,7 +16,9 @@
 //! MLX's quantized matmul computes in the dtype that `x`'s and the scales' promote to, so the
 //! scales and biases take `x`'s dtype. bf16 `x` with f16 scales would run in f32. On an Apple M6,
 //! bf16 `x` `[2048, 5120]` against a `5120 → 17408` projection took 85.7 ms in f32 (f32 scales),
-//! against 20.0 ms with bf16 scales (measured, MLX 0.32.4).
+//! against 20.0 ms with bf16 scales: 4.3 times. Over 512 and 2048 rows of that projection and of
+//! `17408 → 5120`, f32 scales took 2.9 to 4.3 times as long. (Medians, measured 2026-11-14 with
+//! MLX 0.32.4. The M6 was not idle: only terminals were open, at a load average of 1.07–1.37.)
 //!
 //! MLX's dequantize of the result gives `(q - 8) · scale` bit for bit with f32 scales, and that
 //! value rounded once with f16 scales. bf16 scales are the f16 ones rounded once, so with them
