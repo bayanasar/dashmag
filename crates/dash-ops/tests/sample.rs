@@ -1232,11 +1232,13 @@ fn constructed_row(v: usize, groups: &[Group]) -> Vec<f32> {
 
 /// Rows whose top-p cut takes each of the kernel's routes with the device's capacity (0 where the
 /// kernel does not run: the same rows, held to the definition only): every draw to the definition,
-/// and the kernel's tokens to the reference's.
+/// and the kernel's tokens to the reference's. The rows are written for a capacity of 8192 (CUDA's)
+/// and their groups scaled to the device's: 4096 on a Radeon with 64 KiB of shared memory.
 fn top_p_routes(device: &Device, capacity: usize) {
     let _serial = serial();
     let v = 100_000;
-    // Each row: its route, its top-p, and its groups of tokens (count, lowest, highest logit).
+    // Each row: its route, its top-p, and its groups of tokens (count, lowest, highest logit) at a
+    // capacity of 8192.
     let rows: [(&str, u32, f64, &[Group]); 4] = [
         ("candidates fit", 0, 0.9, &[(3000, -9.0, -7.0)]),
         (
@@ -1254,7 +1256,14 @@ fn top_p_routes(device: &Device, capacity: usize) {
         ("radix passes", 3, 0.9, &[(90_000, -2.0, -1.0)]),
     ];
     for (label, route, p, groups) in rows {
-        let z = constructed_row(v, groups);
+        let groups: Vec<Group> = groups
+            .iter()
+            .map(|&(count, lo, hi)| match capacity {
+                0 => (count, lo, hi),
+                _ => (count * capacity / 8192, lo, hi),
+            })
+            .collect();
+        let z = constructed_row(v, &groups);
         if capacity > 0 {
             assert_eq!(
                 top_p_route(&z, p, capacity),

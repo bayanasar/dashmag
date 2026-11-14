@@ -180,11 +180,13 @@ fn splits(device: &Device, label: &str) -> BTreeMap<&'static str, f64> {
     worst
 }
 
-/// Whether `device` is a CubeCL device but a CUDA one (lavapipe, OpenGL, the CPU runtime): the
-/// reference sums in other orders on the CPU runtime, and those bounds are a little wider.
+/// Whether `device` is a CubeCL device but a CUDA or ROCm one (lavapipe, OpenGL, the CPU runtime):
+/// the reference sums in other orders on the CPU runtime, and those bounds are a little wider.
+/// ROCm's kernels come from the same C++ compiler as CUDA's, and every error measured on it is
+/// within CUDA's bounds, bf16's to the same three digits.
 #[cfg(feature = "cubecl")]
 fn other_runtime(device: &Device) -> bool {
-    common::runtime_of(device).is_some() && !common::on_cuda(device)
+    !matches!(common::runtime_of(device), None | Some("cuda" | "hip"))
 }
 
 #[cfg(feature = "flex")]
@@ -338,8 +340,8 @@ mod cube {
                 let (abs, rel) = errors(&actual[part], expected);
                 // f32: rounding, the weight and bias gradients' long sums most; bf16, an ulp of
                 // each side's own rounding (the initial states' gradient is f32). The largest
-                // measured: on CUDA, then on lavapipe / OpenGL / the CPU runtime (whose reference
-                // sums in other orders; neither of the others has bf16).
+                // measured: on CUDA (ROCm within it), then on lavapipe / OpenGL / the CPU runtime
+                // (whose reference sums in other orders; neither of the others has bf16).
                 let bound = match (dtype, *part, other_runtime(&device())) {
                     (_, "final_state", _) => 0.0,
                     (Dtype::F32, "out", _) => 2.6e-7, // 2.58e-7; 2.58e-7 / 2.58e-7 / 1.39e-7

@@ -65,20 +65,23 @@ pub struct Bounds {
 }
 
 /// dash-ops' reference on Flex in f32, which agrees with torch to f32's rounding: just above the
-/// largest error measured over every record.
+/// largest error measured over every record, on x86-64 with AVX-512 and without it (where Flex's
+/// SIMD kernels sum in other orders: dq on the causal records reaches 4.97e-7 there).
 pub const FLEX_F32: Bounds = Bounds {
-    causal: [3e-7, 1.1e-7, 4.5e-7, 3.5e-7, 3.5e-7],
+    causal: [3e-7, 1.1e-7, 5e-7, 3.5e-7, 3.5e-7],
     masks: [3.2e-7, 1.2e-7, 3.2e-7, 4.1e-7, 3.5e-7],
 };
 
 /// dash-ops' reference on a CubeCL device in f32, its products and reductions Burn's CubeCL
 /// kernels, which the runtime picks differently: just above the largest error over the CUDA builds
-/// with and without fusion (an RTX 5070 Ti, CUDA 13), lavapipe and OpenGL over D3D12 through wgpu,
-/// and CubeCL's CPU runtime. On the causal records dq is 4.2e-7 relative on CUDA and 8.1e-7 on
-/// lavapipe, dk 3.3e-7 and 4.4e-7; on OpenGL the log-sum-exp of the mask records reaches 1.33e-7.
+/// with and without fusion (an RTX 5070 Ti, CUDA 13), ROCm (a Radeon AI PRO R9700, gfx1201, ROCm
+/// 7.2.1), lavapipe and OpenGL over D3D12 through wgpu, and CubeCL's CPU runtime. On the causal
+/// records dq is 4.2e-7 relative on CUDA and 8.1e-7 on lavapipe, dk 3.3e-7 and 4.4e-7; on OpenGL
+/// the log-sum-exp of the mask records reaches 1.33e-7. ROCm sets dv on the causal records
+/// (4.01e-7) and dq and dk on the mask records (5.22e-7, 4.23e-7).
 pub const CUBE_F32: Bounds = Bounds {
-    causal: [3.2e-7, 1.1e-7, 8.5e-7, 4.6e-7, 3.8e-7],
-    masks: [5.5e-7, 1.4e-7, 4.3e-7, 4.1e-7, 3.4e-7],
+    causal: [3.2e-7, 1.1e-7, 8.5e-7, 4.6e-7, 4.1e-7],
+    masks: [5.5e-7, 1.4e-7, 5.3e-7, 4.3e-7, 3.4e-7],
 };
 
 /// The same under Burn's autotune, whose kernels change from run to run (the value gradient of

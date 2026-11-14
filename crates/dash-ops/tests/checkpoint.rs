@@ -600,7 +600,7 @@ fn rms_rel(actual: &TensorData, expected: &TensorData) -> f64 {
 /// so the forward pass and the recorded pass round it differently. Plain autodiff's gradients
 /// are the decomposition's throughout; the checkpointed ones are the decomposition's evaluated
 /// at the fused kernel's values. In f32 they differ by a few roundings, up to 2.8e-7 of a
-/// tensor's largest value; in bf16 such a rounding now and then moves a bf16 value by a unit,
+/// tensor's largest value on x86-64 with AVX-512 and 3.8e-7 without it; in bf16 such a rounding now and then moves a bf16 value by a unit,
 /// and the checkpointed gradients are as far from the same stack computed in f32 as plain
 /// autodiff's: over these 8 stacks, at most 2.24 times as far on a single tensor, and over all
 /// of a stack's tensors between 0.955 and 1.115 times (root-mean-square errors). On CUDA layer
@@ -614,7 +614,7 @@ fn a_layer_norm_stack_differs_on_flex_by_roundings() {
         let p = plain(&layers, &x, &mask);
         let r = checkpointed(&layers, &x, &mask, 1);
         let max_rel = match name {
-            "flex" => 3e-7,
+            "flex" => 3.9e-7,
             _ => same_computation(name).0,
         };
         check_run(&format!("{name} layer norm f32"), &r, &p, max_rel);
