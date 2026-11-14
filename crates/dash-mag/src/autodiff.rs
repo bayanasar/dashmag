@@ -3,6 +3,34 @@
 use crate::Result;
 use crate::arm::{Arm, Selected};
 use crate::tensor::{A, Tensor};
+use std::cell::Cell;
+
+thread_local! {
+    /// Whether this thread is running the function [`vjp`] traces, for the operations that have no
+    /// backward pass: they refuse any call made there, on either side, whatever its inputs. (mlx-c
+    /// does not say whether an array is one of MLX's tracers.)
+    static IN_VJP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this thread is inside the function a [`vjp`] runs.
+pub(crate) fn in_vjp() -> bool {
+    IN_VJP.get()
+}
+
+/// [`IN_VJP`] set while this lives, and set back after, should the function panic too.
+struct InVjp(bool);
+
+impl InVjp {
+    fn enter() -> Self {
+        InVjp(IN_VJP.replace(true))
+    }
+}
+
+impl Drop for InVjp {
+    fn drop(&mut self) {
+        IN_VJP.set(self.0);
+    }
+}
 
 /// Runs `f` on `primals` and gives each primal the gradient of the sum of `out * cotangent` over
 /// the outputs that have a cotangent; an output without one takes no part. Returns the outputs,
@@ -25,7 +53,11 @@ where
 {
     let mut run = |arrays: &[A]| -> Result<Vec<A>> {
         let tensors: Vec<Tensor> = arrays.iter().cloned().map(Tensor).collect();
-        Ok(f(&tensors)?.into_iter().map(|t| t.0).collect())
+        let out = {
+            let _in_vjp = InVjp::enter();
+            f(&tensors)
+        };
+        Ok(out?.into_iter().map(|t| t.0).collect())
     };
     let primals: Vec<A> = primals.iter().map(|t| t.0.clone()).collect();
     let cotangents: Vec<Option<A>> = cotangents

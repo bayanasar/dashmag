@@ -467,7 +467,8 @@ impl QuantizedWeight {
 /// the output in `x`'s dtype. The definition is the product in f32, the bias added and the sum
 /// rounded once (`dash_contract::quant`); a side may round `W`, and the product before the bias,
 /// to `x`'s dtype, and is held to the definition within the bounds its tests record. A forward
-/// pass only: refused inside [`crate::vjp`]. On MLX the scales are cast to `x`'s dtype on each
+/// pass only: any call inside [`crate::vjp`] is refused, on both sides, whatever its inputs, a
+/// captured constant `x` too. On MLX the scales are cast to `x`'s dtype on each
 /// call; MLX sums in f32 and gives the product in `x`'s dtype, and past a few rows it forms `W` in
 /// that dtype.
 pub fn quantized_linear(
@@ -476,6 +477,9 @@ pub fn quantized_linear(
     bias: Option<&Tensor>,
 ) -> Result<Tensor> {
     let op = "quantized_linear";
+    if crate::autodiff::in_vjp() {
+        return refuse(format!("{op} is a forward pass only: not inside vjp"));
+    }
     if x.rank() < 2 || x.shape()[x.rank() - 1] != weight.inp {
         return refuse(format!(
             "{op}: x [.., {}] of rank 2 or more, got {:?}",

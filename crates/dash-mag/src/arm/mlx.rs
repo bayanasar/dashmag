@@ -13,7 +13,6 @@ use dash_mlx::mlx::transforms::fallible_vjp;
 use dash_mlx::mlx::{Array, Dtype, fast, memory, nn, transforms, version, with_cpu};
 use dash_mlx::quantized::{GROUP_SIZE, gptq_sym4_to_mlx};
 use half::{bf16, f16};
-use std::cell::Cell;
 
 use super::{
     Arm, Binary, Compare, Drawn, Logical, Mask, Memory, Reduce, RopeAt, Unary, VjpFn, VjpOut,
@@ -105,28 +104,6 @@ fn exact_exp(x: &Array) -> std::result::Result<Array, Exception> {
 fn exact_sigmoid(x: &Array) -> std::result::Result<Array, Exception> {
     let one = Array::from_slice_f64(&[1.0], &[]);
     one.divide(exact_exp(&x.negative()?)?.add(&one)?)
-}
-
-thread_local! {
-    /// Whether this thread is running the function [`Mlx::vjp`] traces. mlx-c does not say whether
-    /// an array is one of MLX's tracers, so an operation with no backward pass refuses any call made
-    /// there, where the Burn side refuses an input that carries a gradient.
-    static IN_VJP: Cell<bool> = const { Cell::new(false) };
-}
-
-/// [`IN_VJP`] set while this lives, and set back after, should the function panic too.
-struct InVjp(bool);
-
-impl InVjp {
-    fn enter() -> Self {
-        InVjp(IN_VJP.replace(true))
-    }
-}
-
-impl Drop for InVjp {
-    fn drop(&mut self) {
-        IN_VJP.set(self.0);
-    }
 }
 
 /// The quantized linear on MLX takes GPTQ's groups of 128 only, as the repack does: any other is
@@ -493,11 +470,7 @@ impl Arm for Mlx {
         let mut outs = Vec::new();
         let (_, grads) = fallible_vjp(
             |p: &[Array]| {
-                let out = {
-                    let _in_vjp = InVjp::enter();
-                    f(p)
-                }
-                .map_err(|e| Exception::custom(e.0))?;
+                let out = f(p).map_err(|e| Exception::custom(e.0))?;
                 if out.len() != cotangents.len() {
                     return Err(Exception::custom(format!(
                         "vjp: {} outputs and {} cotangents",
@@ -684,9 +657,6 @@ impl Arm for Mlx {
         bias: Option<&Array>,
         group: usize,
     ) -> Result<Array> {
-        if IN_VJP.get() {
-            return refuse("quantized_linear is a forward pass only: not inside vjp");
-        }
         groups_of_128(group)?;
         // The definition adds the bias in f32, and MLX's GPU has no f64.
         let bias = bias

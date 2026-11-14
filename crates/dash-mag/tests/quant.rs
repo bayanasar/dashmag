@@ -111,6 +111,15 @@ fn refusals() {
         &[None],
     );
     assert!(inside.is_err(), "refused inside vjp");
+    let constant = vjp(
+        |_: &[Tensor]| Ok(vec![quantized_linear(&x, &w, None)?]),
+        std::slice::from_ref(&x),
+        &[None],
+    );
+    assert!(
+        constant.is_err(),
+        "refused inside vjp on a captured constant too"
+    );
     assert!(quantized_linear(&x, &w, None).is_ok(), "and taken after it");
 }
 
