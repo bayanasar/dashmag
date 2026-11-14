@@ -21,17 +21,17 @@
 //!
 //! Without the `cuda` feature it only says so.
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 fn main() {
-    println!("gated_delta_chunk_bench times the CUDA kernels: run it with --features cuda");
+    println!("gated_delta_chunk_bench times a GPU backend: run it with --features cuda or rocm");
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn main() {
     bench::main();
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 mod bench {
     use burn::tensor::{DType, Device, Distribution, Int, Tensor, TensorData};
     use dash_ops::gated_delta::chunk::{ChunkGatedDeltaOptions, chunk_gated_delta_rule};
@@ -164,7 +164,10 @@ mod bench {
         let only = args.get(6).map(String::as_str).filter(|x| *x != "all");
         let reps = arg(7, 20);
         let pass = args.get(8).map(String::as_str).unwrap_or("all");
+        #[cfg(feature = "cuda")]
         let device = Device::cuda(0);
+        #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+        let device = Device::rocm(0);
         println!(
             "T {t} H {h} Dk = Dv {d} {dtype:?}, l2norm in kernel; {s} sequences of {} tokens",
             t / s

@@ -35,17 +35,17 @@
 //! `nsys stats -r cuda_gpu_kern_sum` (the forward is `forward_kernel`; the backward
 //! `delta_kernel`, `dq_kernel` (deterministic only), `backward_kernel` and `finish_kernel`).
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 fn main() {
-    eprintln!("attention_bench needs --features cuda");
+    eprintln!("attention_bench needs --features cuda or rocm");
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn main() {
     bench::run();
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 mod bench {
     use burn::backend::{DType, ops::AttentionModuleOptions};
     use burn::tensor::{Device, Distribution, Int, Tensor, TensorData, module};
@@ -77,8 +77,29 @@ mod bench {
     /// Burn's `autotune` on, CubeCL's throughput probes reserve a gigabyte there, which no
     /// operation measured here allocates. Under Burn's fusion, synchronise the device first,
     /// or the operations have not run yet.
+    /// The device's CubeCL client: the one device this benchmark runs on.
+    fn client() -> cubecl::client::Client {
+        fn of(device: &burn::backend::DispatchDevice) -> cubecl::client::Client {
+            match device {
+                burn::backend::DispatchDevice::Cube(device) => device.client(),
+                burn::backend::DispatchDevice::Autodiff(device) => of(device),
+                #[allow(unreachable_patterns)]
+                _ => panic!("a CubeCL device"),
+            }
+        }
+        of(gpu().as_dispatch())
+    }
+
+    /// The GPU: CUDA's device 0, or ROCm's without the `cuda` feature.
+    fn gpu() -> Device {
+        #[cfg(feature = "cuda")]
+        return Device::cuda(0);
+        #[cfg(not(feature = "cuda"))]
+        Device::rocm(0)
+    }
+
     fn memory() -> (u64, u64) {
-        let client = cubecl::Device::cuda(0).expect("CUDA device 0").client();
+        let client = client();
         let report = client.memory_report(cubecl::MemoryScope::Device);
         let mut largest = 0;
         for stream in &report.streams {
@@ -140,12 +161,20 @@ mod bench {
             .map(String::as_str)
             .filter(|a| {
                 a.parse::<usize>().is_err()
-                    && !["burn", "fixed", "atomic", "d64", "d128"].contains(a)
+                    && !["burn", "fixed", "atomic", "d64", "d128", "forward"].contains(a)
+                    && !a.starts_with("hq=")
+                    && !a.starts_with("hkv=")
             })
             .collect();
         let picked = |name: &str| filters.is_empty() || filters.iter().any(|f| name.starts_with(f));
-        let device = Device::cuda(0);
-        let (b, hq, hkv) = (1, 8, 2);
+        let device = gpu();
+        // Heads `hq=N` and `hkv=N` (default 8 and 2).
+        let heads = |key: &str, default: usize| {
+            args.iter()
+                .find_map(|a| a.strip_prefix(key))
+                .map_or(default, |n| n.parse().expect("a head count"))
+        };
+        let (b, hq, hkv) = (1, heads("hq=", 8), heads("hkv=", 2));
         println!("training: B {b}, Hq {hq}, Hkv {hkv}, T {t}, D {d}, bf16");
 
         let q = random([b, t, hq, d], &device);
@@ -153,6 +182,35 @@ mod bench {
         let v = random([b, t, hkv, d], &device);
         let grad = random([b, t, hq, d], &device);
         device.sync().unwrap();
+
+        // "forward": the causal forward alone, before anything else has run, so that the
+        // largest allocation is the forward's own.
+        if args.iter().any(|a| a == "forward") {
+            let (before, _) = memory();
+            let run = || {
+                attention_with_lse(
+                    q.clone(),
+                    k.clone(),
+                    v.clone(),
+                    AttentionMask::None,
+                    AttentionOptions::causal(),
+                )
+            };
+            let out = run();
+            device.sync().unwrap();
+            let (after, largest) = memory();
+            drop(out);
+            let ms = median_ms(&device, || {
+                let _ = run();
+            });
+            println!(
+                "  causal forward alone: {ms:.2} ms; +{:.1} MiB over the inputs after it \
+                 (output, log-sum-exp), largest allocation {:.1} MiB",
+                mib(after - before),
+                mib(largest)
+            );
+            return;
+        }
 
         let quarter = (t / 4) as i32;
         let cu = ints((0..=4).map(|i| i * quarter).collect(), &device);
@@ -468,6 +526,7 @@ mod bench {
             expanded * 1e3,
             with_expand * 1e3
         );
+        #[cfg(feature = "cuda")]
         flash_unit_decode(device, [b, hq, s, d]);
     }
 
@@ -475,6 +534,7 @@ mod bench {
     /// default strategy of a Burn built without `autotune`, as this workspace builds it, is the
     /// unfused fallback, and the accelerated flash routine cannot take one query (its stage's
     /// query count must divide the problem's), which leaves the unit routine.
+    #[cfg(feature = "cuda")]
     fn flash_unit_decode(device: &Device, [b, h, s, d]: [usize; 4]) {
         use burn::backend::{Shape, bf16};
         use burn_cubecl::kernel::attention::{AttentionStrategy, attention};
