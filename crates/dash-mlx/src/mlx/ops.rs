@@ -469,7 +469,8 @@ pub fn pad(a: impl AsRef<Array>, widths: &[(i32, i32)]) -> Result<Array> {
 
 /// `x` times `w` in MLX's affine quantization (`scales · q + biases` for each group of
 /// `group_size` values along `w`'s last axis, `bits` bits each), `w` transposed where `transpose`.
-/// It computes in the dtype that `x`'s and the scales' promote to.
+/// It takes `x`, the scales and the biases in the dtype they promote to and gives its output in
+/// it, summing in f32.
 pub fn quantized_matmul(
     x: impl AsRef<Array>,
     w: impl AsRef<Array>,

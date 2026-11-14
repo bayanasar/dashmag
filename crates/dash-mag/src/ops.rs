@@ -468,7 +468,8 @@ impl QuantizedWeight {
 /// rounded once (`dash_contract::quant`); a side may round `W`, and the product before the bias,
 /// to `x`'s dtype, and is held to the definition within the bounds its tests record. A forward
 /// pass only: refused inside [`crate::vjp`]. On MLX the scales are cast to `x`'s dtype on each
-/// call, and the product is computed in it.
+/// call; MLX sums in f32 and gives the product in `x`'s dtype, and past a few rows it forms `W` in
+/// that dtype.
 pub fn quantized_linear(
     x: &Tensor,
     weight: &QuantizedWeight,

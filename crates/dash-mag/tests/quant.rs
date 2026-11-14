@@ -179,8 +179,9 @@ fn the_definition_on_mlx() {
                     worst / scale
                 );
                 // Relative to the output's largest value, just above the largest measured on an
-                // Apple M6 with MLX 0.32.4 (2026-11-14): the product's rounding to `x`'s dtype,
-                // and the sum's with a bias; from bf16 the scales' rounding to bf16 too.
+                // Apple M6 with MLX 0.32.4 (2026-11-14), each at 40 rows: the product's rounding
+                // to `x`'s dtype and the sum's with a bias; past MLX's vector path (at most 33
+                // rows here), `W`'s rounding to `x`'s dtype; from bf16 the scales' rounding too.
                 let bound = match dtype {
                     DType::F32 => 2e-7,    // 1.92e-7
                     DType::BF16 => 3.5e-3, // 3.44e-3

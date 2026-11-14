@@ -13,8 +13,13 @@
 //! without changing them, transposes the scales, and sets `biases = -8 · scales`, which is exact
 //! wherever `8 · scales` is finite.
 //!
-//! MLX's quantized matmul computes in the dtype that `x`'s and the scales' promote to, so the
-//! scales and biases take `x`'s dtype. bf16 `x` with f16 scales would run in f32. On an Apple M6,
+//! MLX's quantized matmul takes `x`, the scales and the biases in the dtype they promote to, and
+//! gives its output in it, so the scales and biases take `x`'s dtype: bf16 `x` with f16 scales
+//! would run in f32. Its sums are f32 either way (MLX 0.32.4's Metal kernels): below a row count
+//! that depends on the GPU and the shape (6 to 33 rows), it reads `x` into f32 and never forms
+//! `W`; from there on, it dequantizes `W`'s tiles into that dtype and multiplies them with f32
+//! accumulation. What is in `x`'s dtype is the scales, the biases, the output and, past that row
+//! count, `W`. On an Apple M6,
 //! bf16 `x` `[2048, 5120]` against a `5120 → 17408` projection took 85.7 ms in f32 (f32 scales),
 //! against 20.0 ms with bf16 scales: 4.3 times. Over 512 and 2048 rows of that projection and of
 //! `17408 → 5120`, f32 scales took 2.9 to 4.3 times as long. (Medians, measured 2026-11-14 with
@@ -94,9 +99,10 @@ pub fn gptq_sym4_to_mlx(
 /// `x`'s dtype.
 ///
 /// The scales are cast to `x`'s dtype and the biases made from them, `-8 · scales`, on each call,
-/// so that MLX's quantized matmul computes in `x`'s dtype ([module](self)) and gives the product
-/// in it. A bias is added to that product in f32 and the sum rounded to `x`'s dtype, as
-/// `dash_contract::quant` allows.
+/// so that MLX's quantized matmul takes everything in `x`'s dtype and gives the product in it,
+/// summed in f32 ([module](self)). A bias is added to that product in f32 and the sum rounded to
+/// `x`'s dtype. `dash_contract::quant` allows each rounding: the scales' to `x`'s dtype, `W`'s
+/// where MLX forms it, and the product's before the bias.
 ///
 /// Made on each call, they cost time rather than memory. On an Apple M6, against `5120 → 17408`
 /// and `17408 → 5120` projections at one row of `x`, a call took 0.028–0.030 ms longer than with
