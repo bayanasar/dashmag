@@ -80,6 +80,14 @@ pub fn eval_async(tensors: &[&Tensor]) -> Result<()> {
 }
 
 /// What the device holds, where the side can say.
+///
+/// On MLX, [`Memory::active`] read right after an [`eval`] still counts buffers that the GPU's
+/// completion handlers have not yet released, such as the computation's intermediates. MLX
+/// releases them shortly after, once Metal has run those handlers. For one layer of
+/// [`chunk_gated_delta_rule`](crate::ops::chunk_gated_delta_rule) over 2700 tokens (16 heads of
+/// 128, bf16), its output dropped and its final state evaluated, `active` read 0.171 GB above its
+/// value before the call right after the `eval`, and 0.0009 GB after MLX's `synchronize` and
+/// 200 ms (Apple M6, MLX 0.32.4, one run).
 pub fn memory() -> Option<Memory> {
     Selected::memory()
 }
