@@ -20,7 +20,7 @@
 //! - [`mlx`]: the layer over Apple's mlx-c these operations are written on.
 //! - [`peft`]: PEFT's adapter files ([`dash_peft`]) read into LoRA's layers and written out of them.
 //! - [`quantized`]: GPTQ's symmetric int4 weights as stored, in the layout MLX's quantized matmul
-//!   takes.
+//!   takes, and the linear layer over them.
 //! - [`loss`]: cross-entropy from the hidden states and the output weight, with its reductions,
 //!   ignore index, label smoothing, z-loss and masked ids, without the n x V logits.
 //! - [`sample`]: the next token drawn on the device, as dash-ops draws it: temperature, top-k,

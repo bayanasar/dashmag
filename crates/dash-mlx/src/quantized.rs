@@ -25,6 +25,7 @@
 //! each weight is within one bf16 unit of `(q - 8) · scale` rounded once (`tests/quantized.rs`).
 
 use crate::mlx::error::{Exception, Result};
+use crate::mlx::ops::quantized_matmul;
 use crate::mlx::{Array, Dtype};
 
 /// GPTQ's group size: the rows of `in` that share a scale.
@@ -85,4 +86,47 @@ pub fn gptq_sym4_to_mlx(
     let scales = scales.as_dtype(dtype)?.t().contiguous()?;
     let biases = scales.multiply(Array::from_f32(-8.0).as_dtype(dtype)?)?;
     Ok((w, scales, biases))
+}
+
+/// `y = x W (+ bias)` over a weight in MLX's layout: `x` `[.., in]` in f32, bf16 or f16, `w` U32
+/// `[out, in/8]` and `scales` `[out, in/128]` as [`gptq_sym4_to_mlx`] gives them, the scales in any
+/// of those dtypes, and `bias` `[out]` in f32, bf16 or f16, or none. The output is `[.., out]` in
+/// `x`'s dtype.
+///
+/// The scales are cast to `x`'s dtype and the biases made from them, `-8 · scales`, on each call,
+/// so that MLX's quantized matmul computes in `x`'s dtype ([module](self)) and gives the product
+/// in it. A bias is added to that product in f32 and the sum rounded to `x`'s dtype, as
+/// `dash_contract::quant` allows.
+///
+/// Made on each call, they cost time rather than memory. On an Apple M6, against `5120 → 17408`
+/// and `17408 → 5120` projections at one row of `x`, a call took 0.028–0.030 ms longer than with
+/// scales and biases made once in bf16 (0.345–0.348 ms against 0.315–0.319), 0.010–0.015 ms
+/// longer in f16; at 512 rows, 0.5% longer or less for `5120 → 17408`, within the runs' spread for
+/// `17408 → 5120` (MLX 0.32.4, 2026-11-14, two runs, load averages 1.55–1.60). Kept, bf16 or f16
+/// scales and biases would add 6.25% of the packed weight's bytes for each dtype.
+///
+/// Errors if `x` or `bias` is not f32, bf16 or f16, or if the shapes do not fit.
+pub fn quantized_linear(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    bias: Option<&Array>,
+) -> Result<Array> {
+    let dtype = x.dtype();
+    let float = |d: Dtype| matches!(d, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16);
+    if !float(dtype) || bias.is_some_and(|b| !float(b.dtype())) {
+        return Err(Exception::custom(format!(
+            "quantized_linear: x and the bias must be f32, bf16 or f16, got {dtype:?} and {:?}",
+            bias.map(Array::dtype)
+        )));
+    }
+    let scales = scales.as_dtype(dtype)?;
+    let biases = scales.multiply(Array::from_f32(-8.0).as_dtype(dtype)?)?;
+    let y = quantized_matmul(x, w, &scales, &biases, true, GROUP_SIZE, BITS)?;
+    let Some(bias) = bias else {
+        return Ok(y);
+    };
+    y.as_dtype(Dtype::Float32)?
+        .add(bias.as_dtype(Dtype::Float32)?)?
+        .as_dtype(dtype)
 }

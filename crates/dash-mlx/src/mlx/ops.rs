@@ -467,6 +467,39 @@ pub fn pad(a: impl AsRef<Array>, widths: &[(i32, i32)]) -> Result<Array> {
     })
 }
 
+/// `x` times `w` in MLX's affine quantization (`scales · q + biases` for each group of
+/// `group_size` values along `w`'s last axis, `bits` bits each), `w` transposed where `transpose`.
+/// It computes in the dtype that `x`'s and the scales' promote to.
+pub fn quantized_matmul(
+    x: impl AsRef<Array>,
+    w: impl AsRef<Array>,
+    scales: impl AsRef<Array>,
+    biases: impl AsRef<Array>,
+    transpose: bool,
+    group_size: i32,
+    bits: i32,
+) -> Result<Array> {
+    let int = |value| sys::mlx_optional_int {
+        value,
+        has_value: true,
+    };
+    // SAFETY: valid handles, for the length of the call; a C string.
+    op(|res, s| unsafe {
+        sys::mlx_quantized_matmul(
+            res,
+            x.as_ref().as_ptr(),
+            w.as_ref().as_ptr(),
+            scales.as_ref().as_ptr(),
+            biases.as_ref().as_ptr(),
+            transpose,
+            int(group_size),
+            int(bits),
+            c"affine".as_ptr(),
+            s,
+        )
+    })
+}
+
 /// `x` where `condition` holds, `y` elsewhere.
 pub fn select(
     condition: impl AsRef<Array>,

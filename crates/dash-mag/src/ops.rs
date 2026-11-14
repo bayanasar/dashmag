@@ -358,8 +358,9 @@ pub fn low_rank(
 }
 
 /// A weight `[in, out]` quantized to 4 bits by group, as GPTQ stores it, checked once and kept as
-/// the side runs it (on Burn the packed `qweight` and the f16 `scales` as stored), for
-/// [`quantized_linear`]. `dash_contract::quant` gives the layout and the definition.
+/// the side runs it (on Burn the packed `qweight` and the f16 `scales` as stored, on MLX the words
+/// in MLX's layout and the scales transposed), for [`quantized_linear`]. `dash_contract::quant`
+/// gives the layout and the definition.
 #[derive(Clone)]
 pub struct QuantizedWeight {
     qweight: Tensor,
@@ -374,7 +375,8 @@ impl QuantizedWeight {
     /// `[in / group, out / 8]` `i32`, `scales` `[in / group, out]` f16, `g_idx` `[in]` `i32` or
     /// none. Refuses shapes that disagree, `in` not a multiple of the group or `out` of 8, scales
     /// not f16, a stored zero other than 8 (GPTQ v1's `zero - 1` among them), or a `g_idx` other
-    /// than `i / group`. Reads `qzeros` and `g_idx` to the host once.
+    /// than `i / group`, and on MLX a group other than 128. Reads `qzeros` and `g_idx` to the host
+    /// once.
     pub fn from_gptq(
         qweight: &Tensor,
         qzeros: &Tensor,
@@ -435,7 +437,7 @@ impl QuantizedWeight {
                 ));
             }
         }
-        let (qweight, scales) = Selected::prepare_quantized(&qweight.0, &scales.0)?;
+        let (qweight, scales) = Selected::prepare_quantized(&qweight.0, &scales.0, group)?;
         Ok(Self {
             qweight: Tensor::wrap(Ok(qweight))?,
             scales: Tensor::wrap(Ok(scales))?,
@@ -465,7 +467,8 @@ impl QuantizedWeight {
 /// the output in `x`'s dtype. The definition is the product in f32, the bias added and the sum
 /// rounded once (`dash_contract::quant`); a side may round `W`, and the product before the bias,
 /// to `x`'s dtype, and is held to the definition within the bounds its tests record. A forward
-/// pass only: refused inside [`crate::vjp`]. On MLX not yet.
+/// pass only: refused inside [`crate::vjp`]. On MLX the scales are cast to `x`'s dtype on each
+/// call, and the product is computed in it.
 pub fn quantized_linear(
     x: &Tensor,
     weight: &QuantizedWeight,

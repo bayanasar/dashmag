@@ -20,7 +20,7 @@ dash-lora's `metal` feature.
 | `lowrank` | the low-rank product `base + scale · (x U) V` with its gradients, f32 throughout, the sum rounded once | dash-ops' `up` kernel for the sum with the base; the rest MLX's matmuls |
 | `lora` | LoRA's layer: a frozen base at its own precision, f32 adapters never folded into it, several by name over one base, the choice of one | through `lowrank` |
 | `peft` | PEFT's adapter files read into LoRA's layers and written out of them byte for byte, under a name, trainable or frozen | dash-peft's format and checks, shared with dash-lora; the factors f32 arrays |
-| `quantized` | GPTQ's symmetric int4 weights as stored (`qweight`, F16 `scales`) in the layout MLX's quantized matmul takes, the scales and biases in the activations' dtype | the words transposed unchanged; MLX's `view`, transpose and cast |
+| `quantized` | GPTQ's symmetric int4 weights as stored (`qweight`, F16 `scales`) in the layout MLX's quantized matmul takes, the scales and biases in the activations' dtype; the linear layer over them | the words transposed unchanged; MLX's `view`, transpose and cast; MLX's quantized matmul |
 | `sample` | the next token drawn on the device, as dash-ops draws it: temperature, top-k, top-p and masked ids, the same Philox words and Gumbel variates, the token's log-probability under the model, the tempered distribution and the one drawn from | one kernel for the generator; the cuts and the draw MLX's operations |
 
 The operations build on `src/mlx`, a thin layer over Apple's mlx-c (below): arrays, MLX's errors,

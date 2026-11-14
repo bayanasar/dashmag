@@ -11,7 +11,9 @@ use dash_mlx::mlx::ops::{
 };
 use dash_mlx::mlx::transforms::fallible_vjp;
 use dash_mlx::mlx::{Array, Dtype, fast, memory, nn, transforms, version, with_cpu};
+use dash_mlx::quantized::{GROUP_SIZE, gptq_sym4_to_mlx};
 use half::{bf16, f16};
+use std::cell::Cell;
 
 use super::{
     Arm, Binary, Compare, Drawn, Logical, Mask, Memory, Reduce, RopeAt, Unary, VjpFn, VjpOut,
@@ -103,6 +105,39 @@ fn exact_exp(x: &Array) -> std::result::Result<Array, Exception> {
 fn exact_sigmoid(x: &Array) -> std::result::Result<Array, Exception> {
     let one = Array::from_slice_f64(&[1.0], &[]);
     one.divide(exact_exp(&x.negative()?)?.add(&one)?)
+}
+
+thread_local! {
+    /// Whether this thread is running the function [`Mlx::vjp`] traces. mlx-c does not say whether
+    /// an array is one of MLX's tracers, so an operation with no backward pass refuses any call made
+    /// there, where the Burn side refuses an input that carries a gradient.
+    static IN_VJP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// [`IN_VJP`] set while this lives, and set back after, should the function panic too.
+struct InVjp(bool);
+
+impl InVjp {
+    fn enter() -> Self {
+        InVjp(IN_VJP.replace(true))
+    }
+}
+
+impl Drop for InVjp {
+    fn drop(&mut self) {
+        IN_VJP.set(self.0);
+    }
+}
+
+/// The quantized linear on MLX takes GPTQ's groups of 128 only, as the repack does: any other is
+/// refused, so that this side never differs silently from the Burn side, which takes any group.
+fn groups_of_128(group: usize) -> Result<()> {
+    if group != GROUP_SIZE as usize {
+        return refuse(format!(
+            "quantized_linear: MLX's side takes groups of {GROUP_SIZE}, not {group}"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) struct Mlx;
@@ -458,7 +493,11 @@ impl Arm for Mlx {
         let mut outs = Vec::new();
         let (_, grads) = fallible_vjp(
             |p: &[Array]| {
-                let out = f(p).map_err(|e| Exception::custom(e.0))?;
+                let out = {
+                    let _in_vjp = InVjp::enter();
+                    f(p)
+                }
+                .map_err(|e| Exception::custom(e.0))?;
                 if out.len() != cotangents.len() {
                     return Err(Exception::custom(format!(
                         "vjp: {} outputs and {} cotangents",
@@ -626,5 +665,41 @@ impl Arm for Mlx {
         options: LowRankOptions,
     ) -> Result<Array> {
         Ok(dash_mlx::lowrank::low_rank(x, u, v, base, options)?)
+    }
+
+    /// The repack: the words in MLX's layout and the f16 scales transposed. Evaluated here, so that
+    /// the checkpoint's own arrays are let go when the caller drops them, not at the weight's first
+    /// call, and that call does not pay for the repack.
+    fn prepare_quantized(qweight: &Array, scales: &Array, group: usize) -> Result<(Array, Array)> {
+        groups_of_128(group)?;
+        let (w, scales, _) = gptq_sym4_to_mlx(qweight, scales, Dtype::Float16)?;
+        transforms::eval([&w, &scales])?;
+        Ok((w, scales))
+    }
+
+    fn quantized_linear(
+        x: &Array,
+        qweight: &Array,
+        scales: &Array,
+        bias: Option<&Array>,
+        group: usize,
+    ) -> Result<Array> {
+        if IN_VJP.get() {
+            return refuse("quantized_linear is a forward pass only: not inside vjp");
+        }
+        groups_of_128(group)?;
+        // The definition adds the bias in f32, and MLX's GPU has no f64.
+        let bias = bias
+            .map(|b| match b.dtype() {
+                Dtype::Float64 => with_cpu(|| b.as_dtype(Dtype::Float32)),
+                _ => Ok(b.clone()),
+            })
+            .transpose()?;
+        Ok(dash_mlx::quantized::quantized_linear(
+            x,
+            qweight,
+            scales,
+            bias.as_ref(),
+        )?)
     }
 }
