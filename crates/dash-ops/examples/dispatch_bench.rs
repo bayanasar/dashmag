@@ -34,12 +34,12 @@
 //! fusion, do not reach them. The `graph` phase records one step on Burn's CubeCL backend and
 //! replays it, checked bit for bit against eager steps (eager without fusion: 4.5-8.3 and
 //! 0.73-1.55 ms).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 use burn::tensor::{DType, Device, Distribution, Tensor};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 use std::time::Instant;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn random(device: &Device, shape: [usize; 2]) -> Tensor<2> {
     Tensor::<2>::random(
         shape,
@@ -52,7 +52,7 @@ fn random(device: &Device, shape: [usize; 2]) -> Tensor<2> {
 /// each step ending by reading one element of its output on the host. With `lazy`, the read is
 /// `into_data()` with its bytes never touched, as in the loop this benchmark comes from: Burn
 /// reads lazily, so that copies nothing and waits for nothing, and the step is timed as issued.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn chain(device: &Device, layers: usize, ops: usize, steps: usize, lazy: bool) -> f64 {
     let w = random(device, [1024, 1024]);
     let mut x = random(device, [8, 1024]);
@@ -87,7 +87,7 @@ fn chain(device: &Device, layers: usize, ops: usize, steps: usize, lazy: bool) -
 }
 
 /// Microseconds per one-element read of a tensor already computed.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn readback(device: &Device, reps: usize) -> f64 {
     let x = random(device, [8, 1024]);
     let read = || x.clone().slice([0..1, 0..1]).into_scalar::<f32>();
@@ -104,7 +104,7 @@ fn readback(device: &Device, reps: usize) -> f64 {
 /// Microseconds per matmul for `n` of them issued back to back and one sync at the end, and
 /// microseconds per matmul until the loop issuing them returned. `dependent` feeds each
 /// product into the next; otherwise all `n` read the same input.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn back_to_back(device: &Device, n: usize, dependent: bool) -> (f64, f64) {
     let w = random(device, [1024, 1024]);
     let x = random(device, [8, 1024]);
@@ -229,13 +229,16 @@ mod graph {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn main() {
     let only: Vec<String> = std::env::args().skip(1).collect();
     let wanted = |phase: &str| only.is_empty() || only.iter().any(|s| s == phase);
-    let device = Device::cuda(0);
+    #[cfg(feature = "cuda")]
+    let (device, runtime) = (Device::cuda(0), "CUDA");
+    #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+    let (device, runtime) = (Device::rocm(0), "ROCm");
     println!(
-        "bf16, [8x1024]x[1024x1024] matmuls, on CUDA, fusion {}",
+        "bf16, [8x1024]x[1024x1024] matmuls, on {runtime}, fusion {}",
         if cfg!(feature = "fusion") {
             "on"
         } else {
@@ -265,6 +268,7 @@ fn main() {
             );
         }
     }
+    #[cfg(feature = "cuda")]
     if wanted("graph") {
         for (ops, label) in [(10, "24 x (matmul + 10 x (mul, tanh))"), (0, "24 x matmul")] {
             let (eager, replayed) = graph::chain(24, ops, 50);
@@ -282,7 +286,9 @@ fn main() {
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 fn main() {
-    eprintln!("dispatch_bench measures the CUDA backend: run it with --features cuda,fusion");
+    eprintln!(
+        "dispatch_bench measures a GPU backend: run it with --features cuda,fusion or rocm,fusion"
+    );
 }

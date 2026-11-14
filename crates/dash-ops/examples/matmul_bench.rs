@@ -76,13 +76,13 @@
 //! why this benchmark reads it. Both are upstream's: cubek-matmul accepts the stage, and
 //! CubeCL counts a tensor map as written even when the kernel only loads from it. The C++
 //! columns above were measured with cubek-matmul refusing the stage, a fix applied locally.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 use burn::tensor::{DType, Device, Distribution, Tensor};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 use std::time::{Duration, Instant};
 
 /// (name, m, k, n, timed repetitions).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 const SHAPES: [(&str, usize, usize, usize, usize); 6] = [
     ("mlp_up", 6144, 1024, 3584, 50),
     ("mlp_down", 6144, 3584, 1024, 50),
@@ -93,15 +93,15 @@ const SHAPES: [(&str, usize, usize, usize, usize); 6] = [
 ];
 
 /// Standard deviation of every input element.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 const STD: f64 = 0.02;
 
 /// The pause on each side of the timed passes: in a device trace (nsys), the kernels between the
 /// two are the timed products' and nothing else's.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 const GAP: Duration = Duration::from_millis(100);
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn random(device: &Device, shape: [usize; 2], dtype: DType) -> Tensor<2> {
     Tensor::<2>::random(shape, Distribution::Normal(0.0, STD), (device, dtype))
 }
@@ -110,7 +110,7 @@ fn random(device: &Device, shape: [usize; 2], dtype: DType) -> Tensor<2> {
 /// come up), then, between two pauses of [`GAP`], the best of three passes of `reps` back to
 /// back with at most four results alive, each timed from the first launch to the device going
 /// idle. Also returns the last product.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn time_matmul(
     device: &Device,
     a: &Tensor<2>,
@@ -143,7 +143,7 @@ fn time_matmul(
 
 /// The elements of `t` on the host, or why they cannot be read: Burn reports a launch that
 /// failed only when its output is read, so this is also where a failure surfaces.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn host(t: Tensor<2>) -> Result<Vec<f32>, String> {
     t.try_into_data_as::<f32>()
         .map_err(|err| format!("{err:?}"))?
@@ -155,7 +155,7 @@ fn host(t: Tensor<2>) -> Result<Vec<f32>, String> {
 /// f64, relative to the size of an entry, `sqrt(k) * STD^2`. A product rounded to bf16 is off by
 /// at most 2^-9 of itself, about 0.01 at four standard deviations; one with inputs rounded to
 /// TF32 by about 1e-3; one computed in f32 by about 1e-6.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn check(a: &Tensor<2>, b: &Tensor<2>, c: &Tensor<2>) -> Result<f64, String> {
     let [m, k] = a.dims();
     let [_, n] = b.dims();
@@ -177,7 +177,7 @@ fn check(a: &Tensor<2>, b: &Tensor<2>, c: &Tensor<2>) -> Result<f64, String> {
 }
 
 /// `MxKxN` as `(m, k, n)`, for `[m x k] x [k x n]`.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn parse_shape(arg: &str) -> Option<(usize, usize, usize)> {
     let dims: Vec<usize> = arg
         .split('x')
@@ -190,7 +190,7 @@ fn parse_shape(arg: &str) -> Option<(usize, usize, usize)> {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let f32 = args.iter().any(|arg| arg == "--f32");
@@ -224,9 +224,12 @@ fn main() {
         (true, true) => 1e-4,
         _ => 0.02,
     };
-    let device = Device::cuda(0);
+    #[cfg(feature = "cuda")]
+    let (device, runtime) = (Device::cuda(0), "CUDA");
+    #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+    let (device, runtime) = (Device::rocm(0), "ROCm");
     println!(
-        "{name} matmul on CUDA, autotune {}, fusion {}",
+        "{name} matmul on {runtime}, autotune {}, fusion {}",
         if cfg!(feature = "autotune") {
             "on"
         } else {
@@ -272,7 +275,7 @@ fn main() {
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 fn main() {
-    eprintln!("matmul_bench measures the CUDA backend: run it with --features cuda");
+    eprintln!("matmul_bench measures a GPU backend: run it with --features cuda or rocm");
 }
