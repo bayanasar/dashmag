@@ -253,7 +253,9 @@ fn on_burn_it_is_dash_lora_s_layer_bit_for_bit() {
     use burn::tensor::{DType as BurnDType, Device, Tensor as Burn, TensorData};
     #[cfg(feature = "cuda")]
     let device = Device::cuda(0);
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+    let device = Device::rocm(0);
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     let device = Device::flex();
 
     for (dtype, burn) in [(DType::BF16, BurnDType::BF16), (DType::F32, BurnDType::F32)] {

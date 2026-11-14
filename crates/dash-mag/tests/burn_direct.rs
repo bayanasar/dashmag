@@ -24,7 +24,11 @@ fn device() -> Device {
     {
         Device::cuda(0)
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+    {
+        Device::rocm(0)
+    }
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
         Device::flex()
     }
@@ -133,7 +137,7 @@ fn conv1d() {
         same("conv1d step", &y, f32s(yd));
         same("conv1d next state", &next, f32s(nd));
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     assert!(
         dash_ops::conv1d::probe::kernel_launches() > 0,
         "the conv1d kernels ran"
@@ -232,6 +236,8 @@ fn gated_delta_chunked_and_step() {
         same("step output", &y, f32s(yd));
         same("step state", &next, f32s(nd));
     }
+    // On ROCm the chunked kernels do not fit a Radeon's 64 KiB of shared memory, nor find
+    // m16n8k16 tensor cores, and the reference runs.
     #[cfg(feature = "cuda")]
     assert!(
         direct_chunk::probe::kernel_launches() > 0,
@@ -343,7 +349,7 @@ fn attention_and_decoding() {
         );
         same("attention decode", &got, f32s(want));
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     assert!(
         direct_attention::probe::kernel_launches() > 0,
         "the attention kernels ran"
@@ -413,7 +419,7 @@ fn chosen_logprob_and_sampling() {
             f32s(want.sampling_logprob),
         );
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     assert!(
         dash_ops::logprob::probe::kernel_launches() > 0,
         "the logprob kernels ran"

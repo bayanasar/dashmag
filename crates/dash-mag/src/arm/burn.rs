@@ -101,7 +101,17 @@ fn check_device() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "cuda"))]
+/// The same refusal on ROCm, where no switch turns TF32 off.
+#[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+fn check_device() -> Result<()> {
+    static REFUSED: OnceLock<bool> = OnceLock::new();
+    if *REFUSED.get_or_init(|| dash_ops::f32_products_in_tf32(device())) {
+        return refuse("this device would run f32 matmuls in TF32");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 fn check_device() -> Result<()> {
     Ok(())
 }
@@ -113,11 +123,15 @@ fn device() -> &'static Device {
         {
             Device::cuda(0)
         }
-        #[cfg(all(not(feature = "cuda"), feature = "flex"))]
+        #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+        {
+            Device::rocm(0)
+        }
+        #[cfg(all(not(any(feature = "cuda", feature = "rocm")), feature = "flex"))]
         {
             Device::flex()
         }
-        #[cfg(not(any(feature = "cuda", feature = "flex")))]
+        #[cfg(not(any(feature = "cuda", feature = "rocm", feature = "flex")))]
         {
             Device::default()
         }

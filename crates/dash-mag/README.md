@@ -2,7 +2,7 @@
 
 The one crate an application names: the gateway to dash, which runs on this machine, and to the
 `mag-` crates, planned and not started, which will pool devices across machines. A model and an
-algorithm are written once and run on every platform: on Burn and dash-ops (CUDA, Flex) on Linux,
+algorithm are written once and run on every platform: on Burn and dash-ops (CUDA, ROCm, Flex) on Linux,
 and on MLX and dash-mlx on macOS, chosen at compile time.
 
 Part of [Dashmag](https://github.com/bayanasar/dashmag). See the repository for the full picture.
@@ -29,6 +29,13 @@ before 8.0 needs neither.
 
 The numbers in `PROGRESS.md` are from this workspace's `Cargo.lock`. A new application resolves the rest
 of CubeCL to its latest patch release beside the patched cubecl-cuda 0.11.1.
+
+## On ROCm
+
+`--features rocm`, built against ROCm 6.2 to 7.x (found through `ROCM_PATH` or `HIP_PATH`). Under WSL2 the
+runtime finds the card only with `HSA_ENABLE_DXG_DETECTION=1`. The same TF32 check runs; no patch is
+needed. dash-ops' tests pass on a Radeon AI PRO R9700 (gfx1201) with ROCm 7.2.1; its speed there has not
+been measured (`PROGRESS.md`).
 
 ## On MLX
 

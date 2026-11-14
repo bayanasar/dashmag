@@ -23,6 +23,8 @@ default = ["flex"]
 flex = ["burn/flex", "burn/simd", "burn/rayon", "dash-ops/flex"]
 # The RTX path: dash-ops' kernels on CUDA.
 cuda = ["burn/cuda", "dash-ops/cuda"]
+# dash-ops' kernels on ROCm, through HIP. `cuda` takes precedence over it.
+rocm = ["burn/rocm", "dash-ops/rocm"]
 # Burn's lazy fusion and autotune, as dash-ops has them: each changes which kernels run and so
 # which low bits come out, and matmul-heavy work wants autotune.
 fusion = ["burn/fusion", "dash-ops/fusion"]

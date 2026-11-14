@@ -564,19 +564,25 @@ fn one_step_from_one_source() {
             "{name} scalars"
         );
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     {
         assert!(
             dash_ops::conv1d::probe::kernel_launches() > 0,
             "the conv1d kernels ran"
         );
         assert!(
-            dash_ops::attention::probe::kernel_launches() > 0,
-            "the attention kernels ran"
-        );
-        assert!(
             dash_ops::logprob::probe::kernel_launches() > 0,
             "the logprob kernels ran"
+        );
+    }
+    // On ROCm attention's training kernels and the chunked delta rule's find no m16n8k16 tensor
+    // cores, and the chunked f32 kernels do not fit a Radeon's 64 KiB of shared memory: the
+    // reference runs.
+    #[cfg(feature = "cuda")]
+    {
+        assert!(
+            dash_ops::attention::probe::kernel_launches() > 0,
+            "the attention kernels ran"
         );
         assert!(
             dash_ops::gated_delta::chunk::probe::kernel_launches() > 0,
