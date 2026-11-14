@@ -48,9 +48,12 @@ on Burn. See the repository for the full picture.
   no plane operations, where the gated delta rule's step and conv1d run their kernels (and on
   lavapipe, with 64-bit integers, the loss's second pass) and the chunked gated delta rule,
   attention, `logprob`'s pass (the loss's first) and sampling run their references; `cpu`, with as
-  many units per cube as cores, where the references run. `vulkan` crashes lavapipe on any kernel
-  with shared memory, Burn's own included (CubeCL's SPIR-V compiler declares shared memory wrongly
-  where a device lacks explicit workgroup layouts); `rocm` builds but is untested, `metal` and
+  many units per cube as cores, where the references run; `rocm` on a Radeon AI PRO R9700
+  (gfx1201, 64 KiB of shared memory, 16x16x16 matrix products and no `ldmatrix`), where conv1d,
+  `logprob`, sampling, the gated delta rule's step and attention's decoding run their kernels, and
+  attention's forward and backward and the chunked gated delta rule run their references. `vulkan`
+  crashes lavapipe on any kernel with shared memory, Burn's own included (CubeCL's SPIR-V compiler
+  declares shared memory wrongly where a device lacks explicit workgroup layouts); `metal` and
   `webgpu` are untested. The tests run the kernels on the device `DASH_OPS_DEVICE` names
   (`tests/common/mod.rs`).
 - `fusion`: Burn's lazy fusion.

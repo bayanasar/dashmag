@@ -32,7 +32,7 @@ of CubeCL to its latest patch release beside the patched cubecl-cuda 0.11.1.
 
 ## On ROCm
 
-`--features rocm`, built against ROCm 6.2 to 7.x (found through `ROCM_PATH` or `HIP_PATH`). Under WSL2 the
+`--features rocm`, built against ROCm 6.2 to 7.2 (found through `ROCM_PATH` or `HIP_PATH`). Under WSL2 the
 runtime finds the card only with `HSA_ENABLE_DXG_DETECTION=1`. The same TF32 check runs; no patch is
 needed. dash-ops' tests pass on a Radeon AI PRO R9700 (gfx1201) with ROCm 7.2.1; its speed there has not
 been measured (`PROGRESS.md`).
