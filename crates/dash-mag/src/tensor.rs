@@ -719,7 +719,9 @@ impl Tensor {
 
     /// [`Tensor::put_along_axis`] on a tensor given up for it, as a cache written a row at a time
     /// is: where nothing else holds its buffer (no clone of it, nor a slice), the side writes in
-    /// place instead of copying it first. The result is the same either way.
+    /// place instead of copying it first. On MLX a write right after an `eval` of the tensor still
+    /// copies, until the GPU's last work on it releases the buffer. The result is the same either
+    /// way.
     pub fn put_along_axis_owned(
         self,
         indices: &Tensor,

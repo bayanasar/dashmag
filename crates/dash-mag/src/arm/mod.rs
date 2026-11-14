@@ -183,8 +183,9 @@ pub(crate) trait Arm {
         axis: usize,
     ) -> Result<Self::Array>;
     /// [`Arm::put_along_axis`] on an `a` its caller gives up. A side that computes at once copies
-    /// `a` for a write unless nothing else holds its buffer, and only an `a` given up can be that;
-    /// a lazy side frees its own reference before it computes, so the default is enough for it.
+    /// `a` for a write unless nothing else holds its buffer, and only an `a` given up can be that.
+    /// MLX takes the default: it frees its own reference before it computes, but still copies while
+    /// the buffer's last GPU work has not released it, as right after an `eval` of it.
     fn put_along_axis_owned(
         a: Self::Array,
         indices: &Self::Array,
