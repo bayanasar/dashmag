@@ -291,4 +291,24 @@ pub(crate) trait Arm {
         base: Option<&Self::Array>,
         options: LowRankOptions,
     ) -> Result<Self::Array>;
+    /// A quantized weight's `qweight` `[in / 8, out]` `i32` and `scales` `[in / group, out]`
+    /// f16, checked by the caller, as the side keeps them for [`Arm::quantized_linear`], prepared
+    /// once when the weight is built. By default, as they are.
+    fn prepare_quantized(
+        qweight: &Self::Array,
+        scales: &Self::Array,
+    ) -> Result<(Self::Array, Self::Array)> {
+        Ok((qweight.clone(), scales.clone()))
+    }
+    /// `x` of rank 2 or more `[.., in]`, `bias` `[out]`, and the weight as
+    /// [`Arm::prepare_quantized`] gave it: checked by the caller. A side without it refuses.
+    fn quantized_linear(
+        _x: &Self::Array,
+        _qweight: &Self::Array,
+        _scales: &Self::Array,
+        _bias: Option<&Self::Array>,
+        _group: usize,
+    ) -> Result<Self::Array> {
+        crate::refuse("quantized_linear: not on this side yet")
+    }
 }

@@ -19,7 +19,8 @@ use dash_ops::conv1d::{causal_conv1d, causal_conv1d_update};
 use dash_ops::gated_delta::chunk::chunk_gated_delta_rule;
 use dash_ops::gated_delta::recurrent::gated_delta_step;
 use dash_ops::logprob::chosen_logprob;
-use dash_ops::lowrank::low_rank;
+use dash_ops::lowrank::{MaybeTensor, low_rank};
+use dash_ops::quant::QuantBackend;
 use dash_ops::sample::sample;
 
 use super::{Arm, Binary, Compare, Drawn, Logical, Mask, Reduce, Unary, VjpFn, VjpOut};
@@ -507,6 +508,33 @@ fn low_rank_ranked<const D: usize>(
         options,
     )
     .into_dispatch()
+}
+
+fn quantized_ranked<const D: usize>(
+    x: &Array,
+    qweight: &Array,
+    scales: &Array,
+    bias: Option<&Array>,
+    group: usize,
+) -> Raw {
+    let x = x.t::<D>();
+    let dims = x.dims();
+    let inp = dims[D - 1];
+    let rows: usize = dims[..D - 1].iter().product();
+    let qweight = qweight.i::<2>();
+    let out = qweight.dims()[1];
+    let y = <Dispatch as QuantBackend>::quantized_linear(
+        x.reshape([rows, inp]).into_dispatch(),
+        qweight.into_dispatch(),
+        scales.t::<2>().into_dispatch(),
+        MaybeTensor::from(bias.map(|b| b.t::<1>().into_dispatch())),
+        group,
+    );
+    let mut out_dims = dims;
+    out_dims[D - 1] = out;
+    Tensor::<2>::from_dispatch(y)
+        .reshape(out_dims)
+        .into_dispatch()
 }
 
 pub(crate) struct Burn;
@@ -1008,6 +1036,24 @@ impl Arm for Burn {
             || base.is_some_and(Array::is_autodiff);
         Ok(Array::float(
             ranked!(x.rank(), low_rank_ranked; x, u, v, base, options, on),
+        ))
+    }
+
+    fn quantized_linear(
+        x: &Array,
+        qweight: &Array,
+        scales: &Array,
+        bias: Option<&Array>,
+        group: usize,
+    ) -> Result<Array> {
+        if x.is_autodiff() || bias.is_some_and(Array::is_autodiff) {
+            return refuse(
+                "quantized_linear is a forward pass only: not inside vjp, where its input would \
+                 carry a gradient",
+            );
+        }
+        Ok(Array::float(
+            ranked!(x.rank(), quantized_ranked; x, qweight, scales, bias, group),
         ))
     }
 }

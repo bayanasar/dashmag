@@ -24,6 +24,8 @@
 //!   adapter PEFT makes by default, and how an adapter is given to a model's layers.
 //! - [`sample`]: sampling the next token on the device, with temperature, top-k, top-p and
 //!   masked ids, from a counter-based generator, and the token's log-probabilities.
+//! - [`quant`]: a linear layer over weights quantized to 4 bits by group, read packed as GPTQ
+//!   stores them, for inference.
 //! - [`clip`]: gradients clipped by their global norm, as `torch.nn.utils.clip_grad_norm_`
 //!   clips them, which training steps take beside the operations.
 //!
@@ -96,6 +98,7 @@ pub mod logprob;
 pub mod lora;
 pub mod loss;
 pub mod lowrank;
+pub mod quant;
 pub mod sample;
 
 /// The float dtypes of the conventions, for what implementations share beside the operations

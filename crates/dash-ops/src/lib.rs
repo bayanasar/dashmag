@@ -83,6 +83,7 @@ pub mod gated_delta;
 pub mod logprob;
 pub mod loss;
 pub mod lowrank;
+pub mod quant;
 mod reference;
 pub mod sample;
 pub mod sequences;

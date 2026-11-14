@@ -8,6 +8,7 @@ pub use dash_contract::gated_delta::chunk::ChunkGatedDeltaOptions;
 pub use dash_contract::gated_delta::recurrent::GatedDeltaStepOptions;
 pub use dash_contract::logprob::LogprobOptions;
 pub use dash_contract::lowrank::LowRankOptions;
+pub use dash_contract::quant::{QuantFormat, QuantOptions};
 pub use dash_contract::sample::SampleOptions;
 
 use crate::arm::{Arm, Mask, Selected};
@@ -354,4 +355,146 @@ pub fn low_rank(
             .chain(base.map(|t| ("base", t))),
     )?;
     Tensor::wrap(Selected::low_rank(&x.0, &u.0, &v.0, option(base), options))
+}
+
+/// A weight `[in, out]` quantized to 4 bits by group, as GPTQ stores it, checked once and kept as
+/// the side runs it (on Burn the packed `qweight` and the f16 `scales` as stored), for
+/// [`quantized_linear`]. `dash_contract::quant` gives the layout and the definition.
+#[derive(Clone)]
+pub struct QuantizedWeight {
+    qweight: Tensor,
+    scales: Tensor,
+    inp: usize,
+    out: usize,
+    options: QuantOptions,
+}
+
+impl QuantizedWeight {
+    /// The weight from a checkpoint's tensors as stored: `qweight` `[in / 8, out]` and `qzeros`
+    /// `[in / group, out / 8]` `i32`, `scales` `[in / group, out]` f16, `g_idx` `[in]` `i32` or
+    /// none. Refuses shapes that disagree, `in` not a multiple of the group or `out` of 8, scales
+    /// not f16, a stored zero other than 8 (GPTQ v1's `zero - 1` among them), or a `g_idx` other
+    /// than `i / group`. Reads `qzeros` and `g_idx` to the host once.
+    pub fn from_gptq(
+        qweight: &Tensor,
+        qzeros: &Tensor,
+        scales: &Tensor,
+        g_idx: Option<&Tensor>,
+        options: QuantOptions,
+    ) -> Result<Self> {
+        let op = "QuantizedWeight::from_gptq";
+        let group = options.group;
+        rank(op, "qweight", qweight, 2)?;
+        let (packed, out) = (qweight.shape()[0], qweight.shape()[1]);
+        let inp = packed * 8;
+        if group == 0 || !inp.is_multiple_of(group) || !out.is_multiple_of(8) {
+            return refuse(format!(
+                "{op}: in = {inp} must be a multiple of the group ({group}), and out = {out} of 8"
+            ));
+        }
+        let groups = inp / group;
+        if scales.shape() != [groups, out] || qzeros.shape() != [groups, out / 8] {
+            return refuse(format!(
+                "{op}: qweight [{packed}, {out}] wants scales [{groups}, {out}] and qzeros \
+                 [{groups}, {}], got {:?} and {:?}",
+                out / 8,
+                scales.shape(),
+                qzeros.shape()
+            ));
+        }
+        if qweight.dtype() != DType::I32 || qzeros.dtype() != DType::I32 {
+            return refuse(format!("{op}: qweight and qzeros are i32"));
+        }
+        if scales.dtype() != DType::F16 {
+            return refuse(format!("{op}: scales are f16, got {:?}", scales.dtype()));
+        }
+        let QuantFormat::Symmetric = options.format;
+        let zero = QuantOptions::SYMMETRIC_ZERO as i32;
+        let words = qzeros.to_i32()?;
+        if let Some(i) = words
+            .iter()
+            .position(|&w| (0..8).any(|j| (w >> (4 * j)) & 15 != zero))
+        {
+            return refuse(format!(
+                "{op}: a symmetric weight's stored zeros are all {zero}, but word {i} of qzeros \
+                 is {:#010x} (GPTQ v1 stores zero - 1, 0x77777777)",
+                words[i] as u32
+            ));
+        }
+        if let Some(g_idx) = g_idx {
+            if g_idx.shape() != [inp] {
+                return refuse(format!("{op}: g_idx is [{inp}], got {:?}", g_idx.shape()));
+            }
+            let g = g_idx.to_i32()?;
+            if let Some(i) = (0..inp).find(|&i| g[i] as usize != i / group) {
+                return refuse(format!(
+                    "{op}: g_idx[{i}] is {}, where groups in order give {} (reordered groups, \
+                     GPTQ's desc_act, are not taken)",
+                    g[i],
+                    i / group
+                ));
+            }
+        }
+        let (qweight, scales) = Selected::prepare_quantized(&qweight.0, &scales.0)?;
+        Ok(Self {
+            qweight: Tensor::wrap(Ok(qweight))?,
+            scales: Tensor::wrap(Ok(scales))?,
+            inp,
+            out,
+            options,
+        })
+    }
+
+    /// `in`, the inputs.
+    pub fn in_features(&self) -> usize {
+        self.inp
+    }
+
+    /// `out`, the outputs.
+    pub fn out_features(&self) -> usize {
+        self.out
+    }
+
+    /// The options it was built with.
+    pub fn options(&self) -> QuantOptions {
+        self.options
+    }
+}
+
+/// `y = x W (+ bias)` over `weight`, for `x` `[.., in]` in f32, bf16 or f16 and `bias` `[out]`:
+/// the product in f32, the bias added in f32, the sum rounded once to `x`'s dtype. A forward pass
+/// only: refused inside [`crate::vjp`]. On MLX not yet.
+pub fn quantized_linear(
+    x: &Tensor,
+    weight: &QuantizedWeight,
+    bias: Option<&Tensor>,
+) -> Result<Tensor> {
+    let op = "quantized_linear";
+    if x.rank() < 2 || x.shape()[x.rank() - 1] != weight.inp {
+        return refuse(format!(
+            "{op}: x [.., {}] of rank 2 or more, got {:?}",
+            weight.inp,
+            x.shape()
+        ));
+    }
+    if !matches!(x.dtype(), DType::F32 | DType::BF16 | DType::F16) {
+        return refuse(format!("{op}: x is f32, bf16 or f16, got {:?}", x.dtype()));
+    }
+    if let Some(bias) = bias
+        && (bias.shape() != [weight.out] || !bias.dtype().is_floating())
+    {
+        return refuse(format!(
+            "{op}: bias is [{}] in a float dtype, got {:?} {:?}",
+            weight.out,
+            bias.shape(),
+            bias.dtype()
+        ));
+    }
+    Tensor::wrap(Selected::quantized_linear(
+        &x.0,
+        &weight.qweight.0,
+        &weight.scales.0,
+        option(bias),
+        weight.options.group,
+    ))
 }
