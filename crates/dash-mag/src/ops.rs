@@ -461,9 +461,11 @@ impl QuantizedWeight {
     }
 }
 
-/// `y = x W (+ bias)` over `weight`, for `x` `[.., in]` in f32, bf16 or f16 and `bias` `[out]`:
-/// the product in f32, the bias added in f32, the sum rounded once to `x`'s dtype. A forward pass
-/// only: refused inside [`crate::vjp`]. On MLX not yet.
+/// `y = x W (+ bias)` over `weight`, for `x` `[.., in]` in f32, bf16 or f16 and `bias` `[out]`,
+/// the output in `x`'s dtype. The definition is the product in f32, the bias added and the sum
+/// rounded once (`dash_contract::quant`); a side may round `W`, and the product before the bias,
+/// to `x`'s dtype, and is held to the definition within the bounds its tests record. A forward
+/// pass only: refused inside [`crate::vjp`]. On MLX not yet.
 pub fn quantized_linear(
     x: &Tensor,
     weight: &QuantizedWeight,

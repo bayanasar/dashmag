@@ -312,7 +312,8 @@ fn empty(like: &CubeTensor, shape: Shape, dtype: DType) -> CubeTensor {
 }
 
 /// `y = x W (+ bias)` with `W` dequantized to `x`'s dtype by [`dequant_kernel`] and multiplied by
-/// Burn's matmul; the bias added in f32 and the sum rounded once to `x`'s dtype.
+/// Burn's matmul, whose product comes out in `x`'s dtype; with a bias, that product taken to f32,
+/// the bias added and the sum rounded to `x`'s dtype again. In f32 nothing is rounded but the sums.
 fn prefill(
     x: CubeTensor,
     qweight: CubeTensor,

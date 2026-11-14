@@ -266,9 +266,11 @@ fn host_ints<const D: usize>(t: Tensor<D, Int>) -> Vec<i64> {
     data.iter::<i64>().collect()
 }
 
-/// `y = x W (+ bias)` over `weight`, for `x` `[.., in]` in f32, bf16 or f16: the product in f32,
-/// the bias added in f32 and the sum rounded once to `x`'s dtype (`dash_contract::quant`). A
-/// forward pass only.
+/// `y = x W (+ bias)` over `weight`, for `x` `[.., in]` in f32, bf16 or f16, the output in `x`'s
+/// dtype: the definition is the product in f32, the bias added and the sum rounded once
+/// (`dash_contract::quant`). The reference and the decoding kernels compute it so; the prefill
+/// path (more than 16 rows on a CubeCL device) rounds `W`, and the product before the bias, to
+/// `x`'s dtype, within the bounds `tests/quant.rs` records. A forward pass only.
 pub fn quantized_linear<const D: usize>(
     x: Tensor<D>,
     weight: &QuantizedWeight,

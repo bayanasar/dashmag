@@ -39,8 +39,9 @@
 //! The definition is the product in f32: `q - zero` is a small integer and `scales` an f16 value,
 //! so each `W[i, o]` is exact in f32, and `y` is that product with `x` read exactly into f32,
 //! accumulated in f32, the bias added in f32 and rounded once to `x`'s dtype. An implementation
-//! may round `W` to `x`'s dtype before its products (as the tensor cores need), and is held to
-//! the definition within the bounds its conformance tests record.
+//! may round `W` to `x`'s dtype before its products (as the tensor cores need), and the product to
+//! `x`'s dtype before the bias is added, and is held to the definition within the bounds its
+//! tests record.
 //!
 //! There is no backward pass yet. A gradient with respect to `x` alone (the weights frozen) is
 //! what a quantized model needs as a teacher; it is not asked for.
