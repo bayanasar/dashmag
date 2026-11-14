@@ -40,8 +40,10 @@
 //! so each `W[i, o]` is exact in f32, and `y` is that product with `x` read exactly into f32,
 //! accumulated in f32, the bias added in f32 and rounded once to `x`'s dtype. An implementation
 //! may round `W` to `x`'s dtype before its products (as the tensor cores need), and the product to
-//! `x`'s dtype before the bias is added, and is held to the definition within the bounds its
-//! tests record.
+//! `x`'s dtype before the bias is added; it may also round the scales to `x`'s dtype before `W` is
+//! formed, which from bf16 makes each weight `(q - zero)` times the scale rounded to bf16, within
+//! one bf16 unit of `W` rounded rather than `W` rounded (MLX's side does, so that its quantized
+//! matmul runs in `x`'s dtype). It is held to the definition within the bounds its tests record.
 //!
 //! There is no backward pass yet. A gradient with respect to `x` alone (the weights frozen) is
 //! what a quantized model needs as a teacher; it is not asked for.
