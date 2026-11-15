@@ -2,7 +2,7 @@
 //! inputs they take (bf16 or f16, head dimension 64, 128 or 256) on a device with what they ask
 //! (the [`Requirements`] of each pass, `mma.sync` m16n8k16 and `ldmatrix` for the dtype); the
 //! forward of `wmma.rs` on a device without those whose 16 x 16 x 16 MMA has the register layout
-//! that kernel is written for ([`wmma_layout`]); and the reference for the rest.
+//! that kernel is written for (`crate::wmma`); and the reference for the rest.
 //!
 //! Inputs are read through their strides, in place where the kernels can (see [`readable`]).
 //! Every tensor the kernels write is allocated contiguous, in the layout the module
@@ -13,7 +13,7 @@ use super::kernels::{
     BLOCK_KV, BLOCK_Q, backward_kernel, decode_merge_kernel, decode_split_kernel, delta_kernel,
     dq_kernel, finish_kernel, forward_kernel,
 };
-use super::wmma::{WMMA_BLOCK_KV, WMMA_BLOCK_Q, forward_wmma_kernel, layout_kernel};
+use super::wmma::{WMMA_BLOCK_KV, WMMA_BLOCK_Q, forward_wmma_kernel};
 use super::{
     AttentionBackend, AttentionMaskPrimitive, AttentionOptions, CacheLengths, MaskShape, Reach,
     check_decode_shapes, check_shapes, probe, reference,
@@ -32,8 +32,6 @@ use cubecl::ir::features::AtomicUsage;
 use cubecl::ir::features::MmaConfig;
 use cubecl::ir::{AddressType, DeviceProperties, ElemType, FloatKind, Type};
 use cubecl::prelude::*;
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 /// Elements per 16-byte vector: the kernels' unit of every load, so strides count in it.
@@ -192,87 +190,6 @@ fn wmma_forward_requirements([_, tq, _, hq, _, d]: [usize; 6]) -> Requirements {
     }
 }
 
-/// Whether the device has a 16 x 16 x 16 MMA from `dtype` into f32.
-fn mma_16x16x16(properties: &DeviceProperties, dtype: DType) -> bool {
-    let elem = dtype_to_elem_type(dtype);
-    properties.features.matmul.mma.contains(&MmaConfig {
-        a_type: elem,
-        b_type: elem,
-        cd_type: ElemType::Float(FloatKind::F32),
-        m: 16,
-        n: 16,
-        k: 16,
-    })
-}
-
-/// The row and column of element `e` of lane `lane` that `forward_wmma_kernel()` is written for,
-/// of A (`ident` 0), B (1) and the accumulator (2): see `wmma.rs`.
-fn wmma_expected(ident: usize, lane: u32, e: u32) -> (u32, u32) {
-    let (index, half) = (lane % 16, 8 * (lane / 16) + e);
-    match ident {
-        0 => (index, half),
-        _ => (half, index),
-    }
-}
-
-/// Whether the 16 x 16 x 16 MMA's register layout, as `position_of_nth` gives it on the device
-/// `client` serves, is the one `forward_wmma_kernel()` is written for (RDNA4's; RDNA3's differs).
-/// Read from each device, by [`layout_kernel`], the first time the forward meets it in each
-/// dtype, and kept for that device and dtype: a process with an RDNA4 card and an RDNA3 one reads
-/// both.
-fn wmma_layout(client: &Client, dtype: DType) -> bool {
-    // The device and its runtime, as CubeCL names its service, and the dtype.
-    static LAYOUTS: Mutex<Option<HashMap<(String, DType), bool>>> = Mutex::new(None);
-    let key = (format!("{:?}", client.service_id()), dtype);
-    if let Some(&known) = LAYOUTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashMap::new)
-        .get(&key)
-    {
-        return known;
-    }
-    let matches = read_wmma_layout(client, dtype);
-    LAYOUTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashMap::new)
-        .insert(key, matches);
-    matches
-}
-
-/// [`wmma_layout`]'s reading: [`layout_kernel`] on the device, its positions against
-/// [`wmma_expected`].
-fn read_wmma_layout(client: &Client, dtype: DType) -> bool {
-    let n = 32 * 3 * 8 * 2;
-    let pos = client.empty(4 * n);
-    // SAFETY: one plane of 32 units; lane `l` writes elements `48 l..48 l + 48` of `n`.
-    unsafe {
-        layout_kernel::launch_unchecked(
-            client,
-            CubeCount::Static(1, 1, 1),
-            CubeDim::new_1d(PLANE),
-            BufferArg::from_raw_parts(pos.clone(), n),
-            dtype_to_storage_type(dtype),
-        );
-    }
-    let Ok(bytes) = client.read_one(pos) else {
-        return false;
-    };
-    let words: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-        .collect();
-    (0..32u32).all(|lane| {
-        (0..3).all(|ident| {
-            (0..8u32).all(|e| {
-                let at = (((lane as usize * 3 + ident) * 8) + e as usize) * 2;
-                (words[at], words[at + 1]) == wmma_expected(ident, lane, e)
-            })
-        })
-    })
-}
-
 /// Whether the forward runs on `wmma.rs`'s kernel: the device lacks what `kernels.rs`'
 /// forward asks, and has a 16 x 16 x 16 MMA in the layout that kernel is written for, with
 /// what else it asks.
@@ -280,9 +197,8 @@ fn forward_on_wmma(client: &Client, dtype: DType, dims: [usize; 6]) -> bool {
     let properties = client.properties();
     let types = [dtype, DType::F32, DType::I32];
     !(tensor_cores(properties, dtype) && forward_requirements(dims).met_on(client, &types))
-        && mma_16x16x16(properties, dtype)
         && wmma_forward_requirements(dims).met_on(client, &types)
-        && wmma_layout(client, dtype)
+        && crate::wmma::rdna4_products(client, dtype)
 }
 
 /// Whether the device adds to f32 in global memory atomically, as the backward sums `dQ`.

@@ -1,7 +1,9 @@
 //! The quantized linear on the CubeCL backend: for a few rows (decoding, up to [`MAX_ROWS`]),
 //! two kernels that read the packed weight once and dequantize it in registers; for more rows
-//! (prefill), the weight dequantized to `x`'s dtype by a kernel and multiplied by Burn's matmul;
-//! on a device without what they ask, the reference.
+//! (prefill), on a device with RDNA4's 16 x 16 x 16 matrix products, one kernel on them that reads
+//! the packed words straight into its operands (`wmma.rs`), and elsewhere the weight dequantized
+//! to `x`'s dtype by a kernel and multiplied by Burn's matmul; on a device without what they ask,
+//! the reference.
 //!
 //! - `gemv`: each unit owns one output column and a run of whole groups of input rows. Per group
 //!   it reads the column's scale once, then per packed word the eight values, `(q - 8) · scale`
@@ -13,6 +15,7 @@
 //!
 //! So each output is the same bits whatever the launch, for given runs.
 
+use super::wmma::{BLOCK_K, BLOCK_M, BLOCK_N, UNITS, matrix_kernel};
 use super::{QuantBackend, probe, reference};
 use crate::cube::Requirements;
 use crate::lowrank::MaybeTensor;
@@ -208,15 +211,54 @@ pub(super) fn kernels_take(
             .met_on(client, &[dtype, DType::F32, DType::I32, DType::F16])
 }
 
+/// What [`matrix_kernel`] asks: 128 units per cube (four planes of 32, the layout's), a cube per 64
+/// rows and 128 outputs, 4 KiB of shared memory, five tensors, 16-byte vectors.
+fn matrix_requirements([rows, inp, out]: [usize; 3]) -> Requirements {
+    Requirements {
+        shared_bytes: BLOCK_M * BLOCK_K * 2,
+        vector_size: 8,
+        plane_width: Some(32),
+        address: AddressType::from_len((rows * inp).max(rows * out).max(inp / 8 * out)),
+        ..Requirements::new(
+            (UNITS, 1),
+            (rows.div_ceil(BLOCK_M), out.div_ceil(BLOCK_N)),
+            5,
+        )
+    }
+}
+
+/// Whether the prefill kernel on RDNA4's matrix products takes `x` `[rows, inp]` in `dtype`: more
+/// rows than the decoding kernels take, bf16 or f16, inputs a multiple of 32 (a step's) and groups
+/// a multiple of 8 (a packed word's), on a device with RDNA4's 16 x 16 x 16 products.
+pub(super) fn matrix_takes(
+    client: &Client,
+    dtype: DType,
+    [rows, inp, out]: [usize; 3],
+    group: usize,
+) -> bool {
+    matches!(dtype, DType::BF16 | DType::F16)
+        && rows > MAX_ROWS
+        && group > 0
+        && group.is_multiple_of(8)
+        && inp.is_multiple_of(group)
+        && inp.is_multiple_of(BLOCK_K)
+        && out > 0
+        && matrix_requirements([rows, inp, out])
+            .met_on(client, &[dtype, DType::F32, DType::I32, DType::F16])
+        && crate::wmma::rdna4_products(client, dtype)
+}
+
 /// Whether the prefill path takes `x` `[rows, inp]` in `dtype`: more rows than the decoding
-/// kernels take, the weight dequantized to `dtype` by a kernel and multiplied by Burn's matmul.
+/// kernels take, the weight dequantized to `dtype` by a kernel and multiplied by Burn's matmul,
+/// where [`matrix_takes`] does not.
 pub(super) fn prefill_takes(
     client: &Client,
     dtype: DType,
     [rows, inp, out]: [usize; 3],
     group: usize,
 ) -> bool {
-    matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
+    !matrix_takes(client, dtype, [rows, inp, out], group)
+        && matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
         && rows > MAX_ROWS
         && group > 0
         && group.is_multiple_of(8)
@@ -241,6 +283,9 @@ impl QuantBackend for CubeBackend {
         let out = qweight.meta.shape()[1];
         if qweight.dtype != DType::I32 || scales.dtype != DType::F16 {
             return reference::forward::<Self>(x, qweight, scales, bias, group);
+        }
+        if matrix_takes(&x.client, x.dtype, [rows, inp, out], group) {
+            return matrix(x, qweight, scales, bias, group);
         }
         if prefill_takes(&x.client, x.dtype, [rows, inp, out], group) {
             return prefill(x, qweight, scales, bias, group);
@@ -309,6 +354,73 @@ impl QuantBackend for CubeBackend {
 
 fn empty(like: &CubeTensor, shape: Shape, dtype: DType) -> CubeTensor {
     empty_device_contiguous_dtype(like.client.clone(), like.device.clone(), shape, dtype)
+}
+
+/// `y = x W (+ bias)` by [`matrix_kernel`]: `x` read in vectors of eight from a contiguous copy
+/// whose first element is 16-byte aligned (a fresh one where the input's is not), the bias in f32.
+fn matrix(
+    x: CubeTensor,
+    qweight: CubeTensor,
+    scales: CubeTensor,
+    bias: MaybeTensor<CubeBackend>,
+    group: usize,
+) -> CubeTensor {
+    let [rows, inp] = x.meta.shape().dims::<2>();
+    let out = qweight.meta.shape()[1];
+    let mut x = into_contiguous(x);
+    if !x.handle.offset_start.unwrap_or(0).is_multiple_of(16) {
+        let (client, device, dtype) = (x.client.clone(), x.device.clone(), x.dtype);
+        let copy = burn_cubecl::cubecl::std::tensor::into_contiguous(
+            &client,
+            x.binding(),
+            dtype_to_storage_type(dtype),
+        );
+        x = CubeTensor::new(client, copy.handle, *copy.metadata, device, dtype);
+    }
+    let qweight = into_contiguous(qweight);
+    let scales = into_contiguous(scales);
+    let bias = match bias {
+        MaybeTensor::None => None,
+        MaybeTensor::Some(bias) => Some(into_contiguous(match bias.dtype {
+            DType::F32 => bias,
+            _ => <CubeBackend as burn::backend::ops::FloatTensorOps<CubeBackend>>::float_cast(
+                bias,
+                burn::tensor::FloatDType::F32,
+            ),
+        })),
+    };
+    let y = empty(&x, Shape::new([rows, out]), x.dtype);
+    let has_bias = bias.is_some();
+    // Bound where the kernel reads no bias.
+    let bias = bias.unwrap_or_else(|| empty(&x, Shape::new([1]), DType::F32));
+    let client = x.client.clone();
+    let dtype = dtype_to_storage_type(x.dtype);
+    probe::MATRIX_LAUNCHES.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: cube (i, j) reads rows below `rows` of x and words and scales of columns below `out`
+    // within qweight `[inp / 8, out]` and scales `[inp / group, out]`, inputs below `inp` (a
+    // multiple of 32); it writes y within `[rows, out]`; the bias is read below `out` when given.
+    unsafe {
+        matrix_kernel::launch_unchecked(
+            &client,
+            CubeCount::Static(
+                rows.div_ceil(BLOCK_M) as u32,
+                out.div_ceil(BLOCK_N) as u32,
+                1,
+            ),
+            CubeDim::new_1d(UNITS),
+            AddressType::from_len((rows * inp).max(rows * out).max(inp / 8 * out)),
+            x.into_tensor_arg(),
+            qweight.into_tensor_arg(),
+            scales.into_tensor_arg(),
+            bias.into_tensor_arg(),
+            y.clone().into_tensor_arg(),
+            group,
+            has_bias,
+            dtype,
+            dtype_to_storage_type(DType::F16),
+        );
+    }
+    y
 }
 
 /// `y = x W (+ bias)` with `W` dequantized to `x`'s dtype by [`dequant_kernel`] and multiplied by

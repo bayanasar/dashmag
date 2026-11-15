@@ -11,7 +11,7 @@
 use burn::tensor::{DType, Device, Distribution, FloatDType, Int, Tensor, TensorData};
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 use dash_ops::quant::{
-    QuantOptions, QuantizedWeight, kernels_take, prefill_takes, quantized_linear,
+    QuantOptions, QuantizedWeight, kernels_take, matrix_takes, prefill_takes, quantized_linear,
 };
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 use std::time::Instant;
@@ -104,6 +104,7 @@ fn main() {
             );
             let takes = kernels_take(&device, DType::BF16, [rows, inp, out], group);
             let pre = prefill_takes(&device, DType::BF16, [rows, inp, out], group);
+            let mat = matrix_takes(&device, DType::BF16, [rows, inp, out], group);
             let mut i = 0;
             let q = time(&device, || {
                 i += 1;
@@ -117,7 +118,9 @@ fn main() {
                 "[{rows}x{inp}] x [{inp}x{out}]: int4 {:.1} us ({:.0} GB/s of weight, {}), bf16 matmul {:.1} us ({:.0} GB/s)",
                 q * 1e6,
                 bytes / q / 1e9,
-                if takes {
+                if mat {
+                    "matrix products"
+                } else if takes {
                     "kernels"
                 } else if pre {
                     "prefill"

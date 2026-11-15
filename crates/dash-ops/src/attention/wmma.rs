@@ -2,8 +2,8 @@
 //! register layout of AMD's RDNA4 (`v_wmma_*_16x16x16`, waves of 32), where the kernels of
 //! `kernels.rs` (`mma.sync` m16n8k16 and `ldmatrix`) do not run.
 //!
-//! The layout, as [`layout_kernel()`] reads it from CubeCL's `position_of_nth` and
-//! [`super::cube`] checks before this kernel is taken: lane `l` holds, of a 16 x 16 A (`m` x
+//! The layout, as `crate::wmma` reads it from CubeCL's `position_of_nth` and checks before this
+//! kernel is taken: lane `l` holds, of a 16 x 16 A (`m` x
 //! `k`), row `l % 16` and the eight columns `8 (l / 16)..8 (l / 16) + 8`; of a B (`k` x `n`),
 //! column `l % 16` and the eight rows `8 (l / 16)..`; of the f32 accumulator (`m` x `n`), column
 //! `l % 16` and the eight rows `8 (l / 16)..`. The accumulator's layout is B's.
@@ -42,7 +42,7 @@
 )]
 
 use super::kernels::{V8, fetch_padding, load_rows, row_bounds, swizzle};
-use cubecl::cmma::{MatrixIdent, MmaDefinition};
+use cubecl::cmma::MmaDefinition;
 use cubecl::prelude::*;
 
 /// One f32 accumulator element per vector, as the layout gives them.
@@ -382,30 +382,5 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
             }
             o[at * comptime!((d / 8) as usize) + (dt * 2 + half) as usize] = out;
         }
-    }
-}
-
-/// Lane `l` of one plane writes, for A, B and the accumulator of the 16 x 16 x 16 MMA in that
-/// order, the row and column of each of its eight elements to `pos[((3 l + ident) 8 + e) 2..]`
-/// (rows and columns as `position_of_nth` gives them): what [`forward_wmma_kernel()`]'s layout
-/// is checked against.
-#[cube(launch_unchecked)]
-pub(crate) fn layout_kernel<E: Float>(pos: &mut [u32], #[define(E)] _dtype: ElemType) {
-    let def = MmaDefinition::<E, E, f32>::new(16usize, 16usize, 16usize);
-    let lane = UNIT_POS_PLANE;
-    #[unroll]
-    for n in 0..8u32 {
-        let (row, col) = def.position_of_nth(lane, n, MatrixIdent::A);
-        let at = ((lane * 3) * 8 + n) as usize * 2;
-        pos[at] = row;
-        pos[at + 1] = col;
-        let (row, col) = def.position_of_nth(lane, n, MatrixIdent::B);
-        let at = ((lane * 3 + 1) * 8 + n) as usize * 2;
-        pos[at] = row;
-        pos[at + 1] = col;
-        let (row, col) = def.position_of_nth(lane, n, MatrixIdent::Accumulator);
-        let at = ((lane * 3 + 2) * 8 + n) as usize * 2;
-        pos[at] = row;
-        pos[at + 1] = col;
     }
 }

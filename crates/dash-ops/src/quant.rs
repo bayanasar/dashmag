@@ -24,6 +24,8 @@ use burn::backend::Flex;
 #[cfg(feature = "cubecl")]
 mod cube;
 mod reference;
+#[cfg(feature = "cubecl")]
+mod wmma;
 
 pub use dash_contract::quant::{QuantFormat, QuantOptions};
 
@@ -34,6 +36,7 @@ pub mod probe {
 
     pub(super) static GEMV_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static DEQUANT_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static MATRIX_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
     /// Launches of the decoding kernel (none where the reference runs).
     pub fn kernel_launches() -> usize {
@@ -43,6 +46,11 @@ pub mod probe {
     /// Launches of the prefill path's dequantizing kernel.
     pub fn dequant_launches() -> usize {
         DEQUANT_LAUNCHES.load(Ordering::SeqCst)
+    }
+
+    /// Launches of the prefill kernel on RDNA4's matrix products.
+    pub fn matrix_launches() -> usize {
+        MATRIX_LAUNCHES.load(Ordering::SeqCst)
     }
 }
 
@@ -65,9 +73,28 @@ pub fn kernels_take(
     false
 }
 
+/// Whether the prefill kernel on RDNA4's 16 x 16 x 16 matrix products takes [`quantized_linear`] on
+/// `device` for these sizes: more than 16 rows of bf16 or f16, inputs a multiple of 32, on a device
+/// with those products in RDNA4's layout. For tests.
+#[doc(hidden)]
+pub fn matrix_takes(
+    device: &burn::tensor::Device,
+    dtype: DType,
+    dims: [usize; 3],
+    group: usize,
+) -> bool {
+    #[cfg(feature = "cubecl")]
+    if let Some(client) = crate::cube::client(device.as_dispatch()) {
+        return cube::matrix_takes(&client, dtype, dims, group);
+    }
+    let _ = (device, dtype, dims, group);
+    false
+}
+
 /// Whether the prefill path (the weight dequantized by a kernel, then Burn's matmul) takes
 /// [`quantized_linear`] on `device` for these sizes: more than 16 rows, on a CubeCL device with
-/// what the kernel asks. For tests.
+/// what the kernel asks, where the kernel on matrix products ([`matrix_takes`]) does not. For
+/// tests.
 #[doc(hidden)]
 pub fn prefill_takes(
     device: &burn::tensor::Device,
@@ -270,7 +297,9 @@ fn host_ints<const D: usize>(t: Tensor<D, Int>) -> Vec<i64> {
 /// dtype: the definition is the product in f32, the bias added and the sum rounded once
 /// (`dash_contract::quant`). The reference and the decoding kernels compute it so; the prefill
 /// path (more than 16 rows on a CubeCL device) rounds `W`, and the product before the bias, to
-/// `x`'s dtype, within the bounds `tests/quant.rs` records. A forward pass only.
+/// `x`'s dtype, and the kernel on RDNA4's matrix products (in its place on such a device) rounds
+/// `W` and adds the bias before its one rounding, within the bounds `tests/quant.rs` records. A
+/// forward pass only.
 pub fn quantized_linear<const D: usize>(
     x: Tensor<D>,
     weight: &QuantizedWeight,

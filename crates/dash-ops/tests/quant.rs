@@ -5,7 +5,8 @@ mod common;
 
 use burn::tensor::{DType, Device, FloatDType, Int, Tensor, TensorData, f16};
 use dash_ops::quant::{
-    QuantOptions, QuantizedWeight, kernels_take, prefill_takes, probe, quantized_linear,
+    QuantOptions, QuantizedWeight, kernels_take, matrix_takes, prefill_takes, probe,
+    quantized_linear,
 };
 
 /// SplitMix64.
@@ -131,7 +132,12 @@ fn matches_the_definition() {
                 let p = packed(2, 384, 40, 128);
                 let takes = kernels_take(&device, dtype, [rows, p.inp, p.out], p.group);
                 let pre = prefill_takes(&device, dtype, [rows, p.inp, p.out], p.group);
-                let before = (probe::kernel_launches(), probe::dequant_launches());
+                let mat = matrix_takes(&device, dtype, [rows, p.inp, p.out], p.group);
+                let before = (
+                    probe::kernel_launches(),
+                    probe::dequant_launches(),
+                    probe::matrix_launches(),
+                );
                 let mut rng = Rng(3);
                 let x: Vec<f32> = (0..rows * p.inp).map(|_| rng.unit()).collect();
                 let bias: Vec<f32> = (0..p.out).map(|_| rng.unit()).collect();
@@ -169,6 +175,8 @@ fn matches_the_definition() {
                     "{name} {dtype:?} {rows} rows ({}): max abs {worst:.3e}, relative {:.3e}",
                     if takes {
                         "kernels"
+                    } else if mat {
+                        "matrix products"
                     } else if pre {
                         "prefill"
                     } else {
@@ -179,8 +187,9 @@ fn matches_the_definition() {
                 // Relative to the output's largest value, just above the largest measured on Flex,
                 // an RTX 5070 Ti (with and without fusion and autotune) and a Radeon AI PRO R9700
                 // (2026-11-13), the same on each to the bit: the output's rounding to its dtype, and
-                // on the prefill path `W`'s too.
-                let bound = match (dtype, pre) {
+                // on the prefill path `W`'s too. The kernel on RDNA4's matrix products rounds `W` as
+                // the prefill path does, and the output once.
+                let bound = match (dtype, pre || mat) {
                     (DType::F32, _) => 5e-7,        // 4.64e-7
                     (DType::BF16, false) => 2.2e-3, // 2.13e-3
                     (DType::BF16, true) => 3.9e-3,  // 3.78e-3
@@ -201,6 +210,11 @@ fn matches_the_definition() {
                 assert_eq!(
                     probe::dequant_launches() > before.1,
                     pre,
+                    "{name} {dtype:?} {rows}"
+                );
+                assert_eq!(
+                    probe::matrix_launches() > before.2,
+                    mat,
                     "{name} {dtype:?} {rows}"
                 );
                 if name == "cubecl" && common::on_cuda(&device) {
