@@ -22,8 +22,8 @@
 //! `[.., Dv, Dk]`) and writes `V'` transposed, which are the operands the next kernel reads.
 //!
 //! Tiles are rows of 16-byte chunks, XOR-swizzled as `tc.rs`' ([`swizzle`]). Shared memory, at
-//! `Dk = Dv = 128`: the prep kernel 58.1 KiB, the state passing 44 KiB, the output kernel
-//! 48.3 KiB, within the 64 KiB a workgroup has on RDNA4.
+//! `Dk = Dv = 128`: the prep kernel 57.25 KiB, the state passing 44 KiB, the output kernel
+//! 48.25 KiB, within the 64 KiB a workgroup has on RDNA4.
 
 // Kernel code is expanded by CubeCL's frontend, which takes the plain operators.
 #![allow(

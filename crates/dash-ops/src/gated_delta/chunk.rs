@@ -58,7 +58,7 @@
 //! RDNA4's register layout (the R9700's), a forward from those dtypes with `Dk` and `Dv` of 32, 64
 //! or 128 runs three kernels of its own on those products instead (`chunk/cube/wmma.rs`), which
 //! form what those on tensor cores form, with the same intermediates in the input dtype and the
-//! same roundings, in at most 58.1 KiB of shared memory; the backward pass there runs the
+//! same roundings, in at most 57.25 KiB of shared memory; the backward pass there runs the
 //! reference. On a device without what any of the kernels ask, and for heads wider than 256, the
 //! reference runs instead (`kernels_take`, `tensor_cores_take` and `wmma_takes` tell which):
 //! under wgpu on OpenGL over D3D12 and on lavapipe (Vulkan on the CPU), both with 32 KiB of shared
