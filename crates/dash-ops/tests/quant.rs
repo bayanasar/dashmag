@@ -121,8 +121,15 @@ fn dequantize_is_exact() {
     }
 }
 
+/// The tests that read the [`probe`] counters, one at a time: the counters are the process's.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn matches_the_definition() {
+    let _serial = serial();
     for (name, device) in devices() {
         for dtype in [DType::F32, DType::BF16, DType::F16] {
             if !common::has(&device, dtype) {
@@ -222,6 +229,63 @@ fn matches_the_definition() {
                     assert_eq!(pre, rows > 16, "CUDA takes the prefill path past 16 rows");
                 }
             }
+        }
+    }
+}
+
+/// The kernel on RDNA4's matrix products where it does not split the inputs between cubes, as
+/// where it does (`matches_the_definition`'s 17 and 100 rows of 40 outputs), held to the definition
+/// within the prefill path's bounds: 1024 rows of 1024 outputs over `matches_the_definition`'s 384
+/// inputs make 128 cubes of 64 rows and 128 outputs, enough to fill a device of 64 compute units.
+/// Only on a device the kernel takes.
+#[test]
+fn matrix_products_whole_inputs() {
+    let _serial = serial();
+    for (name, device) in devices() {
+        for dtype in [DType::BF16, DType::F16] {
+            let p = packed(5, 384, 1024, 128);
+            let rows = 1024;
+            if !matrix_takes(&device, dtype, [rows, p.inp, p.out], p.group) {
+                continue;
+            }
+            let before = probe::matrix_launches();
+            let mut rng = Rng(7);
+            let x: Vec<f32> = (0..rows * p.inp).map(|_| rng.unit()).collect();
+            let xt = Tensor::<2>::from_data(TensorData::new(x, [rows, p.inp]), &device)
+                .cast(FloatDType::from(dtype));
+            let xs: Vec<f32> = xt
+                .clone()
+                .cast(FloatDType::F32)
+                .into_data()
+                .try_to_vec::<f32>()
+                .unwrap();
+            let weight = weight(&p, &device, false).unwrap();
+            let got: Vec<f32> = quantized_linear(xt, &weight, None)
+                .cast(FloatDType::F32)
+                .into_data()
+                .try_to_vec::<f32>()
+                .unwrap();
+            let (mut worst, mut scale) = (0f64, 0f64);
+            for n in 0..rows {
+                for o in 0..p.out {
+                    let exact: f64 = (0..p.inp)
+                        .map(|i| xs[n * p.inp + i] as f64 * w(&p, i, o))
+                        .sum();
+                    worst = worst.max((got[n * p.out + o] as f64 - exact).abs());
+                    scale = scale.max(exact.abs());
+                }
+            }
+            println!(
+                "{name} {dtype:?} {rows} x {} (matrix products, whole inputs): relative {:.3e}",
+                p.out,
+                worst / scale
+            );
+            let bound = if dtype == DType::BF16 { 3.9e-3 } else { 4.4e-4 };
+            assert!(worst / scale <= bound, "{dtype:?}: {:.3e}", worst / scale);
+            assert!(
+                probe::matrix_launches() > before,
+                "{dtype:?}: the kernel ran"
+            );
         }
     }
 }

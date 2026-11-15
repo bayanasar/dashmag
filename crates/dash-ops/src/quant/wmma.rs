@@ -13,7 +13,10 @@
 //! dequantizes two words per lane and multiplies each by four 16-row tiles of `x`, so that the
 //! dequantization is amortised over the rows. The products accumulate in f32; the bias is added
 //! in f32 and the sum rounded once to `x`'s dtype. Cubes are numbered rows first, so that those
-//! running at once read the same columns of the weight.
+//! running at once read the same columns of the weight. Where a product makes too few cubes to
+//! fill the device (a narrow output at few rows), the inputs are split into runs along z: each
+//! cube writes its run's f32 sums, and the decoding path's `finish_kernel` adds the runs in order,
+//! adds the bias and rounds once.
 
 // See `attention/kernels.rs`: CubeCL's frontend takes the plain operators.
 #![allow(clippy::manual_div_ceil, clippy::assign_op_pattern)]
@@ -45,7 +48,9 @@ fn x_slot(r: usize, c: usize) -> usize {
 
 /// `y = x W (+ bias)`: `x` `[rows, inp]` contiguous in vectors of eight, `qweight`
 /// `[inp / 8, out]`, `scales` `[inp / group, out]`, `bias` `[out]` f32 (read when `has_bias`), `y`
-/// `[rows, out]`. One cube per 64 rows (x) and 128 outputs (y).
+/// `[rows, out]`. One cube per 64 rows (x), 128 outputs (y) and run of `run` steps of 32 inputs
+/// (z). With `partial`, each run's f32 sums go to `part` `[runs, rows, out]` instead, without the
+/// bias, for `finish_kernel` to add in order, add the bias to and round.
 #[cube(launch_unchecked, address_type = "dynamic")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matrix_kernel<E: Float, S: Float>(
@@ -54,8 +59,11 @@ pub(crate) fn matrix_kernel<E: Float, S: Float>(
     scales: &Tensor<S>,
     bias: &Tensor<f32>,
     y: &mut Tensor<E>,
+    part: &mut Tensor<f32>,
+    run: usize,
     #[comptime] group: usize,
     #[comptime] has_bias: bool,
+    #[comptime] partial: bool,
     #[define(E)] _dtype: ElemType,
     #[define(S)] _scales_dtype: ElemType,
 ) {
@@ -80,7 +88,10 @@ pub(crate) fn matrix_kernel<E: Float, S: Float>(
     }
 
     let steps = packed / 4;
-    for kb in 0..steps {
+    let z = CUBE_POS_Z as usize;
+    let first = z * run;
+    let last = clamp_max(first + run, steps);
+    for kb in first..last {
         sync_cube();
         #[unroll]
         for i in 0..2usize {
@@ -154,8 +165,12 @@ pub(crate) fn matrix_kernel<E: Float, S: Float>(
                 for i in 0..8usize {
                     let row = m0 + mt * 16 + half * 8 + i;
                     if row < rows {
-                        let v = acc[(mt * 2 + nt) * 8 + i].extract(0usize) + add;
-                        y[row * out + n] = E::cast_from(v);
+                        let v = acc[(mt * 2 + nt) * 8 + i].extract(0usize);
+                        if comptime!(partial) {
+                            part[(z * rows + row) * out + n] = v;
+                        } else {
+                            y[row * out + n] = E::cast_from(v + add);
+                        }
                     }
                 }
             }

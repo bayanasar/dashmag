@@ -212,19 +212,23 @@ pub(super) fn kernels_take(
 }
 
 /// What [`matrix_kernel`] asks: 128 units per cube (four planes of 32, the layout's), a cube per 64
-/// rows and 128 outputs, 4 KiB of shared memory, five tensors, 16-byte vectors.
+/// rows and 128 outputs (and run of the inputs), 4 KiB of shared memory, six tensors, 16-byte
+/// vectors; beside `finish_kernel`'s, which adds the runs' sums where the inputs are split.
 fn matrix_requirements([rows, inp, out]: [usize; 3]) -> Requirements {
-    Requirements {
+    let finish = Requirements::new((CUBE as u32, 1), ((rows * out).div_ceil(CUBE), 1), 3);
+    let product = Requirements {
         shared_bytes: BLOCK_M * BLOCK_K * 2,
         vector_size: 8,
         plane_width: Some(32),
-        address: AddressType::from_len((rows * inp).max(rows * out).max(inp / 8 * out)),
+        // The most runs the inputs split into: one per step of 32.
+        address: matrix_address([rows, inp, out], inp / BLOCK_K),
         ..Requirements::new(
             (UNITS, 1),
             (rows.div_ceil(BLOCK_M), out.div_ceil(BLOCK_N)),
-            5,
+            6,
         )
-    }
+    };
+    product.max(finish)
 }
 
 /// Whether the prefill kernel on RDNA4's matrix products takes `x` `[rows, inp]` in `dtype`: more
@@ -395,6 +399,14 @@ fn matrix(
     let bias = bias.unwrap_or_else(|| empty(&x, Shape::new([1]), DType::F32));
     let client = x.client.clone();
     let dtype = dtype_to_storage_type(x.dtype);
+    let (runs, run) = matrix_split(&client, rows, inp, out);
+    let split = runs > 1;
+    // f32 sums of each run where the inputs are split, else bound and unread.
+    let part = empty(
+        &x,
+        Shape::new(if split { [runs, rows, out] } else { [1, 1, 1] }),
+        DType::F32,
+    );
     probe::MATRIX_LAUNCHES.fetch_add(1, Ordering::SeqCst);
     // SAFETY: cube (i, j) reads rows below `rows` of x and words and scales of columns below `out`
     // within qweight `[inp / 8, out]` and scales `[inp / group, out]`, inputs below `inp` (a
@@ -405,22 +417,59 @@ fn matrix(
             CubeCount::Static(
                 rows.div_ceil(BLOCK_M) as u32,
                 out.div_ceil(BLOCK_N) as u32,
-                1,
+                runs as u32,
             ),
             CubeDim::new_1d(UNITS),
-            AddressType::from_len((rows * inp).max(rows * out).max(inp / 8 * out)),
+            matrix_address([rows, inp, out], runs),
             x.into_tensor_arg(),
             qweight.into_tensor_arg(),
             scales.into_tensor_arg(),
-            bias.into_tensor_arg(),
+            bias.clone().into_tensor_arg(),
             y.clone().into_tensor_arg(),
+            part.clone().into_tensor_arg(),
+            run,
             group,
-            has_bias,
+            has_bias && !split,
+            split,
             dtype,
             dtype_to_storage_type(DType::F16),
         );
+        if split {
+            finish_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static((rows * out).div_ceil(CUBE) as u32, 1, 1),
+                CubeDim::new_1d(CUBE as u32),
+                matrix_address([rows, inp, out], runs),
+                part.into_tensor_arg(),
+                bias.into_tensor_arg(),
+                y.clone().into_tensor_arg(),
+                has_bias,
+                dtype,
+            );
+        }
     }
     y
+}
+
+/// `(runs, run)`: the steps of 32 inputs split into `runs` runs of `run` steps, so that a product
+/// with fewer cubes of 64 rows and 128 outputs than twice the device's compute units fills it; one
+/// run otherwise.
+fn matrix_split(client: &Client, rows: usize, inp: usize, out: usize) -> (usize, usize) {
+    let units = client
+        .properties()
+        .hardware
+        .num_streaming_multiprocessors
+        .unwrap_or(64) as usize;
+    let cubes = rows.div_ceil(BLOCK_M) * out.div_ceil(BLOCK_N);
+    let steps = inp / BLOCK_K;
+    let wanted = (2 * units).div_ceil(cubes).clamp(1, steps);
+    let run = steps.div_ceil(wanted);
+    (steps.div_ceil(run), run)
+}
+
+/// The index type [`matrix_kernel`] and `finish_kernel` need: every tensor they bind indexed.
+fn matrix_address([rows, inp, out]: [usize; 3], runs: usize) -> AddressType {
+    AddressType::from_len((rows * inp).max(runs * rows * out).max(inp / 8 * out))
 }
 
 /// `y = x W (+ bias)` with `W` dequantized to `x`'s dtype by [`dequant_kernel`] and multiplied by
