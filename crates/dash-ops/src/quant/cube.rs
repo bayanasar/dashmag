@@ -252,6 +252,19 @@ pub(super) fn matrix_takes(
         && crate::wmma::rdna4_products(client, dtype)
 }
 
+/// The runs [`matrix_split`] gives where [`matrix_takes`] holds, 0 where it does not.
+pub(super) fn matrix_runs(
+    client: &Client,
+    dtype: DType,
+    [rows, inp, out]: [usize; 3],
+    group: usize,
+) -> usize {
+    match matrix_takes(client, dtype, [rows, inp, out], group) {
+        true => matrix_split(client, rows, inp, out).0,
+        false => 0,
+    }
+}
+
 /// Whether the prefill path takes `x` `[rows, inp]` in `dtype`: more rows than the decoding
 /// kernels take, the weight dequantized to `dtype` by a kernel and multiplied by Burn's matmul,
 /// where [`matrix_takes`] does not.

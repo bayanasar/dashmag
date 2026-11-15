@@ -92,6 +92,23 @@ pub fn matrix_takes(
     false
 }
 
+/// The runs [`matrix_takes`]' kernel splits its inputs into on `device` for these sizes (1: not
+/// split), where it takes them; 0 elsewhere. For tests.
+#[doc(hidden)]
+pub fn matrix_runs(
+    device: &burn::tensor::Device,
+    dtype: DType,
+    dims: [usize; 3],
+    group: usize,
+) -> usize {
+    #[cfg(feature = "cubecl")]
+    if let Some(client) = crate::cube::client(device.as_dispatch()) {
+        return cube::matrix_runs(&client, dtype, dims, group);
+    }
+    let _ = (device, dtype, dims, group);
+    0
+}
+
 /// Whether the prefill path (the weight dequantized by a kernel, then Burn's matmul) takes
 /// [`quantized_linear`] on `device` for these sizes: more than 16 rows, on a CubeCL device with
 /// what the kernel asks, where the kernel on matrix products ([`matrix_takes`]) does not. For

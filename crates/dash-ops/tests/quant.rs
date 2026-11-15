@@ -5,7 +5,7 @@ mod common;
 
 use burn::tensor::{DType, Device, FloatDType, Int, Tensor, TensorData, f16};
 use dash_ops::quant::{
-    QuantOptions, QuantizedWeight, kernels_take, matrix_takes, prefill_takes, probe,
+    QuantOptions, QuantizedWeight, kernels_take, matrix_runs, matrix_takes, prefill_takes, probe,
     quantized_linear,
 };
 
@@ -237,7 +237,8 @@ fn matches_the_definition() {
 /// where it does (`matches_the_definition`'s 17 and 100 rows of 40 outputs), held to the definition
 /// within the prefill path's bounds: 1024 rows of 1024 outputs over `matches_the_definition`'s 384
 /// inputs make 128 cubes of 64 rows and 128 outputs, enough to fill a device of 64 compute units.
-/// Only on a device the kernel takes.
+/// Only on a device the kernel takes, and that does not split this shape ([`matrix_runs`]), saying
+/// so where it does.
 #[test]
 fn matrix_products_whole_inputs() {
     let _serial = serial();
@@ -246,6 +247,11 @@ fn matrix_products_whole_inputs() {
             let p = packed(5, 384, 1024, 128);
             let rows = 1024;
             if !matrix_takes(&device, dtype, [rows, p.inp, p.out], p.group) {
+                continue;
+            }
+            let runs = matrix_runs(&device, dtype, [rows, p.inp, p.out], p.group);
+            if runs != 1 {
+                println!("skipped {dtype:?}: this device splits 1024 x 1024 into {runs} runs");
                 continue;
             }
             let before = probe::matrix_launches();

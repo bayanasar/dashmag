@@ -16,7 +16,9 @@
 //! running at once read the same columns of the weight. Where a product makes too few cubes to
 //! fill the device (a narrow output at few rows), the inputs are split into runs along z: each
 //! cube writes its run's f32 sums, and the decoding path's `finish_kernel` adds the runs in order,
-//! adds the bias and rounds once.
+//! adds the bias and rounds once. How many runs depends on the device's count of compute units, so
+//! the output is the same bits from run to run on one device, and may differ in its last bits
+//! between devices.
 
 // See `attention/kernels.rs`: CubeCL's frontend takes the plain operators.
 #![allow(clippy::manual_div_ceil, clippy::assign_op_pattern)]
