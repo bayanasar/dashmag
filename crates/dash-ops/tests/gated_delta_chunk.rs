@@ -160,7 +160,7 @@ mod cube {
     };
     use dash_ops::gated_delta::chunk::{
         chunk_gated_delta_rule_reference, chunk_gated_delta_rule_reference_backward, kernels_take,
-        probe, tensor_cores_take,
+        probe, tensor_cores_take, wmma_takes,
     };
 
     /// How many kernel launches a forward and a backward pass over `[B, T, H, Dk, Dv]` in `dtype`
@@ -180,11 +180,13 @@ mod cube {
         3 * usize::from(forward) + backward_launches * usize::from(backward)
     }
 
-    /// How many of those launches run on tensor cores: all of them where the kernels on tensor
+    /// How many of those launches run on matrix units: all of them where the kernels on tensor
     /// cores take the pass, which under CUDA they do for bf16 and f16 inputs with heads of 32, 64
-    /// or 128.
+    /// or 128; and the forward's three where those on RDNA4's matrix products take it, whose
+    /// products round as those on tensor cores do.
     fn expected_tc_launches(device: &Device, dtype: DType, dims: [usize; 5]) -> usize {
         let [forward, backward] = tensor_cores_take(device, dtype, dims, None);
+        let forward = forward || wmma_takes(device, dtype, dims, None);
         let narrow = |d: usize| matches!(d, 32 | 64 | 128);
         if common::runtime_of(device) == Some("cuda")
             && matches!(dtype, DType::BF16 | DType::F16)
@@ -208,18 +210,23 @@ mod cube {
         has
     }
 
-    /// Asserts that `f` launched exactly `expected` kernels, `tc` of them on tensor cores: under
+    /// Launches on matrix units so far: on tensor cores and on RDNA4's matrix products.
+    fn matrix_launches() -> usize {
+        probe::tensor_core_launches() + probe::wmma_launches()
+    }
+
+    /// Asserts that `f` launched exactly `expected` kernels, `tc` of them on matrix units: under
     /// fusion the kernels run when their results are read, so `f` reads them.
     fn launches_kernels<R>(expected: usize, tc: usize, f: impl FnOnce() -> R) -> R {
         let before = probe::kernel_launches();
-        let before_tc = probe::tensor_core_launches();
+        let before_tc = matrix_launches();
         let result = f();
         let launched = probe::kernel_launches() - before;
-        let launched_tc = probe::tensor_core_launches() - before_tc;
+        let launched_tc = matrix_launches() - before_tc;
         assert_eq!(
             (launched, launched_tc),
             (expected, tc),
-            "the kernels made {launched} launches ({launched_tc} on tensor cores), expected \
+            "the kernels made {launched} launches ({launched_tc} on matrix units), expected \
              {expected} ({tc})"
         );
         result
@@ -240,7 +247,7 @@ mod cube {
             let expected = expected_launches(device, dtype, dims);
             let tc = expected_tc_launches(device, dtype, dims);
             println!(
-                "{name}: {dims:?} {dtype:?}, {expected} kernel launches, {tc} on tensor cores"
+                "{name}: {dims:?} {dtype:?}, {expected} kernel launches, {tc} on matrix units"
             );
             let ad = Burn::new(device.clone().autodiff());
             if dtype == DType::F32 {
@@ -271,7 +278,7 @@ mod cube {
         kernels_against_reference_on(label, dims, l2norm, dtype).0
     }
 
-    /// [`kernels_against_reference`], and whether the kernels on tensor cores ran.
+    /// [`kernels_against_reference`], and whether kernels on matrix units ran.
     fn kernels_against_reference_on(
         label: &str,
         dims: [usize; 5],
@@ -290,7 +297,7 @@ mod cube {
         };
         let expected = expected_launches(&device, dtype, dims);
         let tc = expected_tc_launches(&device, dtype, dims);
-        let launches_tc = probe::tensor_core_launches();
+        let launches_tc = matrix_launches();
         let x = seeded(7, dims, !l2norm);
         let leaf4 = |i: usize| t4(&x[i], &ad).cast(dtype).require_grad();
         let leaf3 = |i: usize| t3(&x[i], &ad).cast(dtype).require_grad();
@@ -331,9 +338,9 @@ mod cube {
             "the kernels made other launches"
         );
         assert_eq!(
-            probe::tensor_core_launches(),
+            matrix_launches(),
             launches_tc + tc,
-            "the kernels made other launches on tensor cores"
+            "the kernels made other launches on matrix units"
         );
         // The reference in f32 from the inputs as the kernels saw them.
         let r4 = |i: usize| t4(&x[i], &device).cast(dtype).cast(DType::F32);

@@ -74,7 +74,7 @@ pub(super) const STATE_COLS: usize = 32;
 /// columns) with bits 1 and 2, which spreads eight consecutive 64-byte rows over eight bank
 /// groups as well.
 #[cube]
-fn swizzle(r: u32, c: u32, #[comptime] chunks: u32) -> u32 {
+pub(super) fn swizzle(r: u32, c: u32, #[comptime] chunks: u32) -> u32 {
     if comptime!(chunks >= 8) {
         r * chunks + (c ^ (r & 7))
     } else {
@@ -347,7 +347,7 @@ fn zeros(#[comptime] len: u32) -> Array<Vector<f32, R2>> {
 /// `scaled`. The whole cube of 256 units takes part.
 #[cube]
 #[allow(clippy::too_many_arguments)]
-fn stage_tokens<E: Float>(
+pub(super) fn stage_tokens<E: Float>(
     src: &Tensor<Vector<E, V8>>,
     dst: &mut [Vector<E, V8>],
     rows: &[f32],

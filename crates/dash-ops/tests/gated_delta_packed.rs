@@ -365,7 +365,7 @@ mod cube {
     };
     use dash_ops::gated_delta::chunk::{
         chunk_gated_delta_rule_reference, chunk_gated_delta_rule_reference_backward, kernels_take,
-        tensor_cores_take,
+        tensor_cores_take, wmma_takes,
     };
     use dash_ops::gated_delta::recurrent::{self, gated_delta_step_reference, kernel_takes};
 
@@ -389,12 +389,14 @@ mod cube {
         4 * usize::from(forward) + backward_launches * usize::from(backward)
     }
 
-    /// How many of those run on tensor cores: three forward and six backward (all but the
+    /// How many of those run on matrix units: three forward and six backward (all but the
     /// chunks' layout) where the kernels on tensor cores take them, which under CUDA they do for
-    /// bf16 inputs with heads of 32, 64 or 128.
+    /// bf16 inputs with heads of 32, 64 or 128; the forward's three where those on RDNA4's matrix
+    /// products take it, whose products round as those on tensor cores do.
     fn expected_tc_launches(device: &Device, dtype: DType, dims: [usize; 5], seqs: usize) -> usize {
         let int = cu_seqlens(&[0, 1], device).dtype();
         let [forward, backward] = tensor_cores_take(device, dtype, dims, Some((seqs, int)));
+        let forward = forward || wmma_takes(device, dtype, dims, Some((seqs, int)));
         let narrow = |d: usize| matches!(d, 32 | 64 | 128);
         if common::runtime_of(device) == Some("cuda")
             && matches!(dtype, DType::BF16 | DType::F16)
@@ -417,17 +419,22 @@ mod cube {
         has
     }
 
-    /// Asserts that `f` launched exactly `expected` kernels, `tc` of them on tensor cores.
+    /// Launches on matrix units so far: on tensor cores and on RDNA4's matrix products.
+    fn matrix_launches() -> usize {
+        chunk::probe::tensor_core_launches() + chunk::probe::wmma_launches()
+    }
+
+    /// Asserts that `f` launched exactly `expected` kernels, `tc` of them on matrix units.
     fn launches<R>(expected: usize, tc: usize, f: impl FnOnce() -> R) -> R {
         let before = chunk::probe::kernel_launches();
-        let before_tc = chunk::probe::tensor_core_launches();
+        let before_tc = matrix_launches();
         let result = f();
         let launched = chunk::probe::kernel_launches() - before;
-        let launched_tc = chunk::probe::tensor_core_launches() - before_tc;
+        let launched_tc = matrix_launches() - before_tc;
         assert_eq!(
             (launched, launched_tc),
             (expected, tc),
-            "the kernels made {launched} launches ({launched_tc} on tensor cores), expected \
+            "the kernels made {launched} launches ({launched_tc} on matrix units), expected \
              {expected} ({tc})"
         );
         result

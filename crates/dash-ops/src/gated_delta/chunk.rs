@@ -53,11 +53,17 @@
 //! when it comes, the same sums in the same order. The prep and output kernels fit 64 KiB as they
 //! are: `A` takes the keys' place once its products are in registers, and the output kernel holds
 //! the keys 64 columns at a time. CUDA cards of compute capability 8.0 and later have all of it,
-//! and a Radeon AI PRO R9700 (RDNA4, 64 KiB) has what the forward asks. On a device without it,
-//! and for heads wider than 256, the reference runs instead (`kernels_take` and
-//! `tensor_cores_take` tell which): under wgpu on OpenGL over D3D12 and on lavapipe (Vulkan on the
-//! CPU), both with 32 KiB of shared memory and no plane operations, and on CubeCL's CPU runtime
-//! (as many units per cube as cores), for instance.
+//! and a Radeon AI PRO R9700 (RDNA4, 64 KiB) has what the forward asks. Where the tensor cores'
+//! instructions are missing but the device's 16 x 16 x 16 product from bf16 or f16 into f32 has
+//! RDNA4's register layout (the R9700's), a forward from those dtypes with `Dk` and `Dv` of 32, 64
+//! or 128 runs three kernels of its own on those products instead (`chunk/cube/wmma.rs`), which
+//! form what those on tensor cores form, with the same intermediates in the input dtype and the
+//! same roundings, in at most 58.1 KiB of shared memory; the backward pass there runs the
+//! reference. On a device without what any of the kernels ask, and for heads wider than 256, the
+//! reference runs instead (`kernels_take`, `tensor_cores_take` and `wmma_takes` tell which):
+//! under wgpu on OpenGL over D3D12 and on lavapipe (Vulkan on the CPU), both with 32 KiB of shared
+//! memory and no plane operations, and on CubeCL's CPU runtime (as many units per cube as cores),
+//! for instance.
 //!
 //! Measured against transformers' function at f32 (the tests' fixtures), the output, the final
 //! state and every gradient agree to within 1.13e-6 relative to each tensor's largest value; from
@@ -111,6 +117,7 @@ pub mod probe {
     pub(super) static KERNEL_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static FORCE_SMALL_STATE: AtomicBool = AtomicBool::new(false);
     pub(super) static TENSOR_CORE_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static WMMA_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static BACKWARD_RUNS: AtomicUsize = AtomicUsize::new(0);
 
     /// Launches of this module's CubeCL kernels: three for a forward pass; for a backward pass
@@ -124,6 +131,12 @@ pub mod probe {
     /// layout).
     pub fn tensor_core_launches() -> usize {
         TENSOR_CORE_LAUNCHES.load(Ordering::SeqCst)
+    }
+
+    /// Those of [`kernel_launches`] that ran the forward's kernels on RDNA4's matrix products
+    /// (`chunk/cube/wmma.rs`).
+    pub fn wmma_launches() -> usize {
+        WMMA_LAUNCHES.load(Ordering::SeqCst)
     }
 
     /// Runs of the written-out backward pass on `Autodiff`.
@@ -183,6 +196,26 @@ pub fn tensor_cores_take(
     }
     let _ = (device, dtype, dims, packed);
     [false, false]
+}
+
+/// Whether the forward's kernels on RDNA4's matrix products take a forward pass, as
+/// [`kernels_take`]: bf16 or f16 inputs, `Dk` and `Dv` of 32, 64 or 128, where the kernels on
+/// tensor cores do not, on a device whose 16 x 16 x 16 product from the dtype into f32 has RDNA4's
+/// register layout, with what the kernels ask (module documentation). Their products round as
+/// those on tensor cores do. For tests.
+#[doc(hidden)]
+pub fn wmma_takes(
+    device: &Device,
+    dtype: DType,
+    dims: [usize; 5],
+    packed: Option<(usize, DType)>,
+) -> bool {
+    #[cfg(feature = "cubecl")]
+    if let Some(client) = crate::cube::client(device.as_dispatch()) {
+        return cube::wmma_take(&client, dtype, dims, packed);
+    }
+    let _ = (device, dtype, dims, packed);
+    false
 }
 
 /// The shape of what a forward pass over `[B, T, H, Dk, Dv]` in `dtype` keeps for its backward

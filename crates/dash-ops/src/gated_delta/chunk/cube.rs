@@ -1,9 +1,11 @@
-//! The chunked gated delta rule on the CubeCL backend, in CubeCL kernels. From bf16 and f16
-//! inputs with `Dk` and `Dv` of 32, 64 or 128, on devices with the tensor cores' `mma` and
-//! `ldmatrix` and what [`tc_requirements`] lists, the kernels of [`tc`] run, their products on
-//! tensor cores; otherwise, for heads up to [`MAX_KERNEL_HEAD_DIM`] wide (queries and keys wider
+//! The chunked gated delta rule on the CubeCL backend, in CubeCL kernels. From bf16 and f16 inputs
+//! with `Dk` and `Dv` of 32, 64 or 128, on devices with the tensor cores' `mma` and `ldmatrix` and
+//! what [`tc_requirements`] lists, the kernels of [`tc`] run, their products on tensor cores;
+//! forward, on a device without those whose 16 x 16 x 16 product has RDNA4's register layout, with
+//! what [`wmma_requirements`] lists, the kernels of [`wmma`], which compute what [`tc`]'s do on
+//! those products; otherwise, for heads up to [`MAX_KERNEL_HEAD_DIM`] wide (queries and keys wider
 //! than 128 in the kernels of [`wide`]), on devices with what [`requirements`] lists, the f32
-//! kernels below, all in f32 without tensor cores; elsewhere the reference. Both sets share the
+//! kernels below, all in f32 without tensor cores; elsewhere the reference. The sets share the
 //! layout and the per-chunk quantities described here. Notation as in `reference.rs`.
 //!
 //! The per-chunk kernels run one cube per chunk of each head, `cube = (b H + h) N + c`. Batch
@@ -53,6 +55,7 @@ use std::sync::atomic::Ordering;
 
 mod tc;
 mod wide;
+mod wmma;
 
 /// Launches `$narrow`, or `$wide` when `$is_wide` (heads wider than [`wide::HALF`]), with the
 /// same arguments.
@@ -3625,6 +3628,7 @@ pub(super) fn kernels_take(
     backward: bool,
 ) -> bool {
     tensor_cores_take(client, dtype, dims, packed, backward)
+        || !backward && wmma_take(client, dtype, dims, packed)
         || f32_kernels_take(client, dtype, dims, packed, backward)
 }
 
@@ -3862,6 +3866,193 @@ fn tc_wu(
     TcPrep { w, u, kn, gcum, t }
 }
 
+/// Bytes of shared memory the forward's kernels on RDNA4's matrix products hold at most, from
+/// each kernel's `Shared` arrays: tiles of 16-bit values, `64 x 65` f32 blocks.
+fn wmma_shared_bytes(dk: usize, dv: usize) -> usize {
+    let tile = |rows: usize, cols: usize| 2 * rows * cols;
+    let prep = tile(64, dk.max(dv)) + tile(64, 64) + 2 * 4 * 64 * 65 + 4 * 3 * 64;
+    let state_forward = 2 * tile(64, dk) + tile(wmma::STATE_COLS, dk) + tile(32, 64);
+    let output = tile(64, dk.max(dv)) + tile(dv, dk) + 4 * 64;
+    [prep, state_forward, output]
+        .into_iter()
+        .fold(0, usize::max)
+}
+
+/// What the forward's kernels on RDNA4's matrix products over `[B, T, H, Dk, Dv]` ask of the
+/// device: 256 units per cube for the per-chunk kernels and 128 for the state passing, their cube
+/// counts (as [`requirements`] counts them), the shared memory of [`wmma_shared_bytes`], nine
+/// tensors, 16-byte vectors, and planes of exactly 32 units, the waves the fragments are laid out
+/// over.
+fn wmma_requirements([b, t, h, dk, dv]: [usize; 5], packed: Option<usize>) -> Requirements {
+    let (n, rows) = match packed {
+        None => (t.div_ceil(CHUNK), b),
+        Some(seqs) => (max_chunks(t, seqs), seqs),
+    };
+    let per_chunk = Requirements::new((wmma::CHUNK_UNITS, 1), (b * h * n, 1), 9);
+    let state = Requirements::new(
+        (wmma::STATE_UNITS, 1),
+        (dv.div_ceil(wmma::STATE_COLS), rows * h),
+        9,
+    );
+    Requirements {
+        shared_bytes: wmma_shared_bytes(dk, dv),
+        vector_size: 8,
+        plane_width: Some(32),
+        ..per_chunk.max(state)
+    }
+}
+
+/// Whether the forward's kernels on RDNA4's matrix products (`cube/wmma.rs`) take a forward
+/// pass: where those on tensor cores do not, from bf16 or f16 inputs with `Dk` and `Dv` of 32, 64
+/// or 128, on a device whose 16 x 16 x 16 product has RDNA4's register layout and with what
+/// [`wmma_requirements`] lists.
+pub(super) fn wmma_take(
+    client: &Client,
+    dtype: DType,
+    dims: [usize; 5],
+    packed: Option<(usize, DType)>,
+) -> bool {
+    let [_, t, _, dk, dv] = dims;
+    let mut dtypes = vec![dtype, DType::F32, DType::U32];
+    dtypes.extend(packed.map(|(_, int)| int));
+    matches!(dtype, DType::BF16 | DType::F16)
+        && tc_width(dk)
+        && tc_width(dv)
+        && (packed.is_none() || t <= i32::MAX as usize)
+        && !tensor_cores_take(client, dtype, dims, packed, false)
+        && wmma_requirements(dims, packed.map(|(seqs, _)| seqs)).met_on(client, &dtypes)
+        && crate::wmma::rdna4_products(client, dtype)
+}
+
+/// Counts one launch of a kernel on RDNA4's matrix products, in `probe::kernel_launches` and
+/// `probe::wmma_launches`.
+fn launched_wmma() {
+    launched();
+    probe::WMMA_LAUNCHES.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The forward pass on RDNA4's matrix products: the prep kernel, the state passing, the output
+/// kernel of `cube/wmma.rs`. Returns the output and the final states.
+#[allow(clippy::too_many_arguments)]
+fn wmma_forward(
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    g: CubeTensor,
+    beta: CubeTensor,
+    initial_state: CubeTensor,
+    sequences: Sequences<CubeBackend>,
+    use_qk_l2norm: bool,
+    scale: f32,
+) -> (CubeTensor, CubeTensor) {
+    let (q, k, v) = (aligned(q), aligned(k), aligned(v));
+    let l = layout(&q, &v, sequences);
+    let g = into_contiguous(reference::to_f32::<CubeBackend>(g));
+    let beta = into_contiguous(reference::to_f32::<CubeBackend>(beta));
+    let dtype = q.dtype;
+    let client = q.client.clone();
+    // W by rows, U and the keys transposed: `[B, H, N, C, Dk]`, `[B, H, N, Dv, C]`,
+    // `[B, H, N, Dk, C]`.
+    let w = empty_with(&k, l.chunked(l.dk), dtype);
+    let ut = empty_with(&k, Shape::new([l.b, l.h, l.n, l.dv, CHUNK]), dtype);
+    let knt = empty_with(&k, Shape::new([l.b, l.h, l.n, l.dk, CHUNK]), dtype);
+    let gcum = empty_like(&k, l.per_token());
+    let (count, dim) = (
+        CubeCount::Static((l.b * l.h * l.n) as u32, 1, 1),
+        CubeDim::new_1d(wmma::CHUNK_UNITS),
+    );
+    launched_wmma();
+    // SAFETY: the kernel reads chunk rows below each chunk's count of tokens from the inputs and
+    // writes the chunk's rows of the chunked tensors, all allocated for the layout's chunks.
+    unsafe {
+        wmma::wmma_prep_kernel::launch_unchecked(
+            &client,
+            count.clone(),
+            dim,
+            k.clone().into_tensor_arg(),
+            v.into_tensor_arg(),
+            g.into_tensor_arg(),
+            beta.into_tensor_arg(),
+            w.clone().into_tensor_arg(),
+            ut.clone().into_tensor_arg(),
+            knt.clone().into_tensor_arg(),
+            gcum.clone().into_tensor_arg(),
+            l.plan.clone().into_tensor_arg(),
+            l.t as u32,
+            l.n as u32,
+            l.h as u32,
+            l.dk as u32,
+            l.dv as u32,
+            use_qk_l2norm,
+            l.packed,
+            dtype_to_storage_type(dtype),
+        );
+    }
+    // The state entering each chunk, transposed `[B, H, N, Dv, Dk]`, and V' transposed
+    // `[B, H, N, Dv, C]`, in the input dtype; the final states f32.
+    let h0 = into_contiguous(reference::to_f32::<CubeBackend>(initial_state));
+    let states = empty_with(&w, Shape::new([l.b, l.h, l.n, l.dv, l.dk]), dtype);
+    let vnt = empty_with(&w, Shape::new([l.b, l.h, l.n, l.dv, CHUNK]), dtype);
+    let last = empty_like(&w, Shape::new([l.seqs, l.h, l.dk, l.dv]));
+    launched_wmma();
+    // SAFETY: each cube walks the chunks `state_chunks` gives it, within the layout's chunks, and
+    // its block of state columns, within `Dv` (a multiple of 32).
+    unsafe {
+        wmma::wmma_state_forward_kernel::launch_unchecked(
+            &client,
+            CubeCount::Static(
+                l.dv.div_ceil(wmma::STATE_COLS) as u32,
+                (l.seqs * l.h) as u32,
+                1,
+            ),
+            CubeDim::new_1d(wmma::STATE_UNITS),
+            knt.into_tensor_arg(),
+            w.into_tensor_arg(),
+            ut.into_tensor_arg(),
+            gcum.clone().into_tensor_arg(),
+            h0.into_tensor_arg(),
+            l.offsets.clone().into_tensor_arg(),
+            states.clone().into_tensor_arg(),
+            vnt.clone().into_tensor_arg(),
+            last.clone().into_tensor_arg(),
+            l.n as u32,
+            l.h as u32,
+            l.dk as u32,
+            l.dv as u32,
+            l.packed,
+            dtype_to_storage_type(dtype),
+        );
+    }
+    let out = empty_with(&q, Shape::new([l.b, l.t, l.h, l.dv]), dtype);
+    launched_wmma();
+    // SAFETY: as the prep kernel's; rows of the output at or past a chunk's count are not
+    // written.
+    unsafe {
+        wmma::wmma_output_kernel::launch_unchecked(
+            &client,
+            count,
+            dim,
+            q.into_tensor_arg(),
+            k.into_tensor_arg(),
+            gcum.into_tensor_arg(),
+            states.into_tensor_arg(),
+            vnt.into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            l.plan.clone().into_tensor_arg(),
+            l.t as u32,
+            l.n as u32,
+            l.h as u32,
+            scale,
+            l.dk as u32,
+            l.dv as u32,
+            use_qk_l2norm,
+            l.packed,
+            dtype_to_storage_type(dtype),
+        );
+    }
+    (out, last)
+}
+
 /// The tensor-core state passing, forward: the state entering each chunk `[B, H, N, Dk, Dv]`
 /// and `V'` `[B, H, N, C, Dv]` in the input dtype, and the final states, f32.
 fn tc_state_forward(
@@ -4015,7 +4206,19 @@ impl ChunkGatedDeltaBackend for CubeBackend {
             return (out, last, t.or(placeholder).expect("kept or a placeholder"));
         }
         let placeholder = unkept(&q);
-        let (out, last) = if !f32_kernels_take(&q.client, q.dtype, shape, packed, false) {
+        let (out, last) = if wmma_take(&q.client, q.dtype, shape, packed) {
+            wmma_forward(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state,
+                sequences,
+                use_qk_l2norm,
+                scale,
+            )
+        } else if !f32_kernels_take(&q.client, q.dtype, shape, packed, false) {
             super::reference_forward::<Self>(
                 q,
                 k,
