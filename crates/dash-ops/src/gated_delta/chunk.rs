@@ -138,6 +138,7 @@ pub mod probe {
         FORCE_SMALL_STATE.store(on, Ordering::SeqCst);
     }
 
+    #[cfg(feature = "cubecl")]
     pub(super) fn small_state_forced() -> bool {
         FORCE_SMALL_STATE.load(Ordering::SeqCst)
     }
