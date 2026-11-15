@@ -52,8 +52,8 @@ fn wmma_expected(ident: usize, lane: u32, e: u32) -> (u32, u32) {
 
 /// Whether the 16 x 16 x 16 MMA's register layout, as `position_of_nth` gives it on the device
 /// `client` serves, is RDNA4's, which the kernels on it are written for (RDNA3's differs).
-/// Read from each device, by [`layout_kernel`], the first time a kernel asks in each dtype, and kept for that device and dtype: a process with an RDNA4 card and an RDNA3 one reads
-/// both.
+/// Read from each device, by [`layout_kernel`], the first time a kernel asks in each dtype, and
+/// kept for that device and dtype: a process with an RDNA4 card and an RDNA3 one reads both.
 fn wmma_layout(client: &Client, dtype: DType) -> bool {
     // The device and its runtime, as CubeCL names its service, and the dtype.
     static LAYOUTS: Mutex<Option<HashMap<(String, DType), bool>>> = Mutex::new(None);

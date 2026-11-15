@@ -74,8 +74,9 @@ pub fn kernels_take(
 }
 
 /// Whether the prefill kernel on RDNA4's 16 x 16 x 16 matrix products takes [`quantized_linear`] on
-/// `device` for these sizes: more than 16 rows of bf16 or f16, inputs a multiple of 32, on a device
-/// with those products in RDNA4's layout. For tests.
+/// `device` for these sizes: more than 16 rows of bf16 or f16, inputs a multiple of 32, groups a
+/// multiple of 8 that divide the inputs, on a device with those products in RDNA4's layout. For
+/// tests.
 #[doc(hidden)]
 pub fn matrix_takes(
     device: &burn::tensor::Device,
