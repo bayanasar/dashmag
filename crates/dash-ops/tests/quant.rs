@@ -121,6 +121,40 @@ fn dequantize_is_exact() {
     }
 }
 
+/// How a path may round, beyond computing the definition in f32: whether `W` is rounded to `x`'s
+/// dtype before its products, and whether the product is rounded to it before the bias is added.
+#[derive(Clone, Copy)]
+struct Roundings {
+    w: bool,
+    product: bool,
+}
+
+/// What one output may be off by, from the roundings its path is allowed (`dash_contract::quant`),
+/// not from any input set: `y` the output by the definition, `s` the sum of `|x_i w_io|` and `|b|`
+/// over the output's terms, `n` the inputs, `unit` the unit roundoff of `x`'s dtype (2^-8 in bf16,
+/// 2^-11 in f16, 2^-24 in f32). Before the output's rounding, the value computed is off by at most
+/// `e`: `W`'s rounding, `unit · s`; the products and their sum in f32 in any order, `gamma · s` with
+/// `gamma = (n + 2) 2^-24 / (1 - (n + 2) 2^-24)` (over the products of `W` rounded, a little more);
+/// and the product's rounding before the bias, `unit · s`. The output's rounding adds
+/// `unit · (|y| + e)`.
+fn allowed(y: f64, s: f64, n: usize, unit: f64, r: Roundings) -> f64 {
+    let f32_unit = 2f64.powi(-24);
+    let gamma = (n + 2) as f64 * f32_unit / (1.0 - (n + 2) as f64 * f32_unit);
+    let w = if r.w { unit } else { 0.0 };
+    let product = if r.product { unit } else { 0.0 };
+    let e = w * s + gamma * s * (1.0 + w) + product * s * (1.0 + gamma);
+    e + unit * (y.abs() + e)
+}
+
+/// The unit roundoff of `dtype`: half a unit in the last place, relative.
+fn unit_roundoff(dtype: DType) -> f64 {
+    match dtype {
+        DType::BF16 => 2f64.powi(-8),
+        DType::F16 => 2f64.powi(-11),
+        _ => 2f64.powi(-24),
+    }
+}
+
 /// The tests that read the [`probe`] counters, one at a time: the counters are the process's.
 fn serial() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -135,7 +169,8 @@ fn matches_the_definition() {
             if !common::has(&device, dtype) {
                 continue;
             }
-            for rows in [1, 5, 16, 17, 100] {
+            // 8 and 9 rows step over the line past which RDNA4's matrix products take the call.
+            for rows in [1, 5, 8, 9, 16, 17, 100] {
                 let p = packed(2, 384, 40, 128);
                 let takes = kernels_take(&device, dtype, [rows, p.inp, p.out], p.group);
                 let pre = prefill_takes(&device, dtype, [rows, p.inp, p.out], p.group);
@@ -167,19 +202,36 @@ fn matches_the_definition() {
                     .into_data()
                     .try_to_vec::<f32>()
                     .unwrap();
-                let (mut worst, mut scale) = (0f64, 0f64);
+                // The prefill path rounds `W` and the product before the bias; the kernel on matrix
+                // products rounds `W`; the reference and the decoding kernels only the output. In f32
+                // nothing is rounded but the sums.
+                let wide = dtype == DType::F32;
+                let roundings = Roundings {
+                    w: (pre || mat) && !wide,
+                    product: pre && !wide,
+                };
+                let unit = unit_roundoff(dtype);
+                let (mut worst, mut scale, mut share) = (0f64, 0f64, 0f64);
                 for n in 0..rows {
                     for o in 0..p.out {
-                        let exact: f64 = (0..p.inp)
-                            .map(|i| xs[n * p.inp + i] as f64 * w(&p, i, o))
-                            .sum::<f64>()
-                            + bias[o] as f64;
-                        worst = worst.max((got[n * p.out + o] as f64 - exact).abs());
+                        let terms = (0..p.inp).map(|i| xs[n * p.inp + i] as f64 * w(&p, i, o));
+                        let exact = terms.clone().sum::<f64>() + bias[o] as f64;
+                        let s = terms.map(f64::abs).sum::<f64>() + (bias[o] as f64).abs();
+                        let err = (got[n * p.out + o] as f64 - exact).abs();
+                        let bound = allowed(exact, s, p.inp, unit, roundings);
+                        assert!(
+                            err <= bound,
+                            "{name} {dtype:?} {rows} rows, output ({n}, {o}): off by {err:.3e}, \
+                             allowed {bound:.3e}"
+                        );
+                        worst = worst.max(err);
                         scale = scale.max(exact.abs());
+                        share = share.max(err / bound);
                     }
                 }
                 println!(
-                    "{name} {dtype:?} {rows} rows ({}): max abs {worst:.3e}, relative {:.3e}",
+                    "{name} {dtype:?} {rows} rows ({}): max abs {worst:.3e}, relative {:.3e}, \
+                     at most {:.2} of what its roundings allow",
                     if takes {
                         "kernels"
                     } else if mat {
@@ -189,25 +241,8 @@ fn matches_the_definition() {
                     } else {
                         "reference"
                     },
-                    worst / scale
-                );
-                // Relative to the output's largest value, just above the largest measured on Flex,
-                // an RTX 5070 Ti (with and without fusion and autotune) and a Radeon AI PRO R9700
-                // (2026-11-13), the same on each to the bit: the output's rounding to its dtype, and
-                // on the prefill path `W`'s too. The kernel on RDNA4's matrix products rounds `W` as
-                // the prefill path does, and the output once.
-                let bound = match (dtype, pre || mat) {
-                    (DType::F32, _) => 5e-7,        // 4.64e-7
-                    (DType::BF16, false) => 2.2e-3, // 2.13e-3
-                    (DType::BF16, true) => 3.9e-3,  // 3.78e-3
-                    (DType::F16, false) => 2.7e-4,  // 2.64e-4
-                    (_, true) => 4.4e-4,            // 4.28e-4
-                    _ => unreachable!(),
-                };
-                assert!(
-                    worst / scale <= bound,
-                    "{name} {dtype:?} {rows}: {:.3e}",
-                    worst / scale
+                    worst / scale,
+                    share
                 );
                 assert_eq!(
                     probe::kernel_launches() > before.0,
@@ -234,8 +269,9 @@ fn matches_the_definition() {
 }
 
 /// The kernel on RDNA4's matrix products where it does not split the inputs between cubes, as
-/// where it does (`matches_the_definition`'s 17 and 100 rows of 40 outputs), held to the definition
-/// within the prefill path's bounds: 1024 rows of 1024 outputs over `matches_the_definition`'s 384
+/// where it does (`matches_the_definition`'s 17 and 100 rows of 40 outputs), each output held to the
+/// definition within what rounding `W` and the output allows ([`allowed`]): 1024 rows of 1024
+/// outputs over `matches_the_definition`'s 384
 /// inputs make 128 cubes of 64 rows and 128 outputs, enough to fill a device of 64 compute units.
 /// Only on a device the kernel takes, and that does not split this shape ([`matrix_runs`]), saying
 /// so where it does.
@@ -271,23 +307,35 @@ fn matrix_products_whole_inputs() {
                 .into_data()
                 .try_to_vec::<f32>()
                 .unwrap();
-            let (mut worst, mut scale) = (0f64, 0f64);
+            let roundings = Roundings {
+                w: true,
+                product: false,
+            };
+            let unit = unit_roundoff(dtype);
+            let (mut worst, mut scale, mut share) = (0f64, 0f64, 0f64);
             for n in 0..rows {
                 for o in 0..p.out {
-                    let exact: f64 = (0..p.inp)
-                        .map(|i| xs[n * p.inp + i] as f64 * w(&p, i, o))
-                        .sum();
-                    worst = worst.max((got[n * p.out + o] as f64 - exact).abs());
+                    let terms = (0..p.inp).map(|i| xs[n * p.inp + i] as f64 * w(&p, i, o));
+                    let exact = terms.clone().sum::<f64>();
+                    let s = terms.map(f64::abs).sum::<f64>();
+                    let err = (got[n * p.out + o] as f64 - exact).abs();
+                    let bound = allowed(exact, s, p.inp, unit, roundings);
+                    assert!(
+                        err <= bound,
+                        "{dtype:?} output ({n}, {o}): off by {err:.3e}, allowed {bound:.3e}"
+                    );
+                    worst = worst.max(err);
                     scale = scale.max(exact.abs());
+                    share = share.max(err / bound);
                 }
             }
             println!(
-                "{name} {dtype:?} {rows} x {} (matrix products, whole inputs): relative {:.3e}",
+                "{name} {dtype:?} {rows} x {} (matrix products, whole inputs): relative {:.3e}, \
+                 at most {:.2} of what its roundings allow",
                 p.out,
-                worst / scale
+                worst / scale,
+                share
             );
-            let bound = if dtype == DType::BF16 { 3.9e-3 } else { 4.4e-4 };
-            assert!(worst / scale <= bound, "{dtype:?}: {:.3e}", worst / scale);
             assert!(
                 probe::matrix_launches() > before,
                 "{dtype:?}: the kernel ran"
