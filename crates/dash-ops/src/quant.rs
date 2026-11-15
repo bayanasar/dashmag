@@ -54,10 +54,11 @@ pub mod probe {
     }
 }
 
-/// Whether the CubeCL kernels, rather than the reference, take [`quantized_linear`] on `device`
+/// Whether the decoding kernels, rather than the reference, take [`quantized_linear`] on `device`
 /// for `x` `[rows, in]` in `dtype` over a weight of `out` outputs in groups of `group` inputs:
-/// up to 16 rows, on a device with what the kernels ask. `false` on any device not CubeCL's. For
-/// tests, as the [`probe`] counters are.
+/// up to 16 rows, on a device with what the kernels ask, where the kernel on matrix products
+/// ([`matrix_takes`]) does not (past 8 rows on such a device). `false` on any device not CubeCL's.
+/// For tests, as the [`probe`] counters are.
 #[doc(hidden)]
 pub fn kernels_take(
     device: &burn::tensor::Device,
@@ -73,8 +74,8 @@ pub fn kernels_take(
     false
 }
 
-/// Whether the prefill kernel on RDNA4's 16 x 16 x 16 matrix products takes [`quantized_linear`] on
-/// `device` for these sizes: more than 16 rows of bf16 or f16, inputs a multiple of 32, groups a
+/// Whether the kernel on RDNA4's 16 x 16 x 16 matrix products takes [`quantized_linear`] on
+/// `device` for these sizes: more than 8 rows of bf16 or f16, inputs a multiple of 32, groups a
 /// multiple of 8 that divide the inputs, on a device with those products in RDNA4's layout. For
 /// tests.
 #[doc(hidden)]

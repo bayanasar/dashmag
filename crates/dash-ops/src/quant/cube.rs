@@ -1,9 +1,9 @@
 //! The quantized linear on the CubeCL backend: for a few rows (decoding, up to [`MAX_ROWS`]),
-//! two kernels that read the packed weight once and dequantize it in registers; for more rows
-//! (prefill), on a device with RDNA4's 16 x 16 x 16 matrix products, one kernel on them that reads
-//! the packed words straight into its operands (`wmma.rs`), and elsewhere the weight dequantized
-//! to `x`'s dtype by a kernel and multiplied by Burn's matmul; on a device without what they ask,
-//! the reference.
+//! two kernels that read the packed weight once and dequantize it in registers; on a device with
+//! RDNA4's 16 x 16 x 16 matrix products, past [`MATRIX_ROWS_FROM`] rows, one kernel on them that
+//! reads the packed words straight into its operands (`wmma.rs`); elsewhere for more rows
+//! (prefill), the weight dequantized to `x`'s dtype by a kernel and multiplied by Burn's matmul;
+//! on a device without what they ask, the reference.
 //!
 //! - `gemv`: each unit owns one output column and a run of whole groups of input rows. Per group
 //!   it reads the column's scale once, then per packed word the eight values, `(q - 8) · scale`
@@ -37,6 +37,13 @@ use std::sync::atomic::Ordering;
 /// would take about 0.55, and 1.89 ms on a Radeon AI PRO R9700, where it would take about 0.8.
 /// 16 rows is where both cards are close (2026-11-13).
 pub(crate) const MAX_ROWS: usize = 16;
+/// The most rows the decoding kernels take where the kernel on RDNA4's matrix products takes the
+/// call: past 8, the decoding kernels' cost is that of 16 (their rows' variants are powers of
+/// two). On a Radeon AI PRO R9700 (2026-11-15 UTC), at 10 to 16 rows the decoding kernels took
+/// 441-463 us at [5120 x 17408] and 436-463 at [17408 x 5120], the matrix kernel 254-263 and
+/// 353-375; at 8 rows the decoding kernels 252-274 and 253-260, the matrix kernel 251-256 and
+/// 353-367.
+pub(crate) const MATRIX_ROWS_FROM: usize = 8;
 /// Units per cube.
 const CUBE: usize = 256;
 /// Units the kernels aim to spread a product over, beyond which the inputs are not split further.
@@ -201,7 +208,8 @@ pub(super) fn kernels_take(
     [rows, inp, out]: [usize; 3],
     group: usize,
 ) -> bool {
-    matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
+    !matrix_takes(client, dtype, [rows, inp, out], group)
+        && matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
         && (1..=MAX_ROWS).contains(&rows)
         && group > 0
         && group.is_multiple_of(8)
@@ -231,9 +239,10 @@ fn matrix_requirements([rows, inp, out]: [usize; 3]) -> Requirements {
     product.max(finish)
 }
 
-/// Whether the prefill kernel on RDNA4's matrix products takes `x` `[rows, inp]` in `dtype`: more
-/// rows than the decoding kernels take, bf16 or f16, inputs a multiple of 32 (a step's) and groups
-/// a multiple of 8 (a packed word's), on a device with RDNA4's 16 x 16 x 16 products.
+/// Whether the kernel on RDNA4's matrix products takes `x` `[rows, inp]` in `dtype`: more than
+/// [`MATRIX_ROWS_FROM`] rows (where the decoding kernels would cost as for 16), bf16 or f16, inputs a
+/// multiple of 32 (a step's) and groups a multiple of 8 (a packed word's), on a device with RDNA4's
+/// 16 x 16 x 16 products.
 pub(super) fn matrix_takes(
     client: &Client,
     dtype: DType,
@@ -241,7 +250,7 @@ pub(super) fn matrix_takes(
     group: usize,
 ) -> bool {
     matches!(dtype, DType::BF16 | DType::F16)
-        && rows > MAX_ROWS
+        && rows > MATRIX_ROWS_FROM
         && group > 0
         && group.is_multiple_of(8)
         && inp.is_multiple_of(group)
