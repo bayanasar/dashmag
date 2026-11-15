@@ -36,9 +36,9 @@
 //! per cube, up to 97 KiB of shared memory per cube and, for the backward, atomic f32 additions
 //! in global memory: CUDA cards of compute capability 8.0 and later, where they always run.
 //! Where those are missing, a device whose 16 x 16 x 16 MMA from that dtype into f32 has RDNA4's
-//! register layout (checked on the device the first time) runs a forward of its own on it, up
-//! to 33 KiB of shared memory and 128 units per cube: AMD's RDNA4 GPUs under ROCm. Its backward
-//! is the reference. Elsewhere the reference runs (`kernels_take` tells which).
+//! register layout (read from each device the first time, for each dtype) runs a forward of its
+//! own on it, up to 33 KiB of shared memory and 128 units per cube: AMD's RDNA4 GPUs under ROCm.
+//! Its backward is the reference. Elsewhere the reference runs (`kernels_take` tells which).
 //!
 //! - Training: a FlashAttention-2 style forward that also writes each query's log-sum-exp, and a
 //!   backward that by default gives the same bits on every run: `delta = rowsum(dO * O)`; the

@@ -32,7 +32,8 @@ use cubecl::ir::features::AtomicUsage;
 use cubecl::ir::features::MmaConfig;
 use cubecl::ir::{AddressType, DeviceProperties, ElemType, FloatKind, Type};
 use cubecl::prelude::*;
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 /// Elements per 16-byte vector: the kernels' unit of every load, so strides count in it.
@@ -216,36 +217,57 @@ fn wmma_expected(ident: usize, lane: u32, e: u32) -> (u32, u32) {
 
 /// Whether the 16 x 16 x 16 MMA's register layout, as `position_of_nth` gives it on the device
 /// `client` serves, is the one `forward_wmma_kernel()` is written for (RDNA4's; RDNA3's differs).
-/// Read from the device once per process, by [`layout_kernel`], the first time a device with
-/// that MMA meets the forward: the one GPU of a process with it decides for any other.
+/// Read from each device, by [`layout_kernel`], the first time the forward meets it in each
+/// dtype, and kept for that device and dtype: a process with an RDNA4 card and an RDNA3 one reads
+/// both.
 fn wmma_layout(client: &Client, dtype: DType) -> bool {
-    static LAYOUT: OnceLock<bool> = OnceLock::new();
-    *LAYOUT.get_or_init(|| {
-        let n = 32 * 3 * 8 * 2;
-        let pos = client.empty(4 * n);
-        // SAFETY: one plane of 32 units; lane `l` writes elements `48 l..48 l + 48` of `n`.
-        unsafe {
-            layout_kernel::launch_unchecked(
-                client,
-                CubeCount::Static(1, 1, 1),
-                CubeDim::new_1d(PLANE),
-                BufferArg::from_raw_parts(pos.clone(), n),
-                dtype_to_storage_type(dtype),
-            );
-        }
-        let Ok(bytes) = client.read_one(pos) else {
-            return false;
-        };
-        let words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-            .collect();
-        (0..32u32).all(|lane| {
-            (0..3).all(|ident| {
-                (0..8u32).all(|e| {
-                    let at = (((lane as usize * 3 + ident) * 8) + e as usize) * 2;
-                    (words[at], words[at + 1]) == wmma_expected(ident, lane, e)
-                })
+    // The device and its runtime, as CubeCL names its service, and the dtype.
+    static LAYOUTS: Mutex<Option<HashMap<(String, DType), bool>>> = Mutex::new(None);
+    let key = (format!("{:?}", client.service_id()), dtype);
+    if let Some(&known) = LAYOUTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(&key)
+    {
+        return known;
+    }
+    let matches = read_wmma_layout(client, dtype);
+    LAYOUTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, matches);
+    matches
+}
+
+/// [`wmma_layout`]'s reading: [`layout_kernel`] on the device, its positions against
+/// [`wmma_expected`].
+fn read_wmma_layout(client: &Client, dtype: DType) -> bool {
+    let n = 32 * 3 * 8 * 2;
+    let pos = client.empty(4 * n);
+    // SAFETY: one plane of 32 units; lane `l` writes elements `48 l..48 l + 48` of `n`.
+    unsafe {
+        layout_kernel::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new_1d(PLANE),
+            BufferArg::from_raw_parts(pos.clone(), n),
+            dtype_to_storage_type(dtype),
+        );
+    }
+    let Ok(bytes) = client.read_one(pos) else {
+        return false;
+    };
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect();
+    (0..32u32).all(|lane| {
+        (0..3).all(|ident| {
+            (0..8u32).all(|e| {
+                let at = (((lane as usize * 3 + ident) * 8) + e as usize) * 2;
+                (words[at], words[at + 1]) == wmma_expected(ident, lane, e)
             })
         })
     })

@@ -72,11 +72,6 @@ mod bench {
         times[times.len() / 2]
     }
 
-    /// Bytes in use in CubeCL's pools on device 0, and the largest allocation the pools that
-    /// hold tensors (dynamic and persistent) ever served. The dedicated pool is left out: with
-    /// Burn's `autotune` on, CubeCL's throughput probes reserve a gigabyte there, which no
-    /// operation measured here allocates. Under Burn's fusion, synchronise the device first,
-    /// or the operations have not run yet.
     /// The device's CubeCL client: the one device this benchmark runs on.
     fn client() -> cubecl::client::Client {
         fn of(device: &burn::backend::DispatchDevice) -> cubecl::client::Client {
@@ -98,6 +93,11 @@ mod bench {
         Device::rocm(0)
     }
 
+    /// Bytes in use in CubeCL's pools on device 0, and the largest allocation the pools that
+    /// hold tensors (dynamic and persistent) ever served. The dedicated pool is left out: with
+    /// Burn's `autotune` on, CubeCL's throughput probes reserve a gigabyte there, which no
+    /// operation measured here allocates. Under Burn's fusion, synchronise the device first,
+    /// or the operations have not run yet.
     fn memory() -> (u64, u64) {
         let client = client();
         let report = client.memory_report(cubecl::MemoryScope::Device);
