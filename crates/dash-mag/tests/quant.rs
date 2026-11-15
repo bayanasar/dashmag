@@ -1,6 +1,6 @@
 //! The quantized linear through the gateway. On the Burn side, the same bits as dash-ops' own. On
-//! MLX, against its definition computed on the host in f64, held as dash-ops' test holds the Burn
-//! side: the largest error over the output's largest value. On both, the weight refused where
+//! MLX, against its definition computed on the host in f64, each output held, as dash-ops' test
+//! holds the Burn side's, to what its path's roundings allow. On both, the weight refused where
 //! dash-ops' is and a call refused inside `vjp`; on MLX, groups other than 128 refused.
 
 #[cfg(not(target_os = "macos"))]
@@ -185,7 +185,7 @@ fn the_definition_on_mlx() {
     // `e`, the sum of those, bounds the product in f32 against `p`. Rounded to `x`'s dtype, it is
     // within `d = e + ux (|p| + e) + η`, `η` half the dtype's subnormal spacing; with a bias,
     // added in f32 and rounded again, within `d + (u + ux (1 + u)) (|y| + d) + η`. The test holds
-    // the largest error to the largest of those bounds, both over the output's largest value.
+    // each output to its own bound, from its own terms.
     let u = 2f64.powi(-24);
     let gamma = 258.0 * u / (1.0 - 258.0 * u);
     // 1, 8 and 9 rows on the vector path, 32 its last and 33 the matrix path's first on an Apple
@@ -226,7 +226,7 @@ fn the_definition_on_mlx() {
                         "{dtype:?} {rows} rows: the bias not added in f32 to the rounded product"
                     );
                 }
-                let (mut worst, mut scale, mut allowed) = (0f64, 0f64, 0f64);
+                let (mut worst, mut scale, mut share) = (0f64, 0f64, 0f64);
                 for n in 0..rows {
                     for o in 0..16 {
                         let (mut groups, mut xw, mut xspan) = ([0f64; 2], 0f64, 0f64);
@@ -247,26 +247,29 @@ fn the_definition_on_mlx() {
                         } else {
                             d
                         };
-                        worst = worst.max((got[n * 16 + o] as f64 - exact).abs());
+                        let err = (got[n * 16 + o] as f64 - exact).abs();
+                        assert!(
+                            err <= bound,
+                            "{dtype:?} {rows} rows, bias {with_bias}, output ({n}, {o}): off by \
+                             {err:.3e}, allowed {bound:.3e}"
+                        );
+                        worst = worst.max(err);
                         scale = scale.max(exact.abs());
-                        allowed = allowed.max(bound);
+                        share = share.max(err / bound);
                     }
                 }
-                println!(
-                    "MLX {dtype:?} {rows} rows, bias {with_bias}: max abs {worst:.3e}, relative {:.3e}, bound {:.3e}",
-                    worst / scale,
-                    allowed / scale
-                );
                 // The largest measured on an Apple M6 with MLX 0.32.4 (2026-11-14), each at 40
                 // rows, were 1.92e-7 in f32, 3.44e-3 from bf16 and 4.36e-4 from f16; over these
                 // row counts they are the same (2026-11-15 UTC), f32's at 33 and 40 rows, bf16's
                 // at 32, 33 and 40, f16's at 40. The bounds are larger: the f32 sums' term, for
-                // any order, is most of f32's, and `W`'s rounding most of bf16's and f16's.
-                assert!(
-                    worst <= allowed,
-                    "{dtype:?} {rows} rows, bias {with_bias}: {:.3e} over the bound {:.3e}",
-                    worst / scale,
-                    allowed / scale
+                // any order, is most of f32's, and `W`'s rounding most of bf16's and f16's. No
+                // output used more of its own bound than 1.52e-3 in f32 (at 40 rows), 0.272 from
+                // bf16 (at 33 and 40) and 0.225 from f16 (at 40), each with the bias (2026-11-15
+                // UTC).
+                println!(
+                    "MLX {dtype:?} {rows} rows, bias {with_bias}: max abs {worst:.3e}, relative \
+                     {:.3e}, at most {share:.3e} of what its roundings allow",
+                    worst / scale
                 );
             }
         }
