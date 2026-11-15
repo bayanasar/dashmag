@@ -397,6 +397,66 @@ mod cube {
         }
     }
 
+    /// The state passing's form for 64 KiB forced while this lives, and back to the device's choice
+    /// after, should the run panic too.
+    struct SmallState;
+
+    impl SmallState {
+        fn new(on: bool) -> Self {
+            probe::force_small_state(on);
+            Self
+        }
+    }
+
+    impl Drop for SmallState {
+        fn drop(&mut self) {
+            probe::force_small_state(false);
+        }
+    }
+
+    /// The f32 kernels' state passing in its form for 64 KiB of shared memory gives the bits of its
+    /// form for 90 KiB: the output and the final state of a forward pass, f32 inputs, heads of 128
+    /// and of 64 by 96, with and without the l2 normalisation. On a device with less than 90 KiB
+    /// both runs take the 64 KiB form.
+    #[test]
+    fn the_state_passing_for_64_kib_gives_the_same_bits() {
+        let _serial = serial();
+        let device = common::cube_device();
+        for (dims, l2norm) in [([2, 300, 3, 128, 128], true), ([1, 130, 2, 64, 96], false)] {
+            if kernels_take(&device, DType::F32, dims, None) == [false, false] {
+                println!("skipped {dims:?}: the reference runs");
+                continue;
+            }
+            let x = seeded(11, dims, !l2norm);
+            let options = ChunkGatedDeltaOptions::default()
+                .with_qk_l2norm(l2norm)
+                .with_final_state(true);
+            let run = |small: bool| {
+                let _forced = SmallState::new(small);
+                let (out, state) = chunk_gated_delta_rule(
+                    t4(&x[0], &device),
+                    t4(&x[1], &device),
+                    t4(&x[2], &device),
+                    t3(&x[3], &device),
+                    t3(&x[4], &device),
+                    Some(t4(&x[5], &device)),
+                    None,
+                    options,
+                );
+                (to_vec(out), to_vec(state.unwrap()))
+            };
+            let (whole, small) = (run(false), run(true));
+            let same =
+                |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+            assert!(same(&whole.0, &small.0), "{dims:?}: the outputs differ");
+            assert!(
+                same(&whole.1, &small.1),
+                "{dims:?}: the final states differ"
+            );
+            println!("{dims:?} l2norm={l2norm}: the same bits");
+        }
+    }
+
     /// Qwen3.5-0.8B's head shapes (Dk = Dv = 128), a sequence ending mid-chunk, two batch
     /// elements: the kernels within 1e-6 of the reference in fp32 (measured at most 5.6e-7).
     #[test]

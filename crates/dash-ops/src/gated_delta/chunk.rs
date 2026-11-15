@@ -45,13 +45,19 @@
 //! kernels run, in IEEE f32 without tensor cores, nine of them backward. Queries and keys wider
 //! than 128 run f32 kernels of their own (`chunk/cube/wide.rs`) that hold them and the state's
 //! rows a half (128 columns) at a time. The f32 kernels ask 256 units per cube; shared memory up
-//! to 90 KiB forward and 98 KiB backward for heads up to 128 wide, and with wider heads up to 97.5
+//! to 57 KiB forward and 98 KiB backward for heads up to 128 wide, and with wider heads up to 97.5
 //! KiB (the first kernel's rows of the wider of `Dk` and `Dv`, at 256); and backward, planes of
-//! exactly 32 units; their state passings fit one cube per multiprocessor. CUDA cards of compute
-//! capability 8.0 and later have all of it. On a device without it, and for heads wider than 256,
-//! the reference runs instead (`kernels_take` and `tensor_cores_take` tell which): under wgpu on
-//! OpenGL over D3D12 and on lavapipe (Vulkan on the CPU), both with 32 KiB of shared memory and no
-//! plane operations, and on CubeCL's CPU runtime (as many units per cube as cores), for instance.
+//! exactly 32 units; their state passings fit one cube per multiprocessor. The forward's state
+//! passing holds 90 KiB where the device has it, reading the next chunk's `W` and `kt` while it
+//! computes; with less (a Radeon's 64 KiB), it takes a form of 57 KiB that reads each half of them
+//! when it comes, the same sums in the same order. The prep and output kernels fit 64 KiB as they
+//! are: `A` takes the keys' place once its products are in registers, and the output kernel holds
+//! the keys 64 columns at a time. CUDA cards of compute capability 8.0 and later have all of it,
+//! and a Radeon AI PRO R9700 (RDNA4, 64 KiB) has what the forward asks. On a device without it,
+//! and for heads wider than 256, the reference runs instead (`kernels_take` and
+//! `tensor_cores_take` tell which): under wgpu on OpenGL over D3D12 and on lavapipe (Vulkan on the
+//! CPU), both with 32 KiB of shared memory and no plane operations, and on CubeCL's CPU runtime
+//! (as many units per cube as cores), for instance.
 //!
 //! Measured against transformers' function at f32 (the tests' fixtures), the output, the final
 //! state and every gradient agree to within 1.13e-6 relative to each tensor's largest value; from
@@ -100,9 +106,10 @@ pub const MAX_KERNEL_HEAD_DIM: usize = 256;
 /// Counters tests read to tell which path ran. Not part of the API.
 #[doc(hidden)]
 pub mod probe {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     pub(super) static KERNEL_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static FORCE_SMALL_STATE: AtomicBool = AtomicBool::new(false);
     pub(super) static TENSOR_CORE_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static BACKWARD_RUNS: AtomicUsize = AtomicUsize::new(0);
 
@@ -122,6 +129,17 @@ pub mod probe {
     /// Runs of the written-out backward pass on `Autodiff`.
     pub fn backward_runs() -> usize {
         BACKWARD_RUNS.load(Ordering::SeqCst)
+    }
+
+    /// While set, the f32 kernels' state passing forward takes its form for 64 KiB of shared
+    /// memory on any device, as a device with less than 90 KiB always does, so that a test can
+    /// hold the two forms to each other.
+    pub fn force_small_state(on: bool) {
+        FORCE_SMALL_STATE.store(on, Ordering::SeqCst);
+    }
+
+    pub(super) fn small_state_forced() -> bool {
+        FORCE_SMALL_STATE.load(Ordering::SeqCst)
     }
 }
 
