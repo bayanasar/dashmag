@@ -135,14 +135,15 @@ struct Roundings {
 /// 2^-11 in f16, 2^-24 in f32). Before the output's rounding, the value computed is off by at most
 /// `e`: `W`'s rounding, `unit · s`; the products and their sum in f32 in any order, `gamma · s` with
 /// `gamma = (n + 2) 2^-24 / (1 - (n + 2) 2^-24)` (over the products of `W` rounded, a little more);
-/// and the product's rounding before the bias, `unit · s`. The output's rounding adds
-/// `unit · (|y| + e)`.
+/// and the product's rounding before the bias, of a value within `s (1 + w)(1 + gamma)`. The
+/// output's rounding adds `unit · (|y| + e)`. Every f32 operation is taken to round to nearest; an
+/// accumulator that truncates could be off by twice the `gamma` term.
 fn allowed(y: f64, s: f64, n: usize, unit: f64, r: Roundings) -> f64 {
     let f32_unit = 2f64.powi(-24);
     let gamma = (n + 2) as f64 * f32_unit / (1.0 - (n + 2) as f64 * f32_unit);
     let w = if r.w { unit } else { 0.0 };
     let product = if r.product { unit } else { 0.0 };
-    let e = w * s + gamma * s * (1.0 + w) + product * s * (1.0 + gamma);
+    let e = w * s + gamma * s * (1.0 + w) + product * s * (1.0 + w) * (1.0 + gamma);
     e + unit * (y.abs() + e)
 }
 
