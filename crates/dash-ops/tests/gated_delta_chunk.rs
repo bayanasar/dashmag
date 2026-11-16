@@ -421,17 +421,19 @@ mod cube {
         }
     }
 
-    /// The f32 kernels' state passing in its form for 64 KiB of shared memory gives the bits of its
-    /// form for 90 KiB: the output and the final state of a forward pass, f32 inputs, heads of 128
-    /// and of 64 by 96, with and without the l2 normalisation. On a device with less than 90 KiB
-    /// both runs take the 64 KiB form.
+    /// The f32 kernels' state passings in their forms for 64 KiB of shared memory give the bits of
+    /// their larger forms (90 KiB forward, 98 KiB backward): the output, the final state and every
+    /// gradient of a forward and backward pass through Autodiff, f32 inputs, heads of 128 and of
+    /// 64 by 96, with and without the l2 normalisation. On a device with less than 90 KiB both
+    /// runs take the 64 KiB forms.
     #[test]
-    fn the_state_passing_for_64_kib_gives_the_same_bits() {
+    fn the_state_passings_for_64_kib_give_the_same_bits() {
         let _serial = serial();
         let device = common::cube_device();
+        let ad = device.clone().autodiff();
         for (dims, l2norm) in [([2, 300, 3, 128, 128], true), ([1, 130, 2, 64, 96], false)] {
-            if kernels_take(&device, DType::F32, dims, None) == [false, false] {
-                println!("skipped {dims:?}: the reference runs");
+            if kernels_take(&device, DType::F32, dims, None) != [true, true] {
+                println!("skipped {dims:?}: the reference runs one of the passes");
                 continue;
             }
             let x = seeded(11, dims, !l2norm);
@@ -440,27 +442,47 @@ mod cube {
                 .with_final_state(true);
             let run = |small: bool| {
                 let _forced = SmallState::new(small);
+                let leaf4 = |i: usize| t4(&x[i], &ad).require_grad();
+                let leaf3 = |i: usize| t3(&x[i], &ad).require_grad();
+                let (q, k, v, g, beta, h0) =
+                    (leaf4(0), leaf4(1), leaf4(2), leaf3(3), leaf3(4), leaf4(5));
                 let (out, state) = chunk_gated_delta_rule(
-                    t4(&x[0], &device),
-                    t4(&x[1], &device),
-                    t4(&x[2], &device),
-                    t3(&x[3], &device),
-                    t3(&x[4], &device),
-                    Some(t4(&x[5], &device)),
+                    q.clone(),
+                    k.clone(),
+                    v.clone(),
+                    g.clone(),
+                    beta.clone(),
+                    Some(h0.clone()),
                     None,
                     options,
                 );
-                (to_vec(out), to_vec(state.unwrap()))
+                let state = state.unwrap();
+                let loss =
+                    (out.clone() * t4(&x[6], &ad)).sum() + (state.clone() * t4(&x[7], &ad)).sum();
+                let grads = loss.backward();
+                [
+                    to_vec(out),
+                    to_vec(state),
+                    to_vec(q.grad(&grads).unwrap()),
+                    to_vec(k.grad(&grads).unwrap()),
+                    to_vec(v.grad(&grads).unwrap()),
+                    to_vec(g.grad(&grads).unwrap()),
+                    to_vec(beta.grad(&grads).unwrap()),
+                    to_vec(h0.grad(&grads).unwrap()),
+                ]
             };
             let (whole, small) = (run(false), run(true));
-            let same =
-                |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
-            assert!(same(&whole.0, &small.0), "{dims:?}: the outputs differ");
-            assert!(
-                same(&whole.1, &small.1),
-                "{dims:?}: the final states differ"
+            let names = ["out", "state", "dq", "dk", "dv", "dg", "dbeta", "dh0"];
+            for ((name, a), b) in names.iter().zip(&whole).zip(&small) {
+                assert!(
+                    a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "{dims:?}: {name} differs"
+                );
+            }
+            println!(
+                "{dims:?} l2norm={l2norm}: the same bits, forward and backward (one form twice \
+                 where the device has less than 98 KiB)"
             );
-            println!("{dims:?} l2norm={l2norm}: the same bits");
         }
     }
 

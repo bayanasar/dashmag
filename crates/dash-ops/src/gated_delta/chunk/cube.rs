@@ -922,7 +922,9 @@ fn state_backward_kernel(
         let mut acc2 = Array::<f32>::new(16usize);
         #[unroll]
         for x in 0..16usize {
-            acc2[x] = decay * dsreg[x];
+            // Rounded on its own, not fused with the first addition: the loop below may run
+            // unrolled or not, and the fused operations are written out.
+            acc2[x] = fma(decay, dsreg[x], f32::new(0.0f32));
         }
         #[unroll]
         for i in 0..64usize {
@@ -936,8 +938,14 @@ fn state_backward_kernel(
                 for r in 0..4usize {
                     #[unroll]
                     for cc in 0..2usize {
-                        acc2[(half * 4usize + r) * 2usize + cc] +=
-                            qv.extract(r) * ov.extract(cc) - wv.extract(r) * dvv.extract(cc);
+                        // One fused operation, written out, so that the sum does not depend on how a
+                        // compiler contracts it: both forms give the same bits however their loops run.
+                        let at = (half * 4usize + r) * 2usize + cc;
+                        acc2[at] += fma(
+                            qv.extract(r),
+                            ov.extract(cc),
+                            -(wv.extract(r) * dvv.extract(cc)),
+                        );
                     }
                 }
             }
@@ -953,6 +961,233 @@ fn state_backward_kernel(
             dss[(8usize * ty + q) * 16usize + tx] = pair;
         }
         sync_cube();
+    }
+
+    #[unroll]
+    for q in 0..8usize {
+        let k = 8usize * ty + q;
+        #[unroll]
+        for cc in 0..2usize {
+            let col = col0 + cc;
+            if col < dv && k < dk {
+                d_first[(bh * dk + k) * dv + col] = dsreg[q * 2usize + cc];
+            }
+        }
+    }
+}
+
+/// [`state_backward_kernel`] in 49 KiB of shared memory, for a device with less than its 98 KiB
+/// (a Radeon's 64 KiB): the same sums in the same order, each operand staged a part at a time and
+/// read from global memory when its part comes, rather than the next chunk's read ahead. `dV'`
+/// takes `kt` (transposed) 64 of the state's rows at a time; `dS` takes `qg` and `W` 16 tokens at
+/// a time, both where `kt` was. `Dk <= 128`.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn state_backward_small_kernel(
+    kt: &Tensor<f32>,
+    w: &Tensor<f32>,
+    qg: &Tensor<f32>,
+    d_o: &Tensor<f32>,
+    dv_local: &Tensor<f32>,
+    gl: &Tensor<f32>,
+    d_last: &Tensor<f32>,
+    offsets: &Tensor<u32>,
+    ds_next: &mut Tensor<f32>,
+    dvn: &mut Tensor<f32>,
+    d_first: &mut Tensor<f32>,
+    n_chunks: u32,
+    heads: u32,
+    #[comptime] dk: usize,
+    #[comptime] dv: usize,
+    #[comptime] packed: bool,
+) {
+    let bh = CUBE_POS_Y as usize;
+    let tid = UNIT_POS_X as usize;
+    let tx = tid % 16usize;
+    let ty = tid / 16usize;
+    let col0 = CUBE_POS_X as usize * 32usize + 2usize * tx;
+    let (base, n) = state_chunks(offsets, bh, heads as usize, n_chunks as usize, packed);
+    // Half of kt^T by vectors of 4 rows (xs[k * 17 + i / 4], k within the half) for dV'; then a
+    // quarter of qg and of W by vectors of 4 columns (xs[i * 32 + k / 4] and
+    // xs[512 + i * 32 + k / 4], i within the quarter) for dS.
+    let mut xs: Shared<[V4]> = Shared::new_slice(64usize * 17usize);
+    let mut dss: Shared<[V2]> = Shared::new_slice(128usize * 16usize);
+    let mut dvs: Shared<[V2]> = Shared::new_slice(64usize * 16usize);
+    let mut dos: Shared<[V2]> = Shared::new_slice(64usize * 16usize);
+    let mut dsreg = Array::<f32>::new(16usize);
+
+    #[unroll]
+    for q in 0..8usize {
+        let k = 8usize * ty + q;
+        let mut pair = V2::empty();
+        #[unroll]
+        for cc in 0..2usize {
+            let col = col0 + cc;
+            let mut x = f32::new(0.0f32);
+            if col < dv && k < dk {
+                x = d_last[(bh * dk + k) * dv + col];
+            }
+            dsreg[q * 2usize + cc] = x;
+            pair.insert(cc, x);
+        }
+        dss[k * 16usize + tx] = pair;
+    }
+
+    for cr in 0..n {
+        let chunk = base + (n - 1usize - cr);
+        let first = chunk * 64usize * dk;
+        #[unroll]
+        for q in 0..8usize {
+            let k = 8usize * ty + q;
+            #[unroll]
+            for cc in 0..2usize {
+                let col = col0 + cc;
+                if col < dv && k < dk {
+                    ds_next[(chunk * dk + k) * dv + col] = dsreg[q * 2usize + cc];
+                }
+            }
+        }
+        let mut acc = Array::<f32>::new(8usize);
+        #[unroll]
+        for p in 0..4usize {
+            let i = 4usize * ty + p;
+            let mut pair = V2::empty();
+            #[unroll]
+            for cc in 0..2usize {
+                let col = col0 + cc;
+                let mut x = f32::new(0.0f32);
+                let mut y = f32::new(0.0f32);
+                if col < dv {
+                    let idx = (chunk * 64usize + i) * dv + col;
+                    x = dv_local[idx];
+                    y = d_o[idx];
+                }
+                acc[p * 2usize + cc] = x;
+                pair.insert(cc, y);
+            }
+            dos[i * 16usize + tx] = pair;
+        }
+        let decay = gl[chunk];
+
+        // dV' = kt dS + dv_local, the state's rows a half at a time.
+        // Not unrolled: unrolled around its barriers, the kernel took HIP's compiler 73-84 s.
+        for half in 0..2usize {
+            #[unroll]
+            for m in 0..4usize {
+                let e = tid + 256usize * m;
+                let kl = e % 64usize;
+                let i4 = e / 64usize;
+                let k = 64usize * half + kl;
+                let mut kv = V4::empty();
+                #[unroll]
+                for r in 0..4usize {
+                    let mut x = f32::new(0.0f32);
+                    if k < dk {
+                        x = kt[first + (4usize * i4 + r) * dk + k];
+                    }
+                    kv.insert(r, x);
+                }
+                xs[kl * 17usize + i4] = kv;
+            }
+            sync_cube();
+            #[unroll]
+            for kl in 0..64usize {
+                let kv = xs[kl * 17usize + ty];
+                let sv = dss[(64usize * half + kl) * 16usize + tx];
+                #[unroll]
+                for p in 0..4usize {
+                    #[unroll]
+                    for cc in 0..2usize {
+                        acc[p * 2usize + cc] += kv.extract(p) * sv.extract(cc);
+                    }
+                }
+            }
+            sync_cube();
+        }
+        #[unroll]
+        for p in 0..4usize {
+            let i = 4usize * ty + p;
+            let mut pair = V2::empty();
+            #[unroll]
+            for cc in 0..2usize {
+                pair.insert(cc, acc[p * 2usize + cc]);
+                let col = col0 + cc;
+                if col < dv {
+                    dvn[(chunk * 64usize + i) * dv + col] = acc[p * 2usize + cc];
+                }
+            }
+            dvs[i * 16usize + tx] = pair;
+        }
+
+        // dS = exp(G_last) dS + qg^T dO - W^T dV', the chunk's tokens 16 at a time.
+        let mut acc2 = Array::<f32>::new(16usize);
+        #[unroll]
+        for x in 0..16usize {
+            // Rounded on its own, not fused with the first addition: the loop below may run
+            // unrolled or not, and the fused operations are written out.
+            acc2[x] = fma(decay, dsreg[x], f32::new(0.0f32));
+        }
+        for quarter in 0..4usize {
+            #[unroll]
+            for m in 0..2usize {
+                let e = tid + 256usize * m;
+                let il = e / 32usize;
+                let k4 = e % 32usize;
+                let row = first + (16usize * quarter + il) * dk;
+                let mut qv = V4::empty();
+                let mut wv = V4::empty();
+                #[unroll]
+                for r in 0..4usize {
+                    let mut x = f32::new(0.0f32);
+                    let mut y = f32::new(0.0f32);
+                    if 4usize * k4 + r < dk {
+                        x = qg[row + 4usize * k4 + r];
+                        y = w[row + 4usize * k4 + r];
+                    }
+                    qv.insert(r, x);
+                    wv.insert(r, y);
+                }
+                xs[il * 32usize + k4] = qv;
+                xs[512usize + il * 32usize + k4] = wv;
+            }
+            sync_cube();
+            #[unroll]
+            for il in 0..16usize {
+                let i = 16usize * quarter + il;
+                let ov = dos[i * 16usize + tx];
+                let dvv = dvs[i * 16usize + tx];
+                #[unroll]
+                for half in 0..2usize {
+                    let qv = xs[il * 32usize + 2usize * ty + half];
+                    let wv = xs[512usize + il * 32usize + 2usize * ty + half];
+                    #[unroll]
+                    for r in 0..4usize {
+                        #[unroll]
+                        for cc in 0..2usize {
+                            // One fused operation, written out, so that the sum does not depend on how a
+                            // compiler contracts it: both forms give the same bits however their loops run.
+                            let at = (half * 4usize + r) * 2usize + cc;
+                            acc2[at] += fma(
+                                qv.extract(r),
+                                ov.extract(cc),
+                                -(wv.extract(r) * dvv.extract(cc)),
+                            );
+                        }
+                    }
+                }
+            }
+            sync_cube();
+        }
+        #[unroll]
+        for q in 0..8usize {
+            let mut pair = V2::empty();
+            #[unroll]
+            for cc in 0..2usize {
+                dsreg[q * 2usize + cc] = acc2[q * 2usize + cc];
+                pair.insert(cc, acc2[q * 2usize + cc]);
+            }
+            dss[(8usize * ty + q) * 16usize + tx] = pair;
+        }
     }
 
     #[unroll]
@@ -996,6 +1231,41 @@ fn key_norms<E: Float>(
                 ss += x * x;
             }
             factor = f32::new(1.0f32) / (ss + f32::new(1e-6f32)).sqrt();
+        }
+        norm[tid] = factor;
+    }
+    sync_cube();
+}
+
+/// The factor [`load_rows`] scales each of a chunk's 64 rows of `src` by, into `norm`, computed
+/// as it computes it: `scale / sqrt(sum x^2 + 1e-6)` with the l2 normalisation, `scale` without;
+/// for [`load_key_part`], which then stores each value `load_rows` would.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn row_norms<E: Float>(
+    src: &Tensor<E>,
+    norm: &mut Shared<[f32]>,
+    first: usize,
+    count: usize,
+    h: usize,
+    heads: usize,
+    scale: f32,
+    #[comptime] depth: usize,
+    #[comptime] l2norm: bool,
+) {
+    let tid = UNIT_POS_X as usize;
+    if tid < 64usize {
+        let mut factor = scale;
+        if l2norm {
+            let mut ss = f32::new(0.0f32);
+            for d in 0..depth {
+                let mut x = f32::new(0.0f32);
+                if tid < count {
+                    x = f32::cast_from(src[((first + tid) * heads + h) * depth + d]);
+                }
+                ss += x * x;
+            }
+            factor = scale / (ss + f32::new(1e-6f32)).sqrt();
         }
         norm[tid] = factor;
     }
@@ -1645,7 +1915,14 @@ fn dvlocal_kernel<E: Float>(
     #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
 ) {
-    let dks = comptime![dk + 1usize];
+    // Queries and keys a part of at most 64 columns at a time, rows padded to `part + 1`.
+    let part = comptime![if dk > 64usize {
+        dk.div_ceil(2usize)
+    } else {
+        dk
+    }];
+    let parts = comptime![dk.div_ceil(part)];
+    let ps = comptime![part + 1usize];
     let nbv = comptime![dv.div_ceil(16usize)];
     let cube = CUBE_POS_X as usize;
     let n = n_chunks as usize;
@@ -1662,28 +1939,21 @@ fn dvlocal_kernel<E: Float>(
     let tid = UNIT_POS_X as usize;
     let tx = tid % 16usize;
     let ty = tid / 16usize;
-    // ks holds the keys, then 16 rows of dO at a time.
-    let ksz = comptime![if 64usize * (dk + 1usize) > 16usize * dv {
-        64usize * (dk + 1usize)
-    } else {
-        16usize * dv
-    }];
-    let mut qs = Shared::<[f32]>::new_slice(64usize * dks);
-    let mut ks = Shared::<[f32]>::new_slice(ksz);
+    // A part of the queries and of the keys; then `ks` holds 16 rows of dO at a time.
+    let mut qs = Shared::<[f32]>::new_slice(64usize * 65usize);
+    let mut ks = Shared::<[f32]>::new_slice(64usize * 65usize);
     let mut pm = Shared::<[f32]>::new_slice(64usize * 65usize);
     let mut gs = Shared::<[f32]>::new_slice(64usize);
-    let mut norm = Shared::<[f32]>::new_slice(64usize);
+    let mut norm_q = Shared::<[f32]>::new_slice(64usize);
+    let mut norm_k = Shared::<[f32]>::new_slice(64usize);
 
     if tid < 64usize {
         gs[tid] = gcum[cube * 64usize + tid];
     }
-    load_rows::<E>(
-        q, &mut qs, &mut norm, first, count, h, hh, scale, dk, l2norm,
-    );
-    load_rows::<E>(
+    row_norms::<E>(q, &mut norm_q, first, count, h, hh, scale, dk, l2norm);
+    row_norms::<E>(
         k,
-        &mut ks,
-        &mut norm,
+        &mut norm_k,
         first,
         count,
         h,
@@ -1697,19 +1967,39 @@ fn dvlocal_kernel<E: Float>(
     for x in 0..16usize {
         acc[x] = f32::new(0.0f32);
     }
-    for d in 0..dk {
-        let mut ai = Array::<f32>::new(4usize);
-        let mut bj = Array::<f32>::new(4usize);
-        #[unroll]
-        for a in 0..4usize {
-            ai[a] = qs[(ty + 16usize * a) * dks + d];
-            bj[a] = ks[(tx + 16usize * a) * dks + d];
+    // Q K^T, the columns a part at a time, in order; `qg = gamma Q` from each part.
+    for p in 0..parts {
+        let d0 = p * part;
+        sync_cube();
+        load_key_part::<E>(q, &mut qs, &norm_q, first, count, h, hh, d0, part, dk);
+        load_key_part::<E>(k, &mut ks, &norm_k, first, count, h, hh, d0, part, dk);
+        for dl in 0..part {
+            if d0 + dl < dk {
+                let mut ai = Array::<f32>::new(4usize);
+                let mut bj = Array::<f32>::new(4usize);
+                #[unroll]
+                for a in 0..4usize {
+                    ai[a] = qs[(ty + 16usize * a) * ps + dl];
+                    bj[a] = ks[(tx + 16usize * a) * ps + dl];
+                }
+                #[unroll]
+                for a in 0..4usize {
+                    #[unroll]
+                    for bb in 0..4usize {
+                        acc[a * 4usize + bb] += ai[a] * bj[bb];
+                    }
+                }
+            }
         }
         #[unroll]
-        for a in 0..4usize {
-            #[unroll]
-            for bb in 0..4usize {
-                acc[a * 4usize + bb] += ai[a] * bj[bb];
+        for m_ in 0..comptime![(64usize * part).div_ceil(256usize)] {
+            let e = tid + 256usize * m_;
+            if e < 64usize * part {
+                let i = e / part;
+                let dl = e % part;
+                if d0 + dl < dk {
+                    qg[(cube * 64usize + i) * dk + d0 + dl] = qs[i * ps + dl] * gs[i].exp();
+                }
             }
         }
     }
@@ -1724,15 +2014,6 @@ fn dvlocal_kernel<E: Float>(
                 x = acc[a * 4usize + bb] * (gs[i] - gs[j]).exp();
             }
             pm[i * 65usize + j] = x;
-        }
-    }
-    #[unroll]
-    for m_ in 0..comptime![(64usize * dk).div_ceil(256usize)] {
-        let e = tid + 256usize * m_;
-        if e < 64usize * dk {
-            let i = e / dk;
-            let d = e % dk;
-            qg[(cube * 64usize + i) * dk + d] = qs[i * dks + d] * gs[i].exp();
         }
     }
     sync_cube();
@@ -1944,7 +2225,6 @@ fn dstate_kernel(
     let mut sd: Shared<[V4]> = Shared::new_slice(64usize * 9usize);
     let mut ss: Shared<[V4]> = Shared::new_slice(dkp * 9usize);
     let mut sz: Shared<[V4]> = Shared::new_slice(dkp * 9usize);
-    let mut red = Shared::<[f32]>::new_slice(256usize);
     let mut acc1 = Array::<f32>::new(4usize * nbk);
     let mut acc2 = Array::<f32>::new(4usize * nbk);
     let mut acc3 = Array::<f32>::new(4usize * nbk);
@@ -2054,12 +2334,17 @@ fn dstate_kernel(
             }
         }
     }
-    red[tid] = part;
+    // Each unit's part of `<S, dS>`, summed in order where `dO` was (the loop's last barrier is
+    // behind every read of it): a whole 64 KiB, with a reduction array of its own, is more than
+    // a Radeon launches.
+    let mut slot = V4::empty();
+    slot.insert(0usize, part);
+    so[tid] = slot;
     sync_cube();
     if tid == 0usize {
         let mut x = f32::new(0.0f32);
         for y in 0..256usize {
-            x += red[y];
+            x += so[y].extract(0usize);
         }
         s_ds[cube] = x;
     }
@@ -2090,7 +2375,14 @@ fn dattn_kernel<E: Float>(
     #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
 ) {
-    let dks = comptime![dk + 1usize];
+    // Queries and keys a part of at most 64 columns at a time, rows padded to `part + 1`.
+    let part = comptime![if dk > 64usize {
+        dk.div_ceil(2usize)
+    } else {
+        dk
+    }];
+    let parts = comptime![dk.div_ceil(part)];
+    let ps = comptime![part + 1usize];
     let nbk = comptime![dk.div_ceil(16usize)];
     let nvb = comptime![dv.div_ceil(32usize)];
     let cube = CUBE_POS_X as usize;
@@ -2108,13 +2400,14 @@ fn dattn_kernel<E: Float>(
     let tid = UNIT_POS_X as usize;
     let tx = tid % 16usize;
     let ty = tid / 16usize;
-    let mut qs = Shared::<[f32]>::new_slice(64usize * dks);
-    let mut ks = Shared::<[f32]>::new_slice(64usize * dks);
+    // A block of dO and of V' (64 x 33 each), then a part of the queries and of the keys; `xa`
+    // holds `dP P` between the two passes over the parts.
+    let mut xa = Shared::<[f32]>::new_slice(64usize * 65usize);
+    let mut xb = Shared::<[f32]>::new_slice(64usize * 65usize);
     let mut dpm = Shared::<[f32]>::new_slice(64usize * 65usize);
-    // dO and V' blocks (64 x 33 each), then dP P.
-    let mut r4 = Shared::<[f32]>::new_slice(4224usize);
     let mut gs = Shared::<[f32]>::new_slice(64usize);
-    let mut norm = Shared::<[f32]>::new_slice(64usize);
+    let mut norm_q = Shared::<[f32]>::new_slice(64usize);
+    let mut norm_k = Shared::<[f32]>::new_slice(64usize);
 
     if tid < 64usize {
         gs[tid] = gcum[cube * 64usize + tid];
@@ -2139,8 +2432,8 @@ fn dattn_kernel<E: Float>(
                     x = d_o[idx];
                     y = v_new[idx];
                 }
-                r4[i * 33usize + vv] = x;
-                r4[2112usize + i * 33usize + vv] = y;
+                xa[i * 33usize + vv] = x;
+                xb[i * 33usize + vv] = y;
             }
         }
         sync_cube();
@@ -2149,8 +2442,8 @@ fn dattn_kernel<E: Float>(
             let mut x = Array::<f32>::new(4usize);
             #[unroll]
             for a in 0..4usize {
-                o[a] = r4[(ty + 16usize * a) * 33usize + vv];
-                x[a] = r4[2112usize + (tx + 16usize * a) * 33usize + vv];
+                o[a] = xa[(ty + 16usize * a) * 33usize + vv];
+                x[a] = xb[(tx + 16usize * a) * 33usize + vv];
             }
             #[unroll]
             for a in 0..4usize {
@@ -2175,13 +2468,10 @@ fn dattn_kernel<E: Float>(
             dpm[i * 65usize + j] = x;
         }
     }
-    load_rows::<E>(
-        q, &mut qs, &mut norm, first, count, h, hh, scale, dk, l2norm,
-    );
-    load_rows::<E>(
+    row_norms::<E>(q, &mut norm_q, first, count, h, hh, scale, dk, l2norm);
+    row_norms::<E>(
         k,
-        &mut ks,
-        &mut norm,
+        &mut norm_k,
         first,
         count,
         h,
@@ -2194,22 +2484,32 @@ fn dattn_kernel<E: Float>(
     for x in 0..16usize {
         acc[x] = f32::new(0.0f32);
     }
-    for d in 0..dk {
-        let mut ai = Array::<f32>::new(4usize);
-        let mut bj = Array::<f32>::new(4usize);
-        #[unroll]
-        for a in 0..4usize {
-            ai[a] = qs[(ty + 16usize * a) * dks + d];
-            bj[a] = ks[(tx + 16usize * a) * dks + d];
-        }
-        #[unroll]
-        for a in 0..4usize {
-            #[unroll]
-            for bb in 0..4usize {
-                acc[a * 4usize + bb] += ai[a] * bj[bb];
+    // Q K^T, the columns a part at a time, in order.
+    for p in 0..parts {
+        let d0 = p * part;
+        sync_cube();
+        load_key_part::<E>(q, &mut xa, &norm_q, first, count, h, hh, d0, part, dk);
+        load_key_part::<E>(k, &mut xb, &norm_k, first, count, h, hh, d0, part, dk);
+        for dl in 0..part {
+            if d0 + dl < dk {
+                let mut ai = Array::<f32>::new(4usize);
+                let mut bj = Array::<f32>::new(4usize);
+                #[unroll]
+                for a in 0..4usize {
+                    ai[a] = xa[(ty + 16usize * a) * ps + dl];
+                    bj[a] = xb[(tx + 16usize * a) * ps + dl];
+                }
+                #[unroll]
+                for a in 0..4usize {
+                    #[unroll]
+                    for bb in 0..4usize {
+                        acc[a * 4usize + bb] += ai[a] * bj[bb];
+                    }
+                }
             }
         }
     }
+    sync_cube();
     #[unroll]
     for a in 0..4usize {
         #[unroll]
@@ -2223,7 +2523,7 @@ fn dattn_kernel<E: Float>(
                 m = dp * acc[a * 4usize + bb] * decay;
                 dpm[i * 65usize + j] = dp * decay;
             }
-            r4[i * 65usize + j] = m;
+            xa[i * 65usize + j] = m;
         }
     }
     sync_cube();
@@ -2231,8 +2531,8 @@ fn dattn_kernel<E: Float>(
         let mut rs = f32::new(0.0f32);
         let mut cs = f32::new(0.0f32);
         for x in 0..64usize {
-            rs += r4[tid * 65usize + x];
-            cs += r4[x * 65usize + tid];
+            rs += xa[tid * 65usize + x];
+            cs += xa[x * 65usize + tid];
         }
         dg_p[cube * 64usize + tid] = rs - cs;
     }
@@ -2243,27 +2543,33 @@ fn dattn_kernel<E: Float>(
         accq[x] = f32::new(0.0f32);
         acck[x] = f32::new(0.0f32);
     }
-    for j in 0..64usize {
-        let mut pe = Array::<f32>::new(4usize);
-        let mut pt = Array::<f32>::new(4usize);
-        #[unroll]
-        for a in 0..4usize {
-            pe[a] = dpm[(ty + 16usize * a) * 65usize + j];
-            pt[a] = dpm[j * 65usize + ty + 16usize * a];
-        }
-        #[unroll]
-        for bb in 0..nbk {
-            let kk = tx + 16usize * bb;
-            let mut kv = f32::new(0.0f32);
-            let mut qv = f32::new(0.0f32);
-            if kk < dk {
-                kv = ks[j * dks + kk];
-                qv = qs[j * dks + kk];
-            }
+    // dQ = dPe K and dK = dPe^T Q, the columns a part at a time: each sum over the tokens in
+    // order, as before.
+    for p in 0..parts {
+        let d0 = p * part;
+        sync_cube();
+        load_key_part::<E>(q, &mut xa, &norm_q, first, count, h, hh, d0, part, dk);
+        load_key_part::<E>(k, &mut xb, &norm_k, first, count, h, hh, d0, part, dk);
+        for j in 0..64usize {
+            let mut pe = Array::<f32>::new(4usize);
+            let mut pt = Array::<f32>::new(4usize);
             #[unroll]
             for a in 0..4usize {
-                accq[a * nbk + bb] += pe[a] * kv;
-                acck[a * nbk + bb] += pt[a] * qv;
+                pe[a] = dpm[(ty + 16usize * a) * 65usize + j];
+                pt[a] = dpm[j * 65usize + ty + 16usize * a];
+            }
+            #[unroll]
+            for bb in 0..nbk {
+                let kk = tx + 16usize * bb;
+                if kk >= d0 && kk < d0 + part && kk < dk {
+                    let kv = xb[j * ps + kk - d0];
+                    let qv = xa[j * ps + kk - d0];
+                    #[unroll]
+                    for a in 0..4usize {
+                        accq[a * nbk + bb] += pe[a] * kv;
+                        acck[a * nbk + bb] += pt[a] * qv;
+                    }
+                }
             }
         }
     }
@@ -2381,10 +2687,14 @@ fn dwy_kernel<E: Float>(
     let tid = UNIT_POS_X as usize;
     let tx = tid % 16usize;
     let ty = tid / 16usize;
-    let mut blk = Shared::<[f32]>::new_slice(4224usize);
+    // The blocks `rows_product` stages, then `dA A` (64 x 65) for the gate's sums, then the keys.
+    let region = comptime![if 64usize * dks > 4224usize {
+        64usize * dks
+    } else {
+        4224usize
+    }];
+    let mut ks = Shared::<[f32]>::new_slice(region);
     let mut dam = Shared::<[f32]>::new_slice(64usize * 65usize);
-    let mut mam = Shared::<[f32]>::new_slice(64usize * 65usize);
-    let mut ks = Shared::<[f32]>::new_slice(64usize * dks);
     let mut gs = Shared::<[f32]>::new_slice(64usize);
     let mut bs = Shared::<[f32]>::new_slice(64usize);
     let mut norm = Shared::<[f32]>::new_slice(64usize);
@@ -2405,10 +2715,10 @@ fn dwy_kernel<E: Float>(
     }
     // dV_b U^T over Dv, then dKbg W^T over Dk.
     for vb in 0..nvb {
-        rows_product(dvb, u, &mut blk, &mut acc, cube, vb, dv);
+        rows_product(dvb, u, &mut ks, &mut acc, cube, vb, dv);
     }
     for kb in 0..nkb {
-        rows_product(dkbg, w, &mut blk, &mut acc, cube, kb, dk);
+        rows_product(dkbg, w, &mut ks, &mut acc, cube, kb, dk);
     }
     #[unroll]
     for a in 0..4usize {
@@ -2423,10 +2733,21 @@ fn dwy_kernel<E: Float>(
                 m = da * amat[cube * 4096usize + i * 64usize + j];
                 de = da * (gs[i] - gs[j]).exp();
             }
-            mam[i * 65usize + j] = m;
+            ks[i * 65usize + j] = m;
             dam[i * 65usize + j] = de;
         }
     }
+    sync_cube();
+    if tid < 64usize {
+        let mut rs = f32::new(0.0f32);
+        let mut cs = f32::new(0.0f32);
+        for x in 0..64usize {
+            rs += ks[tid * 65usize + x];
+            cs += ks[x * 65usize + tid];
+        }
+        dg_a[cube * 64usize + tid] = rs - cs;
+    }
+    sync_cube();
     load_rows::<E>(
         k,
         &mut ks,
@@ -2439,15 +2760,6 @@ fn dwy_kernel<E: Float>(
         dk,
         l2norm,
     );
-    if tid < 64usize {
-        let mut rs = f32::new(0.0f32);
-        let mut cs = f32::new(0.0f32);
-        for x in 0..64usize {
-            rs += mam[tid * 65usize + x];
-            cs += mam[x * 65usize + tid];
-        }
-        dg_a[cube * 64usize + tid] = rs - cs;
-    }
     let mut acc1 = Array::<f32>::new(4usize * nbk);
     let mut acc2 = Array::<f32>::new(4usize * nbk);
     #[unroll]
@@ -2881,31 +3193,42 @@ fn state_backward(
     let dvn = empty_like(&w, l.chunked(l.dv));
     let d_first = empty_like(&w, Shape::new([l.seqs, l.h, l.dk, l.dv]));
     let (count, dim) = l.per_state();
+    let client = w.client.clone();
+    let small = super::probe::small_state_forced()
+        || client.properties().hardware.max_shared_memory_size < STATE_BACKWARD_BYTES;
     launched();
-    launch_either!(
-        l.dk > wide::HALF,
-        state_backward_kernel::launch,
-        wide::state_backward_wide_kernel::launch,
-        &w.client.clone(),
-        count,
-        dim,
-        kt.into_tensor_arg(),
-        w.into_tensor_arg(),
-        qg.into_tensor_arg(),
-        d_o.into_tensor_arg(),
-        dv_local.into_tensor_arg(),
-        gl.into_tensor_arg(),
-        d_final_state.into_tensor_arg(),
-        l.offsets.clone().into_tensor_arg(),
-        ds_next.clone().into_tensor_arg(),
-        dvn.clone().into_tensor_arg(),
-        d_first.clone().into_tensor_arg(),
-        l.n as u32,
-        l.h as u32,
-        l.dk,
-        l.dv,
-        l.packed,
-    );
+    macro_rules! args {
+        ($launch:expr) => {
+            $launch(
+                &client,
+                count,
+                dim,
+                kt.into_tensor_arg(),
+                w.into_tensor_arg(),
+                qg.into_tensor_arg(),
+                d_o.into_tensor_arg(),
+                dv_local.into_tensor_arg(),
+                gl.into_tensor_arg(),
+                d_final_state.into_tensor_arg(),
+                l.offsets.clone().into_tensor_arg(),
+                ds_next.clone().into_tensor_arg(),
+                dvn.clone().into_tensor_arg(),
+                d_first.clone().into_tensor_arg(),
+                l.n as u32,
+                l.h as u32,
+                l.dk,
+                l.dv,
+                l.packed,
+            )
+        };
+    }
+    if l.dk > wide::HALF {
+        args!(wide::state_backward_wide_kernel::launch);
+    } else if small {
+        args!(state_backward_small_kernel::launch);
+    } else {
+        args!(state_backward_kernel::launch);
+    }
     (ds_next, dvn, d_first)
 }
 
@@ -3504,12 +3827,18 @@ fn tc_backward(
 const STATE_FORWARD_BYTES: usize = 16 * (128 * 17 + 64 * 32) + 8 * (128 * 16 + 64 * 16);
 /// Bytes of shared memory [`state_forward_small_kernel`] holds.
 const STATE_FORWARD_SMALL_BYTES: usize = 16 * (64 * 17 + 32 * 32) + 8 * (128 * 16 + 64 * 16);
+/// Bytes of shared memory [`state_backward_kernel`] holds: 98 KiB. A device with less runs
+/// [`state_backward_small_kernel`], 49 KiB.
+const STATE_BACKWARD_BYTES: usize = 16 * (128 * 17 + 64 * 32) + 8 * (128 * 16 + 2 * 64 * 16);
+/// Bytes of shared memory [`state_backward_small_kernel`] holds.
+const STATE_BACKWARD_SMALL_BYTES: usize = 16 * (64 * 17) + 8 * (128 * 16 + 2 * 64 * 16);
 
 /// Bytes of shared memory the kernels of a forward (or backward) pass hold at most, summed from
-/// each kernel's `Shared` arrays: f32 4 bytes, `V2` 8, `V4` 16; the state passing forward counted
-/// as [`state_forward_small_kernel`], which runs where [`state_forward_kernel`] does not fit.
-/// Heads up to 128 wide, the forward holds at most 57 KiB (the output and the state passing), so
-/// that it runs on a device with 64 KiB; backward, the state passing holds 98 KiB. Wider, the prep
+/// each kernel's `Shared` arrays: f32 4 bytes, `V2` 8, `V4` 16; the state passings counted as
+/// [`state_forward_small_kernel`] and [`state_backward_small_kernel`], which run where
+/// [`state_forward_kernel`] and [`state_backward_kernel`] do not fit. Heads up to 128 wide, the
+/// forward holds at most 57 KiB (the output and the state passing), and the backward 63 KiB (the
+/// products with the state), so that both run on a device with 64 KiB. Wider, the prep
 /// kernel's rows grow with the width, to 97.5 KiB at `Dk = Dv = 256`, while the wide kernels hold
 /// at most 86 KiB.
 fn shared_bytes(dk: usize, dv: usize, backward: bool) -> usize {
@@ -3550,15 +3879,19 @@ fn shared_bytes(dk: usize, dv: usize, backward: bool) -> usize {
         // of the state or of V' in their place.
         let part = dk.div_ceil(if dk > 64 { 2 } else { 1 });
         let output = 4 * (rows(dk) + rows(part).max(square + 16 * dv) + 2 * 64);
-        let state_backward = 16 * (128 * 17 + 64 * 32) + 8 * (128 * 16 + 2 * 64 * 16);
-        let dstate = 16 * (3 * 64 * 9 + 2 * dk.div_ceil(16) * 16 * 9) + 4 * 256;
-        let dattn = 4 * (2 * rows(dk) + square + 4224 + 2 * 64);
-        let dwy = 4 * (4224 + 2 * square + rows(dk) + 3 * 64 + 1024);
+        let state_backward = STATE_BACKWARD_SMALL_BYTES;
+        let dstate = 16 * (3 * 64 * 9 + 2 * dk.div_ceil(16) * 16 * 9);
+        // Both hold their parts of the queries and keys, and their staged blocks, in shared
+        // regions they reuse from phase to phase.
+        let dvlocal = 4 * (3 * square + 3 * 64);
+        let dattn = 4 * (3 * square + 3 * 64);
+        let dwy = 4 * (rows(dk).max(4224) + square + 3 * 64 + 1024);
         if backward {
             vec![
                 prep,
                 state_forward,
                 output,
+                dvlocal,
                 state_backward,
                 dvb,
                 dstate,

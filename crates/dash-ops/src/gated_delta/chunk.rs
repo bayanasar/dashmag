@@ -45,21 +45,26 @@
 //! kernels run, in IEEE f32 without tensor cores, nine of them backward. Queries and keys wider
 //! than 128 run f32 kernels of their own (`chunk/cube/wide.rs`) that hold them and the state's
 //! rows a half (128 columns) at a time. The f32 kernels ask 256 units per cube; shared memory up
-//! to 57 KiB forward and 98 KiB backward for heads up to 128 wide, and with wider heads up to 97.5
+//! to 57 KiB forward and 63 KiB backward for heads up to 128 wide, and with wider heads up to 97.5
 //! KiB (the first kernel's rows of the wider of `Dk` and `Dv`, at 256); and backward, planes of
 //! exactly 32 units; their state passings fit one cube per multiprocessor. The forward's state
 //! passing holds 90 KiB where the device has it, reading the next chunk's `W` and `kt` while it
 //! computes; with less (a Radeon's 64 KiB), it takes a form of 57 KiB that reads each half of them
 //! when it comes, the same sums in the same order. The prep and output kernels fit 64 KiB as they
 //! are: `A` takes the keys' place once its products are in registers, and the output kernel holds
-//! the keys 64 columns at a time. CUDA cards of compute capability 8.0 and later have all of it,
-//! and a Radeon AI PRO R9700 (RDNA4, 64 KiB) has what the forward asks. Where the tensor cores'
+//! the keys 64 columns at a time. Backward, the state passing likewise has a form of 49 KiB beside
+//! its 98 KiB one, taking `kt` a half of the state's rows at a time and `qg` and `W` 16 tokens at
+//! a time; the kernels through `P`, through `A` and for `P^T dO` hold the queries and keys 64
+//! columns at a time and reuse their regions from phase to phase, and the products with the state
+//! keep no reduction array of their own. CUDA cards of compute capability 8.0 and later have all
+//! of it, and a Radeon AI PRO R9700 (RDNA4, 64 KiB) has what both passes ask. Where the tensor
+//! cores'
 //! instructions are missing but the device's 16 x 16 x 16 product from bf16 or f16 into f32 has
 //! RDNA4's register layout (the R9700's), a forward from those dtypes with `Dk` and `Dv` of 32, 64
 //! or 128 runs three kernels of its own on those products instead (`chunk/cube/wmma.rs`), which
 //! form what those on tensor cores form, with the same intermediates in the input dtype and the
-//! same roundings, in at most 57.25 KiB of shared memory; the backward pass there runs the
-//! reference. On a device without what any of the kernels ask, and for heads wider than 256, the
+//! same roundings, in at most 57.25 KiB of shared memory; the backward pass there runs the f32
+//! kernels. On a device without what any of the kernels ask, and for heads wider than 256, the
 //! reference runs instead (`kernels_take`, `tensor_cores_take` and `wmma_takes` tell which):
 //! under wgpu on OpenGL over D3D12 and on lavapipe (Vulkan on the CPU), both with 32 KiB of shared
 //! memory and no plane operations, and on CubeCL's CPU runtime (as many units per cube as cores),
@@ -144,9 +149,9 @@ pub mod probe {
         BACKWARD_RUNS.load(Ordering::SeqCst)
     }
 
-    /// While set, the f32 kernels' state passing forward takes its form for 64 KiB of shared
-    /// memory on any device, as a device with less than 90 KiB always does, so that a test can
-    /// hold the two forms to each other.
+    /// While set, the f32 kernels' state passings take their forms for 64 KiB of shared memory
+    /// on any device, as a device with less than 90 KiB (forward) or 98 KiB (backward) always
+    /// does, so that a test can hold the two forms to each other.
     pub fn force_small_state(on: bool) {
         FORCE_SMALL_STATE.store(on, Ordering::SeqCst);
     }
