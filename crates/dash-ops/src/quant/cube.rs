@@ -492,8 +492,8 @@ fn matrix_split(client: &Client, rows: usize, inp: usize, out: usize) -> (usize,
 /// The 16-row tiles each wave of [`matrix_kernel`] takes for `rows` rows of `x`: eight past 64
 /// rows, so that each dequantized word serves eight products; four up to 64, where a cube of 128
 /// rows would be at least half empty. On a Radeon AI PRO R9700 at `[5120 x 17408]` and
-/// `[17408 x 5120]`, eight took 0.64 to 0.88 times four's time from 96 rows to 2048, and 1.15 to
-/// 1.31 times at 32 to 64 rows.
+/// `[17408 x 5120]`, eight took 0.64 to 0.88 times four's time at 96, 128, 256, 512 and 2048 rows
+/// (0.88 at 256 rows of the second shape), and 1.15 to 1.31 times at 32, 48 and 64 rows.
 fn matrix_tiles(rows: usize) -> usize {
     if rows > 64 { 8 } else { 4 }
 }
