@@ -35,6 +35,10 @@ fn every_operation_refuses(dtype: DType) {
     assert!(sample(&q2, &SampleOptions::greedy()).is_err());
     assert!(low_rank(&q2, &q2, &q2, None, LowRankOptions::default()).is_err());
     let _ = q1;
+    // Wait for the work this thread queued: on ROCm under WSL2, a process that exits while
+    // CubeCL's device thread is still creating this thread's stream crashes in the HIP runtime's
+    // teardown.
+    Tensor::zeros(&[1], DType::F32).unwrap().to_f32().unwrap();
 }
 
 #[test]
