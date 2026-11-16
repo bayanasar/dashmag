@@ -2337,8 +2337,9 @@ fn dstate_kernel(
         }
     }
     // Each unit's part of `<S, dS>`, summed in order where `dO` was (the loop's last barrier is
-    // behind every read of it): a whole 64 KiB, with a reduction array of its own, is more than
-    // a Radeon launches.
+    // behind every read of it). With a reduction array of its own, at exactly 64 KiB, the kernel
+    // did not launch on the R9700, where kernels declaring exactly 64 KiB of arrays do; what
+    // refused it was not looked into.
     let mut slot = V4::empty();
     slot.insert(0usize, part);
     so[tid] = slot;
