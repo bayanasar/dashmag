@@ -35,8 +35,8 @@
     clippy::collapsible_if
 )]
 
-use super::kernels::{V8, fetch_padding, load_rows, query_range, row_bounds, swizzle};
-use super::wmma::{load_vt, vt_index};
+use super::kernels::{V8, fetch_padding, query_range, row_bounds, swizzle};
+use super::wmma::{load_rows_flat, load_vt, vt_index};
 use cubecl::cmma::MmaDefinition;
 use cubecl::prelude::*;
 
@@ -330,7 +330,7 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
     for j in 0..n_blocks {
         let k0 = key0 + j * block_kv;
         sync_cube();
-        load_rows::<E>(
+        load_rows_flat::<E>(
             k,
             s_k.as_mut_slice(),
             k_base,
@@ -341,7 +341,7 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
             chunks,
             threads,
         );
-        load_rows::<E>(
+        load_rows_flat::<E>(
             v,
             s_v.as_mut_slice(),
             v_base,
@@ -362,6 +362,7 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
             block_kv,
             chunks,
             threads,
+            true,
         );
         if comptime!(padded) {
             let flag = fetch_padding(key_mask, m_base, m_st, k0, tk, block_kv);
@@ -571,7 +572,7 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
         let q_base = b as usize * q_sb as usize + h as usize * q_sh as usize;
         let do_base = b as usize * do_sb as usize + h as usize * do_sh as usize;
         sync_cube();
-        load_rows::<E>(
+        load_rows_flat::<E>(
             q,
             s_q.as_mut_slice(),
             q_base,
@@ -582,7 +583,7 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
             chunks,
             threads,
         );
-        load_rows::<E>(
+        load_rows_flat::<E>(
             d_o,
             s_do.as_mut_slice(),
             do_base,
@@ -603,6 +604,7 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
             sq,
             chunks,
             threads,
+            true,
         );
         load_vt::<E>(
             d_o,
@@ -614,6 +616,7 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
             sq,
             chunks,
             threads,
+            true,
         );
         if UNIT_POS < sq {
             let row = q0 + UNIT_POS;

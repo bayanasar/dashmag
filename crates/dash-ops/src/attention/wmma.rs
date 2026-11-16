@@ -61,10 +61,40 @@ pub(super) fn vt_index(col: u32, g: u32, #[comptime] groups: u32) -> u32 {
     col * groups + (g ^ ((col >> 2) & comptime!(groups - 1)))
 }
 
+/// [`load_rows()`] with every row read: rows at or past `limit` are read from row 0 and replaced
+/// by zeros, so that no read sits behind a branch, which on RDNA4 is waited for before the next
+/// read is issued. The backward's kernels stage their tiles this way; the forward's kernel took
+/// 5% longer with it, and keeps [`load_rows()`].
+#[cube]
+pub(super) fn load_rows_flat<E: Float>(
+    src: &Tensor<Vector<E, V8>>,
+    dst: &mut [Vector<E, V8>],
+    base: usize,
+    row_stride: usize,
+    row0: u32,
+    limit: u32,
+    #[comptime] rows: u32,
+    #[comptime] chunks: u32,
+    #[comptime] threads: u32,
+) {
+    let per_thread = comptime!(rows * chunks / threads);
+    #[unroll]
+    for i in 0..per_thread {
+        let idx = i * threads + UNIT_POS;
+        let r = idx / chunks;
+        let c = idx % chunks;
+        let row = row0 + r;
+        let ok = row < limit;
+        let value = src[base + select(ok, row, 0u32) as usize * row_stride + c as usize];
+        dst[swizzle(r, c, chunks) as usize] = select(ok, value, Vector::new(E::from_int(0)));
+    }
+}
+
 /// Copies keys `[k0, k0 + keys)` of one (batch, head) slice of `src` (rows `row_stride` vectors
 /// apart from vector `base`; zeros at or past `limit`) into `dst` transposed: for each column
 /// `c` of `V` and group `g` of eight keys, one vector at [`vt_index()`]. Each thread reads eight
-/// rows' vectors at one chunk and writes eight transposed ones.
+/// rows' vectors at one chunk and writes eight transposed ones; `flat`, the rows past `limit` as
+/// [`load_rows_flat()`] reads them.
 #[cube]
 pub(super) fn load_vt<E: Float>(
     src: &Tensor<Vector<E, V8>>,
@@ -76,6 +106,7 @@ pub(super) fn load_vt<E: Float>(
     #[comptime] keys: u32,
     #[comptime] chunks: u32,
     #[comptime] threads: u32,
+    #[comptime] flat: bool,
 ) {
     let groups = comptime!(keys / 8);
     let blocks = comptime!(groups * chunks);
@@ -90,11 +121,17 @@ pub(super) fn load_vt<E: Float>(
             #[unroll]
             for j in 0..8u32 {
                 let row = k0 + g * 8 + j;
-                let mut value = Vector::<E, V8>::new(E::from_int(0));
-                if row < limit {
-                    value = src[base + row as usize * row_stride + c as usize];
+                if comptime!(flat) {
+                    let ok = row < limit;
+                    let at = base + select(ok, row, 0u32) as usize * row_stride + c as usize;
+                    rows[j as usize] = select(ok, src[at], Vector::new(E::from_int(0)));
+                } else {
+                    let mut value = Vector::<E, V8>::new(E::from_int(0));
+                    if row < limit {
+                        value = src[base + row as usize * row_stride + c as usize];
+                    }
+                    rows[j as usize] = value;
                 }
-                rows[j as usize] = value;
             }
             #[unroll]
             for e in 0..8u32 {
@@ -255,6 +292,7 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
             block_kv,
             chunks,
             threads,
+            false,
         );
         if comptime!(padded) {
             let flag = fetch_padding(key_mask, m_base, m_st, k0, tk, block_kv);
