@@ -4214,7 +4214,7 @@ fn wmma_shared_bytes(dk: usize, dv: usize, backward: bool) -> usize {
     let output = tile(64, wide) + tile(dv, dk) + 4 * 64;
     let kernels = if backward {
         let dvlocal = tile(64, wide) + tile(64, dk) + 4 * 2 * 64;
-        let state_backward = 2 * tile(64, dk) + tile(32, dk) + 2 * tile(32, 64) + 4 * 2 * 64;
+        let state_backward = 2 * tile(64, dk) + tile(32, dk) + 2 * tile(32, 64) + 4 * 3 * 64;
         // The fourth region holds a block of 16 columns of dO, V', S and dS, or the keys.
         let dqk = 2 * tile(64, wide)
             + tile(64, 64)
@@ -4230,10 +4230,11 @@ fn wmma_shared_bytes(dk: usize, dv: usize, backward: bool) -> usize {
 }
 
 /// What the kernels of a forward (or backward) pass on RDNA4's matrix products over
-/// `[B, T, H, Dk, Dv]` ask of the device: 256 units per cube for the per-chunk kernels and 128 for
-/// the state passing, their cube counts (as [`requirements`] counts them), the shared memory of
-/// [`wmma_shared_bytes`], nine tensors (backward 21 per chunk and 13 for the state passing),
-/// 16-byte vectors, and planes of exactly 32 units, the waves the fragments are laid out over.
+/// `[B, T, H, Dk, Dv]` ask of the device: 256 units per cube for the per-chunk kernels and the
+/// state passing backward (128 at `Dk = 32`), 128 for the forward's, their cube counts (as
+/// [`requirements`] counts them), the shared memory of [`wmma_shared_bytes`], nine tensors
+/// (backward 21 per chunk and 13 for the state passing), 16-byte vectors, and planes of exactly
+/// 32 units, the waves the fragments are laid out over.
 fn wmma_requirements(
     [b, t, h, dk, dv]: [usize; 5],
     packed: Option<usize>,
@@ -4249,8 +4250,13 @@ fn wmma_requirements(
         (b * h * n, 1),
         if backward { 21 } else { 9 },
     );
+    let state_units = if backward {
+        wmma_bwd::state_backward_units(dk as u32)
+    } else {
+        wmma::STATE_UNITS
+    };
     let state = Requirements::new(
-        (wmma::STATE_UNITS, 1),
+        (state_units, 1),
         (dv.div_ceil(wmma::STATE_COLS), rows * h),
         if backward { 13 } else { 9 },
     );
@@ -4582,7 +4588,7 @@ fn wmma_backward(
         wmma_bwd::wmma_state_backward_kernel::launch_unchecked(
             &client,
             CubeCount::Static(dv.div_ceil(wmma::STATE_COLS) as u32, (l.seqs * h) as u32, 1),
-            CubeDim::new_1d(wmma_bwd::FOUR_WAVES),
+            CubeDim::new_1d(wmma_bwd::state_backward_units(dk as u32)),
             p.kn.clone().into_tensor_arg(),
             p.w_t.into_tensor_arg(),
             q.clone().into_tensor_arg(),

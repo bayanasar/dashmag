@@ -12,7 +12,7 @@
 //! the kernel stages it transposed (eight rows of eight read, swapped in registers, written), or
 //! the earlier kernel writes both forms.
 //!
-//! Shared memory, at `Dk = Dv = 128`: `dv_local` 32.5 KiB, the state passing 48.5 KiB, the
+//! Shared memory, at `Dk = Dv = 128`: `dv_local` 32.5 KiB, the state passing 48.75 KiB, the
 //! products with the states 59.0 KiB (four regions, each holding several operands in turn), the
 //! WY kernel 50.5 KiB, within the 64 KiB a workgroup has on RDNA4.
 
@@ -31,7 +31,7 @@ use super::{chunk_tokens, state_chunks};
 use cubecl::cmma::MmaDefinition;
 use cubecl::prelude::*;
 
-/// Units of [`wmma_dvlocal_kernel`] and of the state passing: four waves.
+/// Units of [`wmma_dvlocal_kernel`]: four waves.
 pub(super) const FOUR_WAVES: u32 = 128;
 /// Units of the other per-chunk kernels: eight waves.
 pub(super) const EIGHT_WAVES: u32 = 256;
@@ -320,15 +320,223 @@ pub(super) fn wmma_dvlocal_kernel<E: Float>(
     }
 }
 
+/// Chunk `c` of row `r` of a chunk's tokens from `first` (zero from `count` on) of head `h` of a
+/// `[B T, H, D]` tensor of `chunks` chunks to a row, read whether or not `r` is in range (from
+/// token 0 if not), so that a unit's reads are not each behind a branch: on RDNA4 a read behind
+/// one is waited for before the next is issued.
+#[cube]
+fn token_chunk<E: Float>(
+    src: &Tensor<Vector<E, V8>>,
+    first: u32,
+    r: u32,
+    count: u32,
+    h: u32,
+    heads: u32,
+    c: u32,
+    #[comptime] chunks: u32,
+) -> Vector<E, V8> {
+    let ok = r < count;
+    let t = select(ok, first + r, 0u32);
+    let x = src[((t * heads + h) * chunks + c) as usize];
+    select(ok, x, Vector::new(E::from_int(0)))
+}
+
+/// Eight rows of one 16-byte chunk of a chunk's tokens ([`token_chunk`]): block `idx` of a
+/// transposed tile of `chunks` chunks (its rows `8 (idx / chunks)` on, chunk `c0 + idx % chunks`).
+#[cube]
+fn token_block<E: Float>(
+    src: &Tensor<Vector<E, V8>>,
+    rows: &mut Array<Vector<E, V8>>,
+    first: u32,
+    count: u32,
+    h: u32,
+    heads: u32,
+    c0: u32,
+    idx: u32,
+    #[comptime] d: u32,
+    #[comptime] chunks: u32,
+) {
+    let c = idx % chunks;
+    let grp = idx / chunks;
+    #[unroll]
+    for j in 0..8u32 {
+        rows[j as usize] = token_chunk::<E>(
+            src,
+            first,
+            grp * 8 + j,
+            count,
+            h,
+            heads,
+            c0 + c,
+            comptime!(d / 8),
+        );
+    }
+}
+
+/// Writes a [`token_block`] transposed into `dst`, as [`stage_tokens_t`] does.
+#[cube]
+fn token_block_t<E: Float>(
+    rows: &Array<Vector<E, V8>>,
+    dst: &mut [Vector<E, V8>],
+    f1: &[f32],
+    f2: &[f32],
+    idx: u32,
+    #[comptime] chunks: u32,
+    #[comptime] factors: u32,
+) {
+    let c = idx % chunks;
+    let grp = idx / chunks;
+    let cols = transpose8::<E>(rows, 0u32);
+    #[unroll]
+    for e in 0..8u32 {
+        let mut col = cols[e as usize];
+        if comptime!(factors >= 1) {
+            col = Vector::cast_from(Vector::<f32, V8>::cast_from(col) * eight(f1, grp * 8));
+        }
+        if comptime!(factors >= 2) {
+            col = Vector::cast_from(Vector::<f32, V8>::cast_from(col) * eight(f2, grp * 8));
+        }
+        dst[swizzle(c * 8 + e, grp, 8u32) as usize] = col;
+    }
+}
+
+/// Blocks of `dO`'s 32 state columns a cube of [`wmma_state_backward_kernel`] stages transposed,
+/// one to each of its last 32 units.
+const SB_O_BLOCKS: u32 = 32;
+
+/// Units of [`wmma_state_backward_kernel`]: eight waves, four where `Dk` is 32 (the state's
+/// gradient a cube carries then has four tiles).
+pub(super) fn state_backward_units(dk: u32) -> u32 {
+    if dk >= 64 { EIGHT_WAVES } else { FOUR_WAVES }
+}
+
+/// What [`wmma_state_backward_kernel`] reads of chunk `chunk` but the state, into registers: the
+/// keys by rows (`pk`) and `W^T` (`pw`), `8 Dk / units` vectors a unit; eight rows of one
+/// 16-byte chunk of the queries (the first `Dk` units) or of `dO`'s 32 state columns (the last
+/// 32) into `pt`, as [`token_block`] reads them; the lane's vector of `dv_local^T` for each of
+/// its wave's `ptiles` tiles of `dV'^T` (`pl`); and the returned `G` (the first 64 units) or
+/// query row factor (the next 64).
+#[cube]
+fn sb_read<E: Float>(
+    kn: &Tensor<Vector<E, V8>>,
+    w_t: &Tensor<Vector<E, V8>>,
+    q: &Tensor<Vector<E, V8>>,
+    q_factor: &Tensor<f32>,
+    d_out: &Tensor<Vector<E, V8>>,
+    dvl_t: &Tensor<Vector<E, V8>>,
+    gcum: &Tensor<f32>,
+    plan: &Tensor<u32>,
+    pk: &mut Array<Vector<E, V8>>,
+    pw: &mut Array<Vector<E, V8>>,
+    pt: &mut Array<Vector<E, V8>>,
+    pl: &mut Array<Vector<E, V8>>,
+    chunk: u32,
+    b: u32,
+    h: u32,
+    heads: u32,
+    n_chunks: u32,
+    seq_len: u32,
+    scale: f32,
+    v0: u32,
+    lrow: u32,
+    lcol: u32,
+    #[comptime] dk: u32,
+    #[comptime] dv: u32,
+    #[comptime] l2norm: bool,
+    #[comptime] packed: bool,
+    #[comptime] units: u32,
+    #[comptime] ptiles: u32,
+) -> f32 {
+    let ck = comptime!(dk / 8);
+    let (f0, cnt) = chunk_tokens(
+        plan,
+        b as usize,
+        (chunk % n_chunks) as usize,
+        seq_len as usize,
+        packed,
+    );
+    let first = f0 as u32;
+    let count = cnt as u32;
+    #[unroll]
+    for i in 0..comptime!(64 * ck / units) {
+        let at = chunk * 64 * ck + i * units + UNIT_POS;
+        pk[i as usize] = kn[at as usize];
+        pw[i as usize] = w_t[at as usize];
+    }
+    let o0 = comptime!(units - SB_O_BLOCKS);
+    if UNIT_POS < dk {
+        token_block::<E>(q, pt, first, count, h, heads, 0u32, UNIT_POS, dk, ck);
+    } else if UNIT_POS >= o0 {
+        token_block::<E>(
+            d_out,
+            pt,
+            first,
+            count,
+            h,
+            heads,
+            v0 / 8,
+            UNIT_POS - o0,
+            dv,
+            4u32,
+        );
+    }
+    #[unroll]
+    for s in 0..ptiles {
+        pl[s as usize] = dvl_t[((chunk * dv + lrow) * 8 + lcol + 2 * s) as usize];
+    }
+    let mut g = scale;
+    if UNIT_POS < 64 {
+        g = gcum[(chunk * 64 + UNIT_POS) as usize];
+    } else if UNIT_POS < 128 {
+        if comptime!(l2norm) {
+            g = q_factor[(chunk * 64 + UNIT_POS - 64) as usize];
+        }
+    }
+    g
+}
+
+/// Writes the keys by rows and `W^T` [`sb_read`] read into their tiles, and `G`, `exp(G)` and the
+/// query rows' factors.
+#[cube]
+fn sb_stage<E: Float>(
+    pk: &Array<Vector<E, V8>>,
+    pw: &Array<Vector<E, V8>>,
+    g: f32,
+    s_k: &mut [Vector<E, V8>],
+    s_wt: &mut [Vector<E, V8>],
+    s_g: &mut [f32],
+    s_gr: &mut [f32],
+    s_f: &mut [f32],
+    #[comptime] dk: u32,
+    #[comptime] units: u32,
+) {
+    let ck = comptime!(dk / 8);
+    #[unroll]
+    for i in 0..comptime!(64 * ck / units) {
+        let idx = i * units + UNIT_POS;
+        s_k[swizzle(idx / ck, idx % ck, ck) as usize] = pk[i as usize];
+        s_wt[swizzle(idx / 8, idx % 8, 8u32) as usize] = pw[i as usize];
+    }
+    if UNIT_POS < 64 {
+        s_gr[UNIT_POS as usize] = g;
+        s_g[UNIT_POS as usize] = g.exp();
+    } else if UNIT_POS < 128 {
+        s_f[(UNIT_POS - 64) as usize] = g;
+    }
+}
+
 /// The state passing, backward, as `tc.rs`' `tc_state_backward_kernel`: for each of the
 /// sequence's chunks from the last, store `dS_{c+1}` (transposed, in the input dtype), form
 /// `dV'^T = lam (dS^T K^T) + dv_local^T`, then `dS^T = exp(G_last) dS^T + dO^T qg + (-dV'^T) W`,
 /// the state's gradient f32 in registers, laid out as the forward's state (`wmma.rs`): one cube
-/// of four waves per (sequence and head, block of 32 state columns), wave `w` holding `dS^T`'s row
-/// tile and `Dk / 32` column tiles, and forming `dV'^T`'s row tile `w / 2` at token tiles
-/// `2 (w % 2)` and `2 (w % 2) + 1`. One tile holds the keys by rows for `dV'`, then `qg^T`
-/// (`gamma` times each query row times its factor, each rounded to the input dtype, as `tc.rs`
-/// forms it).
+/// per (sequence and head, block of 32 state columns) of [`state_backward_units`], wave `w`
+/// holding `st` consecutive tiles of `dS^T` from tile `st w` (row tiles of `Dk / 16`) and
+/// forming `ptiles` of the eight tiles of `dV'^T` from `ptiles w` (row tiles of four). One tile
+/// holds the keys by rows for `dV'`, then `qg^T` (`gamma` times each query row times its factor,
+/// each rounded to the input dtype, as `tc.rs` forms it). As the forward does, it reads the next
+/// chunk's inputs (all but the state) into registers while forming this chunk's `dS^T`; the keys,
+/// `W^T` and decays go to shared memory after it, the query and `dO` rows once `dV'` is formed and
+/// the keys' tile is free.
 #[cube(launch_unchecked)]
 pub(super) fn wmma_state_backward_kernel<E: Float>(
     kn: &Tensor<Vector<E, V8>>,
@@ -374,13 +582,16 @@ pub(super) fn wmma_state_backward_kernel<E: Float>(
     let b = y / heads;
     let h = y % heads;
 
-    let st = comptime!(dk / 32);
+    let units = comptime!(state_backward_units(dk));
+    let st = comptime!(dk / 8 / (units / 32));
+    let ptiles = comptime!(8 / (units / 32));
     let s_first = wave * st;
     let sv = s_first / comptime!(dk / 16);
     let sd0 = s_first % comptime!(dk / 16);
     let vr = 16 * sv + row;
-    let pv = wave / 2;
-    let pt0 = 2 * (wave % 2);
+    let p_first = wave * ptiles;
+    let pv = p_first / 4;
+    let pt0 = p_first % 4;
     let pr = 16 * pv + row;
 
     // The keys by rows, then qg^T; W^T; dS^T (32 rows of Dk); -dV'^T and dO^T (32 rows of the
@@ -394,6 +605,7 @@ pub(super) fn wmma_state_backward_kernel<E: Float>(
     let mut s_v = Shared::<[Vector<E, V8>]>::new_aligned_slice(256usize, 16usize);
     let mut s_o = Shared::<[Vector<E, V8>]>::new_aligned_slice(256usize, 16usize);
     let mut s_g = Shared::<[f32]>::new_slice(64usize);
+    let mut s_gr = Shared::<[f32]>::new_slice(64usize);
     let mut s_f = Shared::<[f32]>::new_slice(64usize);
 
     let mut sreg = zeros(st);
@@ -407,27 +619,63 @@ pub(super) fn wmma_state_backward_kernel<E: Float>(
         }
     }
 
+    // The first chunk's inputs, read; its keys, W^T and decays staged.
+    let per = comptime!(64 * ck / units);
+    let mut pk = Array::<Vector<E, V8>>::new(per as usize);
+    let mut pw = Array::<Vector<E, V8>>::new(per as usize);
+    let mut pt = Array::<Vector<E, V8>>::new(8usize);
+    let mut pl = Array::<Vector<E, V8>>::new(ptiles as usize);
+    let lrow = v0 + pr;
+    let lcol = 2 * pt0 + half;
+    let o0 = comptime!(units - SB_O_BLOCKS);
+    if n > 0 {
+        let g = sb_read::<E>(
+            kn,
+            w_t,
+            q,
+            q_factor,
+            d_out,
+            dvl_t,
+            gcum,
+            plan,
+            &mut pk,
+            &mut pw,
+            &mut pt,
+            &mut pl,
+            base + n - 1,
+            b,
+            h,
+            heads,
+            n_chunks,
+            seq_len,
+            scale,
+            v0,
+            lrow,
+            lcol,
+            dk,
+            dv,
+            l2norm,
+            packed,
+            units,
+            ptiles,
+        );
+        sb_stage::<E>(
+            &pk,
+            &pw,
+            g,
+            s_k.as_mut_slice(),
+            s_wt.as_mut_slice(),
+            s_g.as_mut_slice(),
+            s_gr.as_mut_slice(),
+            s_f.as_mut_slice(),
+            dk,
+            units,
+        );
+    }
+
     for cr in 0..n {
         let chunk = base + n - 1 - cr;
-        let (f0, cnt) = chunk_tokens(
-            plan,
-            b as usize,
-            (chunk % n_chunks) as usize,
-            seq_len as usize,
-            packed,
-        );
-        let first = f0 as u32;
-        let count = cnt as u32;
-        if UNIT_POS < 64 {
-            s_g[UNIT_POS as usize] = gcum[(chunk * 64 + UNIT_POS) as usize].exp();
-        } else {
-            let mut f = scale;
-            if comptime!(l2norm) {
-                f = q_factor[(chunk * 64 + UNIT_POS - 64) as usize];
-            }
-            s_f[(UNIT_POS - 64) as usize] = f;
-        }
-        // dS_{c+1}, stored and staged; the keys, dO^T, this chunk's dv_local^T and decays.
+        // dS_{c+1}, stored and staged.
         #[unroll]
         for s in 0..st {
             let x = tile_as::<E>(&sreg, s);
@@ -435,92 +683,94 @@ pub(super) fn wmma_state_backward_kernel<E: Float>(
             dsn_t[((chunk * dv + v0 + vr) * ck + cc) as usize] = x;
             s_s[swizzle(vr, cc, ck) as usize] = x;
         }
-        stage_copy::<E>(
-            kn,
-            s_k.as_mut_slice(),
-            chunk * 64 * ck,
-            comptime!(64 * ck),
-            ck,
-            FOUR_WAVES,
-        );
-        stage_tokens_t::<E>(
-            d_out,
-            s_o.as_mut_slice(),
-            s_g.as_slice(),
-            s_g.as_slice(),
-            first,
-            count,
-            h,
-            heads,
-            v0 / 8,
-            dv,
-            4u32,
-            0u32,
-            FOUR_WAVES,
-        );
-        let mut lreg = Array::<Vector<E, V8>>::new(2usize);
-        #[unroll]
-        for s in 0..2u32 {
-            lreg[s as usize] = dvl_t[((chunk * dv + v0 + pr) * 8 + 2 * (pt0 + s) + half) as usize];
-        }
         let g_last = gcum[(chunk * 64 + 63) as usize];
         sync_cube();
 
         // dV'^T = lam (dS^T K^T) + dv_local^T.
-        let mut acc_v = zeros(2u32);
+        let mut acc_v = zeros(ptiles);
         #[unroll]
         for kk in 0..comptime!(dk / 16) {
             let x = frag::<E>(s_s.as_slice(), 16 * pv, kk, ck);
             #[unroll]
-            for s in 0..2u32 {
+            for s in 0..ptiles {
                 let a = frag::<E>(s_k.as_slice(), 16 * (pt0 + s), kk, ck);
                 mma::<E>(&def, &a, &x, &mut acc_v, s);
             }
         }
         #[unroll]
-        for s in 0..2u32 {
+        for s in 0..ptiles {
             let t0 = 16 * (pt0 + s) + 8 * half;
             let mut lam = Vector::<f32, V8>::new(0.0f32);
             #[unroll]
             for e in 0..8u32 {
-                lam.insert(
-                    e as usize,
-                    (g_last - gcum[(chunk * 64 + t0 + e) as usize]).exp(),
-                );
+                lam.insert(e as usize, (g_last - s_gr[(t0 + e) as usize]).exp());
             }
-            let x = tile_f32(&acc_v, s) * lam + Vector::<f32, V8>::cast_from(lreg[s as usize]);
+            let x = tile_f32(&acc_v, s) * lam + Vector::<f32, V8>::cast_from(pl[s as usize]);
             let cc = 2 * (pt0 + s) + half;
             dvn_t[((chunk * dv + v0 + pr) * 8 + cc) as usize] = Vector::cast_from(x);
             s_v[swizzle(pr, cc, 8u32) as usize] = Vector::cast_from(x * Vector::new(-1.0f32));
         }
         sync_cube();
-        // qg^T where the keys were; W^T.
-        stage_tokens_t::<E>(
-            q,
-            s_k.as_mut_slice(),
-            s_f.as_slice(),
-            s_g.as_slice(),
-            first,
-            count,
-            h,
-            heads,
-            0u32,
-            dk,
-            ck,
-            2u32,
-            FOUR_WAVES,
-        );
-        stage_copy::<E>(
-            w_t,
-            s_wt.as_mut_slice(),
-            chunk * dk * 8,
-            comptime!(dk * 8),
-            8u32,
-            FOUR_WAVES,
-        );
+        // qg^T where the keys were; dO^T.
+        if UNIT_POS < dk {
+            token_block_t::<E>(
+                &pt,
+                s_k.as_mut_slice(),
+                s_f.as_slice(),
+                s_g.as_slice(),
+                UNIT_POS,
+                ck,
+                2u32,
+            );
+        } else if UNIT_POS >= o0 {
+            token_block_t::<E>(
+                &pt,
+                s_o.as_mut_slice(),
+                s_g.as_slice(),
+                s_g.as_slice(),
+                UNIT_POS - o0,
+                4u32,
+                0u32,
+            );
+        }
         sync_cube();
 
+        // The next chunk's inputs into registers, while
         // dS^T = exp(G_last) dS^T + dO^T qg + (-dV'^T) W.
+        let more = cr + 1 < n;
+        let mut g = 0.0f32;
+        if more {
+            g = sb_read::<E>(
+                kn,
+                w_t,
+                q,
+                q_factor,
+                d_out,
+                dvl_t,
+                gcum,
+                plan,
+                &mut pk,
+                &mut pw,
+                &mut pt,
+                &mut pl,
+                chunk - 1,
+                b,
+                h,
+                heads,
+                n_chunks,
+                seq_len,
+                scale,
+                v0,
+                lrow,
+                lcol,
+                dk,
+                dv,
+                l2norm,
+                packed,
+                units,
+                ptiles,
+            );
+        }
         let decay = g_last.exp();
         #[unroll]
         for x in 0..comptime!(8 * st) {
@@ -545,6 +795,20 @@ pub(super) fn wmma_state_backward_kernel<E: Float>(
             }
         }
         sync_cube();
+        if more {
+            sb_stage::<E>(
+                &pk,
+                &pw,
+                g,
+                s_k.as_mut_slice(),
+                s_wt.as_mut_slice(),
+                s_g.as_mut_slice(),
+                s_gr.as_mut_slice(),
+                s_f.as_mut_slice(),
+                dk,
+                units,
+            );
+        }
     }
 
     #[unroll]
