@@ -21,6 +21,9 @@
 //! (`[.., Dk, 64]`, `[.., Dv, 64]`), and the state passing keeps the state transposed (`S^T`,
 //! `[.., Dv, Dk]`) and writes `V'` transposed, which are the operands the next kernel reads.
 //!
+//! For the backward (`wmma_bwd.rs`), the prep kernel's backward form also writes the normalised
+//! keys and `U` by rows, `T^T` by rows and `W^T`, the operands the backward's products read.
+//!
 //! Tiles are rows of 16-byte chunks, XOR-swizzled as `tc.rs`' ([`swizzle`]). Shared memory, at
 //! `Dk = Dv = 128`: the prep kernel 57.25 KiB, the state passing 44 KiB, the output kernel
 //! 48.25 KiB, within the 64 KiB a workgroup has on RDNA4.
@@ -39,7 +42,7 @@ use cubecl::cmma::MmaDefinition;
 use cubecl::prelude::*;
 
 /// One f32 accumulator element per vector, as the layout gives them.
-type R1 = Const<1>;
+pub(super) type R1 = Const<1>;
 
 /// Units of a per-chunk kernel: eight waves.
 pub(super) const CHUNK_UNITS: u32 = 256;
@@ -51,7 +54,7 @@ pub(super) const STATE_COLS: usize = 32;
 /// The operand at rows `[r0, r0 + 16)` and inner columns `[16 kk, 16 kk + 16)` of a swizzled
 /// tile of `chunks` chunks per row: lane `l` reads row `r0 + l % 16`, chunk `2 kk + l / 16`.
 #[cube]
-fn frag<E: Float>(
+pub(super) fn frag<E: Float>(
     tile: &[Vector<E, V8>],
     r0: u32,
     kk: u32,
@@ -65,7 +68,7 @@ fn frag<E: Float>(
 
 /// One operand from a vector a lane holds.
 #[cube]
-fn one<E: Float>(x: Vector<E, V8>) -> Array<Vector<E, V8>> {
+pub(super) fn one<E: Float>(x: Vector<E, V8>) -> Array<Vector<E, V8>> {
     let mut a = Array::<Vector<E, V8>>::new(1usize);
     a[0] = x;
     a
@@ -73,7 +76,7 @@ fn one<E: Float>(x: Vector<E, V8>) -> Array<Vector<E, V8>> {
 
 /// `acc[tile] += Y^T` of `zt` (`Z^T`'s rows) and `x` (`X`'s rows), as the module says.
 #[cube]
-fn mma<E: Float>(
+pub(super) fn mma<E: Float>(
     def: &MmaDefinition<E, E, f32>,
     zt: &Array<Vector<E, V8>>,
     x: &Array<Vector<E, V8>>,
@@ -93,7 +96,7 @@ fn mma<E: Float>(
 }
 
 #[cube]
-fn zeros(#[comptime] tiles: u32) -> Array<Vector<f32, R1>> {
+pub(super) fn zeros(#[comptime] tiles: u32) -> Array<Vector<f32, R1>> {
     let mut acc = Array::<Vector<f32, R1>>::new(comptime!((8 * tiles) as usize));
     #[unroll]
     for i in 0..comptime!(8 * tiles) {
@@ -104,7 +107,7 @@ fn zeros(#[comptime] tiles: u32) -> Array<Vector<f32, R1>> {
 
 /// Accumulator tile `tile`, eight f32 of one row, in the input dtype.
 #[cube]
-fn tile_as<E: Float>(acc: &Array<Vector<f32, R1>>, tile: u32) -> Vector<E, V8> {
+pub(super) fn tile_as<E: Float>(acc: &Array<Vector<f32, R1>>, tile: u32) -> Vector<E, V8> {
     let mut x = Vector::<E, V8>::new(E::from_int(0));
     #[unroll]
     for i in 0..8u32 {
@@ -118,7 +121,7 @@ fn tile_as<E: Float>(acc: &Array<Vector<f32, R1>>, tile: u32) -> Vector<E, V8> {
 
 /// Accumulator tile `tile` as eight f32.
 #[cube]
-fn tile_f32(acc: &Array<Vector<f32, R1>>, tile: u32) -> Vector<f32, V8> {
+pub(super) fn tile_f32(acc: &Array<Vector<f32, R1>>, tile: u32) -> Vector<f32, V8> {
     let mut x = Vector::<f32, V8>::new(0.0f32);
     #[unroll]
     for i in 0..8u32 {
@@ -129,7 +132,7 @@ fn tile_f32(acc: &Array<Vector<f32, R1>>, tile: u32) -> Vector<f32, V8> {
 
 /// Eight f32 from `values[at..at + 8]`.
 #[cube]
-fn eight(values: &[f32], at: u32) -> Vector<f32, V8> {
+pub(super) fn eight(values: &[f32], at: u32) -> Vector<f32, V8> {
     let mut x = Vector::<f32, V8>::new(0.0f32);
     #[unroll]
     for i in 0..8u32 {
@@ -141,7 +144,7 @@ fn eight(values: &[f32], at: u32) -> Vector<f32, V8> {
 /// The 8 x 8 block of rows `rows[base..base + 8]` transposed: vector `e` holds element `e` of
 /// each row.
 #[cube]
-fn transpose8<E: Float>(rows: &Array<Vector<E, V8>>, base: u32) -> Array<Vector<E, V8>> {
+pub(super) fn transpose8<E: Float>(rows: &Array<Vector<E, V8>>, base: u32) -> Array<Vector<E, V8>> {
     let mut cols = Array::<Vector<E, V8>>::new(8usize);
     #[unroll]
     for e in 0..8u32 {
@@ -172,6 +175,10 @@ pub(super) fn wmma_prep_kernel<E: Float>(
     ut: &mut Tensor<Vector<E, V8>>,
     knt: &mut Tensor<Vector<E, V8>>,
     gcum: &mut Tensor<f32>,
+    kn: &mut Tensor<Vector<E, V8>>,
+    ttr: &mut Tensor<Vector<E, V8>>,
+    w_t: &mut Tensor<Vector<E, V8>>,
+    u: &mut Tensor<Vector<E, V8>>,
     plan: &Tensor<u32>,
     seq_len: u32,
     n_chunks: u32,
@@ -180,6 +187,7 @@ pub(super) fn wmma_prep_kernel<E: Float>(
     #[comptime] dv: u32,
     #[comptime] l2norm: bool,
     #[comptime] packed: bool,
+    #[comptime] backward: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let def = MmaDefinition::<E, E, f32>::new(16usize, 16usize, 16usize);
@@ -256,6 +264,14 @@ pub(super) fn wmma_prep_kernel<E: Float>(
         }
     }
     sync_cube();
+    // Backward, the keys by rows as well, for the state's gradient passed back.
+    if comptime!(backward) {
+        #[unroll]
+        for i in 0..comptime!(64 * dk / 8 / CHUNK_UNITS) {
+            let idx = i * CHUNK_UNITS + UNIT_POS;
+            kn[(cube * 64 * ck + idx) as usize] = s_x[swizzle(idx / ck, idx % ck, ck) as usize];
+        }
+    }
     // G = cumsum(g): each of the first two waves scans its 32 tokens, the second adding the
     // first's total.
     if tid < 64usize {
@@ -419,6 +435,15 @@ pub(super) fn wmma_prep_kernel<E: Float>(
             x.insert(e as usize, tm[(r * 65 + cc * 8 + e) as usize]);
         }
         s_t[swizzle(r, cc, 8u32) as usize] = Vector::<E, V8>::cast_from(x);
+        // Backward, T^T by rows, in the input dtype.
+        if comptime!(backward) {
+            let mut y = Vector::<f32, V8>::new(0.0f32);
+            #[unroll]
+            for e in 0..8u32 {
+                y.insert(e as usize, tm[((cc * 8 + e) * 65 + r) as usize]);
+            }
+            ttr[(cube * 512 + idx) as usize] = Vector::<E, V8>::cast_from(y);
+        }
     }
     sync_cube();
 
@@ -444,6 +469,32 @@ pub(super) fn wmma_prep_kernel<E: Float>(
     #[unroll]
     for s in 0..wt {
         w[((cube * 64 + i) * ck + 2 * (dt0 + s) + half) as usize] = tile_as::<E>(&acc_w, s);
+    }
+    // Backward, W^T as well: the same products, the operands' roles swapped, so that a lane holds
+    // eight tokens of one of W's columns. Wave w forms row tile `dr` (of Dk) and `Dk / 32` token
+    // tiles from `it0`; T's tiles above the diagonal are zero.
+    if comptime!(backward) {
+        let tt_tiles = comptime!(dk / 32);
+        let first_t = wave * tt_tiles;
+        let dr = first_t / 4;
+        let it0 = first_t % 4;
+        let mut acc_wt = zeros(tt_tiles);
+        #[unroll]
+        for kt in 0..4u32 {
+            let x = frag::<E>(s_x.as_slice(), 16 * dr, kt, 8u32);
+            #[unroll]
+            for s in 0..tt_tiles {
+                if kt <= it0 + s {
+                    let a = frag::<E>(s_t.as_slice(), 16 * (it0 + s), kt, 8u32);
+                    mma::<E>(&def, &a, &x, &mut acc_wt, s);
+                }
+            }
+        }
+        let dw = 16 * dr + row;
+        #[unroll]
+        for s in 0..tt_tiles {
+            w_t[((cube * dk + dw) * 8 + 2 * (it0 + s) + half) as usize] = tile_as::<E>(&acc_wt, s);
+        }
     }
     sync_cube();
 
@@ -488,6 +539,31 @@ pub(super) fn wmma_prep_kernel<E: Float>(
     #[unroll]
     for s in 0..ut_tiles {
         ut[((cube * dv + vr) * 8 + 2 * (tt0 + s) + half) as usize] = tile_as::<E>(&acc_u, s);
+    }
+    // Backward, U by rows as well, the operands' roles swapped: wave w forms token tile `ur` and
+    // `Dv / 32` column tiles from `uc0`.
+    if comptime!(backward) {
+        let uw = comptime!(dv / 32);
+        let first_u = wave * uw;
+        let ur = first_u / comptime!(dv / 16);
+        let uc0 = first_u % comptime!(dv / 16);
+        let mut acc_ur = zeros(uw);
+        #[unroll]
+        for kt in 0..4u32 {
+            if kt <= ur {
+                let x = frag::<E>(s_t.as_slice(), 16 * ur, kt, 8u32);
+                #[unroll]
+                for s in 0..uw {
+                    let a = frag::<E>(s_x.as_slice(), 16 * (uc0 + s), kt, 8u32);
+                    mma::<E>(&def, &a, &x, &mut acc_ur, s);
+                }
+            }
+        }
+        let ui = 16 * ur + row;
+        #[unroll]
+        for s in 0..uw {
+            u[((cube * 64 + ui) * cv + 2 * (uc0 + s) + half) as usize] = tile_as::<E>(&acc_ur, s);
+        }
     }
 }
 

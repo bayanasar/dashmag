@@ -58,17 +58,17 @@
 //! columns at a time and reuse their regions from phase to phase, and the products with the state
 //! keep no reduction array of their own. CUDA cards of compute capability 8.0 and later have all
 //! of it, and a Radeon AI PRO R9700 (RDNA4, 64 KiB) has what both passes ask. Where the tensor
-//! cores'
-//! instructions are missing but the device's 16 x 16 x 16 product from bf16 or f16 into f32 has
-//! RDNA4's register layout (the R9700's), a forward from those dtypes with `Dk` and `Dv` of 32, 64
-//! or 128 runs three kernels of its own on those products instead (`chunk/cube/wmma.rs`), which
-//! form what those on tensor cores form, with the same intermediates in the input dtype and the
-//! same roundings, in at most 57.25 KiB of shared memory; the backward pass there runs the f32
-//! kernels. On a device without what any of the kernels ask, and for heads wider than 256, the
-//! reference runs instead (`kernels_take`, `tensor_cores_take` and `wmma_takes` tell which):
-//! under wgpu on OpenGL over D3D12 and on lavapipe (Vulkan on the CPU), both with 32 KiB of shared
-//! memory and no plane operations, and on CubeCL's CPU runtime (as many units per cube as cores),
-//! for instance.
+//! cores' instructions are missing but the device's 16 x 16 x 16 product from bf16 or f16 into
+//! f32 has RDNA4's register layout (the R9700's), a forward from those dtypes with `Dk` and `Dv`
+//! of 32, 64 or 128 runs three kernels of its own on those products instead
+//! (`chunk/cube/wmma.rs`), and a backward six (`chunk/cube/wmma_bwd.rs`: the prep kernel in a form
+//! that also writes what the backward reads, the state passing, then four of the backward's own),
+//! which form what those on tensor cores form, with the same intermediates in the input dtype, in
+//! at most 57.25 KiB of shared memory forward and 59.0 KiB backward. On a device without what any
+//! of the kernels ask, and for heads wider than 256, the reference runs instead (`kernels_take`,
+//! `tensor_cores_take` and `wmma_takes` tell which): under wgpu on OpenGL over D3D12 and on
+//! lavapipe (Vulkan on the CPU), both with 32 KiB of shared memory and no plane operations, and on
+//! CubeCL's CPU runtime (as many units per cube as cores), for instance.
 //!
 //! Measured against transformers' function at f32 (the tests' fixtures), the output, the final
 //! state and every gradient agree to within 1.13e-6 relative to each tensor's largest value; from
@@ -138,8 +138,8 @@ pub mod probe {
         TENSOR_CORE_LAUNCHES.load(Ordering::SeqCst)
     }
 
-    /// Those of [`kernel_launches`] that ran the forward's kernels on RDNA4's matrix products
-    /// (`chunk/cube/wmma.rs`).
+    /// Those of [`kernel_launches`] that ran the kernels on RDNA4's matrix products
+    /// (`chunk/cube/wmma.rs` and `chunk/cube/wmma_bwd.rs`).
     pub fn wmma_launches() -> usize {
         WMMA_LAUNCHES.load(Ordering::SeqCst)
     }
@@ -203,24 +203,27 @@ pub fn tensor_cores_take(
     [false, false]
 }
 
-/// Whether the forward's kernels on RDNA4's matrix products take a forward pass, as
+/// Whether the kernels on RDNA4's matrix products take a forward and a backward pass, as
 /// [`kernels_take`]: bf16 or f16 inputs, `Dk` and `Dv` of 32, 64 or 128, where the kernels on
-/// tensor cores do not, on a device whose 16 x 16 x 16 product from the dtype into f32 has RDNA4's
-/// register layout, with what the kernels ask (module documentation). Their products round as
-/// those on tensor cores do. For tests.
+/// tensor cores do not take that pass, on a device whose 16 x 16 x 16 product from the dtype into
+/// f32 has RDNA4's register layout, with what the kernels ask (module documentation). Their
+/// products round as those on tensor cores do. For tests.
 #[doc(hidden)]
 pub fn wmma_takes(
     device: &Device,
     dtype: DType,
     dims: [usize; 5],
     packed: Option<(usize, DType)>,
-) -> bool {
+) -> [bool; 2] {
     #[cfg(feature = "cubecl")]
     if let Some(client) = crate::cube::client(device.as_dispatch()) {
-        return cube::wmma_take(&client, dtype, dims, packed);
+        return [
+            cube::wmma_take(&client, dtype, dims, packed),
+            cube::wmma_backward_take(&client, dtype, dims, packed),
+        ];
     }
     let _ = (device, dtype, dims, packed);
-    false
+    [false, false]
 }
 
 /// The shape of what a forward pass over `[B, T, H, Dk, Dv]` in `dtype` keeps for its backward

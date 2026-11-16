@@ -164,7 +164,7 @@ mod cube {
     };
 
     /// How many kernel launches a forward and a backward pass over `[B, T, H, Dk, Dv]` in `dtype`
-    /// make on `device`: three for a forward pass and, for a backward pass, six on tensor cores
+    /// make on `device`: three for a forward pass and, for a backward pass, six on matrix units
     /// and nine on the f32 kernels; none for a pass the reference takes. Under CUDA the kernels
     /// take both: cards of compute capability 8.0 and later have all they ask.
     fn expected_launches(device: &Device, dtype: DType, dims: [usize; 5]) -> usize {
@@ -176,17 +176,19 @@ mod cube {
             );
         }
         let [_, tc_backward] = tensor_cores_take(device, dtype, dims, None);
-        let backward_launches = if tc_backward { 6 } else { 9 };
+        let [_, wmma_backward] = wmma_takes(device, dtype, dims, None);
+        let backward_launches = if tc_backward || wmma_backward { 6 } else { 9 };
         3 * usize::from(forward) + backward_launches * usize::from(backward)
     }
 
     /// How many of those launches run on matrix units: all of them where the kernels on tensor
     /// cores take the pass, which under CUDA they do for bf16 and f16 inputs with heads of 32, 64
-    /// or 128; and the forward's three where those on RDNA4's matrix products take it, whose
-    /// products round as those on tensor cores do.
+    /// or 128, or where those on RDNA4's matrix products take it, whose products round as those
+    /// on tensor cores do.
     fn expected_tc_launches(device: &Device, dtype: DType, dims: [usize; 5]) -> usize {
         let [forward, backward] = tensor_cores_take(device, dtype, dims, None);
-        let forward = forward || wmma_takes(device, dtype, dims, None);
+        let [wmma_forward, wmma_backward] = wmma_takes(device, dtype, dims, None);
+        let (forward, backward) = (forward || wmma_forward, backward || wmma_backward);
         let narrow = |d: usize| matches!(d, 32 | 64 | 128);
         if common::runtime_of(device) == Some("cuda")
             && matches!(dtype, DType::BF16 | DType::F16)

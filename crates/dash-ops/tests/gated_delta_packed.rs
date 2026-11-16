@@ -370,7 +370,7 @@ mod cube {
     use dash_ops::gated_delta::recurrent::{self, gated_delta_step_reference, kernel_takes};
 
     /// The kernel launches a packed forward and backward pass over `[1, T, H, Dk, Dv]` in
-    /// `dtype` make on `device`: four forward and, backward, seven on tensor cores or ten on the
+    /// `dtype` make on `device`: four forward and, backward, seven on matrix units or ten on the
     /// f32 kernels where the kernels take them (the chunks' layout first in each), none where the
     /// reference does. Under CUDA the kernels take heads up to their width.
     fn expected_launches(device: &Device, dtype: DType, dims: [usize; 5], seqs: usize) -> usize {
@@ -385,18 +385,20 @@ mod cube {
             );
         }
         let [_, tc_backward] = tensor_cores_take(device, dtype, dims, Some((seqs, int)));
-        let backward_launches = if tc_backward { 7 } else { 10 };
+        let [_, wmma_backward] = wmma_takes(device, dtype, dims, Some((seqs, int)));
+        let backward_launches = if tc_backward || wmma_backward { 7 } else { 10 };
         4 * usize::from(forward) + backward_launches * usize::from(backward)
     }
 
     /// How many of those run on matrix units: three forward and six backward (all but the
     /// chunks' layout) where the kernels on tensor cores take them, which under CUDA they do for
-    /// bf16 inputs with heads of 32, 64 or 128; the forward's three where those on RDNA4's matrix
-    /// products take it, whose products round as those on tensor cores do.
+    /// bf16 inputs with heads of 32, 64 or 128, or where those on RDNA4's matrix products do,
+    /// whose products round as those on tensor cores do.
     fn expected_tc_launches(device: &Device, dtype: DType, dims: [usize; 5], seqs: usize) -> usize {
         let int = cu_seqlens(&[0, 1], device).dtype();
         let [forward, backward] = tensor_cores_take(device, dtype, dims, Some((seqs, int)));
-        let forward = forward || wmma_takes(device, dtype, dims, Some((seqs, int)));
+        let [wmma_forward, wmma_backward] = wmma_takes(device, dtype, dims, Some((seqs, int)));
+        let (forward, backward) = (forward || wmma_forward, backward || wmma_backward);
         let narrow = |d: usize| matches!(d, 32 | 64 | 128);
         if common::runtime_of(device) == Some("cuda")
             && matches!(dtype, DType::BF16 | DType::F16)
