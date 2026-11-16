@@ -18,9 +18,10 @@
 //!   memory), and `dV^T += dO^T P^T`, `dK^T += Q^T dS^T` from those tiles transposed.
 //!
 //! A wave's accumulator over the whole head dimension would not fit beside the rows it holds at
-//! `D` 256 (and for `dK` and `dV` together at 128), so `ds` waves share each 16 rows, each
-//! accumulating `D / ds` of the columns and each forming the scores and their gradient for the
-//! rows itself.
+//! `D` 256 (and for `dK` and `dV` together past 64), so `ds` waves share each 16 rows: each holds
+//! `D / ds` of the lane's row and accumulates `D / ds` of the gradients' columns, and forms its
+//! part of the sums of `S` and `dP` over those columns; the parts are added through shared memory
+//! in the order of the waves ([`sum_partials`]), so that each product runs once.
 
 // See `kernels.rs`: CubeCL's frontend takes the plain operators.
 #![allow(
@@ -38,22 +39,80 @@ use cubecl::prelude::*;
 /// One f32 accumulator element per vector, as the layout gives them.
 type R1 = Const<1>;
 
-/// Keys per tile of the query gradient's sweep.
-pub(crate) const DQ_BLOCK_KV: u32 = 32;
-
-/// The query gradient's shape for a head dimension `d`: 16-query groups per cube and waves per
-/// group.
-pub(crate) fn dq_shape(d: u32) -> (u32, u32) {
-    if d > 128 { (2, 4) } else { (4, 1) }
+/// The query gradient's shape for a head dimension `d`: 16-query groups per cube, waves per
+/// group (each contracting `D / ds` of the scores' sums and accumulating `D / ds` of the
+/// gradient's columns), and keys per tile. At `D` 256 two waves share each 16 queries: a lane's
+/// rows of `Q` and `dO` and its accumulator over the whole of `D` would not fit together. On a
+/// Radeon AI PRO R9700 four groups of two took 0.88 to 0.95 times the backward's time of two
+/// groups of four, and of four of four, at T 2048 and 4096.
+pub(crate) fn dq_shape(d: u32) -> (u32, u32, u32) {
+    if d > 128 { (4, 2, 16) } else { (4, 1, 32) }
 }
 
 /// The key and value gradients' shape for a head dimension `d`: 16-key groups per cube, waves
-/// per group, and queries per step.
-pub(crate) fn dkdv_shape(d: u32) -> (u32, u32, u32) {
+/// per group, queries per step, and whether the group's waves split the scores' sums over `D` (as
+/// [`dq_shape`]'s) or each forms them whole. Past 64 two waves share each 16 keys, for the two
+/// accumulators beside the lane's rows of `K` and `V`. At `D` 256 those rows would not fit
+/// whole beside them: the waves split the sums, 16 queries a step, so that the partial sums fit
+/// beside the tiles. At `D` 128 each wave forms the scores whole, 32 queries a step. On a Radeon
+/// AI PRO R9700 that took 0.93 to 0.95 times the time of splitting, 16 queries a step, at T 4096,
+/// and 1.03 to 1.06 times at 2048; at `D` 256, splitting with four groups of two took 0.86 times
+/// two groups of four at T 4096 and 8192, and 1.03 to 1.04 times at 2048.
+pub(crate) fn dkdv_shape(d: u32) -> (u32, u32, u32, bool) {
     match d {
-        0..=64 => (4, 1, 32),
-        65..=128 => (4, 2, 32),
-        _ => (2, 4, 16),
+        0..=64 => (4, 1, 32, false),
+        65..=128 => (4, 2, 32, false),
+        _ => (4, 2, 16, true),
+    }
+}
+
+/// Bytes of shared memory the partial scores and their gradient take: with `ds` waves per group,
+/// each wave's `rows / 2` f32 per lane of both.
+pub(crate) fn partial_bytes(groups: u32, ds: u32, rows: u32) -> usize {
+    if ds > 1 {
+        (2 * ds * groups * 32 * (rows / 2) * 4) as usize
+    } else {
+        0
+    }
+}
+
+/// Sums the `ds` waves' partial `acc_s` and `acc_dp` (each `len` f32 a lane) of wave group `g`
+/// through `s_ps` and `s_pdp`, in the order of the waves, into both: every wave of the group then
+/// holds the whole sums. A barrier between the writes and the reads; the caller's barrier before
+/// its next writes.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn sum_partials(
+    acc_s: &mut Array<Vector<f32, R1>>,
+    acc_dp: &mut Array<Vector<f32, R1>>,
+    s_ps: &mut [f32],
+    s_pdp: &mut [f32],
+    g: u32,
+    part: u32,
+    #[comptime] groups: u32,
+    #[comptime] ds: u32,
+    #[comptime] len: u32,
+) {
+    let lane = UNIT_POS_PLANE;
+    #[unroll]
+    for i in 0..len {
+        let at = (((part * groups + g) * len + i) * 32 + lane) as usize;
+        s_ps[at] = acc_s[i as usize].extract(0usize);
+        s_pdp[at] = acc_dp[i as usize].extract(0usize);
+    }
+    sync_cube();
+    #[unroll]
+    for i in 0..len {
+        let mut x = 0.0f32;
+        let mut y = 0.0f32;
+        #[unroll]
+        for p in 0..ds {
+            let at = (((p * groups + g) * len + i) * 32 + lane) as usize;
+            x += s_ps[at];
+            y += s_pdp[at];
+        }
+        acc_s[i as usize] = Vector::new(x);
+        acc_dp[i as usize] = Vector::new(y);
     }
 }
 
@@ -106,9 +165,9 @@ fn tile_as<E: Float>(acc: &Array<Vector<f32, R1>>, tile: u32, factor: f32) -> Ve
     x
 }
 
-/// The lane's row `row` (below `limit`, else zeros) of one (batch, head) slice of `src`, `D / 16`
-/// vectors of eight: the elements `16 kk + 8 (lane / 16)..+8` at `kk`, a B operand per step of 16
-/// along `D`.
+/// The lane's row `row` (below `limit`, else zeros) of one (batch, head) slice of `src`, from
+/// column `16 kk0`, `kks` vectors of eight: the elements `16 (kk0 + kk) + 8 (lane / 16)..+8` at
+/// `kk`, a B operand per step of 16 along `D`.
 #[cube]
 fn lane_row<E: Float>(
     src: &Tensor<Vector<E, V8>>,
@@ -116,15 +175,16 @@ fn lane_row<E: Float>(
     stride: u32,
     row: u32,
     limit: u32,
-    #[comptime] d: u32,
+    kk0: u32,
+    #[comptime] kks: u32,
 ) -> Array<Vector<E, V8>> {
     let half = UNIT_POS_PLANE / 16;
-    let mut x = Array::<Vector<E, V8>>::new(comptime!((d / 16) as usize));
+    let mut x = Array::<Vector<E, V8>>::new(kks as usize);
     #[unroll]
-    for kk in 0..comptime!(d / 16) {
+    for kk in 0..kks {
         let mut value = Vector::<E, V8>::new(E::from_int(0));
         if row < limit {
-            value = src[base + row as usize * stride as usize + (kk * 2 + half) as usize];
+            value = src[base + row as usize * stride as usize + ((kk0 + kk) * 2 + half) as usize];
         }
         x[kk as usize] = value;
     }
@@ -175,15 +235,15 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
     #[comptime] d: u32,
     #[comptime] groups: u32,
     #[comptime] ds: u32,
+    #[comptime] block_kv: u32,
     #[comptime] padded: bool,
     #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
 ) {
     let block_q = comptime!(16 * groups);
-    let block_kv = comptime!(DQ_BLOCK_KV);
     let threads = comptime!(32 * groups * ds);
     let chunks = comptime!(d / 8);
-    let kgroups = comptime!(DQ_BLOCK_KV / 8);
+    let kgroups = comptime!(block_kv / 8);
     let cols = comptime!(d / 16 / ds);
     let def = MmaDefinition::<E, E, f32>::new(16usize, 16usize, 16usize);
     let wave = UNIT_POS / 32;
@@ -234,8 +294,10 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
     ) as u32;
     let key0 = first_tile as u32 * block_kv;
 
-    let q_frag = lane_row::<E>(q, q_base, q_st, row, tq, d);
-    let do_frag = lane_row::<E>(d_o, do_base, do_st, row, tq, d);
+    // The lane's part of its query's rows of Q and dO: columns `part D / ds..`.
+    let kk0 = part * cols;
+    let q_frag = lane_row::<E>(q, q_base, q_st, row, tq, kk0, cols);
+    let do_frag = lane_row::<E>(d_o, do_base, do_st, row, tq, kk0, cols);
     let mut l_row = f32::new(f32::INFINITY);
     let mut delta_row = 0.0f32;
     if row < tq {
@@ -244,12 +306,19 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
         delta_row = delta[at];
     }
 
-    let tile = comptime!((DQ_BLOCK_KV * d / 8) as usize);
+    let tile = comptime!((block_kv * d / 8) as usize);
     let mut s_k = Shared::<[Vector<E, V8>]>::new_aligned_slice(tile, 16usize);
     let mut s_v = Shared::<[Vector<E, V8>]>::new_aligned_slice(tile, 16usize);
     let mut s_kt = Shared::<[Vector<E, V8>]>::new_aligned_slice(tile, 16usize);
     let mut s_pad =
-        Shared::<[i32]>::new_slice(comptime!(if padded { DQ_BLOCK_KV } else { 1u32 }) as usize);
+        Shared::<[i32]>::new_slice(comptime!(if padded { block_kv } else { 1u32 }) as usize);
+    let partial = comptime!(if ds > 1 {
+        ds * groups * 32 * (block_kv / 2)
+    } else {
+        1u32
+    });
+    let mut s_ps = Shared::<[f32]>::new_slice(partial as usize);
+    let mut s_pdp = Shared::<[f32]>::new_slice(partial as usize);
 
     let mut acc_dq = zeros(comptime!(8 * cols));
 
@@ -300,17 +369,31 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
         let start = k0 as i32;
         let masked = padded || !(all_lo <= start && start + size <= all_hi);
 
-        // S^T and dP^T, one 16 x 16 tile per 16 keys: eight keys of the lane's query per tile.
+        // S^T and dP^T, one 16 x 16 tile per 16 keys: eight keys of the lane's query per tile,
+        // over the wave's part of D, then summed over the group's waves.
         let mut acc_s = zeros(comptime!(block_kv / 2));
         let mut acc_dp = zeros(comptime!(block_kv / 2));
         #[unroll]
         for mt in 0..comptime!(block_kv / 16) {
             #[unroll]
-            for kk in 0..comptime!(d / 16) {
-                let at = swizzle(mt * 16 + col, kk * 2 + half, chunks) as usize;
+            for kk in 0..cols {
+                let at = swizzle(mt * 16 + col, (kk0 + kk) * 2 + half, chunks) as usize;
                 mma::<E>(&def, s_k[at], q_frag[kk as usize], &mut acc_s, mt);
                 mma::<E>(&def, s_v[at], do_frag[kk as usize], &mut acc_dp, mt);
             }
+        }
+        if comptime!(ds > 1) {
+            sum_partials(
+                &mut acc_s,
+                &mut acc_dp,
+                s_ps.as_mut_slice(),
+                s_pdp.as_mut_slice(),
+                qg,
+                part,
+                groups,
+                ds,
+                comptime!(block_kv / 2),
+            );
         }
 
         // P = exp(S scale - lse) and dS = P (dP - delta), the lane's query's.
@@ -400,6 +483,7 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
     #[comptime] groups: u32,
     #[comptime] ds: u32,
     #[comptime] sq: u32,
+    #[comptime] split: bool,
     #[comptime] padded: bool,
     #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
@@ -426,9 +510,15 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
     let v_base = b as usize * v_sb as usize + hk as usize * v_sh as usize;
 
     // This lane's key, its rows of K and V, and whether it is padding.
+    // Split, the wave's part of the rows (its columns of D); otherwise the whole rows.
     let key = k0 + kg * 16 + col;
-    let k_frag = lane_row::<E>(k, k_base, k_st, key, tk, d);
-    let v_frag = lane_row::<E>(v, v_base, v_st, key, tk, d);
+    let kks = comptime!(if split { d / 16 / ds } else { d / 16 });
+    let mut kk0 = 0u32;
+    if comptime!(split) {
+        kk0 = part * cols;
+    }
+    let k_frag = lane_row::<E>(k, k_base, k_st, key, tk, kk0, kks);
+    let v_frag = lane_row::<E>(v, v_base, v_st, key, tk, kk0, kks);
     let mut pad = false;
     if comptime!(padded) {
         if key < tk {
@@ -459,6 +549,13 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
     let mut s_delta = Shared::<[f32]>::new_slice(sq as usize);
     let mut s_lo = Shared::<[i32]>::new_slice(sq as usize);
     let mut s_hi = Shared::<[i32]>::new_slice(sq as usize);
+    let partial = comptime!(if split && ds > 1 {
+        ds * groups * 32 * (sq / 2)
+    } else {
+        1u32
+    });
+    let mut s_ps = Shared::<[f32]>::new_slice(partial as usize);
+    let mut s_pdp = Shared::<[f32]>::new_slice(partial as usize);
 
     let mut acc_dk = zeros(comptime!(8 * cols));
     let mut acc_dv = zeros(comptime!(8 * cols));
@@ -534,17 +631,31 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
         // back), and none of them is padding.
         let masked = padded || !(s_lo[(sq - 1) as usize] <= wave_lo && wave_hi <= s_hi[0usize]);
 
-        // S^T = K Q^T and dP^T = V dO^T: the lane's key against eight queries per tile.
+        // S^T = K Q^T and dP^T = V dO^T: the lane's key against eight queries per tile; split,
+        // over the wave's part of D, then summed over the group's waves.
         let mut acc_s = zeros(comptime!(sq / 2));
         let mut acc_dp = zeros(comptime!(sq / 2));
         #[unroll]
         for qt in 0..comptime!(sq / 16) {
             #[unroll]
-            for kk in 0..comptime!(d / 16) {
-                let at = swizzle(qt * 16 + col, kk * 2 + half, chunks) as usize;
+            for kk in 0..kks {
+                let at = swizzle(qt * 16 + col, (kk0 + kk) * 2 + half, chunks) as usize;
                 mma::<E>(&def, s_q[at], k_frag[kk as usize], &mut acc_s, qt);
                 mma::<E>(&def, s_do[at], v_frag[kk as usize], &mut acc_dp, qt);
             }
+        }
+        if comptime!(split && ds > 1) {
+            sum_partials(
+                &mut acc_s,
+                &mut acc_dp,
+                s_ps.as_mut_slice(),
+                s_pdp.as_mut_slice(),
+                kg,
+                part,
+                groups,
+                ds,
+                comptime!(sq / 2),
+            );
         }
 
         // P^T = exp(S^T scale - lse) and dS^T = P^T (dP^T - delta), each query's own.

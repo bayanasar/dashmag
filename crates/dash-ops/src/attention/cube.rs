@@ -15,7 +15,7 @@ use super::kernels::{
     dq_kernel, finish_kernel, forward_kernel,
 };
 use super::wmma::{WMMA_BLOCK_KV, WMMA_BLOCK_Q, forward_wmma_kernel};
-use super::wmma_backward::{DQ_BLOCK_KV, dkdv_shape, dkdv_wmma_kernel, dq_shape, dq_wmma_kernel};
+use super::wmma_backward::{dkdv_shape, dkdv_wmma_kernel, dq_shape, dq_wmma_kernel, partial_bytes};
 use super::{
     AttentionBackend, AttentionMaskPrimitive, AttentionOptions, CacheLengths, MaskShape, Reach,
     check_decode_shapes, check_shapes, probe, reference,
@@ -211,19 +211,25 @@ fn forward_on_wmma(client: &Client, dtype: DType, dims: [usize; 6]) -> bool {
 /// eleven tensors; 16-byte vectors and planes of 32.
 fn wmma_backward_requirements([b, tq, tk, hq, hkv, d]: [usize; 6]) -> Requirements {
     let rows_per_cube = 256 / (d / VECTOR);
-    let (dq_groups, dq_ds) = dq_shape(d as u32);
-    let (kv_groups, kv_ds, sq) = dkdv_shape(d as u32);
-    let (dq_groups, dq_ds, kv_groups, kv_ds, sq) = (
+    let (dq_groups, dq_ds, bkv) = dq_shape(d as u32);
+    let (kv_groups, kv_ds, sq, kv_split) = dkdv_shape(d as u32);
+    let dq_partials = partial_bytes(dq_groups, dq_ds, bkv);
+    let kv_partials = if kv_split {
+        partial_bytes(kv_groups, kv_ds, sq)
+    } else {
+        0
+    };
+    let (dq_groups, dq_ds, bkv, kv_groups, kv_ds, sq) = (
         dq_groups as usize,
         dq_ds as usize,
+        bkv as usize,
         kv_groups as usize,
         kv_ds as usize,
         sq as usize,
     );
-    let bkv = DQ_BLOCK_KV as usize;
     let delta = Requirements::new((256, 1), ((b * tq * hq).div_ceil(rows_per_cube), 1), 11);
     let dq = Requirements {
-        shared_bytes: 3 * bkv * d * 2 + 4 * (2 * dq_groups + bkv),
+        shared_bytes: 3 * bkv * d * 2 + 4 * (2 * dq_groups + bkv) + dq_partials,
         ..Requirements::new(
             ((32 * dq_groups * dq_ds) as u32, 1),
             (tq.div_ceil(16 * dq_groups), hq),
@@ -231,7 +237,7 @@ fn wmma_backward_requirements([b, tq, tk, hq, hkv, d]: [usize; 6]) -> Requiremen
         )
     };
     let dkdv = Requirements {
-        shared_bytes: 4 * sq * d * 2 + 4 * 4 * sq,
+        shared_bytes: 4 * sq * d * 2 + 4 * 4 * sq + kv_partials,
         ..Requirements::new(
             ((32 * kv_groups * kv_ds) as u32, 1),
             (tk.div_ceil(16 * kv_groups), hkv),
@@ -655,7 +661,7 @@ fn wmma_backward(
     let [do_sb, do_sh, do_st] = sequence_strides(grad_output);
     let [m_sb, m_st] = mask.key_strides;
     let group = (hq / hkv) as u32;
-    let (dq_groups, dq_ds) = dq_shape(d as u32);
+    let (dq_groups, dq_ds, dq_keys) = dq_shape(d as u32);
     let q_blocks = tq.div_ceil(16 * dq_groups as usize);
     launched();
     // SAFETY: as for the forward of `wmma.rs`; each cube writes the rows of its own queries,
@@ -700,12 +706,13 @@ fn wmma_backward(
             d as u32,
             dq_groups,
             dq_ds,
+            dq_keys,
             mask.padded,
             mask.packed,
             dtype,
         );
     }
-    let (kv_groups, kv_ds, sq) = dkdv_shape(d as u32);
+    let (kv_groups, kv_ds, sq, kv_split) = dkdv_shape(d as u32);
     launched();
     // SAFETY: as above; each cube writes the rows of its own keys, below Tk.
     unsafe {
@@ -753,6 +760,7 @@ fn wmma_backward(
             kv_groups,
             kv_ds,
             sq,
+            kv_split,
             mask.padded,
             mask.packed,
             dtype,
