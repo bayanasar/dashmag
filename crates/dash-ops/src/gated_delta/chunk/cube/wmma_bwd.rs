@@ -587,44 +587,6 @@ fn fragb<E: Float>(
     x
 }
 
-/// Rows `[r0, r0 + rows)`, chunks `[c0, c0 + chunks)` of a chunked tensor whose rows are `width`
-/// chunks long (from vector `src_base`), transposed into the tile at `base` in `dst`: row `8 c + e`
-/// holds column `8 (c0 + c) + e` of the rows, `rows / 8` chunks to a row ([`swz`]).
-#[cube]
-fn stage_t<E: Float>(
-    src: &Tensor<Vector<E, V8>>,
-    dst: &mut [Vector<E, V8>],
-    base: u32,
-    src_base: u32,
-    r0: u32,
-    c0: u32,
-    #[comptime] width: u32,
-    #[comptime] rows: u32,
-    #[comptime] chunks: u32,
-    #[comptime] units: u32,
-) {
-    let groups = comptime!(rows / 8);
-    let blocks = comptime!(groups * chunks);
-    #[unroll]
-    for i in 0..comptime!((blocks + units - 1) / units) {
-        let idx = i * units + UNIT_POS;
-        if idx < blocks {
-            let c = idx % chunks;
-            let grp = idx / chunks;
-            let mut vals = Array::<Vector<E, V8>>::new(8usize);
-            #[unroll]
-            for j in 0..8u32 {
-                vals[j as usize] = src[(src_base + (r0 + grp * 8 + j) * width + c0 + c) as usize];
-            }
-            let cols = transpose8::<E>(&vals, 0u32);
-            #[unroll]
-            for e in 0..8u32 {
-                dst[(base + swz(c * 8 + e, grp, groups)) as usize] = cols[e as usize];
-            }
-        }
-    }
-}
-
 /// Sums each of a chunk's 64 rows over the lanes and waves holding it: `p` the lane's part of
 /// row `16 it + l % 16` (both half-waves hold a part of it, and the waves of `hf` 0 and 1 each
 /// half of the row tile's columns), `out[r]` the row's sum, added in that order. Two barriers.
@@ -652,6 +614,113 @@ fn dot8<E: Float>(a: Vector<f32, V8>, b: Vector<E, V8>) -> f32 {
         x += p.extract(e);
     }
     x
+}
+
+/// Units of [`wmma_dqk_kernel`] that load the transposed operands of a block of its loop over
+/// `Dv`, each source from its own range of units, so that no unit holds more than eight vectors:
+/// `V'^T` from unit 128, `S^T` from 160 and `dS^T` from 192 (units 0 to 127 load `dO`).
+const DQK_VNT_UNITS: u32 = 128;
+const DQK_S_UNITS: u32 = 160;
+const DQK_DS_UNITS: u32 = 192;
+
+/// The global reads of block `vb` of [`wmma_dqk_kernel`]'s loop over `Dv` (16 columns): the
+/// unit's vector of `dO` (units 0 to 127), or one 16-byte chunk of 8 consecutive rows of the
+/// block's 16 rows of `V'^T`, `S^T` or `dS^T`. Returned to be written by [`dqk_block_store`]
+/// after the products of the block before, so that the reads are in flight while those run.
+#[cube]
+fn dqk_block_load<E: Float>(
+    d_out: &Tensor<Vector<E, V8>>,
+    vnt: &Tensor<Vector<E, V8>>,
+    states: &Tensor<Vector<E, V8>>,
+    dsn_t: &Tensor<Vector<E, V8>>,
+    cube: u32,
+    first: u32,
+    count: u32,
+    h: u32,
+    heads: u32,
+    vb: u32,
+    #[comptime] dk: u32,
+    #[comptime] dv: u32,
+) -> Array<Vector<E, V8>> {
+    let ck = comptime!(dk / 8);
+    let cv = comptime!(dv / 8);
+    let u = UNIT_POS;
+    let mut vals = Array::<Vector<E, V8>>::new(8usize);
+    if u < DQK_VNT_UNITS {
+        let r = u / 2;
+        let mut x = Vector::<E, V8>::new(E::from_int(0));
+        if r < count {
+            x = d_out[(((first + r) * heads + h) * cv + 2 * vb + u % 2) as usize];
+        }
+        vals[0] = x;
+    } else if u < DQK_VNT_UNITS + 16 {
+        let idx = u - DQK_VNT_UNITS;
+        let c = idx % 8;
+        let grp = idx / 8;
+        #[unroll]
+        for j in 0..8u32 {
+            vals[j as usize] = vnt[(cube * dv * 8 + (16 * vb + grp * 8 + j) * 8 + c) as usize];
+        }
+    } else if u >= DQK_S_UNITS && u < comptime!(DQK_S_UNITS + 2 * dk / 8) {
+        let idx = u - DQK_S_UNITS;
+        let c = idx % ck;
+        let grp = idx / ck;
+        #[unroll]
+        for j in 0..8u32 {
+            vals[j as usize] = states[(cube * dv * ck + (16 * vb + grp * 8 + j) * ck + c) as usize];
+        }
+    } else if u >= DQK_DS_UNITS && u < comptime!(DQK_DS_UNITS + 2 * dk / 8) {
+        let idx = u - DQK_DS_UNITS;
+        let c = idx % ck;
+        let grp = idx / ck;
+        #[unroll]
+        for j in 0..8u32 {
+            vals[j as usize] = dsn_t[(cube * dv * ck + (16 * vb + grp * 8 + j) * ck + c) as usize];
+        }
+    }
+    vals
+}
+
+/// Writes what [`dqk_block_load`] read into the loop's region of shared memory: `dO` by rows at
+/// `o_at` (rows of 2 chunks), and `V'`, `S` and `dS` by rows at `v_at`, `s_at` and `z_at`, each
+/// unit's 8 rows of 8 transposed in registers so that row `8 c + e` holds element `e` of chunk
+/// `c` of the 16 rows read, 2 chunks to a row ([`swz`]).
+#[cube]
+fn dqk_block_store<E: Float>(
+    vals: &Array<Vector<E, V8>>,
+    r4: &mut [Vector<E, V8>],
+    o_at: u32,
+    v_at: u32,
+    s_at: u32,
+    z_at: u32,
+    #[comptime] dk: u32,
+) {
+    let ck = comptime!(dk / 8);
+    let u = UNIT_POS;
+    if u < DQK_VNT_UNITS {
+        r4[(o_at + swz(u / 2, u % 2, 2u32)) as usize] = vals[0];
+    } else if u < DQK_VNT_UNITS + 16 {
+        let idx = u - DQK_VNT_UNITS;
+        let cols = transpose8::<E>(vals, 0u32);
+        #[unroll]
+        for e in 0..8u32 {
+            r4[(v_at + swz((idx % 8) * 8 + e, idx / 8, 2u32)) as usize] = cols[e as usize];
+        }
+    } else if u >= DQK_S_UNITS && u < comptime!(DQK_S_UNITS + 2 * dk / 8) {
+        let idx = u - DQK_S_UNITS;
+        let cols = transpose8::<E>(vals, 0u32);
+        #[unroll]
+        for e in 0..8u32 {
+            r4[(s_at + swz((idx % ck) * 8 + e, idx / ck, 2u32)) as usize] = cols[e as usize];
+        }
+    } else if u >= DQK_DS_UNITS && u < comptime!(DQK_DS_UNITS + 2 * dk / 8) {
+        let idx = u - DQK_DS_UNITS;
+        let cols = transpose8::<E>(vals, 0u32);
+        #[unroll]
+        for e in 0..8u32 {
+            r4[(z_at + swz((idx % ck) * 8 + e, idx / ck, 2u32)) as usize] = cols[e as usize];
+        }
+    }
 }
 
 /// Backward, per chunk, everything but the WY part, as `tc.rs`' `tc_dqk_kernel`: `dV_b = T^T dV'`,
@@ -819,56 +888,32 @@ pub(super) fn wmma_dqk_kernel<E: Float>(
     let v_at = 128u32;
     let s_at = 256u32;
     let z_at = comptime!(256 + 2 * dk);
+    // dO by rows (64 rows of 2 chunks), V' by rows from V'^T, and S and dS by rows (Dk rows)
+    // from S^T and dS^T: each block read into registers before the products of the block before
+    // it, written to shared memory after them.
+    let mut ahead = dqk_block_load::<E>(
+        d_out, vnt, states, dsn_t, cube, first, count, h, heads, 0u32, dk, dv,
+    );
     for vb in 0..comptime!(dv / 16) {
         sync_cube();
-        // dO by rows: 64 rows of 2 chunks.
-        if UNIT_POS < 128 {
-            let r = UNIT_POS / 2;
-            let cc = UNIT_POS % 2;
-            let mut x = Vector::<E, V8>::new(E::from_int(0));
-            if r < count {
-                x = d_out[(((first + r) * heads + h) * cv + 2 * vb + cc) as usize];
-            }
-            r4[(o_at + swz(r, cc, 2u32)) as usize] = x;
-        }
-        // V' by rows, from V'^T; S and dS by rows (Dk rows), from S^T and dS^T.
-        stage_t::<E>(
-            vnt,
-            r4.as_mut_slice(),
-            v_at,
-            cube * dv * 8,
-            16 * vb,
-            0u32,
-            8u32,
-            16u32,
-            8u32,
-            EIGHT_WAVES,
-        );
-        stage_t::<E>(
-            states,
-            r4.as_mut_slice(),
-            s_at,
-            cube * dv * ck,
-            16 * vb,
-            0u32,
-            ck,
-            16u32,
-            ck,
-            EIGHT_WAVES,
-        );
-        stage_t::<E>(
-            dsn_t,
-            r4.as_mut_slice(),
-            z_at,
-            cube * dv * ck,
-            16 * vb,
-            0u32,
-            ck,
-            16u32,
-            ck,
-            EIGHT_WAVES,
-        );
+        dqk_block_store::<E>(&ahead, r4.as_mut_slice(), o_at, v_at, s_at, z_at, dk);
         sync_cube();
+        if vb + 1 < comptime!(dv / 16) {
+            ahead = dqk_block_load::<E>(
+                d_out,
+                vnt,
+                states,
+                dsn_t,
+                cube,
+                first,
+                count,
+                h,
+                heads,
+                vb + 1,
+                dk,
+                dv,
+            );
+        }
         // <S, dS> over the block, each unit its vectors.
         #[unroll]
         for m in 0..comptime!((2 * dk + EIGHT_WAVES - 1) / EIGHT_WAVES) {
