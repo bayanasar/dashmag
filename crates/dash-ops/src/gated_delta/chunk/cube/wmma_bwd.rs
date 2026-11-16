@@ -26,7 +26,9 @@
 )]
 
 use super::tc::{V8, swizzle};
-use super::wmma::{eight, frag, mma, one, tile_as, tile_f32, transpose8, zeros};
+use super::wmma::{
+    eight, frag, mma, one, row_factor, tile_as, tile_f32, token_chunk, transpose8, zeros,
+};
 use super::{chunk_tokens, state_chunks};
 use cubecl::cmma::MmaDefinition;
 use cubecl::prelude::*;
@@ -35,35 +37,6 @@ use cubecl::prelude::*;
 pub(super) const FOUR_WAVES: u32 = 128;
 /// Units of the other per-chunk kernels: eight waves.
 pub(super) const EIGHT_WAVES: u32 = 256;
-
-/// The factor a chunk's query (or key) row is scaled by, as `tc.rs`' `stage_tokens` forms it:
-/// `scale / sqrt(sum x^2 + 1e-6)` with the l2 normalisation (`ss` the sum of the squares of the
-/// 16-byte chunk `x`, summed here over the `chunks` consecutive lanes holding the row), `scale`
-/// without.
-#[cube]
-fn row_factor<E: Float>(
-    x: Vector<E, V8>,
-    scale: f32,
-    #[comptime] chunks: u32,
-    #[comptime] l2norm: bool,
-) -> f32 {
-    let mut factor = scale;
-    if comptime!(l2norm) {
-        let f = Vector::<f32, V8>::cast_from(x);
-        let sq = f * f;
-        let mut ss = 0.0f32;
-        #[unroll]
-        for e in 0..8usize {
-            ss += sq.extract(e);
-        }
-        #[unroll]
-        for s in 0..comptime!(chunks.trailing_zeros()) {
-            ss += plane_shuffle_xor(ss, 1u32 << s);
-        }
-        factor = scale / (ss + 1e-6f32).sqrt();
-    }
-    factor
-}
 
 /// A chunk's rows of head `h` of a `[B T, H, D]` tensor (zero past `count`) into the swizzled
 /// tile `dst` (`D / 8` chunks to a row), each row times its [`row_factor`], which goes to
@@ -118,6 +91,31 @@ fn stage_copy<E: Float>(
         if idx < total {
             dst[swizzle(idx / chunks, idx % chunks, chunks) as usize] = src[(base + idx) as usize];
         }
+    }
+}
+
+/// [`stage_copy`] where every unit takes every step, as the WY kernel's copies are: a unit's
+/// reads, then its writes, with no branch between them (see [`token_chunk`]). The kernel whose
+/// products are with the states keeps [`stage_copy`]: with its reads held this way it spills.
+#[cube]
+fn stage_copy_ahead<E: Float>(
+    src: &Tensor<Vector<E, V8>>,
+    dst: &mut [Vector<E, V8>],
+    base: u32,
+    #[comptime] total: u32,
+    #[comptime] chunks: u32,
+    #[comptime] units: u32,
+) {
+    let steps = comptime!(total / units);
+    let mut x = Array::<Vector<E, V8>>::new(steps as usize);
+    #[unroll]
+    for i in 0..steps {
+        x[i as usize] = src[(base + i * units + UNIT_POS) as usize];
+    }
+    #[unroll]
+    for i in 0..steps {
+        let idx = i * units + UNIT_POS;
+        dst[swizzle(idx / chunks, idx % chunks, chunks) as usize] = x[i as usize];
     }
 }
 
@@ -318,27 +316,6 @@ pub(super) fn wmma_dvlocal_kernel<E: Float>(
         dvl_t[((cube * dv + 16 * vt + row) * 8 + 2 * jt + half) as usize] =
             tile_as::<E>(&acc, 0u32);
     }
-}
-
-/// Chunk `c` of row `r` of a chunk's tokens from `first` (zero from `count` on) of head `h` of a
-/// `[B T, H, D]` tensor of `chunks` chunks to a row, read whether or not `r` is in range (from
-/// token 0 if not), so that a unit's reads are not each behind a branch: on RDNA4 a read behind
-/// one is waited for before the next is issued.
-#[cube]
-fn token_chunk<E: Float>(
-    src: &Tensor<Vector<E, V8>>,
-    first: u32,
-    r: u32,
-    count: u32,
-    h: u32,
-    heads: u32,
-    c: u32,
-    #[comptime] chunks: u32,
-) -> Vector<E, V8> {
-    let ok = r < count;
-    let t = select(ok, first + r, 0u32);
-    let x = src[((t * heads + h) * chunks + c) as usize];
-    select(ok, x, Vector::new(E::from_int(0)))
 }
 
 /// Eight rows of one 16-byte chunk of a chunk's tokens ([`token_chunk`]): block `idx` of a
@@ -1527,7 +1504,7 @@ pub(super) fn wmma_wy_kernel<E: Float>(
         }
         bs[tid] = x;
     }
-    stage_copy::<E>(
+    stage_copy_ahead::<E>(
         dvb,
         ra.as_mut_slice(),
         cube * 64 * cv,
@@ -1535,7 +1512,7 @@ pub(super) fn wmma_wy_kernel<E: Float>(
         cv,
         EIGHT_WAVES,
     );
-    stage_copy::<E>(
+    stage_copy_ahead::<E>(
         u,
         rb.as_mut_slice(),
         cube * 64 * cv,
@@ -1586,7 +1563,7 @@ pub(super) fn wmma_wy_kernel<E: Float>(
     }
     sync_cube();
     // dKbg W^T and its transpose.
-    stage_copy::<E>(
+    stage_copy_ahead::<E>(
         dkbg,
         ra.as_mut_slice(),
         cube * 64 * ck,
@@ -1594,7 +1571,7 @@ pub(super) fn wmma_wy_kernel<E: Float>(
         ck,
         EIGHT_WAVES,
     );
-    stage_copy::<E>(
+    stage_copy_ahead::<E>(
         w,
         rb.as_mut_slice(),
         cube * 64 * ck,
@@ -1654,7 +1631,7 @@ pub(super) fn wmma_wy_kernel<E: Float>(
         rk[swz(i, 2 * jt + half, 8u32) as usize] = tile_as::<E>(&acc_a, s);
         rk[(512 + swz(i, 2 * jt + half, 8u32)) as usize] = tile_as::<E>(&acc_at, s);
     }
-    stage_copy::<E>(
+    stage_copy_ahead::<E>(
         knt,
         ra.as_mut_slice(),
         cube * dk * 8,

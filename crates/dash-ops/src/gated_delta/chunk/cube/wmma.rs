@@ -158,6 +158,84 @@ pub(super) fn transpose8<E: Float>(rows: &Array<Vector<E, V8>>, base: u32) -> Ar
     cols
 }
 
+/// The factor a chunk's query (or key) row is scaled by, as `tc.rs`' `stage_tokens` forms it:
+/// `scale / sqrt(sum x^2 + 1e-6)` with the l2 normalisation (`ss` the sum of the squares of the
+/// 16-byte chunk `x`, summed here over the `chunks` consecutive lanes holding the row), `scale`
+/// without.
+#[cube]
+pub(super) fn row_factor<E: Float>(
+    x: Vector<E, V8>,
+    scale: f32,
+    #[comptime] chunks: u32,
+    #[comptime] l2norm: bool,
+) -> f32 {
+    let mut factor = scale;
+    if comptime!(l2norm) {
+        let f = Vector::<f32, V8>::cast_from(x);
+        let sq = f * f;
+        let mut ss = 0.0f32;
+        #[unroll]
+        for e in 0..8usize {
+            ss += sq.extract(e);
+        }
+        #[unroll]
+        for s in 0..comptime!(chunks.trailing_zeros()) {
+            ss += plane_shuffle_xor(ss, 1u32 << s);
+        }
+        factor = scale / (ss + 1e-6f32).sqrt();
+    }
+    factor
+}
+
+/// Chunk `c` of row `r` of a chunk's tokens from `first` (zero from `count` on) of head `h` of a
+/// `[B T, H, D]` tensor of `chunks` chunks to a row, read whether or not `r` is in range (from
+/// token 0 if not), so that a unit's reads are not each behind a branch: on RDNA4 a read behind
+/// one is waited for before the next is issued.
+#[cube]
+pub(super) fn token_chunk<E: Float>(
+    src: &Tensor<Vector<E, V8>>,
+    first: u32,
+    r: u32,
+    count: u32,
+    h: u32,
+    heads: u32,
+    c: u32,
+    #[comptime] chunks: u32,
+) -> Vector<E, V8> {
+    let ok = r < count;
+    let t = select(ok, first + r, 0u32);
+    let x = src[((t * heads + h) * chunks + c) as usize];
+    select(ok, x, Vector::new(E::from_int(0)))
+}
+
+/// A chunk's rows of head `h` of a `[B T, H, D]` tensor (zero past `count`) into the swizzled
+/// tile `dst` (`D / 8` chunks to a row), each row times its [`row_factor`]: `tc.rs`'
+/// `stage_tokens` unscaled, with its reads not behind a branch ([`token_chunk`]).
+#[cube]
+fn stage_rows<E: Float>(
+    src: &Tensor<Vector<E, V8>>,
+    dst: &mut [Vector<E, V8>],
+    first: u32,
+    count: u32,
+    h: u32,
+    heads: u32,
+    scale: f32,
+    #[comptime] d: u32,
+    #[comptime] l2norm: bool,
+) {
+    let chunks = comptime!(d / 8);
+    #[unroll]
+    for i in 0..comptime!(64 * d / 8 / CHUNK_UNITS) {
+        let idx = i * CHUNK_UNITS + UNIT_POS;
+        let r = idx / chunks;
+        let c = idx % chunks;
+        let x = token_chunk::<E>(src, first, r, count, h, heads, c, chunks);
+        let factor = row_factor::<E>(x, scale, chunks, l2norm);
+        dst[swizzle(r, c, chunks) as usize] =
+            Vector::cast_from(Vector::<f32, V8>::cast_from(x) * Vector::new(factor));
+    }
+}
+
 /// Per chunk, everything the state passing needs that does not depend on the state, as
 /// `tc.rs`' prep kernel forms it: `G` (f32), `W = T (beta gamma K)` by rows `[.., 64, Dk]`, and
 /// transposed, `U^T = (beta V)^T T^T` `[.., Dv, 64]` and the keys `K^T` (normalised when asked)
@@ -230,10 +308,9 @@ pub(super) fn wmma_prep_kernel<E: Float>(
         gs[tid] = gv;
         bs[tid] = bv;
     }
-    stage_tokens::<E>(
+    stage_rows::<E>(
         k,
         s_x.as_mut_slice(),
-        fs.as_slice(),
         first,
         count,
         h,
@@ -241,7 +318,6 @@ pub(super) fn wmma_prep_kernel<E: Float>(
         1.0f32,
         dk,
         l2norm,
-        false,
     );
     // The values, eight tokens of one 16-byte chunk per block, read into registers while `A`
     // and its inverse are formed.
