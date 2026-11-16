@@ -15,7 +15,7 @@
 //!
 //! So each output is the same bits whatever the launch, for given runs.
 
-use super::wmma::{BLOCK_K, BLOCK_M, BLOCK_N, UNITS, matrix_kernel};
+use super::wmma::{BLOCK_K, BLOCK_N, UNITS, block_m, matrix_kernel};
 use super::{QuantBackend, probe, reference};
 use crate::cube::Requirements;
 use crate::lowrank::MaybeTensor;
@@ -220,21 +220,19 @@ pub(super) fn kernels_take(
 }
 
 /// What [`matrix_kernel`] asks: 128 units per cube (four planes of 32, the layout's), a cube per 64
-/// rows and 128 outputs (and run of the inputs), 4 KiB of shared memory, six tensors, 16-byte
-/// vectors; beside `finish_kernel`'s, which adds the runs' sums where the inputs are split.
+/// or 128 rows ([`matrix_tiles`]) and 128 outputs (and run of the inputs), 4 or 8 KiB of shared
+/// memory, six tensors, 16-byte vectors; beside `finish_kernel`'s, which adds the runs' sums where
+/// the inputs are split.
 fn matrix_requirements([rows, inp, out]: [usize; 3]) -> Requirements {
+    let block = block_m(matrix_tiles(rows));
     let finish = Requirements::new((CUBE as u32, 1), ((rows * out).div_ceil(CUBE), 1), 3);
     let product = Requirements {
-        shared_bytes: BLOCK_M * BLOCK_K * 2,
+        shared_bytes: block * BLOCK_K * 2,
         vector_size: 8,
         plane_width: Some(32),
         // The most runs the inputs split into: one per step of 32.
         address: matrix_address([rows, inp, out], inp / BLOCK_K),
-        ..Requirements::new(
-            (UNITS, 1),
-            (rows.div_ceil(BLOCK_M), out.div_ceil(BLOCK_N)),
-            6,
-        )
+        ..Requirements::new((UNITS, 1), (rows.div_ceil(block), out.div_ceil(BLOCK_N)), 6)
     };
     product.max(finish)
 }
@@ -421,6 +419,7 @@ fn matrix(
     let bias = bias.unwrap_or_else(|| empty(&x, Shape::new([1]), DType::F32));
     let client = x.client.clone();
     let dtype = dtype_to_storage_type(x.dtype);
+    let mts = matrix_tiles(rows);
     let (runs, run) = matrix_split(&client, rows, inp, out);
     let split = runs > 1;
     // f32 sums of each run where the inputs are split, else bound and unread.
@@ -437,7 +436,7 @@ fn matrix(
         matrix_kernel::launch_unchecked(
             &client,
             CubeCount::Static(
-                rows.div_ceil(BLOCK_M) as u32,
+                rows.div_ceil(block_m(mts)) as u32,
                 out.div_ceil(BLOCK_N) as u32,
                 runs as u32,
             ),
@@ -453,6 +452,7 @@ fn matrix(
             group,
             has_bias && !split,
             split,
+            mts,
             dtype,
             dtype_to_storage_type(DType::F16),
         );
@@ -474,19 +474,28 @@ fn matrix(
 }
 
 /// `(runs, run)`: the steps of 32 inputs split into `runs` runs of `run` steps, so that a product
-/// with fewer cubes of 64 rows and 128 outputs than twice the device's compute units fills it; one
-/// run otherwise.
+/// with fewer cubes of 64 or 128 rows and 128 outputs than twice the device's compute units fills
+/// it; one run otherwise.
 fn matrix_split(client: &Client, rows: usize, inp: usize, out: usize) -> (usize, usize) {
     let units = client
         .properties()
         .hardware
         .num_streaming_multiprocessors
         .unwrap_or(64) as usize;
-    let cubes = rows.div_ceil(BLOCK_M) * out.div_ceil(BLOCK_N);
+    let cubes = rows.div_ceil(block_m(matrix_tiles(rows))) * out.div_ceil(BLOCK_N);
     let steps = inp / BLOCK_K;
     let wanted = (2 * units).div_ceil(cubes).clamp(1, steps);
     let run = steps.div_ceil(wanted);
     (steps.div_ceil(run), run)
+}
+
+/// The 16-row tiles each wave of [`matrix_kernel`] takes for `rows` rows of `x`: eight past 64
+/// rows, so that each dequantized word serves eight products; four up to 64, where a cube of 128
+/// rows would be at least half empty. On a Radeon AI PRO R9700 at `[5120 x 17408]` and
+/// `[17408 x 5120]`, eight took 0.64 to 0.88 times four's time from 96 rows to 2048, and 1.15 to
+/// 1.31 times at 32 to 64 rows.
+fn matrix_tiles(rows: usize) -> usize {
+    if rows > 64 { 8 } else { 4 }
 }
 
 /// The index type [`matrix_kernel`] and `finish_kernel` need: every tensor they bind indexed.
