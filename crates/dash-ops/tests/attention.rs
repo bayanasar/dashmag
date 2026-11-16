@@ -293,7 +293,9 @@ fn decode_with_gradients_is_attention_with_one_query_on_flex() {
 #[cfg(all(feature = "cubecl", feature = "flex"))]
 mod cube {
     use super::*;
-    use dash_ops::attention::{causal_attention_with_lse, decode_kernels_take, kernels_take};
+    use dash_ops::attention::{
+        causal_attention_with_lse, decode_kernels_take, kernels_take, wmma_backward_takes,
+    };
 
     fn device() -> Device {
         common::cube_device().autodiff()
@@ -405,6 +407,8 @@ mod cube {
                 );
                 let launches = expected_launches(&device, DType::BF16, call_dims(dims));
                 let backward = kernels_take(&device, DType::BF16, call_dims(dims))[1];
+                // On RDNA4's products the backward is the fixed-order one, unsplit.
+                let full = backward && !wmma_backward_takes(&device, DType::BF16, call_dims(dims));
                 let (copies, splits) = (probe::input_copies(), probe::split_runs());
                 let atomics = probe::atomic_runs();
                 let actual = launches_kernels(launches, || {
@@ -420,10 +424,10 @@ mod cube {
                     )
                 });
                 assert_eq!(probe::input_copies(), copies);
-                assert_eq!(probe::split_runs() - splits, usize::from(split && backward));
+                assert_eq!(probe::split_runs() - splits, usize::from(split && full));
                 assert_eq!(
                     probe::atomic_runs() - atomics,
-                    usize::from(backward && !deterministic)
+                    usize::from(full && !deterministic)
                 );
                 check(
                     &format!("cube bf16 split {split} deterministic {deterministic} {dims:?}"),

@@ -592,7 +592,7 @@ fn causal_segments_compose_into_the_whole_sequence_on_flex() {
 #[cfg(all(feature = "cubecl", feature = "flex"))]
 mod cube {
     use super::*;
-    use dash_ops::attention::{decode_kernels_take, kernels_take};
+    use dash_ops::attention::{decode_kernels_take, kernels_take, wmma_backward_takes};
 
     fn device() -> Device {
         common::cube_device().autodiff()
@@ -776,11 +776,13 @@ mod cube {
                     };
                     let launches = expected_launches(&device, dtype, case.dims());
                     let backward = kernels_take(&device, dtype, case.dims())[1];
+                    // On RDNA4's products the backward is the fixed-order one, unsplit.
+                    let full = backward && !wmma_backward_takes(&device, dtype, case.dims());
                     let splits = probe::split_runs();
                     let actual = launches_kernels(launches, || run(&device, case, dtype));
                     assert_eq!(
                         probe::split_runs() - splits,
-                        usize::from(split && backward),
+                        usize::from(split && full),
                         "the products did not run {products}"
                     );
                     let name = format!("cube {label} {products} {} {:?}", case.name, case.dims());

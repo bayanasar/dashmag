@@ -652,9 +652,13 @@ impl Adapter for Burn {
             grad,
             "the written-out backward ran where gradients were asked for, and only there"
         );
+        // On RDNA4's products the query gradient is always the fixed-order one.
+        let atomic = backward
+            && !attention::wmma_backward_takes(&device, dtype, [b, tq, tk, hq, hkv, d])
+            && !call.options.deterministic;
         assert_eq!(
             probe::atomic_runs() - atomics,
-            usize::from(grad && backward && !call.options.deterministic),
+            usize::from(grad && atomic),
             "the query gradient was not summed the way asked"
         );
         assert_eq!(

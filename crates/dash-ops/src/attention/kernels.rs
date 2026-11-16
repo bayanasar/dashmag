@@ -476,7 +476,7 @@ pub(super) fn row_bounds(
 /// back, so the queries between see the block too, or nothing at all). Packed, `k0` and
 /// `k1 - 1` fall in the sequences whose queries hold `first` and `end`.
 #[cube]
-fn query_range(
+pub(super) fn query_range(
     k0: i32,
     k1: i32,
     tq: u32,

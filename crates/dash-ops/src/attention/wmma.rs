@@ -57,7 +57,7 @@ pub(crate) const WMMA_BLOCK_KV: u32 = 32;
 /// value tile: rows of `groups` vectors, the group XOR-ed with bits 2 and 3 of the column (for
 /// `groups` 4), so that the 16 columns a wave's half reads at one group fall in distinct banks.
 #[cube]
-fn vt_index(col: u32, g: u32, #[comptime] groups: u32) -> u32 {
+pub(super) fn vt_index(col: u32, g: u32, #[comptime] groups: u32) -> u32 {
     col * groups + (g ^ ((col >> 2) & comptime!(groups - 1)))
 }
 
@@ -66,7 +66,7 @@ fn vt_index(col: u32, g: u32, #[comptime] groups: u32) -> u32 {
 /// `c` of `V` and group `g` of eight keys, one vector at [`vt_index()`]. Each thread reads eight
 /// rows' vectors at one chunk and writes eight transposed ones.
 #[cube]
-fn load_vt<E: Float>(
+pub(super) fn load_vt<E: Float>(
     src: &Tensor<Vector<E, V8>>,
     dst: &mut [Vector<E, V8>],
     base: usize,

@@ -1,8 +1,9 @@
 //! The CubeCL backend, for every CubeCL runtime: launches the kernels of `kernels.rs` for the
 //! inputs they take (bf16 or f16, head dimension 64, 128 or 256) on a device with what they ask
 //! (the [`Requirements`] of each pass, `mma.sync` m16n8k16 and `ldmatrix` for the dtype); the
-//! forward of `wmma.rs` on a device without those whose 16 x 16 x 16 MMA has the register layout
-//! that kernel is written for (`crate::wmma`); and the reference for the rest.
+//! forward of `wmma.rs` and the backward of `wmma_backward.rs` (after `kernels.rs`'
+//! `delta_kernel()`) on a device without those whose 16 x 16 x 16 MMA has the register layout
+//! those kernels are written for (`crate::wmma`); and the reference for the rest.
 //!
 //! Inputs are read through their strides, in place where the kernels can (see [`readable`]).
 //! Every tensor the kernels write is allocated contiguous, in the layout the module
@@ -14,6 +15,7 @@ use super::kernels::{
     dq_kernel, finish_kernel, forward_kernel,
 };
 use super::wmma::{WMMA_BLOCK_KV, WMMA_BLOCK_Q, forward_wmma_kernel};
+use super::wmma_backward::{DQ_BLOCK_KV, dkdv_shape, dkdv_wmma_kernel, dq_shape, dq_wmma_kernel};
 use super::{
     AttentionBackend, AttentionMaskPrimitive, AttentionOptions, CacheLengths, MaskShape, Reach,
     check_decode_shapes, check_shapes, probe, reference,
@@ -201,6 +203,61 @@ fn forward_on_wmma(client: &Client, dtype: DType, dims: [usize; 6]) -> bool {
         && crate::wmma::rdna4_products(client, dtype)
 }
 
+/// What the backward of `wmma_backward.rs` asks: `delta_kernel()`'s cubes; the query gradient's
+/// cube per `16 groups` queries of each query head, the key and value gradients' per `16 groups`
+/// keys of each key-value head ([`dq_shape`], [`dkdv_shape`]); the query gradient's key, value
+/// and transposed key tiles, or the other's query and output-gradient tiles by rows and
+/// transposed with each query's statistics and interval, in shared memory, the most of the two;
+/// eleven tensors; 16-byte vectors and planes of 32.
+fn wmma_backward_requirements([b, tq, tk, hq, hkv, d]: [usize; 6]) -> Requirements {
+    let rows_per_cube = 256 / (d / VECTOR);
+    let (dq_groups, dq_ds) = dq_shape(d as u32);
+    let (kv_groups, kv_ds, sq) = dkdv_shape(d as u32);
+    let (dq_groups, dq_ds, kv_groups, kv_ds, sq) = (
+        dq_groups as usize,
+        dq_ds as usize,
+        kv_groups as usize,
+        kv_ds as usize,
+        sq as usize,
+    );
+    let bkv = DQ_BLOCK_KV as usize;
+    let delta = Requirements::new((256, 1), ((b * tq * hq).div_ceil(rows_per_cube), 1), 11);
+    let dq = Requirements {
+        shared_bytes: 3 * bkv * d * 2 + 4 * (2 * dq_groups + bkv),
+        ..Requirements::new(
+            ((32 * dq_groups * dq_ds) as u32, 1),
+            (tq.div_ceil(16 * dq_groups), hq),
+            10,
+        )
+    };
+    let dkdv = Requirements {
+        shared_bytes: 4 * sq * d * 2 + 4 * 4 * sq,
+        ..Requirements::new(
+            ((32 * kv_groups * kv_ds) as u32, 1),
+            (tk.div_ceil(16 * kv_groups), hkv),
+            11,
+        )
+    };
+    Requirements {
+        vector_size: VECTOR,
+        plane_width: Some(PLANE),
+        ..delta.max(dq).max(dkdv)
+    }
+}
+
+/// Whether the backward runs on `wmma_backward.rs`' kernels: the device lacks what
+/// `kernels.rs`' backward asks (its instructions, its shared memory or f32 atomics), and has a
+/// 16 x 16 x 16 MMA in RDNA4's layout, with what else those kernels ask.
+pub(super) fn backward_on_wmma(client: &Client, dtype: DType, dims: [usize; 6]) -> bool {
+    let properties = client.properties();
+    let types = [dtype, DType::F32, DType::I32];
+    !(tensor_cores(properties, dtype)
+        && float_atomics(properties)
+        && backward_requirements(dims, splits(client, dims)).met_on(client, &types))
+        && wmma_backward_requirements(dims).met_on(client, &types)
+        && crate::wmma::rdna4_products(client, dtype)
+}
+
 /// Whether the device adds to f32 in global memory atomically, as the backward sums `dQ`.
 fn float_atomics(properties: &DeviceProperties) -> bool {
     properties
@@ -225,8 +282,7 @@ pub(super) fn kernels_take(
     } else {
         forward_requirements(dims)
     };
-    (!backward || float_atomics(properties))
-        && matches!(dtype, DType::BF16 | DType::F16)
+    matches!(dtype, DType::BF16 | DType::F16)
         && matches!(d, 64 | 128 | 256)
         && b * tq * hq > 0
         && tk > 0
@@ -234,8 +290,10 @@ pub(super) fn kernels_take(
         && (b * tq.next_multiple_of(BLOCK_KV as usize).max(tk) * hq.max(hkv) * d) < 1 << 32
         && b <= properties.hardware.max_cube_count.2 as usize
         && (tensor_cores(properties, dtype)
+            && (!backward || float_atomics(properties))
             && requirements.met_on(client, &[dtype, DType::F32, DType::I32])
-            || !backward && forward_on_wmma(client, dtype, dims))
+            || !backward && forward_on_wmma(client, dtype, dims)
+            || backward && backward_on_wmma(client, dtype, dims))
 }
 
 /// What the decoding kernels ask for `[B, S, Hq, Hkv, D]` in `splits` splits: 128 units per
@@ -575,6 +633,133 @@ fn unused_f32(like: &CubeTensor) -> CubeTensor {
     )
 }
 
+/// The query gradient, then the key and value gradients, on RDNA4's products
+/// (`wmma_backward.rs`), after `delta_kernel()`: `inputs` the query, key, value and output
+/// gradient, `grads` the query, key and value gradients, written whole.
+fn wmma_backward(
+    inputs: [&CubeTensor; 4],
+    lse: &CubeTensor,
+    delta: &CubeTensor,
+    grads: [&CubeTensor; 3],
+    mask: &Mask,
+    scale: f32,
+    [b, tq, tk, hq, hkv, d]: [usize; 6],
+) {
+    let [query, key, value, grad_output] = inputs;
+    let [grad_query, grad_key, grad_value] = grads;
+    let client = query.client.clone();
+    let dtype = dtype_to_storage_type(query.dtype);
+    let [q_sb, q_sh, q_st] = sequence_strides(query);
+    let [k_sb, k_sh, k_st] = sequence_strides(key);
+    let [v_sb, v_sh, v_st] = sequence_strides(value);
+    let [do_sb, do_sh, do_st] = sequence_strides(grad_output);
+    let [m_sb, m_st] = mask.key_strides;
+    let group = (hq / hkv) as u32;
+    let (dq_groups, dq_ds) = dq_shape(d as u32);
+    let q_blocks = tq.div_ceil(16 * dq_groups as usize);
+    launched();
+    // SAFETY: as for the forward of `wmma.rs`; each cube writes the rows of its own queries,
+    // below Tq, the columns of each wave's part of D.
+    unsafe {
+        dq_wmma_kernel::launch_unchecked(
+            &client,
+            CubeCount::Static(q_blocks as u32, hq as u32, b as u32),
+            CubeDim::new_1d(32 * dq_groups * dq_ds),
+            query.clone().into_tensor_arg(),
+            key.clone().into_tensor_arg(),
+            value.clone().into_tensor_arg(),
+            grad_output.clone().into_tensor_arg(),
+            lse.clone().into_tensor_arg(),
+            delta.clone().into_tensor_arg(),
+            grad_query.clone().into_tensor_arg(),
+            mask.keys.clone().into_tensor_arg(),
+            mask.cu_q.clone().into_tensor_arg(),
+            mask.cu_k.clone().into_tensor_arg(),
+            q_blocks as u32,
+            tq as u32,
+            tk as u32,
+            group,
+            q_sb,
+            q_sh,
+            q_st,
+            k_sb,
+            k_sh,
+            k_st,
+            v_sb,
+            v_sh,
+            v_st,
+            do_sb,
+            do_sh,
+            do_st,
+            m_sb,
+            m_st,
+            mask.seqs,
+            mask.left,
+            mask.right,
+            scale,
+            d as u32,
+            dq_groups,
+            dq_ds,
+            mask.padded,
+            mask.packed,
+            dtype,
+        );
+    }
+    let (kv_groups, kv_ds, sq) = dkdv_shape(d as u32);
+    launched();
+    // SAFETY: as above; each cube writes the rows of its own keys, below Tk.
+    unsafe {
+        dkdv_wmma_kernel::launch_unchecked(
+            &client,
+            CubeCount::Static(
+                tk.div_ceil(16 * kv_groups as usize) as u32,
+                hkv as u32,
+                b as u32,
+            ),
+            CubeDim::new_1d(32 * kv_groups * kv_ds),
+            query.clone().into_tensor_arg(),
+            key.clone().into_tensor_arg(),
+            value.clone().into_tensor_arg(),
+            grad_output.clone().into_tensor_arg(),
+            lse.clone().into_tensor_arg(),
+            delta.clone().into_tensor_arg(),
+            grad_key.clone().into_tensor_arg(),
+            grad_value.clone().into_tensor_arg(),
+            mask.keys.clone().into_tensor_arg(),
+            mask.cu_q.clone().into_tensor_arg(),
+            mask.cu_k.clone().into_tensor_arg(),
+            tq as u32,
+            tk as u32,
+            group,
+            q_sb,
+            q_sh,
+            q_st,
+            k_sb,
+            k_sh,
+            k_st,
+            v_sb,
+            v_sh,
+            v_st,
+            do_sb,
+            do_sh,
+            do_st,
+            m_sb,
+            m_st,
+            mask.seqs,
+            mask.left,
+            mask.right,
+            scale,
+            d as u32,
+            kv_groups,
+            kv_ds,
+            sq,
+            mask.padded,
+            mask.packed,
+            dtype,
+        );
+    }
+}
+
 /// The backward, each gradient contiguous in its input's layout: `delta` (zeroing the f32
 /// accumulators), then either the fixed-order `dQ` and the other four products, or with
 /// `atomic_dq` the five products (`dQ` added to its accumulator with atomics); split, the
@@ -614,7 +799,10 @@ fn backward(
     let delta = contiguous(vec![b, tq, hq], DType::F32);
     // The log-sum-exp as the other kernels read it: `+inf` for a query that sees no key.
     let lse_bwd = contiguous(vec![b, tq, hq], DType::F32);
-    let split = splits(&client, [b, tq, tk, hq, hkv, d]);
+    // On RDNA4's products, the fixed-order `dQ` whatever `atomic_dq` asks, and no split.
+    let on_wmma = backward_on_wmma(&client, query.dtype, [b, tq, tk, hq, hkv, d]);
+    let atomic_dq = atomic_dq && !on_wmma;
+    let split = !on_wmma && splits(&client, [b, tq, tk, hq, hkv, d]);
     if split {
         probe::SPLIT_RUNS.fetch_add(1, Ordering::SeqCst);
     }
@@ -700,6 +888,18 @@ fn backward(
     let grad_query = contiguous(vec![b, tq, hq, d], query.dtype);
     let grad_key = contiguous(vec![b, tk, hkv, d], key.dtype);
     let grad_value = contiguous(vec![b, tk, hkv, d], value.dtype);
+    if on_wmma {
+        wmma_backward(
+            [&query, &key, &value, &grad_output],
+            &lse_bwd,
+            &delta,
+            [&grad_query, &grad_key, &grad_value],
+            mask,
+            scale,
+            [b, tq, tk, hq, hkv, d],
+        );
+        return (grad_query, grad_key, grad_value);
+    }
     if !atomic_dq {
         let dq_blocks = tq.div_ceil(BLOCK_Q as usize);
         launched();

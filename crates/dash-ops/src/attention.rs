@@ -38,7 +38,10 @@
 //! Where those are missing, a device whose 16 x 16 x 16 MMA from that dtype into f32 has RDNA4's
 //! register layout (read from each device the first time, for each dtype) runs a forward of its
 //! own on it, up to 33 KiB of shared memory and 128 units per cube: AMD's RDNA4 GPUs under ROCm.
-//! Its backward is the reference. Elsewhere the reference runs (`kernels_take` tells which).
+//! Its backward runs kernels of its own there too (`wmma_backward.rs`), up to 48.2 KiB and 256
+//! units per cube and without atomics: the default's sums, the query gradient in a fixed order,
+//! whatever [`AttentionOptions::deterministic`] says, and never split. Elsewhere the reference
+//! runs (`kernels_take` tells which, and `wmma_backward_takes` whether RDNA4's backward does).
 //!
 //! - Training: a FlashAttention-2 style forward that also writes each query's log-sum-exp, and a
 //!   backward that by default gives the same bits on every run: `delta = rowsum(dO * O)`; the
@@ -145,6 +148,8 @@ mod kernels;
 mod reference;
 #[cfg(feature = "cubecl")]
 mod wmma;
+#[cfg(feature = "cubecl")]
+mod wmma_backward;
 
 /// Counters tests read to tell which path ran, and a switch they set to run each. Not part of
 /// the API.
@@ -812,6 +817,20 @@ pub fn kernels_take(device: &Device, dtype: DType, dims: [usize; 6]) -> [bool; 2
     }
     let _ = (device, dtype, dims);
     [false, false]
+}
+
+/// Whether the backward that [`kernels_take`] says the kernels take runs on RDNA4's products
+/// (`wmma_backward.rs`): there the query gradient is always the fixed-order one and the products
+/// never split, whatever the options and [`probe::force_split`] ask. For tests.
+#[doc(hidden)]
+pub fn wmma_backward_takes(device: &Device, dtype: DType, dims: [usize; 6]) -> bool {
+    #[cfg(feature = "cubecl")]
+    if let Some(client) = crate::cube::client(device.as_dispatch()) {
+        return cube::kernels_take(&client, dtype, dims, true)
+            && cube::backward_on_wmma(&client, dtype, dims);
+    }
+    let _ = (device, dtype, dims);
+    false
 }
 
 /// Whether the CubeCL kernels take a decoding step over inputs of `dtype` and dimensions
