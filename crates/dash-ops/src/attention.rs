@@ -40,7 +40,8 @@
 //! own on it, up to 33 KiB of shared memory and 128 units per cube: AMD's RDNA4 GPUs under ROCm.
 //! Its backward runs kernels of its own there too (`wmma_backward.rs`), up to 48.3 KiB and 256
 //! units per cube and without atomics: the default's sums, the query gradient in a fixed order,
-//! whatever [`AttentionOptions::deterministic`] says, and never split. Elsewhere the reference
+//! whatever [`AttentionOptions::deterministic`] says, and a key block's queries never split
+//! between cubes. Elsewhere the reference
 //! runs (`kernels_take` tells which, and `wmma_backward_takes` whether RDNA4's backward does).
 //!
 //! - Training: a FlashAttention-2 style forward that also writes each query's log-sum-exp, and a

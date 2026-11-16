@@ -2,26 +2,30 @@
 //! register layout (`crate::wmma`), where `kernels.rs`' backward (`mma.sync` m16n8k16 and
 //! `ldmatrix`) does not run: the query gradient in a fixed order, and the key and value gradients,
 //! after `kernels.rs`' `delta_kernel()` (`delta = rowsum(dO O)`, and the log-sum-exp as these read
-//! it). The same sums as `kernels.rs`' fixed-order backward, unsplit and without atomics.
+//! it). The same sums as `kernels.rs`' fixed-order backward, without atomics and without
+//! splitting a key block's queries between cubes.
 //!
 //! As in `wmma.rs`, every product runs transposed, so that a lane holds one row of it: the
 //! accumulator of `Y^T` holds, in lane `l`, row `l % 16` of `Y` and eight consecutive columns, and
 //! is the B operand of a next product over those columns as it stands.
 //!
 //! - [`dq_wmma_kernel`], a lane per query, as the forward: each lane holds its query's row of
-//!   `Q` and of `dO` in registers; per 32 keys, `S^T = K Q^T` and `dP^T = V dO^T` from the key and
-//!   value tiles by rows, `P = exp(S scale - lse)` and `dS = P (dP - delta)` with the lane's own
-//!   `lse` and `delta`, and `dQ^T += K^T dS^T` from the key tile transposed.
+//!   `Q` and of `dO` in registers; per tile of keys (32, or 16 at `D` 256), `S^T = K Q^T` and
+//!   `dP^T = V dO^T` from the key and value tiles by rows, `P = exp(S scale - lse)` and
+//!   `dS = P (dP - delta)` with the lane's own `lse` and `delta`, and `dQ^T += K^T dS^T` from the
+//!   key tile transposed.
 //! - [`dkdv_wmma_kernel`], a lane per key: each lane holds its key's row of `K` and of `V` in
 //!   registers; per step of the queries that see the block, `P^T` and `dS^T` the same way from the
 //!   query and output-gradient tiles by rows (with each query's `lse` and `delta` from shared
 //!   memory), and `dV^T += dO^T P^T`, `dK^T += Q^T dS^T` from those tiles transposed.
 //!
 //! A wave's accumulator over the whole head dimension would not fit beside the rows it holds at
-//! `D` 256 (and for `dK` and `dV` together past 64), so `ds` waves share each 16 rows: each holds
-//! `D / ds` of the lane's row and accumulates `D / ds` of the gradients' columns, and forms its
-//! part of the sums of `S` and `dP` over those columns; the parts are added through shared memory
-//! in the order of the waves ([`sum_partials`]), so that each product runs once.
+//! `D` 256 (and for `dK` and `dV` together past 64), so `ds` waves share each 16 rows, each
+//! accumulating `D / ds` of the gradients' columns. At `D` 256 each also holds only `D / ds` of
+//! the lane's row and forms its part of the sums of `S` and `dP` over those columns; the parts are
+//! added through shared memory in the order of the waves ([`sum_partials`]), so that each product
+//! runs once. At `D` 128 the key and value gradients' two waves each hold the whole rows and form
+//! those sums whole ([`dkdv_shape`]); the query gradient there takes one wave per 16 rows.
 
 // See `kernels.rs`: CubeCL's frontend takes the plain operators.
 #![allow(
@@ -44,7 +48,7 @@ type R1 = Const<1>;
 /// gradient's columns), and keys per tile. At `D` 256 two waves share each 16 queries: a lane's
 /// rows of `Q` and `dO` and its accumulator over the whole of `D` would not fit together. On a
 /// Radeon AI PRO R9700 four groups of two took 0.88 to 0.95 times the backward's time of two
-/// groups of four, and of four of four, at T 2048 and 4096.
+/// groups of four, and of four of four, at T 2048 and 4096 (one pass of each).
 pub(crate) fn dq_shape(d: u32) -> (u32, u32, u32) {
     if d > 128 { (4, 2, 16) } else { (4, 1, 32) }
 }
@@ -56,8 +60,9 @@ pub(crate) fn dq_shape(d: u32) -> (u32, u32, u32) {
 /// whole beside them: the waves split the sums, 16 queries a step, so that the partial sums fit
 /// beside the tiles. At `D` 128 each wave forms the scores whole, 32 queries a step. On a Radeon
 /// AI PRO R9700 that took 0.93 to 0.95 times the time of splitting, 16 queries a step, at T 4096,
-/// and 1.03 to 1.06 times at 2048; at `D` 256, splitting with four groups of two took 0.86 times
-/// two groups of four at T 4096 and 8192, and 1.03 to 1.04 times at 2048.
+/// and 1.03 to 1.06 times at 2048; at `D` 256, splitting with four groups of two took 0.86 to 0.87
+/// times two groups of four at T 4096, 0.86 at 8192 and 1.03 to 1.05 at 2048 (each range from the
+/// extremes of two passes of each).
 pub(crate) fn dkdv_shape(d: u32) -> (u32, u32, u32, bool) {
     match d {
         0..=64 => (4, 1, 32, false),
