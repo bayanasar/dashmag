@@ -12,7 +12,8 @@
 //!
 //! - `S^T = K Q^T` (keys x queries): A is 16 keys' rows of the key tile, eight consecutive
 //!   elements of a row from shared memory; B is the wave's queries, which a lane holds for its
-//!   query in registers for the whole sweep (`D / 16` vectors of eight).
+//!   query in registers for the whole sweep (`D / 16` vectors of eight, or its wave's part of
+//!   them, below).
 //! - The softmax runs down each column: a lane's eight keys, then the other half of the wave
 //!   (`lane ^ 16`) through one shuffle. Each lane's query has one maximum and one rescaling
 //!   factor, so the output's rescaling is a multiplication by a lane's own scalar.
@@ -21,17 +22,24 @@
 //!   tile is stored transposed in shared memory, eight keys of one column of `V` per 16-byte
 //!   vector, so that a lane reads its eight keys at once.
 //!
-//! The output's accumulator, `D / 16` tiles of eight f32 per lane (128 registers at `D` 256),
-//! holds for each lane eight consecutive elements of its query's output row, written as one
-//! 16-byte vector.
+//! The output's accumulator, `D / 16` tiles of eight f32 per lane (or its wave's part of them),
+//! holds for each lane eight consecutive elements of its query's output row per tile, written as
+//! one 16-byte vector.
 //!
 //! Masks are those of `kernels.rs`: each query sees one interval of keys ([`row_bounds()`]),
 //! padding on top, key by key. A wave masks element by element only the key tiles that cut one
 //! of its queries' intervals or carry padding; a cube sweeps the key tiles some query of it sees.
 //!
-//! Tiles: four waves (64 queries) per cube and 32 keys per step; the key tile and the transposed
-//! value tile take `2 * 32 * D * 2` bytes of shared memory (32 KiB at `D` 256), within the
-//! 64 KiB a workgroup has on RDNA4.
+//! Tiles ([`forward_shape()`]): eight groups of 16 queries per cube, each of `ds` waves. Up to `D`
+//! 128 a wave holds its queries whole and 32 keys are taken per step. At `D` 256 a lane's query
+//! (64 registers) and accumulator (128) leave the rest of its 256 registers too few for the
+//! products (211 of them spilled), so two waves share each 16 queries: each holds half of the
+//! query and of the output accumulator, contracts the scores over its half of `D`, and the two
+//! halves are added through shared memory in the order of the waves ([`sum_scores()`]), so that
+//! both waves hold the same scores and each product runs once; 16 keys are taken per step. The key
+//! tile and the transposed value tile take `2 * keys * D * 2` bytes of shared memory, the partial
+//! scores `ds * 8 * 32 * keys / 2 * 4` (32 KiB in all at `D` 256), within the 64 KiB a workgroup
+//! has on RDNA4. Both tiles are read with no branch before a read ([`load_rows_flat()`]).
 
 // See `kernels.rs`: CubeCL's frontend takes the plain operators.
 #![allow(
@@ -41,17 +49,64 @@
     clippy::collapsible_if
 )]
 
-use super::kernels::{V8, fetch_padding, load_rows, row_bounds, swizzle};
+use super::kernels::{V8, fetch_padding, row_bounds, swizzle};
 use cubecl::cmma::MmaDefinition;
 use cubecl::prelude::*;
 
 /// One f32 accumulator element per vector, as the layout gives them.
 type R1 = Const<1>;
 
-/// Queries per cube: four waves of 16.
-pub(crate) const WMMA_BLOCK_Q: u32 = 64;
-/// Keys per step.
-pub(crate) const WMMA_BLOCK_KV: u32 = 32;
+/// The forward's shape for a head dimension `d`: 16-query groups per cube, waves per group (each
+/// contracting `D / ds` of the scores and accumulating `D / ds` of the output's columns), and keys
+/// per step. See the module's documentation. On a Radeon AI PRO R9700 (the forward alone, causal,
+/// Hq 24, Hkv 4, bf16, T 4096 and 8192, 2026-11-17): eight groups took 0.92 to 0.99 times the time
+/// of four at `D` 64, 128 and 256, and sixteen 1.18 to 1.26 times eight at `D` 128 (and T 2048);
+/// with four groups and the tiles read behind branches, two waves a group took 1.45 to 1.48 times
+/// one at `D` 128, and 32 keys a step 1.10 to 1.13 times 16 at `D` 256.
+pub(crate) fn forward_shape(d: u32) -> (u32, u32, u32) {
+    if d > 128 { (8, 2, 16) } else { (8, 1, 32) }
+}
+
+/// Bytes of shared memory the partial scores take: with `ds` waves per group, each wave's
+/// `keys / 2` f32 per lane.
+pub(crate) fn score_bytes(groups: u32, ds: u32, keys: u32) -> usize {
+    if ds > 1 {
+        (ds * groups * 32 * (keys / 2) * 4) as usize
+    } else {
+        0
+    }
+}
+
+/// Sums the `ds` waves' partial scores `acc_s` (`len` f32 a lane) of wave group `g` through
+/// `s_ps`, in the order of the waves: every wave of the group then holds the whole sums. A barrier
+/// between the writes and the reads; the caller's barrier before its next writes.
+#[cube]
+fn sum_scores(
+    acc_s: &mut Array<Vector<f32, R1>>,
+    s_ps: &mut [f32],
+    g: u32,
+    part: u32,
+    #[comptime] groups: u32,
+    #[comptime] ds: u32,
+    #[comptime] len: u32,
+) {
+    let lane = UNIT_POS_PLANE;
+    #[unroll]
+    for i in 0..len {
+        s_ps[(((part * groups + g) * len + i) * 32 + lane) as usize] =
+            acc_s[i as usize].extract(0usize);
+    }
+    sync_cube();
+    #[unroll]
+    for i in 0..len {
+        let mut x = 0.0f32;
+        #[unroll]
+        for p in 0..ds {
+            x += s_ps[(((p * groups + g) * len + i) * 32 + lane) as usize];
+        }
+        acc_s[i as usize] = Vector::new(x);
+    }
+}
 
 /// The index of the vector holding keys `[8 g, 8 g + 8)` of column `col` of `V` in the transposed
 /// value tile: rows of `groups` vectors, the group XOR-ed with bits 2 and 3 of the column (for
@@ -61,10 +116,10 @@ pub(super) fn vt_index(col: u32, g: u32, #[comptime] groups: u32) -> u32 {
     col * groups + (g ^ ((col >> 2) & comptime!(groups - 1)))
 }
 
-/// [`load_rows()`] with every row read: rows at or past `limit` are read from row 0 and replaced
-/// by zeros, so that no read sits behind a branch, which on RDNA4 is waited for before the next
-/// read is issued. The backward's kernels stage their tiles this way; the forward's kernel took
-/// 5% longer with it, and keeps [`load_rows()`].
+/// `kernels.rs`' `load_rows()` with every row read: rows at or past `limit` are read from row 0
+/// and replaced by zeros, so that no read sits behind a branch, which on RDNA4 is waited for
+/// before the next read is issued. Every thread takes every step: `rows * chunks` is a
+/// multiple of `threads`.
 #[cube]
 pub(super) fn load_rows_flat<E: Float>(
     src: &Tensor<Vector<E, V8>>,
@@ -77,6 +132,10 @@ pub(super) fn load_rows_flat<E: Float>(
     #[comptime] chunks: u32,
     #[comptime] threads: u32,
 ) {
+    comptime!(assert!(
+        rows * chunks % threads == 0,
+        "load_rows_flat: every thread takes every step, so `rows * chunks` is a multiple of `threads`"
+    ));
     let per_thread = comptime!(rows * chunks / threads);
     #[unroll]
     for i in 0..per_thread {
@@ -93,8 +152,8 @@ pub(super) fn load_rows_flat<E: Float>(
 /// Copies keys `[k0, k0 + keys)` of one (batch, head) slice of `src` (rows `row_stride` vectors
 /// apart from vector `base`; zeros at or past `limit`) into `dst` transposed: for each column
 /// `c` of `V` and group `g` of eight keys, one vector at [`vt_index()`]. Each thread reads eight
-/// rows' vectors at one chunk and writes eight transposed ones; `flat`, the rows past `limit` as
-/// [`load_rows_flat()`] reads them.
+/// rows' vectors at one chunk, the rows past `limit` as [`load_rows_flat()`] reads them, and writes
+/// eight transposed ones.
 #[cube]
 pub(super) fn load_vt<E: Float>(
     src: &Tensor<Vector<E, V8>>,
@@ -106,7 +165,6 @@ pub(super) fn load_vt<E: Float>(
     #[comptime] keys: u32,
     #[comptime] chunks: u32,
     #[comptime] threads: u32,
-    #[comptime] flat: bool,
 ) {
     let groups = comptime!(keys / 8);
     let blocks = comptime!(groups * chunks);
@@ -121,17 +179,9 @@ pub(super) fn load_vt<E: Float>(
             #[unroll]
             for j in 0..8u32 {
                 let row = k0 + g * 8 + j;
-                if comptime!(flat) {
-                    let ok = row < limit;
-                    let at = base + select(ok, row, 0u32) as usize * row_stride + c as usize;
-                    rows[j as usize] = select(ok, src[at], Vector::new(E::from_int(0)));
-                } else {
-                    let mut value = Vector::<E, V8>::new(E::from_int(0));
-                    if row < limit {
-                        value = src[base + row as usize * row_stride + c as usize];
-                    }
-                    rows[j as usize] = value;
-                }
+                let ok = row < limit;
+                let at = base + select(ok, row, 0u32) as usize * row_stride + c as usize;
+                rows[j as usize] = select(ok, src[at], Vector::new(E::from_int(0)));
             }
             #[unroll]
             for e in 0..8u32 {
@@ -146,9 +196,9 @@ pub(super) fn load_vt<E: Float>(
     }
 }
 
-/// The training forward on RDNA4's layout. One cube per (64-query block, query head, batch),
-/// query blocks taken last first; a wave per 16 queries, a lane per query and half of the key
-/// or head dimension. Writes the output, contiguous `[B, Tq, Hq, D]` in 16-byte vectors, and
+/// The training forward on RDNA4's layout. One cube per (`16 groups` queries, query head,
+/// batch), query blocks taken last first; `ds` waves per 16 queries, a lane per query and half of
+/// the key or head dimension, wave `w` accumulating columns `(w / groups) D / ds..` of the output. Writes the output, contiguous `[B, Tq, Hq, D]` in 16-byte vectors, and
 /// the natural log-sum-exp, contiguous `[B, Tq, Hq]`, as `forward_kernel()` does. Input strides
 /// are in 8-element vectors.
 #[cube(launch_unchecked)]
@@ -181,18 +231,24 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
     right: i32,
     scale: f32,
     #[comptime] d: u32,
+    #[comptime] groups: u32,
+    #[comptime] ds: u32,
+    #[comptime] block_kv: u32,
     #[comptime] padded: bool,
     #[comptime] packed: bool,
     #[define(E)] _dtype: ElemType,
 ) {
-    let block_q = comptime!(WMMA_BLOCK_Q);
-    let block_kv = comptime!(WMMA_BLOCK_KV);
-    let waves = comptime!(block_q / 16);
-    let threads = comptime!(block_q * 2);
+    let block_q = comptime!(16 * groups);
+    let threads = comptime!(32 * groups * ds);
     let chunks = comptime!(d / 8);
-    let groups = comptime!(block_kv / 8);
+    let kgroups = comptime!(block_kv / 8);
+    let cols = comptime!(d / 16 / ds);
     let def = MmaDefinition::<E, E, f32>::new(16usize, 16usize, 16usize);
     let wave = UNIT_POS / 32;
+    let qg = wave % groups;
+    // `% ds`: with one wave per group, 0 as the compiler sees it, so that the kernel is the one
+    // without the split.
+    let part = (wave / groups) % ds;
     let lane = UNIT_POS_PLANE;
     let col = lane % 16;
     let half = lane / 16;
@@ -210,22 +266,22 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
 
     // This lane's query and the keys it sees; the wave's span of keys and the keys all its
     // queries see; the cube's key tiles.
-    let row = q0 + wave * 16 + col;
+    let row = q0 + qg * 16 + col;
     let (lo, hi) = row_bounds(row, tq, tk, left, right, cu_q, cu_k, seqs, packed);
     let all_lo = plane_max(lo);
     let all_hi = plane_min(hi);
-    let mut s_span = Shared::<[i32]>::new_slice(comptime!((2 * waves) as usize));
+    let mut s_span = Shared::<[i32]>::new_slice(comptime!((2 * groups) as usize));
     let span_lo = plane_min(lo);
     let span_hi = plane_max(hi);
-    if lane == 0 {
-        s_span[(2 * wave) as usize] = span_lo;
-        s_span[(2 * wave + 1) as usize] = span_hi;
+    if lane == 0 && part == 0 {
+        s_span[(2 * qg) as usize] = span_lo;
+        s_span[(2 * qg + 1) as usize] = span_hi;
     }
     sync_cube();
     let mut block_lo = tk as i32;
     let mut block_hi = 0i32;
     #[unroll]
-    for w in 0..waves {
+    for w in 0..groups {
         block_lo = min(block_lo, s_span[(2 * w) as usize]);
         block_hi = max(block_hi, s_span[(2 * w + 1) as usize]);
     }
@@ -238,13 +294,15 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
     ) as u32;
     let key0 = first_tile as u32 * block_kv;
 
-    // The lane's query, `D / 16` vectors of eight: B of `S^T = K Q^T`.
-    let mut q_frag = Array::<Vector<E, V8>>::new(comptime!((d / 16) as usize));
+    // The lane's part of its query, `D / 16 / ds` vectors of eight from column `part D / ds`: B
+    // of `S^T = K Q^T`.
+    let kk0 = part * cols;
+    let mut q_frag = Array::<Vector<E, V8>>::new(cols as usize);
     #[unroll]
-    for kk in 0..comptime!(d / 16) {
+    for kk in 0..cols {
         let mut value = Vector::<E, V8>::new(E::from_int(0));
         if row < tq {
-            value = q[q_base + row as usize * q_st as usize + (kk * 2 + half) as usize];
+            value = q[q_base + row as usize * q_st as usize + ((kk0 + kk) * 2 + half) as usize];
         }
         q_frag[kk as usize] = value;
     }
@@ -259,19 +317,24 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
     );
     let mut s_pad =
         Shared::<[i32]>::new_slice(comptime!(if padded { block_kv } else { 1u32 }) as usize);
+    let mut s_ps = Shared::<[f32]>::new_slice(comptime!(if ds > 1 {
+        ds * groups * 32 * (block_kv / 2)
+    } else {
+        1u32
+    }) as usize);
 
     let mut run_max = f32::new(f32::NEG_INFINITY);
     let mut run_sum = 0.0f32;
-    let mut acc_o = Array::<Vector<f32, R1>>::new(comptime!((d / 2) as usize));
+    let mut acc_o = Array::<Vector<f32, R1>>::new(comptime!((8 * cols) as usize));
     #[unroll]
-    for i in 0..comptime!(d / 2) {
+    for i in 0..comptime!(8 * cols) {
         acc_o[i as usize] = Vector::new(0.0f32);
     }
 
     for j in 0..n_blocks {
         let k0 = key0 + j * block_kv;
         sync_cube();
-        load_rows::<E>(
+        load_rows_flat::<E>(
             k,
             s_k.as_mut_slice(),
             k_base,
@@ -292,7 +355,6 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
             block_kv,
             chunks,
             threads,
-            false,
         );
         if comptime!(padded) {
             let flag = fetch_padding(key_mask, m_base, m_st, k0, tk, block_kv);
@@ -306,7 +368,8 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
         // Mask unless every query of the wave sees the whole tile.
         let masked = padded || !(all_lo <= start && start + size <= all_hi);
 
-        // S^T, one 16 x 16 tile per 16 keys: eight keys of the lane's query per tile.
+        // S^T, one 16 x 16 tile per 16 keys: eight keys of the lane's query per tile, over the
+        // wave's part of D, then summed over the group's waves.
         let mut acc_s = Array::<Vector<f32, R1>>::new(comptime!((block_kv / 2) as usize));
         #[unroll]
         for mt in 0..comptime!(block_kv / 16) {
@@ -316,9 +379,9 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
                 c[i as usize] = Vector::new(0.0f32);
             }
             #[unroll]
-            for kk in 0..comptime!(d / 16) {
+            for kk in 0..cols {
                 let mut a = Array::<Vector<E, V8>>::new(1usize);
-                a[0] = s_k[swizzle(mt * 16 + col, kk * 2 + half, chunks) as usize];
+                a[0] = s_k[swizzle(mt * 16 + col, (kk0 + kk) * 2 + half, chunks) as usize];
                 let mut bq = Array::<Vector<E, V8>>::new(1usize);
                 bq[0] = q_frag[kk as usize];
                 c = def.execute(&a, &bq, &c);
@@ -327,6 +390,17 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
             for i in 0..8u32 {
                 acc_s[(mt * 8 + i) as usize] = c[i as usize];
             }
+        }
+        if comptime!(ds > 1) {
+            sum_scores(
+                &mut acc_s,
+                s_ps.as_mut_slice(),
+                qg,
+                part,
+                groups,
+                ds,
+                comptime!(block_kv / 2),
+            );
         }
 
         // Scale, mask and the tile's maximum down the lane's column, then across the halves.
@@ -365,7 +439,7 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
         // Each lane sums its own keys; the halves are added once, after the loop.
         run_sum = run_sum * alpha + tile_sum;
         #[unroll]
-        for i in 0..comptime!(d / 2) {
+        for i in 0..comptime!(8 * cols) {
             acc_o[i as usize] = acc_o[i as usize] * Vector::new(alpha);
         }
 
@@ -383,18 +457,19 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
             let mut bp = Array::<Vector<E, V8>>::new(1usize);
             bp[0] = p;
             #[unroll]
-            for dt in 0..comptime!(d / 16) {
+            for t in 0..cols {
+                let dt = part * cols + t;
                 let mut a = Array::<Vector<E, V8>>::new(1usize);
-                a[0] = s_vt[vt_index(dt * 16 + col, kt * 2 + half, groups) as usize];
+                a[0] = s_vt[vt_index(dt * 16 + col, kt * 2 + half, kgroups) as usize];
                 let mut c = Array::<Vector<f32, R1>>::new(8usize);
                 #[unroll]
                 for i in 0..8u32 {
-                    c[i as usize] = acc_o[(dt * 8 + i) as usize];
+                    c[i as usize] = acc_o[(t * 8 + i) as usize];
                 }
                 let out = def.execute(&a, &bp, &c);
                 #[unroll]
                 for i in 0..8u32 {
-                    acc_o[(dt * 8 + i) as usize] = out[i as usize];
+                    acc_o[(t * 8 + i) as usize] = out[i as usize];
                 }
             }
         }
@@ -405,17 +480,18 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
     // Row `row` of this head in `[B, Tq, Hq]` order.
     let at = (b as usize * tq as usize + row as usize) * hq as usize + h as usize;
     if row < tq {
-        if half == 0 {
+        if half == 0 && part == 0 {
             lse[at] = run_max + total.ln();
         }
         #[unroll]
-        for dt in 0..comptime!(d / 16) {
+        for t in 0..cols {
+            let dt = part * cols + t;
             let mut out = Vector::<E, V8>::new(E::from_int(0));
             #[unroll]
             for i in 0..8u32 {
                 out.insert(
                     i as usize,
-                    E::cast_from(acc_o[(dt * 8 + i) as usize].extract(0usize) * inv),
+                    E::cast_from(acc_o[(t * 8 + i) as usize].extract(0usize) * inv),
                 );
             }
             o[at * comptime!((d / 8) as usize) + (dt * 2 + half) as usize] = out;

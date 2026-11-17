@@ -362,7 +362,6 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
             block_kv,
             chunks,
             threads,
-            true,
         );
         if comptime!(padded) {
             let flag = fetch_padding(key_mask, m_base, m_st, k0, tk, block_kv);
@@ -604,7 +603,6 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
             sq,
             chunks,
             threads,
-            true,
         );
         load_vt::<E>(
             d_o,
@@ -616,7 +614,6 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
             sq,
             chunks,
             threads,
-            true,
         );
         if UNIT_POS < sq {
             let row = q0 + UNIT_POS;

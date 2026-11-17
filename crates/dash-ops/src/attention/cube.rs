@@ -14,7 +14,7 @@ use super::kernels::{
     BLOCK_KV, BLOCK_Q, backward_kernel, decode_merge_kernel, decode_split_kernel, delta_kernel,
     dq_kernel, finish_kernel, forward_kernel,
 };
-use super::wmma::{WMMA_BLOCK_KV, WMMA_BLOCK_Q, forward_wmma_kernel};
+use super::wmma::{forward_shape, forward_wmma_kernel, score_bytes};
 use super::wmma_backward::{dkdv_shape, dkdv_wmma_kernel, dq_shape, dq_wmma_kernel, partial_bytes};
 use super::{
     AttentionBackend, AttentionMaskPrimitive, AttentionOptions, CacheLengths, MaskShape, Reach,
@@ -178,17 +178,23 @@ fn tensor_cores(properties: &DeviceProperties, dtype: DType) -> bool {
         && properties.features.matmul.ldmatrix.contains(&elem)
 }
 
-/// What the forward of `wmma.rs` asks: 128 units per cube (four waves of 32), a cube per 64
-/// queries of each query head (and batch element), the key tile and the transposed value tile
-/// (32 keys each), the waves' spans and the padding flags in shared memory, eight tensors,
-/// 16-byte vectors and planes of 32.
+/// What the forward of `wmma.rs` asks: a cube per `16 groups` queries of each query head (and
+/// batch element), `ds` waves of 32 per 16 queries ([`forward_shape`]); the key tile and the
+/// transposed value tile, the groups' spans, the padding flags and the partial scores in shared
+/// memory; eight tensors, 16-byte vectors and planes of 32.
 fn wmma_forward_requirements([_, tq, _, hq, _, d]: [usize; 6]) -> Requirements {
-    let (rows, bkv) = (WMMA_BLOCK_Q as usize, WMMA_BLOCK_KV as usize);
+    let (groups, ds, bkv) = forward_shape(d as u32);
+    let partials = score_bytes(groups, ds, bkv);
+    let (groups, ds, bkv) = (groups as usize, ds as usize, bkv as usize);
     Requirements {
-        shared_bytes: 2 * bkv * d * 2 + 4 * (2 * rows / 16 + bkv),
+        shared_bytes: 2 * bkv * d * 2 + 4 * (2 * groups + bkv) + partials,
         vector_size: VECTOR,
         plane_width: Some(PLANE),
-        ..Requirements::new((2 * rows as u32, 1), (tq.div_ceil(rows), hq), 8)
+        ..Requirements::new(
+            ((32 * groups * ds) as u32, 1),
+            (tq.div_ceil(16 * groups), hq),
+            8,
+        )
     }
 }
 
@@ -520,7 +526,8 @@ fn forward(
     let [m_sb, m_st] = mask.key_strides;
     if forward_on_wmma(&client, query.dtype, [b, tq, tk, hq, hkv, d]) {
         let dtype = dtype_to_storage_type(query.dtype);
-        let q_blocks = tq.div_ceil(WMMA_BLOCK_Q as usize);
+        let (groups, ds, bkv) = forward_shape(d as u32);
+        let q_blocks = tq.div_ceil(16 * groups as usize);
         launched();
         // SAFETY: as below; the cube count and units are those `wmma_forward_requirements`
         // checked, and the kernel bounds every index as `forward_kernel` does.
@@ -528,7 +535,7 @@ fn forward(
             forward_wmma_kernel::launch_unchecked(
                 &client,
                 CubeCount::Static(q_blocks as u32, hq as u32, b as u32),
-                CubeDim::new_1d(2 * WMMA_BLOCK_Q),
+                CubeDim::new_1d(32 * groups * ds),
                 query.into_tensor_arg(),
                 key.into_tensor_arg(),
                 value.into_tensor_arg(),
@@ -557,6 +564,9 @@ fn forward(
                 mask.right,
                 scale,
                 d as u32,
+                groups,
+                ds,
+                bkv,
                 mask.padded,
                 mask.packed,
                 dtype,
