@@ -106,6 +106,10 @@ fn stage_copy_ahead<E: Float>(
     #[comptime] chunks: u32,
     #[comptime] units: u32,
 ) {
+    comptime!(assert!(
+        total % units == 0,
+        "stage_copy_ahead: every unit takes every step, so `total` is a multiple of `units`"
+    ));
     let steps = comptime!(total / units);
     let mut x = Array::<Vector<E, V8>>::new(steps as usize);
     #[unroll]
