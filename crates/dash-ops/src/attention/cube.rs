@@ -214,7 +214,7 @@ fn forward_on_wmma(client: &Client, dtype: DType, dims: [usize; 6]) -> bool {
 /// keys of each key-value head ([`dq_shape`], [`dkdv_shape`]); the query gradient's key, value
 /// and transposed key tiles, or the other's query and output-gradient tiles by rows and
 /// transposed with each query's statistics and interval, in shared memory, the most of the two;
-/// eleven tensors; 16-byte vectors and planes of 32.
+/// thirteen tensors; 16-byte vectors and planes of 32.
 fn wmma_backward_requirements([b, tq, tk, hq, hkv, d]: [usize; 6]) -> Requirements {
     let rows_per_cube = 256 / (d / VECTOR);
     let (dq_groups, dq_ds, bkv) = dq_shape(d as u32);
@@ -239,7 +239,7 @@ fn wmma_backward_requirements([b, tq, tk, hq, hkv, d]: [usize; 6]) -> Requiremen
         ..Requirements::new(
             ((32 * dq_groups * dq_ds) as u32, 1),
             (tq.div_ceil(16 * dq_groups), hq),
-            10,
+            11,
         )
     };
     let dkdv = Requirements {
@@ -247,7 +247,7 @@ fn wmma_backward_requirements([b, tq, tk, hq, hkv, d]: [usize; 6]) -> Requiremen
         ..Requirements::new(
             ((32 * kv_groups * kv_ds) as u32, 1),
             (tk.div_ceil(16 * kv_groups), hkv),
-            11,
+            13,
         )
     };
     Requirements {
