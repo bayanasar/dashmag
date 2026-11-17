@@ -37,7 +37,7 @@
 //! in global memory: CUDA cards of compute capability 8.0 and later, where they always run.
 //! Where those are missing, a device whose 16 x 16 x 16 MMA from that dtype into f32 has RDNA4's
 //! register layout (read from each device the first time, for each dtype) runs a forward of its
-//! own on it, up to 33 KiB of shared memory and 128 units per cube: AMD's RDNA4 GPUs under ROCm.
+//! own on it, up to 32.1 KiB of shared memory and 512 units per cube: AMD's RDNA4 GPUs under ROCm.
 //! Its backward runs kernels of its own there too (`wmma_backward.rs`), up to 48.3 KiB and 256
 //! units per cube and without atomics: the default's sums, the query gradient in a fixed order,
 //! whatever [`AttentionOptions::deterministic`] says, and a key block's queries never split
