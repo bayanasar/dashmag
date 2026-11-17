@@ -36,7 +36,7 @@
 )]
 
 use super::kernels::{V8, fetch_padding, query_range, row_bounds, swizzle};
-use super::wmma::{load_rows_flat, load_vt, vt_index};
+use super::wmma::{V2, load_rows_flat, load_vt, vt_index};
 use cubecl::cmma::MmaDefinition;
 use cubecl::prelude::*;
 
@@ -201,7 +201,8 @@ fn lane_row<E: Float>(
 /// per query, wave `w` accumulating columns `(w / groups) D / ds..` of `dQ`. Sweeps the key tiles
 /// its queries see in order (the forward's span), so that the same inputs give the same bits on
 /// every run. `lse` is the log-sum-exp as `delta_kernel()` leaves it (`+inf` for a query that
-/// sees no key). Writes `dQ` contiguous `[B, Tq, Hq, D]`.
+/// sees no key). Writes `dQ` contiguous `[B, Tq, Hq, D]`. `k2` is `k` viewed two elements a vector,
+/// which the transposed key tile is read through ([`load_vt()`]).
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dq_wmma_kernel<E: Float>(
@@ -209,6 +210,7 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
     k: &Tensor<Vector<E, V8>>,
     v: &Tensor<Vector<E, V8>>,
     d_o: &Tensor<Vector<E, V8>>,
+    k2: &Tensor<Vector<E, V2>>,
     lse: &Tensor<f32>,
     delta: &Tensor<f32>,
     dq: &mut Tensor<Vector<E, V8>>,
@@ -353,10 +355,10 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
             threads,
         );
         load_vt::<E>(
-            k,
+            k2,
             s_kt.as_mut_slice(),
-            k_base,
-            k_st as usize,
+            k_base * 4,
+            k_st as usize * 4,
             k0,
             tk,
             block_kv,
@@ -448,7 +450,8 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
 /// waves per 16 keys, a lane per key, wave `w` accumulating columns `(w / groups) D / ds..` of `dK`
 /// and `dV`. Sweeps the query heads of the group and, for each, the `sq`-query steps of the
 /// queries that see the block ([`query_range()`]), in order. Writes `dK` (times `scale`) and `dV`
-/// contiguous `[B, Tk, Hkv, D]`.
+/// contiguous `[B, Tk, Hkv, D]`. `q2` and `do2` are `q` and `d_o` viewed two elements a vector,
+/// which the transposed tiles are read through ([`load_vt()`]).
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dkdv_wmma_kernel<E: Float>(
@@ -456,6 +459,8 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
     k: &Tensor<Vector<E, V8>>,
     v: &Tensor<Vector<E, V8>>,
     d_o: &Tensor<Vector<E, V8>>,
+    q2: &Tensor<Vector<E, V2>>,
+    do2: &Tensor<Vector<E, V2>>,
     lse: &Tensor<f32>,
     delta: &Tensor<f32>,
     dk: &mut Tensor<Vector<E, V8>>,
@@ -594,10 +599,10 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
             threads,
         );
         load_vt::<E>(
-            q,
+            q2,
             s_qt.as_mut_slice(),
-            q_base,
-            q_st as usize,
+            q_base * 4,
+            q_st as usize * 4,
             q0,
             tq,
             sq,
@@ -605,10 +610,10 @@ pub(crate) fn dkdv_wmma_kernel<E: Float>(
             threads,
         );
         load_vt::<E>(
-            d_o,
+            do2,
             s_dot.as_mut_slice(),
-            do_base,
-            do_st as usize,
+            do_base * 4,
+            do_st as usize * 4,
             q0,
             tq,
             sq,

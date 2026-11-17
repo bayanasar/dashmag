@@ -39,7 +39,8 @@
 //! both waves hold the same scores and each product runs once; 16 keys are taken per step. The key
 //! tile and the transposed value tile take `2 * keys * D * 2` bytes of shared memory, the partial
 //! scores `ds * 8 * 32 * keys / 2 * 4` (32 KiB in all at `D` 256), within the 64 KiB a workgroup
-//! has on RDNA4. Both tiles are read with no branch before a read ([`load_rows_flat()`]).
+//! has on RDNA4. The key tile is read with no branch before a read ([`load_rows_flat()`]), the
+//! value tile four bytes of eight rows at a time, spread over the units ([`load_vt()`]).
 
 // See `kernels.rs`: CubeCL's frontend takes the plain operators.
 #![allow(
@@ -55,6 +56,9 @@ use cubecl::prelude::*;
 
 /// One f32 accumulator element per vector, as the layout gives them.
 type R1 = Const<1>;
+
+/// Two elements a vector: the view [`load_vt()`] reads a tile through.
+pub(super) type V2 = Const<2>;
 
 /// The forward's shape for a head dimension `d`: 16-query groups per cube, waves per group (each
 /// contracting `D / ds` of the scores and accumulating `D / ds` of the output's columns), and keys
@@ -151,12 +155,14 @@ pub(super) fn load_rows_flat<E: Float>(
 
 /// Copies keys `[k0, k0 + keys)` of one (batch, head) slice of `src` (rows `row_stride` vectors
 /// apart from vector `base`; zeros at or past `limit`) into `dst` transposed: for each column
-/// `c` of `V` and group `g` of eight keys, one vector at [`vt_index()`]. Each thread reads eight
-/// rows' vectors at one chunk, the rows past `limit` as [`load_rows_flat()`] reads them, and writes
-/// eight transposed ones.
+/// `c` of `V` and group `g` of eight keys, one vector at [`vt_index()`]. `src` is viewed two
+/// elements a vector, and `base` and `row_stride` count those. An item is one pair of columns of
+/// eight rows: eight 4-byte reads, in flight together, the rows past `limit` read as
+/// [`load_rows_flat()`] reads them, and two transposed vectors written. The items are spread over
+/// every thread; where there are fewer items than threads, whole waves take one and the rest none.
 #[cube]
 pub(super) fn load_vt<E: Float>(
-    src: &Tensor<Vector<E, V8>>,
+    src: &Tensor<Vector<E, V2>>,
     dst: &mut [Vector<E, V8>],
     base: usize,
     row_stride: usize,
@@ -167,45 +173,63 @@ pub(super) fn load_vt<E: Float>(
     #[comptime] threads: u32,
 ) {
     let groups = comptime!(keys / 8);
-    let blocks = comptime!(groups * chunks);
-    let per_thread = comptime!((blocks + threads - 1) / threads);
+    let pairs = comptime!(chunks * 4);
+    let items = comptime!(groups * pairs);
+    comptime!(assert!(
+        items % threads == 0 || items < threads && items % 32 == 0,
+        "load_vt: every thread takes every step, or whole waves take one and the rest none"
+    ));
+    let per_thread = comptime!(items.div_ceil(threads));
     #[unroll]
     for i in 0..per_thread {
         let idx = i * threads + UNIT_POS;
-        if idx < blocks {
-            let c = idx % chunks;
-            let g = idx / chunks;
-            let mut rows = Array::<Vector<E, V8>>::new(8usize);
-            #[unroll]
-            for j in 0..8u32 {
-                let row = k0 + g * 8 + j;
-                let ok = row < limit;
-                let at = base + select(ok, row, 0u32) as usize * row_stride + c as usize;
-                rows[j as usize] = select(ok, src[at], Vector::new(E::from_int(0)));
-            }
-            #[unroll]
-            for e in 0..8u32 {
-                let mut column = Vector::<E, V8>::new(E::from_int(0));
-                #[unroll]
-                for j in 0..8u32 {
-                    column.insert(j as usize, rows[j as usize].extract(e as usize));
-                }
-                dst[vt_index(c * 8 + e, g, groups) as usize] = column;
-            }
+        if comptime!(items >= threads) || idx < items {
+            load_vt_item::<E>(src, dst, base, row_stride, k0, limit, idx, groups, pairs);
         }
     }
+}
+
+/// One item of [`load_vt()`]: the pair of columns `idx % pairs` of key group `idx / pairs`.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn load_vt_item<E: Float>(
+    src: &Tensor<Vector<E, V2>>,
+    dst: &mut [Vector<E, V8>],
+    base: usize,
+    row_stride: usize,
+    k0: u32,
+    limit: u32,
+    idx: u32,
+    #[comptime] groups: u32,
+    #[comptime] pairs: u32,
+) {
+    let p = idx % pairs;
+    let g = idx / pairs;
+    let mut even = Vector::<E, V8>::new(E::from_int(0));
+    let mut odd = Vector::<E, V8>::new(E::from_int(0));
+    #[unroll]
+    for j in 0..8u32 {
+        let row = k0 + g * 8 + j;
+        let ok = row < limit;
+        let at = base + select(ok, row, 0u32) as usize * row_stride + p as usize;
+        let x = select(ok, src[at], Vector::new(E::from_int(0)));
+        even.insert(j as usize, x.extract(0usize));
+        odd.insert(j as usize, x.extract(1usize));
+    }
+    dst[vt_index(2 * p, g, groups) as usize] = even;
+    dst[vt_index(2 * p + 1, g, groups) as usize] = odd;
 }
 
 /// The training forward on RDNA4's layout. One cube per (`16 groups` queries, query head,
 /// batch), query blocks taken last first; `ds` waves per 16 queries, a lane per query and half of
 /// the key or head dimension, wave `w` accumulating columns `(w / groups) D / ds..` of the output. Writes the output, contiguous `[B, Tq, Hq, D]` in 16-byte vectors, and
 /// the natural log-sum-exp, contiguous `[B, Tq, Hq]`, as `forward_kernel()` does. Input strides
-/// are in 8-element vectors.
+/// are in 8-element vectors; `v` is viewed two elements a vector, as [`load_vt()`] reads it.
 #[cube(launch_unchecked)]
 pub(crate) fn forward_wmma_kernel<E: Float>(
     q: &Tensor<Vector<E, V8>>,
     k: &Tensor<Vector<E, V8>>,
-    v: &Tensor<Vector<E, V8>>,
+    v: &Tensor<Vector<E, V2>>,
     o: &mut Tensor<Vector<E, V8>>,
     lse: &mut Tensor<f32>,
     key_mask: &Tensor<i32>,
@@ -348,8 +372,8 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
         load_vt::<E>(
             v,
             s_vt.as_mut_slice(),
-            v_base,
-            v_st as usize,
+            v_base * 4,
+            v_st as usize * 4,
             k0,
             tk,
             block_kv,
