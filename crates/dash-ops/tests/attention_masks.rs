@@ -41,7 +41,8 @@ use dash_ops::attention::{
 };
 use std::sync::{Mutex, MutexGuard};
 
-/// The probe counters are global: tests that read them run one at a time.
+/// The probe counters are global: tests that read them, and tests that move them (any backward
+/// pass), run one at a time.
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -1057,6 +1058,7 @@ fn decode_is_attention_with_one_query_on_flex() {
 #[cfg(feature = "flex")]
 #[test]
 fn decode_with_lengths_takes_gradients_on_flex() {
+    let _serial = serial();
     let device = Device::flex().autodiff();
     let [b, s, hq, hkv, d] = [3, 20, 4, 2, 64];
     let q = host(&[b, 1, hq, d], 410);
