@@ -820,9 +820,23 @@ pub fn kernels_take(device: &Device, dtype: DType, dims: [usize; 6]) -> [bool; 2
     [false, false]
 }
 
+/// Whether the forward that [`kernels_take`] says the kernels take runs on RDNA4's products
+/// (`wmma.rs`): there a kernel copies the values transposed ahead of it. For tests.
+#[doc(hidden)]
+pub fn wmma_forward_takes(device: &Device, dtype: DType, dims: [usize; 6]) -> bool {
+    #[cfg(feature = "cubecl")]
+    if let Some(client) = crate::cube::client(device.as_dispatch()) {
+        return cube::kernels_take(&client, dtype, dims, false)
+            && cube::forward_on_wmma(&client, dtype, dims);
+    }
+    let _ = (device, dtype, dims);
+    false
+}
+
 /// Whether the backward that [`kernels_take`] says the kernels take runs on RDNA4's products
 /// (`wmma_backward.rs`): there the query gradient is always the fixed-order one and the products
-/// never split, whatever the options and [`probe::force_split`] ask. For tests.
+/// never split, whatever the options and [`probe::force_split`] ask, and a kernel copies the keys
+/// transposed ahead of the query gradient. For tests.
 #[doc(hidden)]
 pub fn wmma_backward_takes(device: &Device, dtype: DType, dims: [usize; 6]) -> bool {
     #[cfg(feature = "cubecl")]

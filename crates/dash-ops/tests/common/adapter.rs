@@ -622,8 +622,15 @@ impl Adapter for Burn {
                 cu_seqlens_k: self.offsets(cu_seqlens_k, &device),
             },
         };
-        let [forward, backward] = attention_kernels_take(&device, dtype, [b, tq, tk, hq, hkv, d]);
-        let expected = usize::from(forward) + 3 * usize::from(backward && grad);
+        let dims = [b, tq, tk, hq, hkv, d];
+        let [forward, backward] = attention_kernels_take(&device, dtype, dims);
+        // On RDNA4's products one more each: the values, or the keys, copied transposed ahead of
+        // the forward or the query gradient.
+        let wmma = |takes: fn(&Device, DType, [usize; 6]) -> bool| {
+            usize::from(takes(&device, dtype, dims))
+        };
+        let expected = usize::from(forward) * (1 + wmma(attention::wmma_forward_takes))
+            + usize::from(backward && grad) * (3 + wmma(attention::wmma_backward_takes));
         let (runs, copies, atomics) = (
             probe::backward_runs(),
             probe::input_copies(),

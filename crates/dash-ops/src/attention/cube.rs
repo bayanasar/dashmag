@@ -14,7 +14,9 @@ use super::kernels::{
     BLOCK_KV, BLOCK_Q, backward_kernel, decode_merge_kernel, decode_split_kernel, delta_kernel,
     dq_kernel, finish_kernel, forward_kernel,
 };
-use super::wmma::{forward_shape, forward_wmma_kernel, score_bytes};
+use super::wmma::{
+    KEY_BLOCK, blocked_kernel, forward_shape, forward_wmma_kernel, key_blocks, score_bytes,
+};
 use super::wmma_backward::{dkdv_shape, dkdv_wmma_kernel, dq_shape, dq_wmma_kernel, partial_bytes};
 use super::{
     AttentionBackend, AttentionMaskPrimitive, AttentionOptions, CacheLengths, MaskShape, Reach,
@@ -181,8 +183,9 @@ fn tensor_cores(properties: &DeviceProperties, dtype: DType) -> bool {
 /// What the forward of `wmma.rs` asks: a cube per `16 groups` queries of each query head (and
 /// batch element), `ds` waves of 32 per 16 queries ([`forward_shape`]); the key tile and the
 /// transposed value tile, the groups' spans, the padding flags and the partial scores in shared
-/// memory; eight tensors, 16-byte vectors and planes of 32.
-fn wmma_forward_requirements([_, tq, _, hq, _, d]: [usize; 6]) -> Requirements {
+/// memory; eight tensors, 16-byte vectors and planes of 32; and [`blocked()`]'s copy of the
+/// values.
+fn wmma_forward_requirements([_, tq, tk, hq, hkv, d]: [usize; 6]) -> Requirements {
     let (groups, ds, bkv) = forward_shape(d as u32);
     let partials = score_bytes(groups, ds, bkv);
     let (groups, ds, bkv) = (groups as usize, ds as usize, bkv as usize);
@@ -196,12 +199,64 @@ fn wmma_forward_requirements([_, tq, _, hq, _, d]: [usize; 6]) -> Requirements {
             8,
         )
     }
+    .max(blocked_requirements(tk, hkv, d))
+}
+
+/// Units per cube of [`blocked_kernel()`].
+const BLOCKED_UNITS: usize = 256;
+
+/// What [`blocked()`] asks for `t` keys of `h` heads of `D` columns: a cube per 256 of its units,
+/// two tensors.
+fn blocked_requirements(t: usize, h: usize, d: usize) -> Requirements {
+    Requirements::new(
+        (BLOCKED_UNITS as u32, 1),
+        ((key_blocks(t) * d).div_ceil(BLOCKED_UNITS), h),
+        2,
+    )
+}
+
+/// `V` (or `K`), `[B, T, H, D]`, as the products read it transposed: [`blocked_kernel()`]'s
+/// contiguous `[B, H, blocks, D, 16]` copy, and its blocks a (batch, head) slice.
+fn blocked(tensor: &CubeTensor) -> (CubeTensor, u32) {
+    let [b, t, h, d] = tensor.meta.shape().dims::<4>();
+    let blocks = key_blocks(t);
+    let out = empty_device_contiguous_dtype(
+        tensor.client.clone(),
+        tensor.device.clone(),
+        Shape::new([b, h, blocks, d, KEY_BLOCK]),
+        tensor.dtype,
+    );
+    let [sb, sh, st] = sequence_strides(tensor);
+    launched();
+    // SAFETY: `blocked_requirements` checked the cube count; each unit writes the two vectors of
+    // its own pair of columns and eight keys, below the copy's size, and reads rows below `t`.
+    unsafe {
+        blocked_kernel::launch_unchecked(
+            &tensor.client,
+            CubeCount::Static(
+                (blocks * d).div_ceil(BLOCKED_UNITS) as u32,
+                h as u32,
+                b as u32,
+            ),
+            CubeDim::new_1d(BLOCKED_UNITS as u32),
+            tensor.clone().into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            t as u32,
+            blocks as u32,
+            sb,
+            sh,
+            st,
+            d as u32,
+            dtype_to_storage_type(tensor.dtype),
+        );
+    }
+    (out, blocks as u32)
 }
 
 /// Whether the forward runs on `wmma.rs`'s kernel: the device lacks what `kernels.rs`'
 /// forward asks, and has a 16 x 16 x 16 MMA in the layout that kernel is written for, with
 /// what else it asks.
-fn forward_on_wmma(client: &Client, dtype: DType, dims: [usize; 6]) -> bool {
+pub(super) fn forward_on_wmma(client: &Client, dtype: DType, dims: [usize; 6]) -> bool {
     let properties = client.properties();
     let types = [dtype, DType::F32, DType::I32];
     !(tensor_cores(properties, dtype) && forward_requirements(dims).met_on(client, &types))
@@ -214,7 +269,7 @@ fn forward_on_wmma(client: &Client, dtype: DType, dims: [usize; 6]) -> bool {
 /// keys of each key-value head ([`dq_shape`], [`dkdv_shape`]); the query gradient's key, value
 /// and transposed key tiles, or the other's query and output-gradient tiles by rows and
 /// transposed with each query's statistics and interval, in shared memory, the most of the two;
-/// thirteen tensors; 16-byte vectors and planes of 32.
+/// thirteen tensors; 16-byte vectors and planes of 32; and [`blocked()`]'s copy of the keys.
 fn wmma_backward_requirements([b, tq, tk, hq, hkv, d]: [usize; 6]) -> Requirements {
     let rows_per_cube = 256 / (d / VECTOR);
     let (dq_groups, dq_ds, bkv) = dq_shape(d as u32);
@@ -253,7 +308,10 @@ fn wmma_backward_requirements([b, tq, tk, hq, hkv, d]: [usize; 6]) -> Requiremen
     Requirements {
         vector_size: VECTOR,
         plane_width: Some(PLANE),
-        ..delta.max(dq).max(dkdv)
+        ..delta
+            .max(dq)
+            .max(dkdv)
+            .max(blocked_requirements(tk, hkv, d))
     }
 }
 
@@ -528,9 +586,11 @@ fn forward(
         let dtype = dtype_to_storage_type(query.dtype);
         let (groups, ds, bkv) = forward_shape(d as u32);
         let q_blocks = tq.div_ceil(16 * groups as usize);
+        let (value_t, kv_blocks) = blocked(&value);
         launched();
         // SAFETY: as below; the cube count and units are those `wmma_forward_requirements`
-        // checked, and the kernel bounds every index as `forward_kernel` does.
+        // checked, and the kernel bounds every index as `forward_kernel` does; `value_t` holds
+        // keys up to the last step's.
         unsafe {
             forward_wmma_kernel::launch_unchecked(
                 &client,
@@ -538,7 +598,7 @@ fn forward(
                 CubeDim::new_1d(32 * groups * ds),
                 query.into_tensor_arg(),
                 key.into_tensor_arg(),
-                value.into_tensor_arg(),
+                value_t.into_tensor_arg(),
                 output.clone().into_tensor_arg(),
                 lse.clone().into_tensor_arg(),
                 mask.keys.clone().into_tensor_arg(),
@@ -554,9 +614,7 @@ fn forward(
                 k_sb,
                 k_sh,
                 k_st,
-                v_sb,
-                v_sh,
-                v_st,
+                kv_blocks,
                 m_sb,
                 m_st,
                 mask.seqs,
@@ -673,6 +731,7 @@ fn wmma_backward(
     let group = (hq / hkv) as u32;
     let (dq_groups, dq_ds, dq_keys) = dq_shape(d as u32);
     let q_blocks = tq.div_ceil(16 * dq_groups as usize);
+    let (key_t, kv_blocks) = blocked(key);
     launched();
     // SAFETY: as for the forward of `wmma.rs`; each cube writes the rows of its own queries,
     // below Tq, the columns of each wave's part of D.
@@ -685,7 +744,7 @@ fn wmma_backward(
             key.clone().into_tensor_arg(),
             value.clone().into_tensor_arg(),
             grad_output.clone().into_tensor_arg(),
-            key.clone().into_tensor_arg(),
+            key_t.into_tensor_arg(),
             lse.clone().into_tensor_arg(),
             delta.clone().into_tensor_arg(),
             grad_query.clone().into_tensor_arg(),
@@ -708,6 +767,7 @@ fn wmma_backward(
             do_sb,
             do_sh,
             do_st,
+            kv_blocks,
             m_sb,
             m_st,
             mask.seqs,

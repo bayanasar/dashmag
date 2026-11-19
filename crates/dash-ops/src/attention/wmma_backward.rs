@@ -36,7 +36,7 @@
 )]
 
 use super::kernels::{V8, fetch_padding, query_range, row_bounds, swizzle};
-use super::wmma::{V2, load_rows_flat, load_vt, vt_index};
+use super::wmma::{V2, load_rows_flat, load_vt, load_vt_blocked, vt_index};
 use cubecl::cmma::MmaDefinition;
 use cubecl::prelude::*;
 
@@ -201,8 +201,9 @@ fn lane_row<E: Float>(
 /// per query, wave `w` accumulating columns `(w / groups) D / ds..` of `dQ`. Sweeps the key tiles
 /// its queries see in order (the forward's span), so that the same inputs give the same bits on
 /// every run. `lse` is the log-sum-exp as `delta_kernel()` leaves it (`+inf` for a query that
-/// sees no key). Writes `dQ` contiguous `[B, Tq, Hq, D]`. `k2` is `k` viewed two elements a vector,
-/// which the transposed key tile is read through ([`load_vt()`]).
+/// sees no key). Writes `dQ` contiguous `[B, Tq, Hq, D]`. `kt` is `K` as `wmma.rs`'
+/// `blocked_kernel()` leaves it, `kv_blocks` blocks a (batch, head) slice, which the transposed key
+/// tile is read from ([`load_vt_blocked()`]).
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dq_wmma_kernel<E: Float>(
@@ -210,7 +211,7 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
     k: &Tensor<Vector<E, V8>>,
     v: &Tensor<Vector<E, V8>>,
     d_o: &Tensor<Vector<E, V8>>,
-    k2: &Tensor<Vector<E, V2>>,
+    kt: &Tensor<Vector<E, V8>>,
     lse: &Tensor<f32>,
     delta: &Tensor<f32>,
     dq: &mut Tensor<Vector<E, V8>>,
@@ -233,6 +234,7 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
     do_sb: u32,
     do_sh: u32,
     do_st: u32,
+    kv_blocks: u32,
     m_sb: u32,
     m_st: u32,
     seqs: u32,
@@ -270,6 +272,7 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
     let do_base = b as usize * do_sb as usize + h as usize * do_sh as usize;
     let k_base = b as usize * k_sb as usize + hk as usize * k_sh as usize;
     let v_base = b as usize * v_sb as usize + hk as usize * v_sh as usize;
+    let kt_base = ((b * (hq / group) + hk) * kv_blocks) as usize * comptime!((2 * d) as usize);
     let m_base = b as usize * m_sb as usize;
 
     // This lane's query and the keys it sees; the wave's and the cube's spans, as the forward's.
@@ -354,17 +357,7 @@ pub(crate) fn dq_wmma_kernel<E: Float>(
             chunks,
             threads,
         );
-        load_vt::<E>(
-            k2,
-            s_kt.as_mut_slice(),
-            k_base * 4,
-            k_st as usize * 4,
-            k0,
-            tk,
-            block_kv,
-            chunks,
-            threads,
-        );
+        load_vt_blocked::<E>(kt, s_kt.as_mut_slice(), kt_base, k0, block_kv, d, threads);
         if comptime!(padded) {
             let flag = fetch_padding(key_mask, m_base, m_st, k0, tk, block_kv);
             if UNIT_POS < block_kv {

@@ -295,6 +295,7 @@ mod cube {
     use super::*;
     use dash_ops::attention::{
         causal_attention_with_lse, decode_kernels_take, kernels_take, wmma_backward_takes,
+        wmma_forward_takes,
     };
 
     fn device() -> Device {
@@ -308,7 +309,9 @@ mod cube {
 
     /// The kernel launches a forward and backward pass over `dims` (`[B, Tq, Tk, Hq, Hkv, D]`) in
     /// `dtype` makes on `device`: one forward and three backward kernels where the kernels take
-    /// them, none where the reference runs; [`launches_kernels`] adds the fourth of a
+    /// them, and one more each on RDNA4's products (the values, or the keys, copied transposed
+    /// ahead of the forward or the query gradient), none where the reference runs;
+    /// [`launches_kernels`] adds the fourth of a
     /// deterministic backward whose products split. Under CUDA the kernels take every bf16 and f16 call
     /// with a head dimension of 64, 128 or 256: cards of compute capability 8.0 and later have
     /// all they ask.
@@ -322,7 +325,8 @@ mod cube {
                 "CUDA turned the kernels away for {dims:?} {dtype:?}"
             );
         }
-        usize::from(forward) + 3 * usize::from(backward)
+        usize::from(forward) * (1 + usize::from(wmma_forward_takes(device, dtype, dims)))
+            + usize::from(backward) * (3 + usize::from(wmma_backward_takes(device, dtype, dims)))
     }
 
     /// Whether `device` stores `dtype`; the tests in a dtype it does not skip, saying so.

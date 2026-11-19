@@ -39,8 +39,14 @@
 //! both waves hold the same scores and each product runs once; 16 keys are taken per step. The key
 //! tile and the transposed value tile take `2 * keys * D * 2` bytes of shared memory, the partial
 //! scores `ds * 8 * 32 * keys / 2 * 4` (32 KiB in all at `D` 256), within the 64 KiB a workgroup
-//! has on RDNA4. The key tile is read with no branch before a read ([`load_rows_flat()`]), the
-//! value tile four bytes of eight rows at a time, spread over the units ([`load_vt()`]).
+//! has on RDNA4. The key tile is read with no branch before a read ([`load_rows_flat()`]). The
+//! value tile is read from a copy of `V` transposed ahead of the kernel ([`blocked_kernel()`]),
+//! a 16-byte read and write for each column of eight keys ([`load_vt_blocked()`]). On a Radeon AI
+//! PRO R9700 (causal, Hq 24, Hkv 4, bf16, `D` 64 to 256, T 4096 and 8192, 2026-11-19) the forward
+//! took 0.84 to 0.92 times as long so between the backward's launches and 0.88 to 0.95 alone as
+//! transposing the tile in each step, eight 4-byte reads and two writes for two columns
+//! ([`load_vt()`]); the copies took 0.015 to 0.081 ms between the backward's launches and 0.017
+//! to 0.129 ahead of the forward alone.
 
 // See `kernels.rs`: CubeCL's frontend takes the plain operators.
 #![allow(
@@ -220,16 +226,101 @@ fn load_vt_item<E: Float>(
     dst[vt_index(2 * p + 1, g, groups) as usize] = odd;
 }
 
+/// Keys of a block of [`blocked_kernel()`]'s output: `D` columns of 16 keys, each column two
+/// 16-byte vectors of eight.
+pub(crate) const KEY_BLOCK: usize = 16;
+
+/// Blocks of [`KEY_BLOCK`] keys [`blocked_kernel()`] writes for `t` keys: the keys rounded up to
+/// 32, the most a kernel's step reads, so that a step past the last key reads zeros.
+pub(crate) fn key_blocks(t: usize) -> usize {
+    t.div_ceil(32) * 2
+}
+
+/// Copies `src`, `[B, T, H, D]` (strides in 8-element vectors, viewed two elements a vector),
+/// into `dst`, contiguous `[B, H, blocks, D, 16]` ([`key_blocks()`]): for each block of 16 keys
+/// and each column of `V`, the column's 16 keys, zeros at or past `t`. A unit per pair of columns
+/// and eight keys, as [`load_vt()`] takes them: eight 4-byte reads, two 16-byte writes. One cube
+/// per 256 such pairs of a (head, batch) slice.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn blocked_kernel<E: Float>(
+    src: &Tensor<Vector<E, V2>>,
+    dst: &mut Tensor<Vector<E, V8>>,
+    t: u32,
+    blocks: u32,
+    s_sb: u32,
+    s_sh: u32,
+    s_st: u32,
+    #[comptime] d: u32,
+    #[define(E)] _dtype: ElemType,
+) {
+    let pairs = comptime!(d / 2);
+    let idx = CUBE_POS_X * CUBE_DIM_X + UNIT_POS;
+    let g = idx / pairs;
+    let p = idx % pairs;
+    if g < blocks * 2 {
+        let h = CUBE_POS_Y;
+        let b = CUBE_POS_Z;
+        let base = (b as usize * s_sb as usize + h as usize * s_sh as usize) * 4;
+        let mut even = Vector::<E, V8>::new(E::from_int(0));
+        let mut odd = Vector::<E, V8>::new(E::from_int(0));
+        #[unroll]
+        for j in 0..8u32 {
+            let row = g * 8 + j;
+            let ok = row < t;
+            let at = base + select(ok, row, 0u32) as usize * s_st as usize * 4 + p as usize;
+            let x = select(ok, src[at], Vector::new(E::from_int(0)));
+            even.insert(j as usize, x.extract(0usize));
+            odd.insert(j as usize, x.extract(1usize));
+        }
+        let block =
+            ((b * CUBE_COUNT_Y + h) * blocks + g / 2) as usize * comptime!((2 * d) as usize);
+        dst[block + (4 * p + g % 2) as usize] = even;
+        dst[block + (4 * p + 2 + g % 2) as usize] = odd;
+    }
+}
+
+/// Copies keys `[k0, k0 + keys)` of one (batch, head) slice of a [`blocked_kernel()`] output
+/// (from vector `base`) into `dst` as [`load_vt()`] leaves it: one 16-byte read and write per
+/// column and eight keys, a step's reads contiguous. `k0` is a multiple of 16, as every kernel's
+/// key tiles start at a multiple of their size. Every thread takes every step.
+#[cube]
+pub(super) fn load_vt_blocked<E: Float>(
+    src: &Tensor<Vector<E, V8>>,
+    dst: &mut [Vector<E, V8>],
+    base: usize,
+    k0: u32,
+    #[comptime] keys: u32,
+    #[comptime] d: u32,
+    #[comptime] threads: u32,
+) {
+    let groups = comptime!(keys / 8);
+    let items = comptime!(groups * d);
+    comptime!(assert!(
+        items % threads == 0,
+        "load_vt_blocked: every thread takes every step, so `keys / 8 * D` is a multiple of `threads`"
+    ));
+    #[unroll]
+    for i in 0..comptime!(items / threads) {
+        let idx = i * threads + UNIT_POS;
+        let g = idx % groups;
+        let c = idx / groups;
+        let at = base + ((k0 / 16 + g / 2) * comptime!(2 * d) + c * 2 + g % 2) as usize;
+        dst[vt_index(c, g, groups) as usize] = src[at];
+    }
+}
+
 /// The training forward on RDNA4's layout. One cube per (`16 groups` queries, query head,
 /// batch), query blocks taken last first; `ds` waves per 16 queries, a lane per query and half of
 /// the key or head dimension, wave `w` accumulating columns `(w / groups) D / ds..` of the output. Writes the output, contiguous `[B, Tq, Hq, D]` in 16-byte vectors, and
 /// the natural log-sum-exp, contiguous `[B, Tq, Hq]`, as `forward_kernel()` does. Input strides
-/// are in 8-element vectors; `v` is viewed two elements a vector, as [`load_vt()`] reads it.
+/// are in 8-element vectors. `vt` is `V` as [`blocked_kernel()`] leaves it, `kv_blocks` blocks
+/// a (batch, head) slice.
 #[cube(launch_unchecked)]
 pub(crate) fn forward_wmma_kernel<E: Float>(
     q: &Tensor<Vector<E, V8>>,
     k: &Tensor<Vector<E, V8>>,
-    v: &Tensor<Vector<E, V2>>,
+    vt: &Tensor<Vector<E, V8>>,
     o: &mut Tensor<Vector<E, V8>>,
     lse: &mut Tensor<f32>,
     key_mask: &Tensor<i32>,
@@ -245,9 +336,7 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
     k_sb: u32,
     k_sh: u32,
     k_st: u32,
-    v_sb: u32,
-    v_sh: u32,
-    v_st: u32,
+    kv_blocks: u32,
     m_sb: u32,
     m_st: u32,
     seqs: u32,
@@ -285,7 +374,7 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
 
     let q_base = b as usize * q_sb as usize + h as usize * q_sh as usize;
     let k_base = b as usize * k_sb as usize + hk as usize * k_sh as usize;
-    let v_base = b as usize * v_sb as usize + hk as usize * v_sh as usize;
+    let vt_base = ((b * (hq / group) + hk) * kv_blocks) as usize * comptime!((2 * d) as usize);
     let m_base = b as usize * m_sb as usize;
 
     // This lane's query and the keys it sees; the wave's span of keys and the keys all its
@@ -369,17 +458,7 @@ pub(crate) fn forward_wmma_kernel<E: Float>(
             chunks,
             threads,
         );
-        load_vt::<E>(
-            v,
-            s_vt.as_mut_slice(),
-            v_base * 4,
-            v_st as usize * 4,
-            k0,
-            tk,
-            block_kv,
-            chunks,
-            threads,
-        );
+        load_vt_blocked::<E>(vt, s_vt.as_mut_slice(), vt_base, k0, block_kv, d, threads);
         if comptime!(padded) {
             let flag = fetch_padding(key_mask, m_base, m_st, k0, tk, block_kv);
             if UNIT_POS < block_kv {
