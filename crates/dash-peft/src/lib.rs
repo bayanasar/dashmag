@@ -505,7 +505,7 @@ pub trait AdapterLayer {
     /// [`PeftAdapter::apply_with`] makes every adapter before it puts any, so that a refusal
     /// leaves the layers unchanged; a `put_lora` that errs partway leaves the layers before it
     /// changed. An implementation should not err here once `make_lora` has succeeded
-    /// (dash-mag's never does).
+    /// (dash-mag's errs only on factors that do not fit the layer, which `apply_with` refuses first).
     fn put_lora(&mut self, name: &str, lora: Self::Lora) -> Result<(), PeftError>;
 
     /// Removes the adapter named `name`, if the layer holds one.
