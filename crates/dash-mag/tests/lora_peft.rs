@@ -22,14 +22,13 @@
 //! reference's largest value, to three figures rounded up, and is held to a `(max abs, relative)`
 //! pair; a loss to an absolute bound alone. The pairs are dash-lora's on the same recordings: its
 //! Flex arm on Flex, which rounds as PyTorch's CPU kernels do at these sizes, and its CUDA arm on
-//! every other device (CUDA, ROCm, MLX), whose products sum in other orders. Two exceptions:
-//!
-//! - Flex's bf16 factors after three free-running steps take the CUDA arm's `(1e-3, 6e-3)` in place
-//!   of `(5e-4, 3e-3)`: from torch's own factors after step 1 a bf16 activation rounds to its
-//!   neighbour here and not in torch (the loss 2.8e-5 apart, the gradients 5.2e-4), the steps after
-//!   compound it, and with this AdamW the factors end 3.7e-3 apart where Burn's ended 1.9e-3.
-//! - On MLX the two-adapter model's bf16 logits take dash-mlx's bound on these recordings, one bf16
-//!   unit relative with no absolute half: MLX's products round a larger logit to its neighbour.
+//! every other device (CUDA, ROCm, MLX), whose products sum in other orders. One exception: Flex's
+//! bf16 factors after three free-running steps take the CUDA arm's `(1e-3, 6e-3)` in place of
+//! `(5e-4, 3e-3)`. From torch's own factors after step 1 a bf16 activation rounds to its neighbour
+//! here and not in torch (the loss 2.8e-5 apart, the gradients 5.2e-4), the steps after compound
+//! it, and with this AdamW the factors end 3.7e-3 apart where Burn's ended 1.9e-3. (dash-mlx's own
+//! layer needed one bf16 unit for the two-adapter model's logits on MLX; dash-mag's gives PEFT's
+//! bits there, or 1.45e-8 with no adapter, within the CUDA arm.)
 //!
 //! A bf16 gradient is also held to its distance from the same model computed in f64, no more than
 //! 1.1 times PEFT's own.
@@ -771,13 +770,8 @@ fn multi_bounds(prec: &str) -> MultiBounds {
             grad: (7e-8, 3.5e-6),
             step1: (3e-8, 2e-7),
         },
-        // On MLX the logits dash-mlx's: the module documentation says why.
         (false, _) => MultiBounds {
-            logits: if cfg!(target_os = "macos") {
-                relative(ONE_BF16_UNIT)
-            } else {
-                (1.5e-3, 7e-4)
-            },
+            logits: (1.5e-3, 7e-4),
             loss: 1e-6,
             grad: (3e-5, 1.5e-3),
             step1: (3e-7, 2.5e-6),
