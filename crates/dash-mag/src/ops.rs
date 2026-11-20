@@ -467,11 +467,11 @@ impl QuantizedWeight {
 /// the output in `x`'s dtype. The definition is the product in f32, the bias added and the sum
 /// rounded once (`dash_contract::quant`); a side may round `W`, and the product before the bias,
 /// to `x`'s dtype, and is held to the definition within the bounds its tests record. Inside
-/// [`crate::vjp`], on Burn, `x` and the bias take their gradients by the definition's backward
-/// (`dash_contract::quant`), the weight frozen; on MLX a call inside `vjp` is refused, whatever its
-/// inputs, until MLX's backward is held to that definition. On MLX the scales are cast to `x`'s dtype on each
+/// [`crate::vjp`], `x` and the bias take their gradients by the definition's backward
+/// (`dash_contract::quant`), the weight frozen. On MLX the scales are cast to `x`'s dtype on each
 /// call; MLX sums in f32 and gives the product in `x`'s dtype, and past a few rows it forms `W` in
-/// that dtype.
+/// that dtype. So does its backward for `x` from 4 rows on; below them, in bf16 and f16, `x`'s
+/// gradient is taken in f32 with `W` exact (`dash_mlx::quantized`).
 pub fn quantized_linear(
     x: &Tensor,
     weight: &QuantizedWeight,

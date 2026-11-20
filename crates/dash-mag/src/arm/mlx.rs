@@ -124,6 +124,7 @@ impl Arm for Mlx {
 
     const HAS_ROPE: bool = true;
     const LORA_AS_ROWS: bool = false;
+    const QUANTIZED_BACKWARD: bool = true;
 
     fn describe() -> String {
         format!("MLX {}, Metal", version().unwrap_or_default())
@@ -665,11 +666,12 @@ impl Arm for Mlx {
                 _ => Ok(b.clone()),
             })
             .transpose()?;
-        Ok(dash_mlx::quantized::quantized_linear(
-            x,
-            qweight,
-            scales,
-            bias.as_ref(),
-        )?)
+        // Inside `vjp`, `x`'s gradient held to the definition, at a little time on each call.
+        let linear = if crate::autodiff::in_vjp() {
+            dash_mlx::quantized::quantized_linear_in_vjp
+        } else {
+            dash_mlx::quantized::quantized_linear
+        };
+        Ok(linear(x, qweight, scales, bias.as_ref())?)
     }
 }
