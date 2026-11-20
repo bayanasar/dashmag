@@ -18,11 +18,21 @@
 //!   gradients, and one AdamW step, against PEFT's, and bit for bit against the model holding
 //!   "default" alone.
 //!
-//! Errors are relative to each reference's largest value, printed to three figures and rounded up.
-//! The bounds are those dash-lora's layer was held to on the same recordings: on Flex, which rounds
-//! as PyTorch's CPU kernels do at these sizes, a few f32 roundings; on a GPU, whose products sum in
-//! other orders, one bf16 unit where a bf16 activation rounds to its neighbour. A bf16 gradient is
-//! held to its distance from the same model computed in f64, no more than 1.1 times PEFT's own.
+//! Each comparison prints the largest absolute difference and that difference relative to the
+//! reference's largest value, to three figures rounded up, and is held to a `(max abs, relative)`
+//! pair; a loss to an absolute bound alone. The pairs are dash-lora's on the same recordings: its
+//! Flex arm on Flex, which rounds as PyTorch's CPU kernels do at these sizes, and its CUDA arm on
+//! every other device (CUDA, ROCm, MLX), whose products sum in other orders. Two exceptions:
+//!
+//! - Flex's bf16 factors after three free-running steps take the CUDA arm's `(1e-3, 6e-3)` in place
+//!   of `(5e-4, 3e-3)`: from torch's own factors after step 1 a bf16 activation rounds to its
+//!   neighbour here and not in torch (the loss 2.8e-5 apart, the gradients 5.2e-4), the steps after
+//!   compound it, and with this AdamW the factors end 3.7e-3 apart where Burn's ended 1.9e-3.
+//! - On MLX the two-adapter model's bf16 logits take dash-mlx's bound on these recordings, one bf16
+//!   unit relative with no absolute half: MLX's products round a larger logit to its neighbour.
+//!
+//! A bf16 gradient is also held to its distance from the same model computed in f64, no more than
+//! 1.1 times PEFT's own.
 //!
 //!   cargo test --release -p dash-mag --test lora_peft -- --nocapture
 //!   CUBECL_CUDA_TF32=0 cargo test --release -p dash-mag --features cuda --test lora_peft -- --nocapture
@@ -179,8 +189,17 @@ fn up3(x: f64) -> String {
     format!("{:.2}e{e}", m / 100.0)
 }
 
-/// The largest difference relative to the largest reference value, printed, and held to `bound`.
-fn check(label: &str, got: &[f64], want: &[f64], bound: f64) -> f64 {
+/// `(max abs, relative)`: both halves hold.
+type Bound = (f64, f64);
+
+/// Relative alone, as dash-lora held one layer.
+fn relative(bound: f64) -> Bound {
+    (f64::INFINITY, bound)
+}
+
+/// The largest difference and that over the largest reference value, printed, and held to `bound`;
+/// returns the relative one.
+fn check(label: &str, got: &[f64], want: &[f64], bound: Bound) -> f64 {
     assert_eq!(got.len(), want.len(), "{label}: lengths");
     let (mut worst, mut scale) = (0f64, 0f64);
     for (g, w) in got.iter().zip(want) {
@@ -191,8 +210,8 @@ fn check(label: &str, got: &[f64], want: &[f64], bound: f64) -> f64 {
     let relative = if scale > 0.0 { worst / scale } else { worst };
     println!("{label:52} max abs {worst:.3e}  relative {}", up3(relative));
     assert!(
-        relative <= bound,
-        "{label}: {relative:.3e} above {bound:.1e}"
+        worst <= bound.0 && relative <= bound.1,
+        "{label}: {worst:.3e} and {relative:.3e} against {bound:?}"
     );
     relative
 }
@@ -211,9 +230,19 @@ fn check_loss(label: &str, got: f64, want: f64, bound: f64) {
 /// A bf16 gradient against the same model's gradient computed exactly (f64): no further from it
 /// than 1.1 times PEFT's own; the distance from PEFT's printed.
 fn check_against_exact(label: &str, got: &[f64], peft: &[f64], exact: &[f64]) {
-    check(&format!("{label} vs PEFT"), got, peft, f64::INFINITY);
-    let theirs = check("  PEFT's own vs exact", peft, exact, f64::INFINITY);
-    let ours = check("  dash-mag vs exact", got, exact, 1.1 * theirs);
+    check(
+        &format!("{label} vs PEFT"),
+        got,
+        peft,
+        relative(f64::INFINITY),
+    );
+    let theirs = check(
+        "  PEFT's own vs exact",
+        peft,
+        exact,
+        relative(f64::INFINITY),
+    );
+    let ours = check("  dash-mag vs exact", got, exact, relative(1.1 * theirs));
     println!("  dash-mag {:.2} times PEFT's distance", ours / theirs);
 }
 
@@ -222,7 +251,7 @@ fn check_against_exact(label: &str, got: &[f64], peft: &[f64], exact: &[f64]) {
 /// whatever the gradient's last bits, but where `|g|` is within a few eps of zero the step follows
 /// the gradient's last bits, which differ between two correct computations. Elements with a torch
 /// gradient below 100 eps are held only to the bound every AdamW step obeys, at most `2 lr` apart.
-fn check_first_step(label: &str, got: &[f64], want: &[f64], grad: &[f64], bound: f64) {
+fn check_first_step(label: &str, got: &[f64], want: &[f64], grad: &[f64], bound: Bound) {
     let scale = want.iter().fold(0f64, |m, v| m.max(v.abs()));
     let (mut well, mut ill, mut n_ill) = (0f64, 0f64, 0usize);
     for ((a, e), g) in got.iter().zip(want).zip(grad) {
@@ -238,8 +267,8 @@ fn check_first_step(label: &str, got: &[f64], want: &[f64], grad: &[f64], bound:
         up3(well / scale)
     );
     assert!(
-        well / scale <= bound,
-        "{label}: {:.3e} above {bound:.1e}",
+        well <= bound.0 && well / scale <= bound.1,
+        "{label}: {well:.3e} and {:.3e} against {bound:?}",
         well / scale
     );
     assert!(ill <= 2.0 * LR, "{label}: an element moved {ill:.3e}");
@@ -289,10 +318,10 @@ fn one_layer_matches_peft() {
             ONE_BF16_UNIT
         };
         for (what, got, bound) in [
-            ("y", &out[0], in_x),
-            ("dx", &grads[0], in_x),
-            ("da", &grads[1], 1e-6),
-            ("db", &grads[2], 1e-6),
+            ("y", &out[0], relative(in_x)),
+            ("dx", &grads[0], relative(in_x)),
+            ("da", &grads[1], relative(1e-6)),
+            ("db", &grads[2], relative(1e-6)),
         ] {
             check(
                 &format!("{tag} {what}"),
@@ -496,50 +525,56 @@ fn tiny(f: &Fixture, prec: &str) -> Tiny {
     model
 }
 
-/// Bounds relative to each reference's largest value, the loss's absolute, per quantity: those
-/// dash-lora's layer was held to on these recordings, with Burn's AdamW where this has its own.
+/// dash-lora's bounds for the model, per quantity: `(max abs, relative)` pairs, the losses'
+/// absolute. The measured maxima behind them were in dash-lora's `tests/tiny.rs`, removed with it.
 struct Bounds {
-    logits: f64,
+    logits: Bound,
     loss: f64,
-    grad: f64,
-    step1: f64,
-    step3: f64,
+    grad: Bound,
+    step1: Bound,
+    step3: Bound,
     /// Every step's gradients and loss from torch's factors at that step (teacher-forced).
-    forced_grad: f64,
+    forced_grad: Bound,
     forced_loss: f64,
 }
 
 fn tiny_bounds(prec: &str) -> Bounds {
     match (ON_CPU, prec) {
-        (_, "f32") => Bounds {
-            logits: 5e-7,
+        (true, "f32") => Bounds {
+            logits: (1e-6, 5e-7),
             loss: 1e-6,
-            grad: 1e-6,
-            step1: 2e-7,
-            step3: 3e-6,
-            forced_grad: 1e-6,
+            grad: (2e-8, 1e-6),
+            step1: (3e-8, 2e-7),
+            step3: (4e-7, 2e-6),
+            forced_grad: (2e-8, 1e-6),
             forced_loss: 2e-6,
         },
-        // Three free-running bf16 steps: from torch's own factors after step 1, an activation
-        // rounds to its neighbouring bf16 value here and not in torch (the loss 2.8e-5 apart, the
-        // gradients 5.2e-4), and the steps after compound it; with this AdamW 3.7e-3 apart after
-        // step 3, with Burn's 1.9e-3. The bound is the GPU's.
+        (false, "f32") => Bounds {
+            logits: (1e-6, 5e-7),
+            loss: 1e-6,
+            grad: (2e-8, 1e-6),
+            step1: (3e-8, 2e-7),
+            step3: (4e-7, 3e-6),
+            forced_grad: (2e-8, 1e-6),
+            forced_loss: 2e-6,
+        },
+        // Step 3 the CUDA arm's: the module documentation says why.
         (true, _) => Bounds {
-            logits: 1e-6,
+            logits: (1e-6, 1e-6),
             loss: 2e-6,
-            grad: 5e-6,
-            step1: 2e-7,
-            step3: 6e-3,
-            forced_grad: 1e-3,
+            grad: (1e-7, 5e-6),
+            step1: (3e-8, 2e-7),
+            step3: (1e-3, 6e-3),
+            forced_grad: (2e-5, 1e-3),
             forced_loss: 5e-5,
         },
         (false, _) => Bounds {
-            logits: 7e-4,
+            logits: (1.5e-3, 7e-4),
             loss: 2e-6,
-            grad: 3e-3,
-            step1: 1e-4,
-            step3: 6e-3,
-            forced_grad: 3e-3,
+            grad: (5e-5, 3e-3),
+            step1: (2e-5, 1e-4),
+            step3: (1e-3, 6e-3),
+            forced_grad: (5e-5, 3e-3),
             forced_loss: 5e-5,
         },
     }
@@ -652,8 +687,8 @@ fn every_step_s_gradients_match_from_torch_s_factors() {
 fn adamw_matches_torch_on_torch_s_gradients() {
     let _turn = serial();
     let f = Fixture::load("tiny.safetensors");
-    // Measured with Burn's AdamW on these gradients: 2.3e-7 on Flex, 3.4e-7 on CUDA with fusion.
-    let bound = if ON_CPU { 4e-7 } else { 4.5e-7 };
+    // dash-lora's, from Burn's AdamW on these gradients: 2.3e-7 on Flex, 3.4e-7 on CUDA with fusion.
+    let bound = if ON_CPU { (5e-8, 4e-7) } else { (7e-8, 4.5e-7) };
     for prec in ["f32", "bf16"] {
         let mut model = tiny(&f, prec);
         let mut optim = adamw();
@@ -714,36 +749,38 @@ fn kl_loss(logits: &Tensor, reference: &Tensor, one_hot: &Tensor) -> Result<Tens
     ce.add(&kl.mul_scalar(BETA)?)
 }
 
-fn multi_bounds(prec: &str) -> Bounds {
-    let mlx = cfg!(target_os = "macos");
+/// dash-lora's bounds for two adapters over one base, as [`Bounds`] are for the model.
+struct MultiBounds {
+    logits: Bound,
+    loss: f64,
+    grad: Bound,
+    step1: Bound,
+}
+
+fn multi_bounds(prec: &str) -> MultiBounds {
     match (ON_CPU, prec) {
-        (_, "f32") => Bounds {
-            logits: 5e-7,
+        (_, "f32") => MultiBounds {
+            logits: (1e-6, 5e-7),
             loss: 1e-6,
-            grad: 1e-6,
-            step1: 2e-7,
-            step3: 0.0,
-            forced_grad: 0.0,
-            forced_loss: 0.0,
+            grad: (2e-8, 1e-6),
+            step1: (3e-8, 2e-7),
         },
-        (true, _) => Bounds {
-            logits: 0.0,
+        (true, _) => MultiBounds {
+            logits: (0.0, 0.0),
             loss: 1e-6,
-            grad: 3.5e-6,
-            step1: 2e-7,
-            step3: 0.0,
-            forced_grad: 0.0,
-            forced_loss: 0.0,
+            grad: (7e-8, 3.5e-6),
+            step1: (3e-8, 2e-7),
         },
-        // MLX's products round a larger logit to its neighbour: one bf16 unit, as for one layer.
-        (false, _) => Bounds {
-            logits: if mlx { ONE_BF16_UNIT } else { 7e-4 },
+        // On MLX the logits dash-mlx's: the module documentation says why.
+        (false, _) => MultiBounds {
+            logits: if cfg!(target_os = "macos") {
+                relative(ONE_BF16_UNIT)
+            } else {
+                (1.5e-3, 7e-4)
+            },
             loss: 1e-6,
-            grad: 1.5e-3,
-            step1: 2.5e-6,
-            step3: 0.0,
-            forced_grad: 0.0,
-            forced_loss: 0.0,
+            grad: (3e-5, 1.5e-3),
+            step1: (3e-7, 2.5e-6),
         },
     }
 }
