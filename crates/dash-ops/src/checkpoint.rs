@@ -95,9 +95,9 @@
 //!   leaves, operations on its parameters (a transposed weight) set some steps' depths, deep in
 //!   the stack its input does. A sum of three or more contributions then rounds differently.
 //!   LoRA'd blocks showed it in bf16 on 2026-10-26 (`tests/checkpoint_lowrank.rs`), their
-//!   gradients as far from the same stack computed in f32 as plain autodiff's; on Flex and on
-//!   CUDA on 2026-11-20 their 64 stacks are exactly as far as plain autodiff's (every ratio
-//!   1.00).
+//!   gradients as far from the same stack computed in f32 as plain autodiff's. Since then they
+//!   have been plain autodiff's bit for bit, on Flex, on CUDA, also with `fusion` and
+//!   `autotune`, and on ROCm (2026-11-20), and that test holds them to it.
 
 use burn::module::{Module, ModuleVisitor, Param};
 use burn::tensor::{GradientCheckpointingStrategy, Gradients, Tensor};

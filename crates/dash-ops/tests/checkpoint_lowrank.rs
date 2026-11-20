@@ -10,10 +10,10 @@
 //! In bf16 they need not be: Burn adds up a tensor's gradient contributions as they arrive, a
 //! block's input has five consumers, and the per-block graphs can reach them in a different order
 //! than the whole-stack graph, so that their bf16 sums round differently and the difference
-//! travels down the stack. On 2026-10-26 they did; on Flex and on CUDA on 2026-11-20 they do not
-//! (below).
-//! What is asserted is that both are as far from the same stack computed in f32, over several
-//! random stacks.
+//! travels down the stack. On 2026-10-26 they did. Since then they have been the same bits, on
+//! Flex, on CUDA, also with `fusion` and `autotune`, and on ROCm (2026-11-20), and the bf16 test holds them
+//! to it, so that a change in that order shows; it still prints how far both are from the same
+//! stack computed in f32.
 //! The stacks are drawn on the host from a seeded generator, not from Burn's process-wide one,
 //! so they do not depend on which other tests run at the same time.
 //!
@@ -317,14 +317,26 @@ fn recomputed_f32_stack_gives_plain_autodiff_s_gradients() {
 /// from 0.83 to 1.29: recomputing cost no accuracy, it only rounded differently. The largest
 /// element-error ratio of a single tensor was noisier, median 1.41, up to 2.46. The bounds sit just
 /// above those maxima; the 8 stacks checked here include the worst of the 64 then (seed 1). On
-/// Flex and on CUDA on 2026-11-20 every ratio of the 64 is 1.00, on Flex with dash-lora's layer as
-/// with this one.
+/// Flex, on CUDA and on ROCm on 2026-11-20 every ratio of the 64 is 1.00, on Flex with dash-lora's layer as
+/// with this one, and the 8 stacks' gradients are plain autodiff's bit for bit: that is asserted,
+/// and the bounds stay for a build where the order differs again.
 #[test]
 fn recomputed_bf16_stack_is_as_close_to_f32_as_plain_autodiff() {
     let _serial = serial();
     for (name, device) in devices_with(DType::BF16) {
         for seed in 0..8 {
             let (worst, overall) = bf16_ratios(name, &device, seed, seed == 0);
+            let (blocks, x) = stack(&device, DType::BF16, seed);
+            let (p, r) = (plain(&blocks, &x), recomputed(&blocks, &x));
+            let same = r.dx.as_bytes() == p.dx.as_bytes()
+                && r.grads
+                    .iter()
+                    .zip(&p.grads)
+                    .all(|(r, p)| r.as_bytes() == p.as_bytes());
+            assert!(
+                same,
+                "{name} seed {seed}: recomputed bf16 gradients are no longer plain autodiff's bits"
+            );
             println!(
                 "{name} seed {seed}: recomputed vs plain distance from f32, largest ratio {worst:.2}, \
                  overall {overall:.3}"
