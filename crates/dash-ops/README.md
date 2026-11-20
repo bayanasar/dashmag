@@ -146,7 +146,9 @@ host-side cost of each unfused operation.
     CUBECL_CUDA_TF32=0 cargo test -p dash-ops --features cuda  # the kernels, against them
 
 `CUBECL_CUDA_TF32=0` keeps f32 matmuls in IEEE f32 (the workspace's patched cubecl-cuda); the f32
-tolerances assume it. The fixtures in `tests/fixtures/` were recorded once from PyTorch and
+tolerances assume it. An application that calls dash-ops directly gets no check of this: with
+cubecl-cuda as published, its f32 matmuls run in TF32 on compute capability 8.0 and later. dash-mag
+refuses such a device, and its README gives the `[patch]` an application repeats. The fixtures in `tests/fixtures/` were recorded once from PyTorch and
 transformers on seeded inputs; nothing in the repository runs Python. The operation-level tests
 of conv1d, the gated delta rule, the chosen-token log-probability and attention are
 `dash-conformance`'s, for every implementation of the operations to run; the tests here run them
