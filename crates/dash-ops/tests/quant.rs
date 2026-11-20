@@ -396,8 +396,8 @@ fn refuses_what_it_cannot_read() {
 /// The backward pass on `Autodiff`: `x`'s gradient against `dy Wᵀ` and the bias's against the sum
 /// of `dy` over the rows, both computed on the host in f64, each element within what summing in
 /// f32 and the one rounding to its dtype allow ([`allowed`], neither `W` nor the product rounded);
-/// the bias in f32 beside `x` in another dtype at 9 rows; and with neither asking for a gradient,
-/// nothing recorded.
+/// the bias in f32 beside `x` in another dtype at 9 rows; beside a frozen bias, `x`'s gradient the
+/// same and none for the bias; and with neither asking for a gradient, nothing recorded.
 #[test]
 fn backward_gives_x_and_the_bias_their_gradients() {
     let _serial = serial();
@@ -437,9 +437,23 @@ fn backward_gives_x_and_the_bias_their_gradients() {
                     "{name} {rows}"
                 );
                 let read = |data: TensorData| data.convert::<f32>().try_to_vec::<f32>().unwrap();
-                let dys = read(dy.cast(FloatDType::F32).into_data());
+                let dys = read(dy.clone().cast(FloatDType::F32).into_data());
                 let dxs = read(dx.cast(FloatDType::F32).into_data());
                 let dbs = read(db.cast(FloatDType::F32).into_data());
+                // A frozen bias beside a trained `x`, LoRA's usual case: `x`'s gradient alone, the
+                // same bits, and none for the bias. (Burn's `detach` keeps a tensor's requirement.)
+                let frozen = bias.clone().detach().set_require_grad(false);
+                let y = quantized_linear(x.clone(), &weight, Some(frozen.clone()));
+                let grads = (y.cast(FloatDType::F32) * dy.clone().cast(FloatDType::F32))
+                    .sum()
+                    .backward();
+                assert!(frozen.grad(&grads).is_none(), "{name} {dtype:?} {rows}");
+                let alone = x.grad(&grads).expect("x's gradient beside a frozen bias");
+                assert_eq!(
+                    read(alone.cast(FloatDType::F32).into_data()),
+                    dxs,
+                    "{name} {dtype:?} {rows}: x's gradient beside a frozen bias"
+                );
                 let none = Roundings {
                     w: false,
                     product: false,
