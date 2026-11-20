@@ -21,7 +21,7 @@ runtime whose device offers what they ask; and an implementation for `Autodiff` 
 written-out backward pass, so that training records one node instead of the reference's
 intermediate tensors. `tests/extension_pattern.rs` is the smallest complete example of that
 shape. Each operation's definition, shapes, dtypes and options, and what it matches, are in
-the module of the same name in [`dash-contract`](https://crates.io/crates/dash-contract),
+the module of the same name in [`dash-contract`](https://github.com/bayanasar/dashmag/tree/main/crates/dash-contract),
 written once for every implementation of these operations; this crate re-exports its option
 types and documents its own kernels in each module.
 
