@@ -1,7 +1,6 @@
 //! LoRA's layer: the base product plus the low-rank term at `x`'s dtype, an adapter chosen or none,
-//! factors refused that do not fit; on MLX the same bits as dash-mlx's layer, output and gradients;
-//! and on every side PEFT's files through the layers and back byte for byte. Against values
-//! recorded from PEFT itself: `tests/lora_peft.rs`.
+//! factors refused that do not fit; and on every side PEFT's files through the layers and back
+//! byte for byte. Against values recorded from PEFT itself: `tests/lora_peft.rs`.
 
 mod common;
 
@@ -10,8 +9,6 @@ use dash_mag::lora::{
     AdapterLayer, ApplyOptions, DEFAULT_ADAPTER, HostTensor, Lora, LoraLinear, LoraWeights,
     PeftAdapter, PeftConfig,
 };
-#[cfg(target_os = "macos")]
-use dash_mag::vjp;
 use dash_mag::{DType, Tensor};
 use std::path::PathBuf;
 
@@ -31,22 +28,6 @@ fn layer(dtype: DType) -> LoraLinear {
     .unwrap();
     layer.insert_adapter(DEFAULT_ADAPTER, lora).unwrap();
     layer
-}
-
-/// `f` over the chosen adapter's factors and `x`.
-#[cfg(target_os = "macos")]
-fn run(layer: &LoraLinear, x: &Tensor, cotangent: &Tensor) -> (Vec<Tensor>, Vec<Tensor>) {
-    let lora = layer.lora().unwrap();
-    let mut held = layer.clone();
-    vjp(
-        |p| {
-            held.set_factors(p[1].clone(), p[2].clone())?;
-            Ok(vec![held.forward(&p[0])?])
-        },
-        &[x.clone(), lora.a.clone(), lora.b.clone()],
-        &[Some(cotangent.clone())],
-    )
-    .unwrap()
 }
 
 #[test]
@@ -195,58 +176,4 @@ fn set_weight_replaces_the_base_and_refuses_another_shape() {
     assert!(layer.set_weight(tensor(6, &[8, 15], DType::F32)).is_err());
     let integers = Tensor::from_i32(&[0; 128], &[8, 16]).unwrap();
     assert!(layer.set_weight(integers).is_err());
-}
-
-/// The MLX side against dash-mlx's layer.
-#[cfg(target_os = "macos")]
-#[test]
-fn on_mlx_it_is_dash_mlx_s_layer_bit_for_bit() {
-    use dash_mlx::mlx::module::Module;
-    use dash_mlx::mlx::transforms::fallible_vjp;
-    use dash_mlx::mlx::{Array, Dtype};
-
-    let plain = |seed: u64, shape: &[i32], dtype: Dtype| {
-        let n = shape.iter().product::<i32>() as usize;
-        Array::from_slice(&common::values(seed, n), shape)
-            .as_dtype(dtype)
-            .unwrap()
-    };
-    let f32s = |a: &Array| -> Vec<u32> {
-        let a = a.as_dtype(Dtype::Float32).unwrap().contiguous().unwrap();
-        a.as_slice::<f32>().iter().map(|v| v.to_bits()).collect()
-    };
-    let rows: [(&[usize], &[i32]); 2] = [(&[3], &[3]), (&[1, 3], &[1, 3])];
-    for ((dtype, mlx), (lead, plain_lead)) in
-        [(DType::BF16, Dtype::Bfloat16), (DType::F32, Dtype::Float32)]
-            .into_iter()
-            .flat_map(|d| rows.iter().map(move |r| (d, *r)))
-    {
-        let front = layer(dtype);
-        let shape = |last: usize| [lead, &[last]].concat();
-        let plain_shape = |last: i32| [plain_lead, &[last]].concat();
-        let x = tensor(4, &shape(16), dtype);
-        let (outs, grads) = run(&front, &x, &tensor(5, &shape(8), DType::F32));
-
-        let weight = plain(1, &[8, 16], mlx);
-        let (y, g) = fallible_vjp(
-            |p: &[Array]| {
-                let mut layer = dash_mlx::lora::LoraLinear::frozen(&weight)?
-                    .with_lora(dash_mlx::lora::Lora::new(&p[1], &p[2], 2.0)?)?;
-                Ok(vec![layer.forward(&p[0])?])
-            },
-            &[
-                plain(4, &plain_shape(16), mlx),
-                plain(2, &[4, 16], Dtype::Float32),
-                plain(3, &[8, 4], Dtype::Float32),
-            ],
-            &[plain(5, &plain_shape(8), Dtype::Float32)
-                .as_dtype(mlx)
-                .unwrap()],
-        )
-        .unwrap();
-        assert_eq!(bits(&outs[0]), f32s(&y[0]), "output, {dtype:?}");
-        assert_eq!(bits(&grads[0]), f32s(&g[0]), "x, {dtype:?}");
-        assert_eq!(bits(&grads[1]), f32s(&g[1]), "a, {dtype:?}");
-        assert_eq!(bits(&grads[2]), f32s(&g[2]), "b, {dtype:?}");
-    }
 }

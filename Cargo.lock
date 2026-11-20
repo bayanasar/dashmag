@@ -2405,7 +2405,6 @@ dependencies = [
  "cmake",
  "dash-conformance",
  "dash-contract",
- "dash-peft",
  "half",
  "safetensors 0.8.0",
  "serde_json",

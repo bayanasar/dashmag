@@ -1,4 +1,4 @@
-//! dash-ops' operations and LoRA on MLX, for Apple silicon.
+//! dash-ops' operations on MLX, for Apple silicon.
 //!
 //! On NVIDIA, dashmag's training operations sit on Burn: dash-ops adds what Burn lacks, as
 //! CubeCL kernels. On Apple silicon the backend is MLX instead, which already has what
@@ -15,10 +15,8 @@
 //! - [`gated_delta`]: the gated delta rule, chunked for training and recurrent for decoding.
 //! - [`logprob`]: the chosen tokens' log-probabilities and entropies over a large vocabulary,
 //!   without the n x V logits.
-//! - [`lowrank`]: the low-rank product `base + scale · (x U) V` LoRA's layers use.
-//! - [`lora`]: LoRA's layer over a frozen base, several adapters by name, the choice of one.
+//! - [`lowrank`]: the low-rank product `base + scale · (x U) V` dash-mag's LoRA layer runs on.
 //! - [`mlx`]: the layer over Apple's mlx-c these operations are written on.
-//! - [`peft`]: PEFT's adapter files ([`dash_peft`]) read into LoRA's layers and written out of them.
 //! - [`quantized`]: GPTQ's symmetric int4 weights as stored, in the layout MLX's quantized matmul
 //!   takes, and the linear layer over them.
 //! - [`loss`]: cross-entropy from the hidden states and the output weight, with its reductions,
@@ -54,15 +52,11 @@ mod kernel;
 #[cfg(target_os = "macos")]
 pub mod logprob;
 #[cfg(target_os = "macos")]
-pub mod lora;
-#[cfg(target_os = "macos")]
 pub mod loss;
 #[cfg(target_os = "macos")]
 pub mod lowrank;
 #[cfg(target_os = "macos")]
 pub mod mlx;
-#[cfg(target_os = "macos")]
-pub mod peft;
 #[cfg(target_os = "macos")]
 pub mod quantized;
 #[cfg(target_os = "macos")]

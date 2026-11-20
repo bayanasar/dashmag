@@ -1,8 +1,7 @@
 //! LoRA adapters in PEFT's format: a directory with `adapter_model.safetensors` and
 //! `adapter_config.json`, as PEFT 0.20's `save_pretrained` writes them, read and written with no
-//! tensor library. dash-mag's LoRA layer (on Burn or on MLX) and dash-mlx's give their layers
-//! adapters from it and write theirs out through it, each implementing [`AdapterLayer`] for its
-//! layer.
+//! tensor library. dash-mag's LoRA layer, on Burn or on MLX, takes its adapters from it and writes
+//! them out through it, implementing [`AdapterLayer`].
 //!
 //! In the weights file every adapted module has two tensors,
 //! `base_model.model.<module path>.lora_A.weight` `[r, in]` and `….lora_B.weight` `[out, r]`;
@@ -479,7 +478,7 @@ struct RawTensor {
 
 /// A backend's LoRA layer as [`PeftAdapter`] reads adapters into it and writes them out: its
 /// weight's shape, how the backend makes an adapter from the file's factors, and the layer's
-/// adapters by name. dash-mag implements it for its layer, dash-mlx for its MLX one.
+/// adapters by name. dash-mag implements it for its layer.
 pub trait AdapterLayer {
     /// The backend's adapter: its two factors, its scale and its dropout.
     type Lora;

@@ -1,7 +1,7 @@
 # dash-mlx
 
-dash-ops' operations and LoRA on MLX, for Apple silicon, with dash-contract's options and
-held to dash-ops' tests and PEFT's recordings: conv1d, the gated delta rule, the log-probability and
+dash-ops' operations on MLX, for Apple silicon, with dash-contract's options and
+held to dash-ops' tests: conv1d, the gated delta rule, the log-probability and
 attention through dash-conformance; the rest by ports of them until dash-conformance has bodies
 for them. For now this crate is dashmag's path on Apple silicon: MLX
 already has arrays, autodiff, matmul, a fused attention forward, rms_norm, RoPE and Metal, and this crate adds what dash-ops
@@ -18,8 +18,6 @@ feature.
 | `logprob` | the chosen tokens' log-probabilities and entropies over a large vocabulary with a frozen output weight, masked tokens left out, without the n x V logits; the gradient to the hidden states | one kernel a chunk of the vocabulary for the online log-sum-exp and the entropy, one for the backward pass's weights; the logits and the weighted sums MLX's matmuls |
 | `loss` | cross-entropy straight from the hidden states and the output weight: torch's reductions, ignore index and label smoothing, a z-loss and masked tokens, each row's log-probability and, if asked, its entropy, without the n x V logits; the gradients to the hidden states and the weight | `logprob`'s pass, one kernel a chunk for the gradient of the logits; the products MLX's matmuls |
 | `lowrank` | the low-rank product `base + scale · (x U) V` with its gradients, f32 throughout, the sum rounded once | dash-ops' `up` kernel for the sum with the base; the rest MLX's matmuls |
-| `lora` | LoRA's layer: a frozen base at its own precision, f32 adapters never folded into it, several by name over one base, the choice of one | through `lowrank` |
-| `peft` | PEFT's adapter files read into LoRA's layers and written out of them byte for byte, under a name, trainable or frozen | dash-peft's format and checks, shared with dash-mag; the factors f32 arrays |
 | `quantized` | GPTQ's symmetric int4 weights as stored (`qweight`, F16 `scales`) in the layout MLX's quantized matmul takes, the scales and biases in the activations' dtype; the linear layer over them | the words transposed unchanged; MLX's `view`, transpose and cast; MLX's quantized matmul |
 | `sample` | the next token drawn on the device, as dash-ops draws it: temperature, top-k, top-p and masked ids, the same Philox words and Gumbel variates, the token's log-probability under the model, the tempered distribution and the one drawn from | one kernel for the generator; the cuts and the draw MLX's operations |
 
@@ -287,32 +285,17 @@ its own layout, takes 1.61 to 3.20. Its gradient, to the query and the cache, is
 The low-rank product (`tests/lowrank.rs`, on dash-ops' ten recorded cases: f32, bf16 and f16,
 ranks 1 to 64, with and without a base, rows as a batch, long sums) within dash-ops' bounds, the
 largest over every output and gradient: 3.78e-7 in f32 (8e-7), 3.30e-3 in bf16 (3.5e-3), 2.78e-4 in
-f16 (3e-4), the base's gradient exact. LoRA (`tests/lora.rs`, on the fixtures in dash-mag's `tests/fixtures/lora`,
-recorded from PEFT 0.20): one layer's output and the gradients of `x`, A and B bit-identical to PEFT's, with a
-bf16 and with an f32 base; a two-block model with a trainable and a frozen adapter over one base,
-the logits under each choice and with none within 2.32e-7 of PEFT in f32 (in bf16 the default's
-bit-identical, the reference's one logit one bf16 unit apart: two correct bf16 products rounding an
-element to neighbouring values), the loss within 2.17e-7, and the gradients, which reach the
-trained adapter alone, within 5.09e-7 in f32 and in bf16 0.95 to 1.02 times as far from the exact
-gradients as PEFT's own; a choice of one adapter over a shared base gives, bit for bit, what a
-layer holding it alone gives. PEFT's files (`tests/peft.rs`, on those `peft_*`
-fixtures) go into the layers and come back out byte for byte, a frozen adapter beside the trained
-default left out of MLX's trainable parameters.
+f16 (3e-4), the base's gradient exact. LoRA's layer on it is dash-mag's, held to PEFT's
+recordings by dash-mag's `tests/lora_peft.rs`.
 
-A LoRA'd layer at 6144 tokens of 1024, a frozen bf16 `[6144, 1024]` weight, rank 16, against
-mlx-lm's `LoRALinear` (`linear(x) + (scale * ((x @ lora_a) @ lora_b)).astype(x.dtype)`, which adds
-the term in bf16), the range over two runs:
-
-| | forward | forward + backward (x, A, B) |
-|---|---|---|
-| dash-mlx `LoraLinear` | 8.78-8.81 ms, +169 MiB | 21.2-21.4 ms, +386 MiB |
-| mlx-lm's `LoRALinear` | 9.83-9.92 ms, +312 MiB | 21.9-22.3 ms, +505 MiB |
-
-    cargo run --release -p dash-mlx --example lora_bench
-
-The `up` kernel is what makes the exact f32 sum cheap: with MLX's operations instead (the base
-cast to f32, the term formed, added and cast back) the layer took 13.2-14.2 ms and 27.5-27.8 ms
-at +456 and +865 MiB.
+The `up` kernel is what makes the exact f32 sum cheap. Measured through dash-mlx's own LoRA layer,
+since removed (its `examples/lora_bench.rs`): at 6144 tokens of 1024, a frozen bf16 `[6144, 1024]`
+weight and rank 16, the range over two runs, the layer took 8.78-8.81 ms forward and 21.2-21.4 ms
+forward and backward (x, A, B), at +169 and +386 MiB; with MLX's operations in place of the kernel
+(the base cast to f32, the term formed, added and cast back), 13.2-14.2 ms and 27.5-27.8 ms at +456
+and +865 MiB; and mlx-lm's `LoRALinear`
+(`linear(x) + (scale * ((x @ lora_a) @ lora_b)).astype(x.dtype)`, which adds the term in bf16),
+9.83-9.92 ms and 21.9-22.3 ms at +312 and +505 MiB.
 
 Recompute (`tests/checkpoint.rs`) gives a stack of LoRA'd blocks' input gradient and every
 adapter's bit for bit as MLX's autodiff over the whole stack gives them, in f32 and bf16, and
