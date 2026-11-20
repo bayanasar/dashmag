@@ -28,9 +28,24 @@
 //! MLX's dequantize of the result gives `(q - 8) · scale` bit for bit with f32 scales, and that
 //! value rounded once with f16 scales. bf16 scales are the f16 ones rounded once, so with them
 //! each weight is within one bf16 unit of `(q - 8) · scale` rounded once (`tests/quantized.rs`).
+//!
+//! # Backward
+//!
+//! Under MLX's autodiff the weight is frozen and `x` takes `dy Wᵀ`. MLX's own backward is the
+//! quantized matmul again, untransposed, with `dy` and the scales and biases in `x`'s dtype. From
+//! 4 rows of a matrix on, it takes its matrix path: like the forward's, it dequantizes `W`'s tiles
+//! into that dtype and sums in f32. Below 4 rows it takes its vector path, which forms `W` in f32
+//! but, from 1024 outputs on, splits the sum over them into 8 parts (32 past 8192), rounds each
+//! part to `x`'s dtype and sums the parts in that dtype (MLX 0.32.4). `dash_contract::quant`
+//! allows neither of those roundings. So in bf16 and f16 below 4 rows, [`quantized_linear_in_vjp`]
+//! gives `x` its gradient through a backward of its own: the same product with `dy` and the scales
+//! read into f32, `W` exact, summed in f32 and rounded once to `x`'s dtype. In f32, MLX's own
+//! backward already sums in f32 throughout. dash-mag's `tests/quant.rs` holds both paths to the
+//! definition.
 
 use crate::mlx::error::{Exception, Result};
 use crate::mlx::ops::quantized_matmul;
+use crate::mlx::transforms::custom_vjp;
 use crate::mlx::{Array, Dtype};
 
 /// GPTQ's group size: the rows of `in` that share a scale.
@@ -38,6 +53,10 @@ pub const GROUP_SIZE: i32 = 128;
 
 /// GPTQ's bits per weight.
 pub const BITS: i32 = 4;
+
+/// The rows of a matrix from which MLX's quantized matmul, untransposed, takes its matrix path
+/// (MLX 0.32.4's `vector_limit` for it, the same on every GPU).
+const MATRIX_ROWS: i32 = 4;
 
 fn contract(message: String) -> Exception {
     Exception::custom(format!("gptq_sym4_to_mlx: {message}"))
@@ -111,12 +130,48 @@ pub fn gptq_sym4_to_mlx(
 /// `17408 → 5120` (MLX 0.32.4, 2026-11-14, two runs, load averages 1.55–1.60). Kept, bf16 or f16
 /// scales and biases would add 6.25% of the packed weight's bytes for each dtype.
 ///
+/// Under MLX's autodiff the weight is frozen, and the bias takes the sum of `dy` over the rows in
+/// f32, rounded once to its dtype. `x` takes MLX's own backward, which below 4 rows in bf16 and f16
+/// rounds what `dash_contract::quant` does not allow ([module](self#backward)): where `x`'s
+/// gradient may be asked, call [`quantized_linear_in_vjp`].
+///
 /// Errors if `x` or `bias` is not f32, bf16 or f16, or if the shapes do not fit.
 pub fn quantized_linear(
     x: &Array,
     w: &Array,
     scales: &Array,
     bias: Option<&Array>,
+) -> Result<Array> {
+    linear(x, w, scales, bias, false)
+}
+
+/// [`quantized_linear`] for a call inside MLX's `vjp`: the same bits, and `x`'s gradient held to
+/// the definition, below 4 rows in bf16 and f16 by a backward of its own in f32, otherwise by
+/// MLX's ([module](self#backward)).
+///
+/// Below 4 rows in bf16 and f16 the product goes through `custom_vjp`, which costs time on every
+/// call, so [`quantized_linear`] does without it. On an Apple M6, at one row of `x` in bf16, a call
+/// took 0.0014–0.0035 ms longer against `5120 → 17408` and `17408 → 5120` projections (0.3–0.8%),
+/// and in a graph of 64 calls against `5120 → 5120`, 0.0014–0.0034 ms longer each (1.7–4.4%)
+/// (medians, MLX 0.32.4, 2026-11-20 UTC, two runs, load averages 1.22–2.33).
+///
+/// Errors as [`quantized_linear`] does.
+pub fn quantized_linear_in_vjp(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    bias: Option<&Array>,
+) -> Result<Array> {
+    linear(x, w, scales, bias, true)
+}
+
+/// [`quantized_linear`], and with `in_vjp` [`quantized_linear_in_vjp`].
+fn linear(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    bias: Option<&Array>,
+    in_vjp: bool,
 ) -> Result<Array> {
     let dtype = x.dtype();
     let float = |d: Dtype| matches!(d, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16);
@@ -126,13 +181,56 @@ pub fn quantized_linear(
             bias.map(Array::dtype)
         )));
     }
-    let scales = scales.as_dtype(dtype)?;
-    let biases = scales.multiply(Array::from_f32(-8.0).as_dtype(dtype)?)?;
-    let y = quantized_matmul(x, w, &scales, &biases, true, GROUP_SIZE, BITS)?;
+    let cast = scales.as_dtype(dtype)?;
+    let biases = cast.multiply(Array::from_f32(-8.0).as_dtype(dtype)?)?;
+    let rows = match x.ndim() {
+        0 | 1 => 1,
+        n => x.shape()[n - 2],
+    };
+    let y = if in_vjp && dtype != Dtype::Float32 && rows < MATRIX_ROWS {
+        with_f32_backward(x, w, scales, &cast, &biases)?
+    } else {
+        quantized_matmul(x, w, &cast, &biases, true, GROUP_SIZE, BITS)?
+    };
     let Some(bias) = bias else {
         return Ok(y);
     };
     y.as_dtype(Dtype::Float32)?
         .add(bias.as_dtype(Dtype::Float32)?)?
         .as_dtype(dtype)
+}
+
+/// [`quantized_linear`]'s product, the same bits, with a backward of its own for `x`: below
+/// [`MATRIX_ROWS`] rows in all, `dy` and `scales` (as given) read into f32, so that `W` is exact,
+/// and the sum rounded once to `x`'s dtype; from there on, MLX's own, on all the rows as one matrix
+/// ([module](self#backward)).
+fn with_f32_backward(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    cast: &Array,
+    biases: &Array,
+) -> Result<Array> {
+    let (fw, fcast, fbiases) = (w.clone(), cast.clone(), biases.clone());
+    let (w, scales, cast, biases) = (w.clone(), scales.clone(), cast.clone(), biases.clone());
+    let product = custom_vjp(
+        move |p: &[Array]| {
+            let y = quantized_matmul(&p[0], &fw, &fcast, &fbiases, true, GROUP_SIZE, BITS)?;
+            Ok(vec![y])
+        },
+        move |p: &[Array], cotangents: &[Array], _: &[Array]| {
+            let (x, dy) = (&p[0], &cotangents[0]);
+            let dy = dy.reshape(&[-1, dy.shape()[dy.ndim() - 1]])?;
+            let dx = if dy.shape()[0] < MATRIX_ROWS {
+                let scales = scales.as_dtype(Dtype::Float32)?;
+                let biases = scales.multiply(Array::from_f32(-8.0))?;
+                let dy = dy.as_dtype(Dtype::Float32)?;
+                quantized_matmul(&dy, &w, &scales, &biases, false, GROUP_SIZE, BITS)?
+            } else {
+                quantized_matmul(&dy, &w, &cast, &biases, false, GROUP_SIZE, BITS)?
+            };
+            Ok(vec![dx.reshape(x.shape())?.as_dtype(x.dtype())?])
+        },
+    )?;
+    Ok(product.apply(std::slice::from_ref(x))?.remove(0))
 }
