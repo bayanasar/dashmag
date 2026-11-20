@@ -1,6 +1,6 @@
 [package]
 name = "dash-mlx"
-description = "dash-ops' operations and LoRA on MLX, for Apple silicon: the same contracts, with MLX's arrays in place of Burn's tensors."
+description = "dash-ops' operations on MLX, for Apple silicon: the same contracts, with MLX's arrays in place of Burn's tensors."
 readme = "README.md"
 keywords = ["mlx", "metal", "apple-silicon", "machine-learning"]
 categories = ["science"]
@@ -17,7 +17,6 @@ links = "mlx"
 # target without it.
 [target.'cfg(target_os = "macos")'.dependencies]
 dash-contract = { workspace = true }
-dash-peft = { workspace = true }
 half = "2"
 
 # The bindings to mlx-c (`mlx-c/`), and mlx-c itself (build.rs).
