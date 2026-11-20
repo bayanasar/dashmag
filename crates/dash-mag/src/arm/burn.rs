@@ -516,18 +516,20 @@ fn quantized_ranked<const D: usize>(
     scales: &Array,
     bias: Option<&Array>,
     group: usize,
+    on: bool,
 ) -> Raw {
-    let x = x.t::<D>();
+    let x = ad(x.t::<D>(), on);
     let dims = x.dims();
     let inp = dims[D - 1];
     let rows: usize = dims[..D - 1].iter().product();
-    let qweight = qweight.i::<2>();
+    // The weight is a constant: on an autodiff device beside `x`, recording nothing of its own.
+    let qweight = ad(qweight.i::<2>(), on);
     let out = qweight.dims()[1];
     let y = <Dispatch as QuantBackend>::quantized_linear(
         x.reshape([rows, inp]).into_dispatch(),
         qweight.into_dispatch(),
-        scales.t::<2>().into_dispatch(),
-        MaybeTensor::from(bias.map(|b| b.t::<1>().into_dispatch())),
+        ad(scales.t::<2>(), on).into_dispatch(),
+        MaybeTensor::from(bias.map(|b| ad(b.t::<1>(), on).into_dispatch())),
         group,
     );
     let mut out_dims = dims;
@@ -541,6 +543,8 @@ pub(crate) struct Burn;
 
 impl Arm for Burn {
     type Array = Array;
+
+    const QUANTIZED_BACKWARD: bool = true;
 
     fn describe() -> String {
         format!("Burn, {:?}", device())
@@ -1046,14 +1050,9 @@ impl Arm for Burn {
         bias: Option<&Array>,
         group: usize,
     ) -> Result<Array> {
-        if x.is_autodiff() || bias.is_some_and(Array::is_autodiff) {
-            return refuse(
-                "quantized_linear is a forward pass only: not inside vjp, where its input would \
-                 carry a gradient",
-            );
-        }
+        let on = x.is_autodiff() || bias.is_some_and(Array::is_autodiff);
         Ok(Array::float(
-            ranked!(x.rank(), quantized_ranked; x, qweight, scales, bias, group),
+            ranked!(x.rank(), quantized_ranked; x, qweight, scales, bias, group, on),
         ))
     }
 }

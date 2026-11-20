@@ -1,7 +1,8 @@
-//! The quantized linear through the gateway. On the Burn side, the same bits as dash-ops' own. On
-//! MLX, against its definition computed on the host in f64, each output held, as dash-ops' test
-//! holds the Burn side's, to what its path's roundings allow. On both, the weight refused where
-//! dash-ops' is and a call refused inside `vjp`; on MLX, groups other than 128 refused.
+//! The quantized linear through the gateway. On the Burn side, the same bits as dash-ops' own,
+//! forward and, inside `vjp`, backward. On MLX, against its definition computed on the host in
+//! f64, each output held, as dash-ops' test holds the Burn side's, to what its path's roundings
+//! allow. On both, the weight refused where dash-ops' is; on MLX, a call inside `vjp` refused, and
+//! groups other than 128.
 
 #[cfg(not(target_os = "macos"))]
 use burn::tensor::{DType as BurnDType, Device, Int, Tensor as Burn, TensorData};
@@ -105,22 +106,123 @@ fn refusals() {
     assert!(quantized_linear(&x, &w, None).is_err(), "in disagrees");
     let x = Tensor::from_f32(&vec![0.5; 2 * 256], &[2, 256]).unwrap();
     assert!(quantized_linear(&x, &w, None).is_ok());
+    // MLX's backward is not yet held to the definition: refused inside vjp, whatever the inputs.
     let inside = vjp(
         |p: &[Tensor]| Ok(vec![quantized_linear(&p[0], &w, None)?]),
         std::slice::from_ref(&x),
         &[None],
     );
-    assert!(inside.is_err(), "refused inside vjp");
     let constant = vjp(
         |_: &[Tensor]| Ok(vec![quantized_linear(&x, &w, None)?]),
         std::slice::from_ref(&x),
         &[None],
     );
-    assert!(
-        constant.is_err(),
-        "refused inside vjp on a captured constant too"
-    );
+    let mlx = cfg!(target_os = "macos");
+    assert_eq!(inside.is_err(), mlx, "inside vjp");
+    assert_eq!(constant.is_err(), mlx, "inside vjp on a captured constant");
     assert!(quantized_linear(&x, &w, None).is_ok(), "and taken after it");
+}
+
+/// Inside `vjp` on the Burn side: `x`'s and the bias's gradients the same bits as dash-ops' own
+/// backward under Burn's autodiff, and a captured constant `x`, as a frozen teacher's, the
+/// forward's bits.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn inside_vjp_the_same_bits_as_dash_ops() {
+    let (words, zeros, scales) = parts();
+    let w = weight(&zeros).unwrap();
+    let device = device().autodiff();
+    let direct = dash_ops::quant::QuantizedWeight::from_gptq(
+        Burn::<2, Int>::from_data(TensorData::new(words, [32, 16]), (&device, BurnDType::I32)),
+        Burn::<2, Int>::from_data(TensorData::new(zeros, [2, 2]), (&device, BurnDType::I32)),
+        Burn::<2>::from_data(TensorData::new(scales, [2, 16]), (&device, BurnDType::F16)),
+        None,
+        QuantOptions::default(),
+    )
+    .unwrap();
+    let bits = |t: Burn<3>| -> Vec<u32> {
+        t.cast(burn::tensor::FloatDType::F32)
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    let gateway_bits = |t: &Tensor| -> Vec<u32> {
+        t.as_dtype(DType::F32)
+            .unwrap()
+            .to_f32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    for rows in [1, 40] {
+        let values: Vec<f32> = (0..rows * 256)
+            .map(|i| ((i % 17) as f32 - 8.0) / 8.0)
+            .collect();
+        let cotangent: Vec<f32> = (0..rows * 16)
+            .map(|i| ((i % 13) as f32 - 6.0) / 4.0)
+            .collect();
+        let bias: Vec<f32> = (0..16).map(|i| i as f32 / 16.0).collect();
+        for (dtype, burn_dtype) in [(DType::F32, BurnDType::F32), (DType::BF16, BurnDType::BF16)] {
+            let as_dtype = |t: Tensor| t.as_dtype(dtype).unwrap();
+            let x = as_dtype(Tensor::from_f32(&values, &[1, rows, 256]).unwrap());
+            let dy = as_dtype(Tensor::from_f32(&cotangent, &[1, rows, 16]).unwrap());
+            let b = Tensor::from_f32(&bias, &[16]).unwrap();
+            let (outs, grads) = vjp(
+                |p: &[Tensor]| Ok(vec![quantized_linear(&p[0], &w, Some(&p[1]))?]),
+                &[x.clone(), b.clone()],
+                &[Some(dy)],
+            )
+            .unwrap();
+            assert_eq!((grads[0].dtype(), grads[1].dtype()), (dtype, DType::F32));
+
+            let cast = burn::tensor::FloatDType::from(burn_dtype);
+            let bx = Burn::<3>::from_data(TensorData::new(values.clone(), [1, rows, 256]), &device)
+                .cast(cast)
+                .require_grad();
+            let bb =
+                Burn::<1>::from_data(TensorData::new(bias.clone(), [16]), &device).require_grad();
+            let bdy =
+                Burn::<3>::from_data(TensorData::new(cotangent.clone(), [1, rows, 16]), &device)
+                    .cast(cast);
+            let y = dash_ops::quant::quantized_linear(bx.clone(), &direct, Some(bb.clone()));
+            let g = (y.clone().cast(burn::tensor::FloatDType::F32)
+                * bdy.cast(burn::tensor::FloatDType::F32))
+            .sum()
+            .backward();
+            assert_eq!(gateway_bits(&outs[0]), bits(y), "{rows} rows {dtype:?} y");
+            assert_eq!(
+                gateway_bits(&grads[0]),
+                bits(bx.grad(&g).unwrap()),
+                "{rows} rows {dtype:?} dx"
+            );
+            assert_eq!(
+                gateway_bits(&grads[1]),
+                bits(bb.grad(&g).unwrap().unsqueeze::<3>()),
+                "{rows} rows {dtype:?} dbias"
+            );
+
+            // A captured constant: the forward's bits.
+            let (constant, _) = vjp(
+                |p: &[Tensor]| {
+                    Ok(vec![
+                        quantized_linear(&x, &w, None)?.sum()?.add(&p[0].sum()?)?,
+                    ])
+                },
+                std::slice::from_ref(&b),
+                &[None],
+            )
+            .unwrap();
+            let plain = quantized_linear(&x, &w, None).unwrap().sum().unwrap();
+            assert_eq!(
+                gateway_bits(&constant[0]),
+                gateway_bits(&plain.add(&b.sum().unwrap()).unwrap())
+            );
+        }
+    }
 }
 
 /// `W` `[in, out]` in f64 by the definition, `(q - 8) · scale`, the scales as f16 holds them; and

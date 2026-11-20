@@ -118,6 +118,9 @@ pub(crate) trait Arm {
     /// batch shape: the shape of a bf16 matmul moves its low bits, and the models' numbers are those
     /// of the products as they are written.
     const LORA_AS_ROWS: bool = true;
+    /// Whether [`Arm::quantized_linear`] has a backward pass held to its definition, so that the
+    /// gateway takes it inside [`crate::vjp`].
+    const QUANTIZED_BACKWARD: bool = false;
 
     fn describe() -> String;
     fn clear_cache();
