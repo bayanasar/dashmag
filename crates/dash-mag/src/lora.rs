@@ -5,8 +5,10 @@
 //! `y = x Wᵀ + scale · (x Aᵀ) Bᵀ`, with PEFT's layout and arithmetic, as PEFT's `lora.Linear`
 //! computes it: the base product at the weight's dtype, the low-rank product in f32, their sum in
 //! f32 and rounded once to `x`'s dtype (`tests/lora_peft.rs` holds it to PEFT's recorded values).
-//! The adapter is never folded into the weight: in a bf16 weight most of an update's elements
-//! would round away, where kept apart it reaches the output at f32 precision. A layer holds plain
+//! The adapter is never folded into the weight. Folded into a bf16 weight, an update a thousandth
+//! of the weight's spread, as a fine-tuning update is, mostly rounds away: in `tests/lora.rs` 83% of
+//! its elements round to zero, and what is left has a cosine of 0.575 with it. Kept apart, it reaches the
+//! output at f32 precision. A layer holds plain
 //! tensors, so a training step passes an
 //! adapter's factors to [`crate::vjp`] as primals and puts them back with [`LoraLinear::set_factors`];
 //! the base, which `f` captures, stays a constant.
@@ -183,6 +185,26 @@ impl LoraLinear {
         let options = LowRankOptions::default().with_scale(lora.scale);
         low_rank(x, &lora.a.t()?, &lora.b.t()?, Some(&product), options)?.as_dtype(dtype)
     }
+}
+
+/// Chooses the adapter `name` for every one of `layers`, or the base alone with `None`, as PEFT's
+/// `set_adapter` and `disable_adapter()` do across a model. A layer that does not hold `name` runs
+/// its base alone. A name that none of `layers` holds is refused, and no layer changes: a misspelt
+/// name would otherwise run every base alone, and a training step would train nothing.
+pub fn set_adapter<'a>(
+    layers: impl IntoIterator<Item = &'a mut LoraLinear>,
+    name: Option<&str>,
+) -> Result<()> {
+    let layers: Vec<&mut LoraLinear> = layers.into_iter().collect();
+    if let Some(name) = name
+        && !layers.iter().any(|layer| layer.adapter(name).is_some())
+    {
+        return refuse(format!("set_adapter: no layer holds an adapter {name}"));
+    }
+    for layer in layers {
+        layer.set_adapter(name);
+    }
+    Ok(())
 }
 
 fn peft(e: crate::Error) -> PeftError {
