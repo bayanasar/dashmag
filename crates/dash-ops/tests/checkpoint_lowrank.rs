@@ -318,8 +318,9 @@ fn recomputed_f32_stack_gives_plain_autodiff_s_gradients() {
 /// element-error ratio of a single tensor was noisier, median 1.41, up to 2.46. The bounds sit just
 /// above those maxima; the 8 stacks checked here include the worst of the 64 then (seed 1). On
 /// Flex, on CUDA and on ROCm on 2026-11-20 every ratio of the 64 is 1.00, on Flex with dash-lora's layer as
-/// with this one, and the 8 stacks' gradients are plain autodiff's bit for bit: that is asserted,
-/// and the bounds stay for a build where the order differs again.
+/// with this one, and the 8 stacks' gradients are plain autodiff's bit for bit: that is asserted
+/// first, so the ratio bounds come into play only if the assertion is relaxed for a build whose
+/// order differs again.
 #[test]
 fn recomputed_bf16_stack_is_as_close_to_f32_as_plain_autodiff() {
     let _serial = serial();
