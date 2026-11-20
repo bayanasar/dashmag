@@ -394,7 +394,7 @@ impl HostTensor {
         if self.dtype != DType::F32 {
             return Err(Error::Shape(format!("as_f32 called on {:?}", self.dtype)));
         }
-        if self.data.len() % 4 != 0 {
+        if !self.data.len().is_multiple_of(4) {
             return Err(Error::Shape("byte length not a multiple of 4".into()));
         }
         Ok(self

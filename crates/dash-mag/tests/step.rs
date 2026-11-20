@@ -78,6 +78,9 @@ impl State {
     }
 }
 
+// Two blocks of a test model: the variants' sizes do not matter, and they differ only where the
+// side's tensor is large (on CUDA).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum Block {
     Delta {

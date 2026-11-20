@@ -243,6 +243,8 @@ fn run(case: &Case, device: &Device, name: &str) {
     }
 }
 
+// Each device is pushed under its own feature.
+#[allow(clippy::vec_init_then_push)]
 fn devices() -> Vec<(&'static str, Device)> {
     #[allow(unused_mut)]
     let mut devices = Vec::new();
@@ -281,6 +283,7 @@ fn matches_torch() {
 }
 
 /// Seeded host values `[rows, width]` from SplitMix64, uniform on `[-1, 1)`.
+#[cfg(feature = "cubecl")]
 fn random(seed: u64, shape: [usize; 2]) -> TensorData {
     let mut state = seed;
     let values: Vec<f32> = (0..shape[0] * shape[1])

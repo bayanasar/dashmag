@@ -11,7 +11,10 @@ use dash_core::{
     Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Runtime, Tensor, TensorSpec, argmax,
 };
 use dash_tract::TractRuntime;
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 /// PyTorch reference for the fixed input: class 258 "Samoyed".
 const REF_CLASS: usize = 258;
@@ -23,7 +26,7 @@ fn fixtures_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures"))
 }
 
-fn input_floats(dir: &PathBuf) -> Vec<f32> {
+fn input_floats(dir: &Path) -> Vec<f32> {
     let raw = fs::read(dir.join("input_1x3x224x224.f32")).expect("input fixture missing");
     raw.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

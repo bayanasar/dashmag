@@ -162,12 +162,12 @@ impl Session for IreeSession {
                     "reading output {i}: {e} (declared {n_out} outputs)"
                 ))
             })?;
-            if let Some(dt) = self.meta.output_dtype(i) {
-                if dt != DType::F32 {
-                    return Err(Error::Shape(format!(
-                        "dash-iree spike decodes f32 outputs only, output {i} is declared {dt:?}"
-                    )));
-                }
+            if let Some(dt) = self.meta.output_dtype(i)
+                && dt != DType::F32
+            {
+                return Err(Error::Shape(format!(
+                    "dash-iree spike decodes f32 outputs only, output {i} is declared {dt:?}"
+                )));
             }
             if raw.len() % 4 != 0 {
                 return Err(Error::Run(format!(

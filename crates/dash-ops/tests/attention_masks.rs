@@ -36,9 +36,9 @@ use burn::backend::{DType, FloatDType, bf16};
 use burn::tensor::{Bool, Device, Int, Tensor, TensorData};
 use common::adapter::Burn;
 use dash_conformance::attention::{self as conformance, FLEX_F32};
-use dash_ops::attention::{
-    AttentionMask, AttentionOptions, attention_decode, attention_with_lse, probe,
-};
+#[cfg(feature = "cubecl")]
+use dash_ops::attention::probe;
+use dash_ops::attention::{AttentionMask, AttentionOptions, attention_decode, attention_with_lse};
 use std::sync::{Mutex, MutexGuard};
 
 /// The probe counters are global: tests that read them, and tests that move them (any backward
@@ -116,8 +116,9 @@ impl Host {
     }
 }
 
-/// The mask of a call, on the host.
+/// The mask of a call, on the host. Only the kernels' tests pad or pack.
 #[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "cubecl"), allow(dead_code))]
 enum Mask {
     None,
     /// `[B, Tk]`, `true` where a key is left out.

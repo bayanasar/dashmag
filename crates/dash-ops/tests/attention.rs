@@ -24,9 +24,9 @@ use burn::backend::{DType, FloatDType, bf16};
 use burn::tensor::{Device, Tensor, TensorData};
 #[cfg(feature = "cuda")]
 use dash_ops::attention::causal_attention_backward;
-use dash_ops::attention::{
-    AttentionMask, AttentionOptions, attention_decode, attention_with_lse, causal_attention, probe,
-};
+#[cfg(all(feature = "cubecl", feature = "flex"))]
+use dash_ops::attention::{AttentionMask, attention_with_lse};
+use dash_ops::attention::{AttentionOptions, attention_decode, causal_attention, probe};
 use std::sync::Mutex;
 
 /// The probe counters are global: tests that read them run one at a time.
@@ -85,6 +85,7 @@ impl Host {
 }
 
 /// What a run produces: the output, the log-sum-exp and the three input gradients.
+#[cfg(all(feature = "cubecl", feature = "flex"))]
 struct Results {
     o: Host,
     lse: Host,
@@ -96,6 +97,7 @@ struct Results {
 /// The causal forward with its log-sum-exp, then the backward of `sum(o * grad)`, on `device` (an
 /// autodiff device) with inputs and the output gradient in `dtype`, the backward deterministic or
 /// not ([`AttentionOptions::deterministic`]).
+#[cfg(all(feature = "cubecl", feature = "flex"))]
 #[allow(clippy::too_many_arguments)]
 fn run(
     device: &Device,
@@ -146,6 +148,7 @@ fn errors(actual: &Host, expected: &Host) -> (f32, f32) {
 
 /// Compares every result with the reference: each relative error must stay under `tolerance`
 /// (one per result, in the order o, lse, dq, dk, dv). Prints the errors.
+#[cfg(all(feature = "cubecl", feature = "flex"))]
 fn check(label: &str, actual: &Results, expected: &Results, tolerance: [f32; 5]) {
     let pairs = [
         ("o", &actual.o, &expected.o),
