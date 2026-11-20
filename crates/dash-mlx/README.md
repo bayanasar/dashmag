@@ -307,6 +307,10 @@ bf16, rank 16), a forward and backward pass, the range over two runs:
 | MLX's autodiff over the stack | 294.8-295.8 ms | +2337 MiB |
 | dash-mlx `checkpoint` | 369.2-369.9 ms | +920 MiB |
 
+These were measured with the blocks on dash-mlx's own LoRA layer, since removed. The bench and the
+test now build them on a local projection that computes what the layer computed; the figures have
+not been taken again.
+
     cargo run --release -p dash-mlx --example checkpoint_bench
 
 The next token (`tests/sample.rs`, dash-ops' sampling tests on MLX): every draw against the

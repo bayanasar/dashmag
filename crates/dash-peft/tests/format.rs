@@ -511,3 +511,28 @@ fn pattern_keys_match_whole_path_components() {
         assert_eq!(config.alpha_for(path).unwrap(), alpha, "{path}");
     }
 }
+
+/// An adapter of rank 0, which the format does not refuse, goes into layers and comes back out, and
+/// through its files byte for byte.
+#[test]
+fn an_empty_adapter_goes_through_and_back() {
+    use dash_peft::{HostTensor, PeftConfig};
+    let mut adapter = PeftAdapter::new(PeftConfig::new(0, 1.0, &["m"]));
+    adapter.insert(
+        "m",
+        LoraWeights {
+            a: HostTensor::from_f32(vec![0, 4], &[]).unwrap(),
+            b: HostTensor::from_f32(vec![3, 0], &[]).unwrap(),
+        },
+    );
+    let mut named = layers(&adapter);
+    adapter
+        .apply(named.iter_mut().map(|(p, l)| (p.as_str(), l)), &())
+        .unwrap();
+    let back = PeftAdapter::from_layers(adapter.config.clone(), named.iter().map(|(p, l)| (p, l)))
+        .unwrap();
+    assert_eq!(back.module("m"), adapter.module("m"));
+    let (config, weights) = adapter.to_bytes().unwrap();
+    let read = PeftAdapter::from_bytes(&config, &weights).unwrap();
+    assert_eq!(read.to_bytes().unwrap(), (config, weights));
+}

@@ -84,7 +84,9 @@ warm-up, twelve processes of each in turn over two batches, the median of those 
 
 A second run of eight processes each gave 2.356 against 2.257 in f32, and 2.458 against 2.381 in bf16.
 The M6 was not strictly idle: other applications were open, the load average was 2.1 to 2.8, and when
-sampled no other process used more than 6.4% of a core.
+sampled no other process used more than 6.4% of a core. The direct side was then built on dash-mlx's
+LoRA layer, since removed: `step_bench` now builds it on a local projection that computes what the
+layer computed, and these figures have not been taken again.
 
 Both ways compute the same: the loss and the norm agree to the printed digit. The update's gap is host
 time per operation. The gateway's checks and handles take an add of one shape from 0.105 µs to 0.21 µs

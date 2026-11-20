@@ -177,3 +177,24 @@ fn set_weight_replaces_the_base_and_refuses_another_shape() {
     let integers = Tensor::from_i32(&[0; 128], &[8, 16]).unwrap();
     assert!(layer.set_weight(integers).is_err());
 }
+
+/// An adapter of rank 0, which PEFT's format does not refuse, goes into the layer and comes back out,
+/// on every side.
+#[test]
+fn an_empty_adapter_goes_through_and_back() {
+    let mut adapter = PeftAdapter::new(PeftConfig::new(0, 1.0, &["m"]));
+    adapter.insert(
+        "m",
+        LoraWeights {
+            a: HostTensor::from_f32(vec![0, 4], &[]).unwrap(),
+            b: HostTensor::from_f32(vec![3, 0], &[]).unwrap(),
+        },
+    );
+    let mut named = layers(&adapter);
+    adapter
+        .apply(named.iter_mut().map(|(p, l)| (p.as_str(), l)), &())
+        .unwrap();
+    let back = PeftAdapter::from_layers(adapter.config.clone(), named.iter().map(|(p, l)| (p, l)))
+        .unwrap();
+    assert_eq!(back.module("m"), adapter.module("m"));
+}
