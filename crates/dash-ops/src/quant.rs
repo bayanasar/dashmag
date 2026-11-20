@@ -9,14 +9,21 @@
 //! format's, and `g_idx` against groups in order. [`quantized_linear`] then reads the packed
 //! weight on every call, through [`QuantBackend`]: its default body is the reference (`W` unpacked
 //! and dequantized to f32 in Burn's integer and float operations, then multiplied in f32), and a
-//! CubeCL device runs kernels where they take the call. It is a forward pass only: on `Autodiff`
-//! an input that carries a gradient is refused.
+//! CubeCL device runs kernels where they take the call. On `Autodiff` its backward pass gives `x`
+//! and the bias their gradients, the weight frozen ([`QuantBackend::quantized_linear_backward`]:
+//! `dy Wᵀ` with `W` dequantized to f32, on every device, with no kernel of its own yet).
 
 use crate::lowrank::MaybeTensor;
+use burn::backend::autodiff::checkpoint::base::Checkpointer;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
+use burn::backend::autodiff::grads::Gradients;
+use burn::backend::autodiff::ops::{Backward, Ops, OpsKind};
 use burn::backend::tensor::{FloatTensor, IntTensor};
-use burn::backend::{Autodiff, AutodiffBackend, Backend, Dispatch, backend_extension};
+use burn::backend::{
+    Autodiff, Backend, Dispatch, FloatDType, Shape, TensorMetadata, backend_extension,
+};
 use burn::tensor::{DType, Int, Tensor, TensorData};
+use std::sync::atomic::Ordering;
 
 #[cfg(feature = "flex")]
 use burn::backend::Flex;
@@ -37,6 +44,7 @@ pub mod probe {
     pub(super) static GEMV_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static DEQUANT_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static MATRIX_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static BACKWARD_RUNS: AtomicUsize = AtomicUsize::new(0);
 
     /// Launches of the decoding kernel (none where the reference runs).
     pub fn kernel_launches() -> usize {
@@ -51,6 +59,11 @@ pub mod probe {
     /// Launches of the prefill kernel on RDNA4's matrix products.
     pub fn matrix_launches() -> usize {
         MATRIX_LAUNCHES.load(Ordering::SeqCst)
+    }
+
+    /// Backward passes run.
+    pub fn backward_runs() -> usize {
+        BACKWARD_RUNS.load(Ordering::SeqCst)
     }
 }
 
@@ -144,6 +157,15 @@ mod fusion_meta {
     ) -> TensorSpec {
         TensorSpec::new(Shape::new([x.shape[0], qweight.shape[1]]), x.dtype)
     }
+
+    pub(super) fn backward(
+        dy: &TensorSpec,
+        qweight: &TensorSpec,
+        _scales: &TensorSpec,
+        _group: &usize,
+    ) -> TensorSpec {
+        TensorSpec::new(Shape::new([dy.shape[0], qweight.shape[0] * 8]), dy.dtype)
+    }
 }
 
 /// The quantized linear as a backend extension, on rows: call it through [`quantized_linear`].
@@ -167,10 +189,94 @@ pub trait QuantBackend: Backend {
     ) -> FloatTensor<Self> {
         reference::forward::<Self>(x, qweight, scales, bias, group)
     }
+
+    /// `dx` `[N, in]` in `dy`'s dtype (`x`'s) for `dy` `[N, out]`: `dy Wᵀ`, `W` dequantized to f32,
+    /// the product in f32, rounded once.
+    #[fusion(meta = fusion_meta::backward)]
+    fn quantized_linear_backward(
+        dy: FloatTensor<Self>,
+        qweight: IntTensor<Self>,
+        scales: FloatTensor<Self>,
+        group: usize,
+    ) -> FloatTensor<Self> {
+        reference::backward::<Self>(dy, qweight, scales, group)
+    }
 }
 
 #[cfg(feature = "flex")]
 impl QuantBackend for Flex {}
+
+/// What the backward pass keeps: the frozen weight, and the bias's dtype where there is one.
+#[derive(Clone, Debug)]
+struct QuantState<B: Backend> {
+    qweight: IntTensor<B>,
+    scales: FloatTensor<B>,
+    group: usize,
+    bias_dtype: Option<DType>,
+}
+
+/// `dx` and `dbias` from `dy`, for the parents that ask for them.
+fn quant_backward<B: Backend + QuantBackend>(
+    state: QuantState<B>,
+    dy: FloatTensor<B>,
+    x_wanted: bool,
+    bias_wanted: bool,
+) -> (Option<FloatTensor<B>>, Option<FloatTensor<B>>) {
+    probe::BACKWARD_RUNS.fetch_add(1, Ordering::SeqCst);
+    let dbias = match (bias_wanted, state.bias_dtype) {
+        (true, Some(dtype)) => {
+            // The sum over the rows in f32, rounded once to the bias's dtype.
+            let out = dy.shape()[1];
+            let sum = B::float_sum_dim(B::float_cast(dy.clone(), FloatDType::F32), 0);
+            let sum = B::float_reshape(sum, Shape::new([out]));
+            Some(match dtype {
+                DType::F32 => sum,
+                _ => B::float_cast(sum, dtype.into()),
+            })
+        }
+        _ => None,
+    };
+    let dx = x_wanted
+        .then(|| B::quantized_linear_backward(dy, state.qweight, state.scales, state.group));
+    (dx, dbias)
+}
+
+/// The node `Autodiff` records without a bias: parent `x`.
+#[derive(Debug)]
+struct QuantNode;
+
+impl<B: Backend + QuantBackend> Backward<B, 1> for QuantNode {
+    type State = QuantState<B>;
+
+    fn backward(self, ops: Ops<Self::State, 1>, grads: &mut Gradients, _: &mut Checkpointer) {
+        let dy = grads.consume::<B>(&ops.node);
+        let [x_node] = ops.parents;
+        if let Some(node) = x_node {
+            let (dx, _) = quant_backward(ops.state, dy, true, false);
+            grads.register::<B>(node.id, dx.expect("x's gradient, asked for"));
+        }
+    }
+}
+
+/// The node `Autodiff` records with a bias: parents `x` and the bias.
+#[derive(Debug)]
+struct QuantBiasNode;
+
+impl<B: Backend + QuantBackend> Backward<B, 2> for QuantBiasNode {
+    type State = QuantState<B>;
+
+    fn backward(self, ops: Ops<Self::State, 2>, grads: &mut Gradients, _: &mut Checkpointer) {
+        let dy = grads.consume::<B>(&ops.node);
+        let [x_node, bias_node] = ops.parents;
+        let (dx, dbias) = quant_backward(ops.state, dy, x_node.is_some(), bias_node.is_some());
+        if let (Some(node), Some(dx)) = (x_node, dx) {
+            grads.register::<B>(node.id, dx);
+        }
+        if let (Some(node), Some(dbias)) = (bias_node, dbias) {
+            grads.register::<B>(node.id, dbias);
+        }
+    }
+}
 
 impl<B: Backend + QuantBackend, C: CheckpointStrategy> QuantBackend for Autodiff<B, C> {
     fn quantized_linear(
@@ -180,22 +286,41 @@ impl<B: Backend + QuantBackend, C: CheckpointStrategy> QuantBackend for Autodiff
         bias: MaybeTensor<Self>,
         group: usize,
     ) -> FloatTensor<Self> {
-        assert!(
-            !x.is_tracked(),
-            "quantized_linear is a forward pass only: x carries a gradient (detach it)"
-        );
-        let bias = match bias {
-            MaybeTensor::None => MaybeTensor::None,
-            MaybeTensor::Some(bias) => MaybeTensor::Some(bias.into_primitive()),
+        let bias = bias.into_option();
+        let x_node = x.node();
+        let bias_node = bias.as_ref().map(|bias| bias.node());
+        let scales = scales.into_primitive();
+        let state = QuantState {
+            qweight: qweight.clone(),
+            scales: scales.clone(),
+            group,
+            bias_dtype: bias.as_ref().map(|bias| bias.dtype()),
         };
-        <Self as AutodiffBackend>::from_inner(B::quantized_linear(
+        let y = B::quantized_linear(
             x.into_primitive(),
             qweight,
-            scales.into_primitive(),
-            bias,
+            scales,
+            MaybeTensor::from(bias.map(|bias| bias.into_primitive())),
             group,
-        ))
+        );
+        match bias_node {
+            None => match QuantNode.prepare::<C>([x_node]).compute_bound().stateful() {
+                OpsKind::Tracked(prep) => prep.finish(state, y),
+                OpsKind::UnTracked(prep) => prep.finish(y),
+            },
+            Some(bias_node) => match QuantBiasNode
+                .prepare::<C>([x_node, bias_node])
+                .compute_bound()
+                .stateful()
+            {
+                OpsKind::Tracked(prep) => prep.finish(state, y),
+                OpsKind::UnTracked(prep) => prep.finish(y),
+            },
+        }
     }
+
+    // `quantized_linear_backward` keeps the default body: under `Autodiff` it is differentiable
+    // through Burn's own operations.
 }
 
 /// A weight `[in, out]` packed as GPTQ stores it, checked: `qweight` `[in / 8, out]` (`i32`) and
@@ -317,8 +442,9 @@ fn host_ints<const D: usize>(t: Tensor<D, Int>) -> Vec<i64> {
 /// (`dash_contract::quant`). The reference and the decoding kernels compute it so; the prefill
 /// path (more than 16 rows on a CubeCL device) rounds `W`, and the product before the bias, to
 /// `x`'s dtype, and the kernel on RDNA4's matrix products (in its place on such a device) rounds
-/// `W` and adds the bias before its one rounding, within the bounds `tests/quant.rs` records. A
-/// forward pass only.
+/// `W` and adds the bias before its one rounding, within the bounds `tests/quant.rs` records. Its
+/// backward pass, on `Autodiff`, gives `x` and the bias their gradients by the definition's
+/// (`dash_contract::quant`); the weight has none.
 pub fn quantized_linear<const D: usize>(
     x: Tensor<D>,
     weight: &QuantizedWeight,

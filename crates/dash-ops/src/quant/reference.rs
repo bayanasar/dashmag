@@ -41,6 +41,26 @@ pub(crate) fn dequantize<B: Backend>(
     B::float_reshape(B::float_mul(centred, scales), Shape::new([inp, out]))
 }
 
+/// `dx = dy Wᵀ` for `dy` `[N, out]`: in f32, rounded once to `dy`'s dtype.
+pub(super) fn backward<B: Backend>(
+    dy: FloatTensor<B>,
+    qweight: IntTensor<B>,
+    scales: FloatTensor<B>,
+    group: usize,
+) -> FloatTensor<B> {
+    let dtype = dy.dtype();
+    let dy = match dtype {
+        DType::F32 => dy,
+        _ => B::float_cast(dy, FloatDType::F32),
+    };
+    let w = dequantize::<B>(qweight, scales, group);
+    let dx = matmul::<B>(dy, B::float_transpose(w));
+    match dtype {
+        DType::F32 => dx,
+        _ => B::float_cast(dx, dtype.into()),
+    }
+}
+
 /// `y = x W (+ bias)` for `x` `[N, in]`: in f32, rounded once to `x`'s dtype.
 pub(super) fn forward<B: Backend>(
     x: FloatTensor<B>,

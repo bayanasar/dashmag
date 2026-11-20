@@ -392,3 +392,103 @@ fn refuses_what_it_cannot_read() {
     .unwrap_err();
     assert!(err.contains("f16"), "{err}");
 }
+
+/// The backward pass on `Autodiff`: `x`'s gradient against `dy Wᵀ` and the bias's against the sum
+/// of `dy` over the rows, both computed on the host in f64, each element within what summing in
+/// f32 and the one rounding to its dtype allow ([`allowed`], neither `W` nor the product rounded);
+/// the bias in f32 beside `x` in another dtype at 9 rows; and with neither asking for a gradient,
+/// nothing recorded.
+#[test]
+fn backward_gives_x_and_the_bias_their_gradients() {
+    let _serial = serial();
+    for (name, plain) in devices() {
+        let device = plain.autodiff();
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            if !common::has(&device, dtype) {
+                continue;
+            }
+            for rows in [1, 9, 100] {
+                let p = packed(4, 384, 40, 128);
+                let weight = weight(&p, &device, false).unwrap();
+                let bias_dtype = if rows == 9 { DType::F32 } else { dtype };
+                let mut rng = Rng(5);
+                let mut host = |n: usize| (0..n).map(|_| rng.unit()).collect::<Vec<f32>>();
+                let (x, dy, b) = (host(rows * p.inp), host(rows * p.out), host(p.out));
+                let x = Tensor::<3>::from_data(TensorData::new(x, [1, rows, p.inp]), &device)
+                    .cast(FloatDType::from(dtype))
+                    .require_grad();
+                let dy = Tensor::<3>::from_data(TensorData::new(dy, [1, rows, p.out]), &device)
+                    .cast(FloatDType::from(dtype));
+                let bias = Tensor::<1>::from_data(TensorData::new(b, [p.out]), &device)
+                    .cast(FloatDType::from(bias_dtype))
+                    .require_grad();
+                let runs = probe::backward_runs();
+                let y = quantized_linear(x.clone(), &weight, Some(bias.clone()));
+                // The gradient of `sum(y · dy)` with respect to `y` is `dy`, exactly.
+                let grads = (y.cast(FloatDType::F32) * dy.clone().cast(FloatDType::F32))
+                    .sum()
+                    .backward();
+                assert_eq!(probe::backward_runs(), runs + 1, "{name} {dtype:?} {rows}");
+                let dx = x.grad(&grads).expect("x's gradient");
+                let db = bias.grad(&grads).expect("the bias's gradient");
+                assert_eq!(
+                    (dx.dtype(), db.dtype()),
+                    (dtype, bias_dtype),
+                    "{name} {rows}"
+                );
+                let read = |data: TensorData| data.convert::<f32>().try_to_vec::<f32>().unwrap();
+                let dys = read(dy.cast(FloatDType::F32).into_data());
+                let dxs = read(dx.cast(FloatDType::F32).into_data());
+                let dbs = read(db.cast(FloatDType::F32).into_data());
+                let none = Roundings {
+                    w: false,
+                    product: false,
+                };
+                let (mut worst_x, mut share_x) = (0f64, 0f64);
+                for n in 0..rows {
+                    for i in 0..p.inp {
+                        let terms = (0..p.out).map(|o| dys[n * p.out + o] as f64 * w(&p, i, o));
+                        let exact = terms.clone().sum::<f64>();
+                        let s = terms.map(f64::abs).sum::<f64>();
+                        let err = (dxs[n * p.inp + i] as f64 - exact).abs();
+                        let bound = allowed(exact, s, p.out, unit_roundoff(dtype), none);
+                        assert!(
+                            err <= bound,
+                            "{name} {dtype:?} {rows} rows, dx ({n}, {i}): off by {err:.3e}, \
+                             allowed {bound:.3e}"
+                        );
+                        worst_x = worst_x.max(err);
+                        share_x = share_x.max(err / bound);
+                    }
+                }
+                let (mut worst_b, mut share_b) = (0f64, 0f64);
+                for o in 0..p.out {
+                    let terms = (0..rows).map(|n| dys[n * p.out + o] as f64);
+                    let exact = terms.clone().sum::<f64>();
+                    let s = terms.map(f64::abs).sum::<f64>();
+                    let err = (dbs[o] as f64 - exact).abs();
+                    let bound = allowed(exact, s, rows, unit_roundoff(bias_dtype), none);
+                    assert!(
+                        err <= bound,
+                        "{name} {dtype:?} {rows} rows, dbias {o}: off by {err:.3e}, allowed \
+                         {bound:.3e}"
+                    );
+                    worst_b = worst_b.max(err);
+                    share_b = share_b.max(err / bound);
+                }
+                println!(
+                    "{name} {dtype:?} {rows} rows, backward: dx max abs {worst_x:.3e}, at most \
+                     {share_x:.2} of what its roundings allow; dbias ({bias_dtype:?}) {worst_b:.3e}, \
+                     {share_b:.2}"
+                );
+            }
+        }
+        // Neither `x` nor the bias asks for a gradient: the output records nothing.
+        let p = packed(4, 384, 40, 128);
+        let weight = weight(&p, &device, false).unwrap();
+        let x = Tensor::<2>::zeros([3, p.inp], &device);
+        let bias = Tensor::<1>::zeros([p.out], &device);
+        assert!(!quantized_linear(x.clone(), &weight, Some(bias)).is_require_grad());
+        assert!(!quantized_linear(x, &weight, None).is_require_grad());
+    }
+}

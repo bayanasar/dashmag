@@ -45,8 +45,20 @@
 //! one bf16 unit of `W` rounded rather than `W` rounded (MLX's side does, so that its quantized
 //! matmul runs in `x`'s dtype). It is held to the definition within the bounds its tests record.
 //!
-//! There is no backward pass yet. A gradient with respect to `x` alone (the weights frozen) is
-//! what a quantized model needs as a teacher; it is not asked for.
+//! # Backward
+//!
+//! The weight is frozen: `qweight` and `scales` have no gradient. For `dy` `[N, out]`, the
+//! gradient of `y`:
+//!
+//! ```text
+//! dx[n, i] = sum_o dy[n, o] W[i, o]      [N, in]
+//! dbias[o] = sum_n dy[n, o]              [out]
+//! ```
+//!
+//! Each in f32, `dy` read exactly into it and `W` exact in it, rounded once: `dx` to `x`'s dtype,
+//! `dbias` to the bias's. An implementation may sum in any order and is held to the definition
+//! within the bounds its tests record. This is what LoRA trained over a quantized base needs: the
+//! adapters of a layer below take their gradients through `x`.
 
 /// How the packed weights encode their values.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
