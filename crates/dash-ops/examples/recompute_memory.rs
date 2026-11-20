@@ -14,10 +14,13 @@
 //! also printed. The gradient checksum (sum of every adapter gradient's squares) lets the modes
 //! be compared.
 //!
-//!   CUBECL_CUDA_TF32=0 cargo run --release -p dash-lora --features cuda --example recompute_memory -- layer
+//!   CUBECL_CUDA_TF32=0 cargo run --release -p dash-ops --features cuda --example recompute_memory -- layer
 //!   ... -- <none|balanced|layer> [layers 24] [tokens 6144] [timed repetitions 3]
 //!
-//! On an RTX 5070 Ti, 24 layers, 6144 tokens: the peak in use above the weights and input
+//! Each projection is LoRA's layer as dash-mag and PEFT compute it ([`LoraProj`]). The figures
+//! below were measured on 2026-10-27 with dash-lora's layer, which computed the same, in this
+//! example when it was dash-lora's. On an RTX 5070 Ti, 24 layers, 6144 tokens: the peak in use
+//! above the weights and input
 //! (536 MiB), the largest over repeated runs of this workspace's build (a sampled peak varies by
 //! some 60 MiB from run to run), and the median step, the median over runs; PyTorch 2.13 with
 //! PEFT 0.20 on the same blocks and card beside it (`torch.utils.checkpoint` around each block
@@ -41,23 +44,59 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use burn::module::Module;
+use burn::module::{Module, Param, ParamId};
 use burn::optim::GradientsParams;
 use burn::tensor::{DType, Device, Tensor, TensorData, activation};
-use dash_lora::{Lora, LoraLinear};
 use dash_ops::checkpoint;
+use dash_ops::lowrank::{LowRankOptions, low_rank};
 
 const HIDDEN: usize = 1024;
 const MLP: usize = 3584;
 const RANK: usize = 16;
 const ALPHA: f64 = 32.0;
 
+/// A LoRA'd projection as LoRA's layer computes one (dash-mag's, and PEFT's `lora.Linear`):
+/// `x Wᵀ + scale · (x Aᵀ) Bᵀ`, the base product at the weight's dtype, the low-rank term by
+/// [`dash_ops::lowrank`] in f32, their sum in f32 rounded once to `x`'s dtype. `W` is frozen.
+#[derive(Module, Debug)]
+struct LoraProj {
+    weight: Param<Tensor<2>>,
+    a: Param<Tensor<2>>,
+    b: Param<Tensor<2>>,
+    scale: f64,
+}
+
+impl LoraProj {
+    fn new(weight: Tensor<2>, a: Tensor<2>, b: Tensor<2>, scale: f64) -> Self {
+        Self {
+            weight: Param::initialized(ParamId::new(), weight.detach()),
+            a: Param::from_tensor(a.cast(DType::F32).detach()),
+            b: Param::from_tensor(b.cast(DType::F32).detach()),
+            scale,
+        }
+    }
+
+    fn forward(&self, x: Tensor<2>) -> Tensor<2> {
+        let dtype = x.dtype();
+        let weight = self.weight.val();
+        let base = x.clone().cast(weight.dtype()).matmul(weight.transpose());
+        let base = if base.dtype() == dtype {
+            base
+        } else {
+            base.cast(DType::F32)
+        };
+        let (u, v) = (self.a.val().transpose(), self.b.val().transpose());
+        let options = LowRankOptions::default().with_scale(self.scale);
+        low_rank(x, u, v, Some(base), options).cast(dtype)
+    }
+}
+
 /// `x + down(silu(gate(x)) * up(x))`, every projection LoRA'd.
 #[derive(Module, Debug)]
 struct Block {
-    gate: LoraLinear,
-    up: LoraLinear,
-    down: LoraLinear,
+    gate: LoraProj,
+    up: LoraProj,
+    down: LoraProj,
 }
 
 impl Block {
@@ -71,7 +110,7 @@ impl Block {
                 g.uniform(-1.0, 1.0) / si
             });
             let b = rng.tensor([out, RANK], DType::F32, device, |g| 1e-3 * g.normal());
-            LoraLinear::frozen(w).with_lora(Lora::new(a, b, ALPHA / RANK as f64))
+            LoraProj::new(w, a, b, ALPHA / RANK as f64)
         };
         Self {
             gate: linear(MLP, HIDDEN),
@@ -154,9 +193,9 @@ impl Peak {
                 device.clone(),
             );
             std::thread::spawn(move || {
-                // DASH_LORA_SPIN=1 samples without pausing, for peaks shorter than 100 µs; it
+                // DASH_OPS_SPIN=1 samples without pausing, for peaks shorter than 100 µs; it
                 // slows the step down, so time is read from a run without it.
-                let spin = std::env::var("DASH_LORA_SPIN").is_ok_and(|v| v == "1");
+                let spin = std::env::var("DASH_OPS_SPIN").is_ok_and(|v| v == "1");
                 while !stop.load(Ordering::Relaxed) {
                     if let Some(u) = device.memory_pool_usage() {
                         in_use.fetch_max(u.bytes_in_use, Ordering::Relaxed);
@@ -236,8 +275,7 @@ fn checksum(blocks: &[Block], params: &GradientsParams) -> f64 {
     let mut sum = 0.0;
     for b in blocks {
         for layer in [&b.gate, &b.up, &b.down] {
-            let lora = layer.lora().unwrap();
-            for id in [lora.a.id, lora.b.id] {
+            for id in [layer.a.id, layer.b.id] {
                 let g = params.get::<2>(id).expect("every adapter has a gradient");
                 sum += g.powi_scalar(2).sum().into_scalar::<f32>() as f64;
             }

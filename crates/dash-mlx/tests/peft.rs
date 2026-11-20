@@ -1,5 +1,5 @@
-//! PEFT's files into LoRA's MLX layers and out again, on dash-lora's `peft_*` fixtures (written by
-//! PEFT 0.20), as dash-lora's tests hold its Burn layers to them: each adapter applied to layers of
+//! PEFT's files into LoRA's MLX layers and out again, on the `peft_*` fixtures in dash-mag's
+//! `tests/fixtures/lora` (written by PEFT 0.20): each adapter applied to layers of
 //! its modules' shapes with PEFT's scale and dropout, read back out byte for byte; a frozen
 //! adapter beside the trained default, MLX's trainable parameters holding the default's factors
 //! alone; an adapter of rank 0 through and back.
@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 fn fixture(dir: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../dash-lora/tests/fixtures")
+        .join("../dash-mag/tests/fixtures/lora")
         .join(dir)
 }
 

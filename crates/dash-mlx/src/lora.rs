@@ -1,8 +1,8 @@
 //! LoRA on MLX: a linear layer whose base weight is frozen at its own precision (bf16) while the
 //! low-rank adapters `A` and `B` are f32 and alone receive gradients, never folded into the base;
-//! several adapters over one base by name, and the choice of the one a forward pass uses. This is
-//! dash-lora's `LoraLinear`, `Lora` and adapter choice (their module documentation gives the
-//! arithmetic and why the adapters are never merged).
+//! several adapters over one base by name, and the choice of the one a forward pass uses, as
+//! dash-mag's layer computes them (its module documentation gives the arithmetic and why the
+//! adapters are never merged).
 //!
 //! `y = x Wᵀ + scale · (x Aᵀ) Bᵀ`, `W` `[out, in]` frozen, `A` `[r, in]` and `B` `[out, r]` f32,
 //! `scale = lora_alpha / r` (`/ √r` with rsLoRA): PEFT's layout, names and arithmetic.
@@ -18,8 +18,8 @@
 //! The base weight is a frozen parameter: MLX's `value_and_grad` over the trainable parameters
 //! never differentiates it. An adapter's factors train unless frozen (`freeze_parameters`).
 //!
-//! **The choice of adapter.** dash-lora sets it across a whole module tree through Burn's module
-//! mapper; nothing here maps over a module's own fields, so it is a setting of each layer,
+//! **The choice of adapter.** Nothing here maps over a module's own fields, so it is a setting of
+//! each layer,
 //! [`LoraLinear::set_adapter`], and [`set_adapter`] sets it on every layer a model hands over (its
 //! LoRA'd layers, by whatever path holds them). A layer that does not hold the chosen adapter runs
 //! its base alone; `None` runs every layer's base alone, as PEFT's `disable_adapter()` does. The

@@ -133,8 +133,10 @@ with top-k.
 The low-rank product's row is by device time under Nsight Systems: the kernels and Burn's own
 matmuls from `lowrank_bench`, PEFT's term the same way on PyTorch, from its timed passes but for
 1024 -> 2048 forward and backward, where the card had lowered its clocks during them (0.19 ms) and
-the passes run back to back before them give 0.15 (`dash-lora`'s README says why). Each example
-in `examples/` reproduces its row (`--features cuda`).
+the passes run back to back before them give 0.15: the timed passes ran 100 ms of idle device
+apart, too little work for the card, which lowered its clocks within two seconds. Those passes were
+dash-lora's `examples/lora_layer.rs`, removed with that crate on 2026-11-20 (`lowrank_bench`'s
+documentation says more). Each example in `examples/` reproduces its row (`--features cuda`).
 `matmul_bench` and `dispatch_bench` measure Burn itself: bf16 matmul against cuBLAS, and the
 host-side cost of each unfused operation.
 

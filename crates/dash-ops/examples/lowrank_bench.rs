@@ -10,8 +10,8 @@
 //! Each time is the median over 9 runs, each followed by a device sync, after 3 warm-up runs (which
 //! also let Burn's autotuner settle where it is on); wall clock, on a shared machine. "fwd+bwd"
 //! runs the backward pass from a gradient of ones, `x` and both factors requiring gradients.
-//! `dash-lora`'s `examples/lora_layer.rs` measures the whole LoRA'd layer against PEFT by device
-//! time.
+//! dash-lora's `examples/lora_layer.rs` measured the whole LoRA'd layer against PEFT by device
+//! time until that crate was removed (2026-11-20); LoRA's layer is dash-mag's now.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -52,7 +52,7 @@ mod bench {
         Tensor::from_data(data, (device, dtype))
     }
 
-    /// The product from Burn's operations, as `dash_lora` computed it before.
+    /// The product from Burn's operations, as LoRA's layer computed it before these kernels.
     fn composed(x: Tensor<2>, u: Tensor<2>, v: Tensor<2>, base: Option<Tensor<2>>) -> Tensor<2> {
         let z = x.cast(DType::F32).matmul(u).matmul(v).mul_scalar(SCALE);
         match base {

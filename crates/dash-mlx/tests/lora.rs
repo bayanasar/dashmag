@@ -1,5 +1,6 @@
-//! LoRA against dash-lora's fixtures, recorded from PEFT 0.20 on torch 2.13, with dash-lora's
-//! bounds for builds whose products sum in another order than the CPU's:
+//! LoRA against the fixtures in dash-mag's `tests/fixtures/lora`, recorded from PEFT 0.20 on torch
+//! 2.13, with the bounds dash-lora's layer was held to for builds whose products sum in another
+//! order than the CPU's:
 //!
 //! - `linear.safetensors`: one LoRA'd layer, `x` `[48, 96]`, `W` `[80, 96]`, r 16, alpha 32, with a
 //!   bf16 base (x and W bf16, A and B f32) and an f32 base: the output and the gradients of `x`, A
@@ -24,7 +25,7 @@ use dash_mlx::mlx::{Array, Dtype};
 use safetensors::{Dtype as StDtype, SafeTensors};
 use std::collections::HashMap;
 
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../dash-lora/tests/fixtures");
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../dash-mag/tests/fixtures/lora");
 const REFERENCE: &str = "reference";
 const BETA: f32 = 0.5;
 

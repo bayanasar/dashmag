@@ -1,9 +1,9 @@
-//! dash-ops' and dash-lora's operations on MLX, for Apple silicon.
+//! dash-ops' operations and LoRA on MLX, for Apple silicon.
 //!
-//! On NVIDIA, dashmag's training operations sit on Burn: dash-ops and dash-lora add what Burn
-//! lacks, as CubeCL kernels. On Apple silicon the backend is MLX instead, which already has what
+//! On NVIDIA, dashmag's training operations sit on Burn: dash-ops adds what Burn lacks, as
+//! CubeCL kernels. On Apple silicon the backend is MLX instead, which already has what
 //! Burn gives there: arrays, autodiff, matmul, a fused attention forward, rms_norm, RoPE, Metal.
-//! This crate adds the rest, with dash-ops' and dash-lora's contracts (arguments, shapes, dtypes,
+//! This crate adds the rest, with dash-ops' contracts (arguments, shapes, dtypes,
 //! states in and out), so that an application can target either backend, and holds each operation
 //! to their tests.
 //!

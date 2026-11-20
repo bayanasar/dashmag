@@ -2384,28 +2384,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "dash-lora"
-version = "0.0.1"
-dependencies = [
- "burn",
- "dash-contract",
- "dash-ops",
- "dash-peft",
- "safetensors 0.8.0",
- "serde_json",
-]
-
-[[package]]
 name = "dash-mag"
 version = "0.0.1"
 dependencies = [
  "burn",
  "dash-contract",
- "dash-lora",
  "dash-mlx",
  "dash-ops",
  "dash-peft",
  "half",
+ "safetensors 0.8.0",
  "serde_json",
 ]
 

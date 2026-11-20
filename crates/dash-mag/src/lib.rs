@@ -3,7 +3,7 @@
 //! an algorithm are written once against it and run on every platform.
 //!
 //! ```text
-//! algorithm → dash-mag ─┬ dash-ops, dash-lora's arithmetic → Burn → CubeCL → CUDA (or Flex)
+//! algorithm → dash-mag ─┬ dash-ops → Burn → CubeCL → CUDA, ROCm (or Flex)
 //!                       └ dash-mlx → MLX → Metal (macOS)
 //! ```
 //!

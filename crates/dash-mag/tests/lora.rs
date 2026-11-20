@@ -1,5 +1,7 @@
-//! LoRA's layer: on the Burn side the same bits as dash-lora's, output and gradients, with a bf16
-//! and an f32 base; and on every side, PEFT's files through the layers and back byte for byte.
+//! LoRA's layer: the base product plus the low-rank term at `x`'s dtype, an adapter chosen or none,
+//! factors refused that do not fit; on MLX the same bits as dash-mlx's layer, output and gradients;
+//! and on every side PEFT's files through the layers and back byte for byte. Against values
+//! recorded from PEFT itself: `tests/lora_peft.rs`.
 
 mod common;
 
@@ -8,12 +10,14 @@ use dash_mag::lora::{
     AdapterLayer, ApplyOptions, DEFAULT_ADAPTER, HostTensor, Lora, LoraLinear, LoraWeights,
     PeftAdapter, PeftConfig,
 };
-use dash_mag::{DType, Tensor, vjp};
+#[cfg(target_os = "macos")]
+use dash_mag::vjp;
+use dash_mag::{DType, Tensor};
 use std::path::PathBuf;
 
 fn fixture(dir: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../dash-lora/tests/fixtures")
+        .join("tests/fixtures/lora")
         .join(dir)
 }
 
@@ -30,6 +34,7 @@ fn layer(dtype: DType) -> LoraLinear {
 }
 
 /// `f` over the chosen adapter's factors and `x`.
+#[cfg(target_os = "macos")]
 fn run(layer: &LoraLinear, x: &Tensor, cotangent: &Tensor) -> (Vec<Tensor>, Vec<Tensor>) {
     let lora = layer.lora().unwrap();
     let mut held = layer.clone();
@@ -243,60 +248,5 @@ fn on_mlx_it_is_dash_mlx_s_layer_bit_for_bit() {
         assert_eq!(bits(&grads[0]), f32s(&g[0]), "x, {dtype:?}");
         assert_eq!(bits(&grads[1]), f32s(&g[1]), "a, {dtype:?}");
         assert_eq!(bits(&grads[2]), f32s(&g[2]), "b, {dtype:?}");
-    }
-}
-
-/// The Burn side against dash-lora's layer.
-#[cfg(not(target_os = "macos"))]
-#[test]
-fn on_burn_it_is_dash_lora_s_layer_bit_for_bit() {
-    use burn::tensor::{DType as BurnDType, Device, Tensor as Burn, TensorData};
-    #[cfg(feature = "cuda")]
-    let device = Device::cuda(0);
-    #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
-    let device = Device::rocm(0);
-    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
-    let device = Device::flex();
-
-    for (dtype, burn) in [(DType::BF16, BurnDType::BF16), (DType::F32, BurnDType::F32)] {
-        let plain = |seed: u64, shape: [usize; 2], d: BurnDType| {
-            let n = shape.iter().product();
-            Burn::<2>::from_data(TensorData::new(common::values(seed, n), shape), &device).cast(d)
-        };
-        let f32s = |t: Burn<2>| -> Vec<u32> {
-            let data = t.inner().cast(BurnDType::F32).into_data();
-            data.try_to_vec::<f32>()
-                .unwrap()
-                .iter()
-                .map(|v| v.to_bits())
-                .collect()
-        };
-        let front = layer(dtype);
-        let x = tensor(4, &[3, 16], dtype);
-        let (outs, grads) = run(&front, &x, &tensor(5, &[3, 8], DType::F32));
-
-        let ad = device.clone().autodiff();
-        let a = plain(2, [4, 16], BurnDType::F32);
-        let b = plain(3, [8, 4], BurnDType::F32);
-        let direct = dash_lora::LoraLinear::frozen(plain(1, [8, 16], burn).autodiff())
-            .with_lora(dash_lora::Lora::new(a.autodiff(), b.autodiff(), 2.0));
-        let _ = ad;
-        let xd = plain(4, [3, 16], burn).autodiff().require_grad();
-        let y = direct.forward(xd.clone());
-        let c = plain(5, [3, 8], BurnDType::F32).cast(y.dtype());
-        let g = (y.clone() * c).sum().cast(BurnDType::F32).backward();
-        let lora = direct.lora().unwrap();
-        assert_eq!(bits(&outs[0]), f32s(y), "output, {dtype:?}");
-        assert_eq!(bits(&grads[0]), f32s(xd.grad(&g).unwrap()), "x, {dtype:?}");
-        assert_eq!(
-            bits(&grads[1]),
-            f32s(lora.a.val().grad(&g).unwrap()),
-            "a, {dtype:?}"
-        );
-        assert_eq!(
-            bits(&grads[2]),
-            f32s(lora.b.val().grad(&g).unwrap()),
-            "b, {dtype:?}"
-        );
     }
 }

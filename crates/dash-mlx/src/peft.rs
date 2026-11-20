@@ -1,7 +1,7 @@
 //! LoRA adapters in PEFT's format, and the MLX side of them. The format (PEFT 0.20's
 //! `adapter_model.safetensors` and `adapter_config.json`, read and written back byte for byte,
 //! the configuration, the module paths, applying an adapter to the caller's layers and writing
-//! theirs out) is [`dash_peft`]'s, re-exported here, as dash-lora re-exports it for Burn; this
+//! theirs out) is [`dash_peft`]'s, re-exported here, as dash-mag re-exports it; this
 //! module makes [`LoraLinear`] one of its [`AdapterLayer`]s, the factors read as f32 arrays and
 //! written out as f32. MLX makes arrays on no device, so the adapter's device is `()`:
 //! `adapter.apply(layers, &())`.
@@ -69,7 +69,7 @@ impl AdapterLayer for LoraLinear {
     }
 }
 
-/// A factor as an f32 array: bf16 and f16 widened exactly, f64 rounded to f32, as dash-lora reads
+/// A factor as an f32 array: bf16 and f16 widened exactly, f64 rounded to f32, as dash-mag reads
 /// them.
 fn array(tensor: &HostTensor) -> Result<Array, PeftError> {
     let bytes = tensor.bytes();

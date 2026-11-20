@@ -2,9 +2,12 @@
 //! f32 adapters never folded into it, several by name over one base, the choice of one, and PEFT's
 //! files through [`dash_peft`].
 //!
-//! `y = x Wᵀ + scale · (x Aᵀ) Bᵀ`, with PEFT's layout and arithmetic, as dash-lora and dash-mlx
-//! compute it: the base product at the weight's dtype, the low-rank product in f32, their sum in
-//! f32 and rounded once to `x`'s dtype. A layer holds plain tensors, so a training step passes an
+//! `y = x Wᵀ + scale · (x Aᵀ) Bᵀ`, with PEFT's layout and arithmetic, as PEFT's `lora.Linear`
+//! computes it: the base product at the weight's dtype, the low-rank product in f32, their sum in
+//! f32 and rounded once to `x`'s dtype (`tests/lora_peft.rs` holds it to PEFT's recorded values).
+//! The adapter is never folded into the weight: in a bf16 weight most of an update's elements
+//! would round away, where kept apart it reaches the output at f32 precision. A layer holds plain
+//! tensors, so a training step passes an
 //! adapter's factors to [`crate::vjp`] as primals and puts them back with [`LoraLinear::set_factors`];
 //! the base, which `f` captures, stays a constant.
 //!

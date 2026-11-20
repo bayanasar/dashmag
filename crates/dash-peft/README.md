@@ -19,9 +19,9 @@ this crate does not interpret are kept, and the configuration is written as PEFT
   every backend: a module's shapes against its layer's, every module and tensor taken by some
   layer, each layer's scale and rank against the configuration.
 
-`dash-lora` implements `AdapterLayer` for its Burn layer and re-exports this crate. The tests
-(`tests/format.rs`) read and write back dash-lora's `peft_*` fixtures, recorded from PEFT 0.20, and
-apply them to layers that keep host data.
+`dash-mag` implements `AdapterLayer` for its LoRA layer and re-exports this crate. The tests
+(`tests/format.rs`) read and write back the `peft_*` fixtures in dash-mag's `tests/fixtures/lora`,
+recorded from PEFT 0.20, and apply them to layers that keep host data.
 
 Part of [Dashmag](https://github.com/bayanasar/dashmag). See the repository for the full picture.
 

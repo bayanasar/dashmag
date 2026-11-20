@@ -1,6 +1,6 @@
 [package]
 name = "dash-peft"
-description = "PEFT's LoRA adapter files, read and written back byte for byte, with no tensor library: the format dash-lora's Burn layers and dash-mlx's MLX layers share."
+description = "PEFT's LoRA adapter files, read and written back byte for byte, with no tensor library: the format dash-mag's and dash-mlx's LoRA layers share."
 readme = "README.md"
 keywords = ["lora", "peft", "safetensors", "machine-learning"]
 categories = ["science"]

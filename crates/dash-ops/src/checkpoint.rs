@@ -55,7 +55,7 @@
 //! is still decided operation by operation. On a stack of MLP blocks whose projections carry
 //! LoRA adapters it keeps more, not less: the f32 base product and low-rank term feeding each
 //! sum are backed up, where plain autodiff frees them. Over 6144 tokens through 24 such blocks
-//! at Qwen3.5-0.8B's shapes on an RTX 5070 Ti (dash-lora's `examples/recompute_memory.rs`), the
+//! at Qwen3.5-0.8B's shapes on an RTX 5070 Ti (`examples/recompute_memory.rs`), the
 //! peak above the weights is 7.2 GiB with plain autodiff, 14.2 GiB with balanced checkpointing,
 //! and 0.69 GiB with this module (PyTorch with `torch.utils.checkpoint` around each block: 0.73
 //! GiB). Each layer's forward pass runs twice: the step is 11 to 42% longer than plain
@@ -94,8 +94,10 @@
 //!   input is a leaf can order its steps otherwise than the same layer deep in a stack: near the
 //!   leaves, operations on its parameters (a transposed weight) set some steps' depths, deep in
 //!   the stack its input does. A sum of three or more contributions then rounds differently.
-//!   dash-lora's LoRA'd blocks show it in bf16 (`tests/recompute.rs` there): their gradients are
-//!   as far from the same stack computed in f32 as plain autodiff's.
+//!   LoRA'd blocks showed it in bf16 on 2026-10-26 (`tests/checkpoint_lowrank.rs`), their
+//!   gradients as far from the same stack computed in f32 as plain autodiff's; on Flex and on
+//!   CUDA on 2026-11-20 their 64 stacks are exactly as far as plain autodiff's (every ratio
+//!   1.00).
 
 use burn::module::{Module, ModuleVisitor, Param};
 use burn::tensor::{GradientCheckpointingStrategy, Gradients, Tensor};

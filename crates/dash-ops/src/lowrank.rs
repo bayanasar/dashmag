@@ -41,8 +41,9 @@
 //! by device time (the sum of the kernels' times under Nsight Systems), against PEFT's
 //! `lora_B(lora_A(x.float())) * scaling` on PyTorch 2.13 (cuBLAS), for `in -> out` 1024 -> 3584,
 //! 3584 -> 1024, 1024 -> 2048 and 1024 -> 256 (`examples/lowrank_bench.rs` and dash-lora's
-//! `examples/lora_layer.rs`, the latter's passes as its documentation says; Burn's matrix
-//! products over 6144 tokens were timed on a card shared with other work):
+//! `examples/lora_layer.rs`, the latter's passes as its documentation said, an example removed with
+//! that crate on 2026-11-20; Burn's matrix products over 6144 tokens were timed on a card shared
+//! with other work):
 //!
 //! | tokens | pass | dash-ops | PEFT | Burn's matrix products |
 //! |---|---|---|---|---|

@@ -1,6 +1,6 @@
 [package]
 name = "dash-mlx"
-description = "dash-ops' and dash-lora's operations on MLX, for Apple silicon: the same contracts, with MLX's arrays in place of Burn's tensors."
+description = "dash-ops' operations and LoRA on MLX, for Apple silicon: the same contracts, with MLX's arrays in place of Burn's tensors."
 readme = "README.md"
 keywords = ["mlx", "metal", "apple-silicon", "machine-learning"]
 categories = ["science"]

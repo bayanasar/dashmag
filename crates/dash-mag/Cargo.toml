@@ -44,8 +44,8 @@ dash-ops = { workspace = true, default-features = false }
 dash-mlx = { workspace = true }
 
 [dev-dependencies]
+safetensors = "0.8"
 serde_json = "1"
 
 [target.'cfg(not(target_os = "macos"))'.dev-dependencies]
 burn = { workspace = true, features = ["autodiff"] }
-dash-lora = { path = "../dash-lora", default-features = false }
