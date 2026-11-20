@@ -640,6 +640,13 @@ fn a_dimension_past_i32_is_refused() {
     assert!(Tensor::from_bool(&[], &[past, 0]).is_err(), "from_bool");
     assert!(empty.reshape(&[past as isize, 0]).is_err(), "reshape");
     assert!(empty.broadcast_to(&[past, 0, 2]).is_err(), "broadcast_to");
+    // Two inputs within the limit whose join is past it.
+    let half = Tensor::zeros(&[0, past / 2 + 1], DType::F32).unwrap();
+    assert!(Tensor::concat(&[&half, &half], 1).is_err(), "concat");
+    assert!(
+        Tensor::concat(&[&half, &half], 0).is_ok(),
+        "concat along the other axis"
+    );
 }
 
 /// What comes out is what `x` and the weight promote to, each pair on every side: a bf16 `x` with an

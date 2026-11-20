@@ -666,6 +666,10 @@ impl Tensor {
                 return refuse(format!("concat: {a:?} and {b:?} along axis {axis}"));
             }
         }
+        // Inputs within the limit can join past it; `pad` and `stack` come through here too.
+        let mut joined = first.shape();
+        joined[axis] = cast.iter().map(|t| t.shape()[axis]).sum();
+        check_shape("concat", &joined)?;
         let arrays: Vec<&A> = cast.iter().map(|t| &t.0).collect();
         Self::wrap(Selected::concat(&arrays, axis))
     }
