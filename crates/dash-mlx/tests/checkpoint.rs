@@ -2,23 +2,66 @@
 //! bf16 or f32 base with a trainable adapter each) run through `checkpoint::forward` and
 //! `checkpoint::backward` gives the input's gradient and every adapter's, bit for bit, as MLX's
 //! autodiff over the whole stack gives them, in f32 and bf16; the layers hold their own arrays
-//! afterwards, and only trainable parameters get gradients.
+//! afterwards, and only trainable parameters get gradients. Each projection is LoRA's layer as
+//! dash-mag and PEFT compute it ([`LoraProj`]), as dash-ops' `tests/checkpoint_lowrank.rs` has it
+//! on Burn.
 //!
 //!   cargo test -p dash-mlx --test checkpoint
 #![cfg(target_os = "macos")]
 
 use dash_mlx::checkpoint;
-use dash_mlx::lora::{Lora, LoraLinear};
+use dash_mlx::lowrank::{LowRankOptions, low_rank};
 use dash_mlx::mlx::error::Result;
-use dash_mlx::mlx::module::{Module, ModuleParameters};
+use dash_mlx::mlx::module::{ModuleParameters, Param};
 use dash_mlx::mlx::transforms::fallible_vjp;
 use dash_mlx::mlx::{Array, Dtype};
 
+/// A LoRA'd projection as LoRA's layer computes one (dash-mag's, and PEFT's `lora.Linear`):
+/// `x Wᵀ + scale · (x Aᵀ) Bᵀ`, the base product at the weight's dtype, the low-rank term by
+/// [`dash_mlx::lowrank`] in f32, their sum in f32 rounded once to `x`'s dtype. `W` is frozen.
+#[derive(Debug, Clone)]
+struct LoraProj {
+    weight: Param<Array>,
+    a: Param<Array>,
+    b: Param<Array>,
+    scale: f64,
+}
+
+dash_mlx::module_parameters!(LoraProj { weight, a, b });
+
+impl LoraProj {
+    fn new(weight: &Array, a: &Array, b: &Array, scale: f64) -> Result<Self> {
+        let mut weight = Param::new(weight.clone());
+        weight.freeze();
+        Ok(Self {
+            weight,
+            a: Param::new(a.as_dtype(Dtype::Float32)?),
+            b: Param::new(b.as_dtype(Dtype::Float32)?),
+            scale,
+        })
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let weight = self.weight.as_ref();
+        let base = x.as_dtype(weight.dtype())?.matmul(weight.t())?;
+        // Where the base's dtype is not x's, it goes in as f32 (exactly) and the f32 sum is
+        // rounded once to x's.
+        let base = if base.dtype() == x.dtype() {
+            base
+        } else {
+            base.as_dtype(Dtype::Float32)?
+        };
+        let (u, v) = (self.a.as_ref().t(), self.b.as_ref().t());
+        let options = LowRankOptions::default().with_scale(self.scale);
+        low_rank(x, &u, &v, Some(&base), options)?.as_dtype(x.dtype())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Block {
-    up: LoraLinear,
-    gate: LoraLinear,
-    down: LoraLinear,
+    up: LoraProj,
+    gate: LoraProj,
+    down: LoraProj,
 }
 
 dash_mlx::module_parameters!(Block { up, gate, down });
@@ -34,13 +77,12 @@ impl Block {
             )?
             .multiply(Array::from_f32(scale))
         };
-        let layer = |out: i32, inp: i32, seed: u64| -> Result<LoraLinear> {
-            LoraLinear::frozen(&normal(&[out, inp], 0.05, seed)?.as_dtype(dtype)?)?.with_lora(
-                Lora::new(
-                    &normal(&[8, inp], 0.05, seed + 1)?,
-                    &normal(&[out, 8], 0.05, seed + 2)?,
-                    2.0,
-                )?,
+        let layer = |out: i32, inp: i32, seed: u64| -> Result<LoraProj> {
+            LoraProj::new(
+                &normal(&[out, inp], 0.05, seed)?.as_dtype(dtype)?,
+                &normal(&[8, inp], 0.05, seed + 1)?,
+                &normal(&[out, 8], 0.05, seed + 2)?,
+                2.0,
             )
         };
         Ok(Self {

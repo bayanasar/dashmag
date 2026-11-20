@@ -348,9 +348,8 @@ mod direct {
     use dash_mlx::conv1d::{Activation, CausalConv1dOptions, causal_conv1d};
     use dash_mlx::gated_delta::chunk::{ChunkGatedDeltaOptions, chunk_gated_delta_rule};
     use dash_mlx::logprob::{LogprobOptions, chosen_logprob};
-    use dash_mlx::lora::{DEFAULT_ADAPTER, Lora, LoraLinear};
+    use dash_mlx::lowrank::{LowRankOptions, low_rank};
     use dash_mlx::mlx::error::Result;
-    use dash_mlx::mlx::module::{Module, Param};
     use dash_mlx::mlx::ops::indexing::TryIndexOp;
     use dash_mlx::mlx::ops::{concatenate, select, sigmoid, zeros_like};
     use dash_mlx::mlx::transforms::{eval, fallible_vjp};
@@ -375,29 +374,54 @@ mod direct {
             .unwrap()
     }
 
-    fn projection(seed: u64, out: i32, inp: i32, dtype: Dtype) -> LoraLinear {
-        let a = scaled(seed + 1, &[RANK as i32, inp], Dtype::Float32, 0.125);
-        let b = scaled(seed + 2, &[out, RANK as i32], Dtype::Float32, 0.125);
-        LoraLinear::frozen(&scaled(seed, &[out, inp], dtype, 0.25))
-            .unwrap()
-            .with_lora(Lora::new(&a, &b, 2.0).unwrap())
-            .unwrap()
+    /// A LoRA'd projection as LoRA's layer computes one (dash-mag's, and PEFT's `lora.Linear`):
+    /// `x Wᵀ + scale · (x Aᵀ) Bᵀ`, the base product at the weight's dtype, the low-rank term by
+    /// `dash_mlx::lowrank` in f32, their sum in f32 rounded once to `x`'s dtype. `W` is frozen:
+    /// only `A` and `B` are the step's primals.
+    #[derive(Clone)]
+    struct LoraProj {
+        weight: Array,
+        a: Array,
+        b: Array,
+        scale: f64,
+    }
+
+    impl LoraProj {
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let base = x.as_dtype(self.weight.dtype())?.matmul(self.weight.t())?;
+            let base = if base.dtype() == x.dtype() {
+                base
+            } else {
+                base.as_dtype(Dtype::Float32)?
+            };
+            let options = LowRankOptions::default().with_scale(self.scale);
+            low_rank(x, &self.a.t(), &self.b.t(), Some(&base), options)?.as_dtype(x.dtype())
+        }
+    }
+
+    fn projection(seed: u64, out: i32, inp: i32, dtype: Dtype) -> LoraProj {
+        LoraProj {
+            weight: scaled(seed, &[out, inp], dtype, 0.25),
+            a: scaled(seed + 1, &[RANK as i32, inp], Dtype::Float32, 0.125),
+            b: scaled(seed + 2, &[out, RANK as i32], Dtype::Float32, 0.125),
+            scale: 2.0,
+        }
     }
 
     #[derive(Clone)]
     enum Block {
         Delta {
-            qkv: LoraLinear,
-            decay: LoraLinear,
-            gate: LoraLinear,
-            out: LoraLinear,
+            qkv: LoraProj,
+            decay: LoraProj,
+            gate: LoraProj,
+            out: LoraProj,
             conv: Array,
         },
         Attention {
-            q: LoraLinear,
-            k: LoraLinear,
-            v: LoraLinear,
-            out: LoraLinear,
+            q: LoraProj,
+            k: LoraProj,
+            v: LoraProj,
+            out: LoraProj,
         },
     }
 
@@ -429,7 +453,7 @@ mod direct {
             }
         }
 
-        fn layers(&self) -> Vec<&LoraLinear> {
+        fn layers(&self) -> Vec<&LoraProj> {
             match self {
                 Block::Delta {
                     qkv,
@@ -442,7 +466,7 @@ mod direct {
             }
         }
 
-        fn layers_mut(&mut self) -> Vec<&mut LoraLinear> {
+        fn layers_mut(&mut self) -> Vec<&mut LoraProj> {
             match self {
                 Block::Delta {
                     qkv,
@@ -516,9 +540,8 @@ mod direct {
             let mut factors = Vec::new();
             for block in &self.blocks {
                 for layer in block.layers() {
-                    let lora = layer.adapter(DEFAULT_ADAPTER).unwrap();
-                    factors.push(lora.a.value.clone());
-                    factors.push(lora.b.value.clone());
+                    factors.push(layer.a.clone());
+                    factors.push(layer.b.clone());
                 }
             }
             factors
@@ -529,9 +552,8 @@ mod direct {
             for block in &mut self.blocks {
                 for layer in block.layers_mut() {
                     let pair = at.next().expect("two factors per layer");
-                    let lora = layer.adapter_mut(DEFAULT_ADAPTER).unwrap();
-                    lora.a = Param::new(pair[0].clone());
-                    lora.b = Param::new(pair[1].clone());
+                    layer.a = pair[0].clone();
+                    layer.b = pair[1].clone();
                 }
             }
         }

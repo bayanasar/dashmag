@@ -2,7 +2,8 @@
 //! frozen bf16 base and a rank-16 f32 adapter in each linear): 8 blocks, 4096 tokens of 1024, a
 //! hidden width of 3584, bf16; one forward and backward pass to every adapter and the input.
 //! Plain: MLX's autodiff over the whole stack in one evaluation. Recompute: `checkpoint::forward`
-//! and `checkpoint::backward`, one layer's activations alive at a time.
+//! and `checkpoint::backward`, one layer's activations alive at a time. Each linear is LoRA's
+//! layer as dash-mag and PEFT compute it, as `tests/checkpoint.rs` has it.
 //!
 //!   cargo run --release -p dash-mlx --example checkpoint_bench
 
@@ -24,9 +25,9 @@ mod common;
 mod bench {
     use crate::common::{measure, normal, report};
     use dash_mlx::checkpoint;
-    use dash_mlx::lora::{Lora, LoraLinear};
+    use dash_mlx::lowrank::{LowRankOptions, low_rank};
     use dash_mlx::mlx::error::Result;
-    use dash_mlx::mlx::module::Module;
+    use dash_mlx::mlx::module::Param;
     use dash_mlx::mlx::transforms::{eval, fallible_vjp};
     use dash_mlx::mlx::{Array, Dtype};
 
@@ -35,24 +36,62 @@ mod bench {
     const HIDDEN: i32 = 3584;
     const DEPTH: usize = 8;
 
+    /// A LoRA'd projection as LoRA's layer computes one: the base product at the weight's dtype,
+    /// the low-rank term by [`dash_mlx::lowrank`] in f32, their sum in f32 rounded once to `x`'s
+    /// dtype. `W` is frozen.
+    #[derive(Debug, Clone)]
+    struct LoraProj {
+        weight: Param<Array>,
+        a: Param<Array>,
+        b: Param<Array>,
+        scale: f64,
+    }
+
+    dash_mlx::module_parameters!(LoraProj { weight, a, b });
+
+    impl LoraProj {
+        fn new(weight: &Array, a: &Array, b: &Array, scale: f64) -> Result<Self> {
+            let mut weight = Param::new(weight.clone());
+            weight.freeze();
+            Ok(Self {
+                weight,
+                a: Param::new(a.as_dtype(Dtype::Float32)?),
+                b: Param::new(b.as_dtype(Dtype::Float32)?),
+                scale,
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let weight = self.weight.as_ref();
+            let base = x.as_dtype(weight.dtype())?.matmul(weight.t())?;
+            let base = if base.dtype() == x.dtype() {
+                base
+            } else {
+                base.as_dtype(Dtype::Float32)?
+            };
+            let (u, v) = (self.a.as_ref().t(), self.b.as_ref().t());
+            let options = LowRankOptions::default().with_scale(self.scale);
+            low_rank(x, &u, &v, Some(&base), options)?.as_dtype(x.dtype())
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct Block {
-        up: LoraLinear,
-        gate: LoraLinear,
-        down: LoraLinear,
+        up: LoraProj,
+        gate: LoraProj,
+        down: LoraProj,
     }
 
     dash_mlx::module_parameters!(Block { up, gate, down });
 
     impl Block {
         fn new(seed: u64) -> Result<Self> {
-            let layer = |out: i32, inp: i32, seed: u64| -> Result<LoraLinear> {
-                LoraLinear::frozen(&normal(&[out, inp], 0.02, Dtype::Bfloat16, seed)?)?.with_lora(
-                    Lora::new(
-                        &normal(&[16, inp], 0.02, Dtype::Float32, seed + 1)?,
-                        &normal(&[out, 16], 0.02, Dtype::Float32, seed + 2)?,
-                        2.0,
-                    )?,
+            let layer = |out: i32, inp: i32, seed: u64| -> Result<LoraProj> {
+                LoraProj::new(
+                    &normal(&[out, inp], 0.02, Dtype::Bfloat16, seed)?,
+                    &normal(&[16, inp], 0.02, Dtype::Float32, seed + 1)?,
+                    &normal(&[out, 16], 0.02, Dtype::Float32, seed + 2)?,
+                    2.0,
                 )
             };
             Ok(Self {
@@ -72,10 +111,7 @@ mod bench {
         fn factors(&self) -> Vec<Array> {
             [&self.up, &self.gate, &self.down]
                 .iter()
-                .flat_map(|l| {
-                    let lora = l.lora().expect("an adapter");
-                    [lora.a.as_ref().clone(), lora.b.as_ref().clone()]
-                })
+                .flat_map(|l| [l.a.as_ref().clone(), l.b.as_ref().clone()])
                 .collect()
         }
 
@@ -85,12 +121,8 @@ mod bench {
                 .into_iter()
                 .enumerate()
             {
-                let lora = layer.lora().expect("an adapter").clone();
-                *layer = LoraLinear::frozen(layer.weight.as_ref())?.with_lora(Lora::new(
-                    &f[2 * i],
-                    &f[2 * i + 1],
-                    lora.scale,
-                )?)?;
+                *layer =
+                    LoraProj::new(layer.weight.as_ref(), &f[2 * i], &f[2 * i + 1], layer.scale)?;
             }
             Ok(block)
         }
