@@ -37,7 +37,8 @@
 //! into that dtype and sums in f32. Below 4 rows it takes its vector path, which forms `W` in f32
 //! but, from 1024 outputs on, splits the sum over them into 8 parts (32 past 8192), rounds each
 //! part to `x`'s dtype and sums the parts in that dtype (MLX 0.32.4). `dash_contract::quant`
-//! allows neither of those roundings. So in bf16 and f16 below 4 rows, [`quantized_linear_in_vjp`]
+//! allows the matrix path's roundings, as it does the forward's, and not the vector path's: a
+//! partial sum rounded to `x`'s dtype. So in bf16 and f16 below 4 rows, [`quantized_linear_in_vjp`]
 //! gives `x` its gradient through a backward of its own: the same product with `dy` and the scales
 //! read into f32, `W` exact, summed in f32 and rounded once to `x`'s dtype. In f32, MLX's own
 //! backward already sums in f32 throughout. dash-mag's `tests/quant.rs` holds both paths to the

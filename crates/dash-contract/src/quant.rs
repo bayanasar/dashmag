@@ -56,9 +56,11 @@
 //! ```
 //!
 //! Each in f32, `dy` read exactly into it and `W` exact in it, rounded once: `dx` to `x`'s dtype,
-//! `dbias` to the bias's. An implementation may sum in any order and is held to the definition
-//! within the bounds its tests record. This is what LoRA trained over a quantized base needs: the
-//! adapters of a layer below take their gradients through `x`.
+//! `dbias` to the bias's. As in the forward, an implementation may round the scales and `W` to
+//! `x`'s dtype before its products (as the tensor cores need), and may sum in any order; it may
+//! not round a partial sum to `x`'s dtype. It is held to the definition within the bounds its
+//! tests record. This is what LoRA trained over a quantized base needs: the adapters of a layer
+//! below take their gradients through `x`.
 
 /// How the packed weights encode their values.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
