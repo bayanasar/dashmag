@@ -226,7 +226,10 @@ impl Session for TensorRtSession {
                 .find(|o| o.get("name").and_then(|n| n.as_str()) == Some(&binding.name))
                 .or_else(|| arr.get(i))
                 .ok_or_else(|| {
-                    Error::Run(format!("output '{}' missing from trtexec json", binding.name))
+                    Error::Run(format!(
+                        "output '{}' missing from trtexec json",
+                        binding.name
+                    ))
                 })?;
             let values = obj
                 .get("values")
@@ -237,10 +240,7 @@ impl Session for TensorRtSession {
                 .filter_map(|v| v.as_f64().map(|x| x as f32))
                 .collect();
             // Declared meta wins; otherwise use the dims trtexec reported.
-            let declared = self
-                .meta
-                .output_shape(i)
-                .or(binding.dims.as_deref());
+            let declared = self.meta.output_shape(i).or(binding.dims.as_deref());
             outs.push(Tensor::Host(HostTensor::f32_shaped(&data, declared)));
         }
         Ok(outs)

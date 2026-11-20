@@ -159,9 +159,7 @@ impl Session for EdgeTpuSession {
             )));
         }
         if outs.is_empty() {
-            return Err(Error::Run(
-                "edgetpu runner produced no output files".into(),
-            ));
+            return Err(Error::Run("edgetpu runner produced no output files".into()));
         }
         Ok(outs)
     }

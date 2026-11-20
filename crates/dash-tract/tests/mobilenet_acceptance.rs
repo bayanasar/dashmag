@@ -8,7 +8,7 @@
 //! Fixture location overridable via the `DASH_FIXTURES` env var.
 
 use dash_core::{
-    argmax, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Runtime, TensorSpec, Tensor,
+    Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Runtime, Tensor, TensorSpec, argmax,
 };
 use dash_tract::TractRuntime;
 use std::{env, fs, path::PathBuf};

@@ -25,7 +25,10 @@ use dash_mlx::mlx::{Array, Dtype};
 use safetensors::{Dtype as StDtype, SafeTensors};
 use std::collections::HashMap;
 
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../dash-mag/tests/fixtures/lora");
+const FIXTURES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../dash-mag/tests/fixtures/lora"
+);
 const REFERENCE: &str = "reference";
 const BETA: f32 = 0.5;
 

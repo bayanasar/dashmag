@@ -34,8 +34,8 @@
 #![cfg(all(feature = "tract", feature = "iree"))]
 
 use dash_core::{
-    argmax, AccelClass, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Runtime, Tensor,
-    TensorSpec,
+    AccelClass, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Runtime, Tensor,
+    TensorSpec, argmax,
 };
 use std::{
     env, fs,

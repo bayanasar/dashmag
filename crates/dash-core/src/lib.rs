@@ -294,8 +294,14 @@ impl ArtifactMeta {
     /// Convenience: declare f32 IO with the given shapes.
     pub fn f32_io(inputs: &[&[usize]], outputs: &[&[usize]]) -> Self {
         ArtifactMeta {
-            inputs: inputs.iter().map(|s| TensorSpec::new(DType::F32, s)).collect(),
-            outputs: outputs.iter().map(|s| TensorSpec::new(DType::F32, s)).collect(),
+            inputs: inputs
+                .iter()
+                .map(|s| TensorSpec::new(DType::F32, s))
+                .collect(),
+            outputs: outputs
+                .iter()
+                .map(|s| TensorSpec::new(DType::F32, s))
+                .collect(),
             quantized: false,
             dynamic_shapes: false,
             model: None,
@@ -677,25 +683,27 @@ mod tests {
             .expect("a backend should admit");
         assert_eq!(sel.kind(), BackendKind::Tract);
 
-        assert!(reg
-            .select(
+        assert!(
+            reg.select(
                 &art(BackendKind::Iree),
                 &TargetProfile {
                     accel: AccelClass::Cpu,
                     no_std: true,
                 },
             )
-            .is_none());
+            .is_none()
+        );
 
-        assert!(reg
-            .select(
+        assert!(
+            reg.select(
                 &art(BackendKind::EdgeTpu),
                 &TargetProfile {
                     accel: AccelClass::VendorNpu,
                     no_std: false,
                 },
             )
-            .is_none());
+            .is_none()
+        );
     }
 
     #[test]
@@ -731,26 +739,30 @@ mod tests {
     #[test]
     fn capability_rejects_quantized_and_dynamic() {
         let c = cap(AccelClass::Cpu, false);
-        assert!(c
-            .admits(&ArtifactMeta {
+        assert!(
+            c.admits(&ArtifactMeta {
                 quantized: true,
                 ..Default::default()
             })
-            .is_err());
-        assert!(c
-            .admits(&ArtifactMeta {
+            .is_err()
+        );
+        assert!(
+            c.admits(&ArtifactMeta {
                 dynamic_shapes: true,
                 ..Default::default()
             })
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
     fn empty_meta_is_admitted_not_guessed() {
         // No declaration is not evidence of incompatibility.
-        assert!(cap(AccelClass::Cpu, false)
-            .admits(&ArtifactMeta::default())
-            .is_ok());
+        assert!(
+            cap(AccelClass::Cpu, false)
+                .admits(&ArtifactMeta::default())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -845,7 +857,11 @@ mod tests {
     fn f32_shaped_falls_back_when_count_mismatches() {
         let flat: Vec<f32> = vec![0.0; 999];
         let t = HostTensor::f32_shaped(&flat, Some(&[1, 1000]));
-        assert_eq!(t.shape, vec![999], "must not adopt a shape that does not fit");
+        assert_eq!(
+            t.shape,
+            vec![999],
+            "must not adopt a shape that does not fit"
+        );
     }
 
     // --- argmax: report NaN, never panic ---

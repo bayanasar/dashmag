@@ -264,11 +264,8 @@ pub fn sample(logits: Tensor<2>, options: &SampleOptions) -> Sampled {
     check(v, options);
     let device = logits.device();
     let out_dtype = get_or_init_device_settings::<Dispatch>(device.as_dispatch()).int_dtype;
-    let (tokens, logprob, tempered, sampling) = <Dispatch as SampleBackend>::sample(
-        logits.into_dispatch(),
-        normalised(options),
-        out_dtype,
-    );
+    let (tokens, logprob, tempered, sampling) =
+        <Dispatch as SampleBackend>::sample(logits.into_dispatch(), normalised(options), out_dtype);
     Sampled {
         tokens: Tensor::from_dispatch(tokens),
         logprob: Tensor::from_dispatch(logprob),

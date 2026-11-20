@@ -16,8 +16,8 @@
 //! used as given.
 
 use dash_core::{
-    argmax, AccelClass, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Runtime, Tensor,
-    TensorSpec,
+    AccelClass, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Runtime, Tensor,
+    TensorSpec, argmax,
 };
 use dash_iree::IreeRuntime;
 use std::{env, fs, path::PathBuf};

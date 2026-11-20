@@ -42,8 +42,12 @@ fn dash_runs_a_burn_model_from_weights_and_its_description() {
         .flat_map(f32::to_le_bytes)
         .collect();
 
-    let (weights, meta, x_path, logits) =
-        (tmp("model.safetensors"), tmp("model.json"), tmp("x.f32"), tmp("logits.f32"));
+    let (weights, meta, x_path, logits) = (
+        tmp("model.safetensors"),
+        tmp("model.json"),
+        tmp("x.f32"),
+        tmp("logits.f32"),
+    );
     fs::write(&weights, model.to_safetensors().unwrap()).unwrap();
     fs::write(
         &meta,
@@ -52,7 +56,14 @@ fn dash_runs_a_burn_model_from_weights_and_its_description() {
             "input": [1, 3, 64, 64]}"#,
     )
     .unwrap();
-    fs::write(&x_path, input.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    fs::write(
+        &x_path,
+        input
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_dash"))
         .args(["--backend", "burn", "--device", "cpu", "--model"])
@@ -69,9 +80,17 @@ fn dash_runs_a_burn_model_from_weights_and_its_description() {
     for p in [&weights, &meta, &x_path, &logits] {
         fs::remove_file(p).ok();
     }
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(String::from_utf8_lossy(&out.stderr).contains("dispatch -> Burn"));
-    assert_eq!(got.unwrap(), want, "dash must return the module's logits bit for bit");
+    assert_eq!(
+        got.unwrap(),
+        want,
+        "dash must return the module's logits bit for bit"
+    );
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.starts_with("a: a"), "{text}");
     assert!(text.lines().nth(1).unwrap().starts_with("b: b"), "{text}");

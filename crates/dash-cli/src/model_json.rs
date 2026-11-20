@@ -38,7 +38,11 @@ fn strings(v: &Value, what: &str) -> Result<Vec<String>, String> {
     v.as_array()
         .ok_or(format!("{what} is not a list"))?
         .iter()
-        .map(|s| s.as_str().map(str::to_string).ok_or(format!("{what} holds a non-string")))
+        .map(|s| {
+            s.as_str()
+                .map(str::to_string)
+                .ok_or(format!("{what} holds a non-string"))
+        })
         .collect()
 }
 
@@ -47,7 +51,11 @@ fn rgb(v: &Value, what: &str) -> Result<[f32; 3], String> {
         .as_array()
         .ok_or(format!("{what} is not a list"))?
         .iter()
-        .map(|x| x.as_f64().map(|f| f as f32).ok_or(format!("{what} holds a non-number")))
+        .map(|x| {
+            x.as_f64()
+                .map(|f| f as f32)
+                .ok_or(format!("{what} holds a non-number"))
+        })
         .collect::<Result<_, _>>()?;
     vals.try_into()
         .map_err(|v: Vec<f32>| format!("{what} needs three values, has {}", v.len()))
@@ -74,9 +82,9 @@ pub fn parse(text: &str) -> Result<Description, String> {
                 .as_object()
                 .ok_or(format!("undefined_when of {output:?} is not an object"))?
             {
-                let is = is
-                    .as_str()
-                    .ok_or(format!("undefined_when of {output:?}: {when:?} is not a class name"))?;
+                let is = is.as_str().ok_or(format!(
+                    "undefined_when of {output:?}: {when:?} is not a class name"
+                ))?;
                 undefined_when.push(UndefinedWhen {
                     output: output.clone(),
                     when: when.clone(),
@@ -86,7 +94,11 @@ pub fn parse(text: &str) -> Result<Description, String> {
         }
     }
     let spec = ModelSpec {
-        arch: j.get("arch").and_then(Value::as_str).unwrap_or_default().to_string(),
+        arch: j
+            .get("arch")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         outputs,
         undefined_when,
     };
@@ -101,7 +113,11 @@ pub fn parse(text: &str) -> Result<Description, String> {
             v.as_array()
                 .ok_or("input is not a list")?
                 .iter()
-                .map(|d| d.as_u64().map(|d| d as usize).ok_or("input holds a non-integer"))
+                .map(|d| {
+                    d.as_u64()
+                        .map(|d| d as usize)
+                        .ok_or("input holds a non-integer")
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         ),
     };
@@ -110,8 +126,12 @@ pub fn parse(text: &str) -> Result<Description, String> {
     Ok(Description {
         spec,
         input,
-        mean: field("mean").map(|v| rgb(v, "preprocessing.mean")).transpose()?,
-        std: field("std").map(|v| rgb(v, "preprocessing.std")).transpose()?,
+        mean: field("mean")
+            .map(|v| rgb(v, "preprocessing.mean"))
+            .transpose()?,
+        std: field("std")
+            .map(|v| rgb(v, "preprocessing.std"))
+            .transpose()?,
         calibration_applied: j
             .get("calibration_applied")
             .filter(|v| !v.is_null())

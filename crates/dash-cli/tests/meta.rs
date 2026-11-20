@@ -73,26 +73,55 @@ fn with_meta(when_class: &str, tag: &str) -> (String, Vec<u8>) {
 fn outputs_are_named_and_the_undefined_one_is_not_answered() {
     let (_, plain) = dash(
         &[
-            "--shape", "1,3,64,64", "--out-shape", "1,3", "--out-shape", "1,3",
-            "--out-shape", "1,3", "--out-shape", "1,2", "--out-shape", "1,2",
+            "--shape",
+            "1,3,64,64",
+            "--out-shape",
+            "1,3",
+            "--out-shape",
+            "1,3",
+            "--out-shape",
+            "1,3",
+            "--out-shape",
+            "1,2",
+            "--out-shape",
+            "1,2",
         ],
         "plain",
     );
-    assert_eq!(plain.len(), (3 + 3 + 3 + 2 + 2) * 4, "every output's logits, in order");
+    assert_eq!(
+        plain.len(),
+        (3 + 3 + 3 + 2 + 2) * 4,
+        "every output's logits, in order"
+    );
 
     // time_of_day's top-1 is class 0, `daytime`: the condition holds.
     let (text, named) = with_meta("daytime", "fires");
-    assert_eq!(named, plain, "the description must not change a single logit bit");
+    assert_eq!(
+        named, plain,
+        "the description must not change a single logit bit"
+    );
     let lines: Vec<&str> = text.lines().collect();
-    assert!(lines[0].starts_with("time_of_day: daytime  (class 0"), "{text}");
+    assert!(
+        lines[0].starts_with("time_of_day: daytime  (class 0"),
+        "{text}"
+    );
     assert!(
         lines[1].starts_with("weather: undefined (time_of_day is daytime)"),
         "{text}"
     );
-    assert!(!lines[1].contains("rainy"), "an undefined output must not print an answer");
-    assert!(lines[2].starts_with("road_type: parking_lot  (class 2"), "{text}");
+    assert!(
+        !lines[1].contains("rainy"),
+        "an undefined output must not print an answer"
+    );
+    assert!(
+        lines[2].starts_with("road_type: parking_lot  (class 2"),
+        "{text}"
+    );
     assert!(lines[3].starts_with("surface: wet  (class 1"), "{text}");
-    assert!(lines[4].starts_with("traffic: congested  (class 1"), "{text}");
+    assert!(
+        lines[4].starts_with("traffic: congested  (class 1"),
+        "{text}"
+    );
     // Printed as a record; nothing in dash adds it to a logit.
     assert!(lines[5].starts_with("calibration applied in training, already in the weights:"));
     assert!(lines[5].contains(r#""shift":0.5"#), "{text}");
@@ -100,7 +129,13 @@ fn outputs_are_named_and_the_undefined_one_is_not_answered() {
     // Under a condition that does not hold, weather answers like any other output.
     let (text, named) = with_meta("night", "holds-not");
     assert_eq!(named, plain);
-    assert!(text.lines().nth(1).unwrap().starts_with("weather: rainy  (class 2"), "{text}");
+    assert!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("weather: rainy  (class 2"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -123,14 +158,21 @@ fn a_flag_that_contradicts_the_recorded_preprocessing_is_warned_about() {
             .args(extra)
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8(out.stderr).unwrap()
     };
     let wrong = stderr(&["--mean", "0.5,0.5,0.5"]);
     let same = stderr(&["--mean", "0.485,0.456,0.406"]);
     let none = stderr(&[]);
     fs::remove_file(&meta).ok();
-    assert!(wrong.contains("warning: --mean [0.5, 0.5, 0.5] overrides"), "{wrong}");
+    assert!(
+        wrong.contains("warning: --mean [0.5, 0.5, 0.5] overrides"),
+        "{wrong}"
+    );
     assert!(!wrong.contains("--std"), "{wrong}");
     assert!(!same.contains("warning"), "{same}");
     assert!(!none.contains("warning"), "{none}");

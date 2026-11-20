@@ -67,11 +67,7 @@ struct Coeffs {
 
 fn bilinear(x: f64) -> f64 {
     let x = x.abs();
-    if x < 1.0 {
-        1.0 - x
-    } else {
-        0.0
-    }
+    if x < 1.0 { 1.0 - x } else { 0.0 }
 }
 
 /// Pillow's `precompute_coeffs` followed by `normalize_coeffs_8bpc`, for the whole

@@ -103,7 +103,10 @@ impl Session for TractSession {
             tvals.push(tt.into());
         }
 
-        let result = self.plan.run(tvals).map_err(|e| Error::Run(e.to_string()))?;
+        let result = self
+            .plan
+            .run(tvals)
+            .map_err(|e| Error::Run(e.to_string()))?;
 
         let mut outs = Vec::with_capacity(result.len());
         for r in result {
@@ -129,7 +132,7 @@ impl Session for TractSession {
                 dt => {
                     return Err(Error::Shape(format!(
                         "dash-tract: unsupported output dtype {dt:?} (f32 and i64 are supported)"
-                    )))
+                    )));
                 }
             }
         }

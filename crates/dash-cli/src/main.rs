@@ -4,11 +4,11 @@
 //! artifact with its `BackendKind` and declared IO, and lets the registry
 //! *dispatch*. Same path the acceptance tests drive.
 
-use dash_core::{
-    argmax, AccelClass, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Registry,
-    TensorSpec, TargetProfile, Tensor,
-};
 use dash_cli::model_json;
+use dash_core::{
+    AccelClass, Artifact, ArtifactMeta, BackendKind, DType, HostTensor, Registry, TargetProfile,
+    Tensor, TensorSpec, argmax,
+};
 use std::fs;
 use std::process::ExitCode;
 
@@ -181,7 +181,9 @@ fn run() -> Result<(), String> {
                 shape = Some(parse_shape(&args.next().ok_or("--shape needs a value")?)?);
             }
             "--out-shape" => {
-                out_shapes.push(parse_shape(&args.next().ok_or("--out-shape needs a value")?)?);
+                out_shapes.push(parse_shape(
+                    &args.next().ok_or("--out-shape needs a value")?,
+                )?);
             }
             "-h" | "--help" => usage(),
             other => return Err(format!("unknown argument {other:?}")),
@@ -341,7 +343,10 @@ fn run() -> Result<(), String> {
                     tensor.shape()
                 );
             } else {
-                let name = o.classes.get(class).map_or("<no such class>", String::as_str);
+                let name = o
+                    .classes
+                    .get(class)
+                    .map_or("<no such class>", String::as_str);
                 println!(
                     "{}: {name}  (class {class}, logit {val:.4})   [shape {:?}]",
                     o.name,

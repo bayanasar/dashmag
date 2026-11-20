@@ -158,7 +158,9 @@ impl Session for IreeSession {
         let mut outs = Vec::with_capacity(out_paths.len());
         for (i, p) in out_paths.iter().enumerate() {
             let raw = std::fs::read(p).map_err(|e| {
-                Error::Run(format!("reading output {i}: {e} (declared {n_out} outputs)"))
+                Error::Run(format!(
+                    "reading output {i}: {e} (declared {n_out} outputs)"
+                ))
             })?;
             if let Some(dt) = self.meta.output_dtype(i) {
                 if dt != DType::F32 {
