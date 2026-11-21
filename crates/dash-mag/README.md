@@ -27,8 +27,25 @@ missing or the variable unset, refuses the first tensor, with an error that says
 `CUBECL_CUDA_TF32=1` accepts TF32. The check asks the device what the matmul kernels ask it, so a card
 before 8.0 needs neither.
 
-The numbers in `PROGRESS.md` are from this workspace's `Cargo.lock`. A new application resolves the rest
-of CubeCL to its latest patch release beside the patched cubecl-cuda 0.11.1.
+The numbers in `PROGRESS.md` are from this workspace's `Cargo.lock`, CubeCL 0.11.1 throughout. A new
+application resolves the rest of CubeCL to its latest patch release beside the patched cubecl-cuda
+0.11.1 (0.11.4 on 2026-11-21), and builds and runs so. To hold it to the versions the numbers were taken
+with, downgrade the crates one at a time, from the top of their dependencies down:
+
+```sh
+for c in cubecl-cpu cubecl-hip cubecl-llvm cubecl-metal cubecl-std cubecl-wgpu cubecl-cpp \
+    cubecl-server cubecl-spirv cubecl-opt cubecl-core cubecl-macros cubecl-runtime \
+    cubecl-zspace cubecl-monitoring cubecl-ir cubecl-macros-internal cubecl-common \
+    cubecl-environment; do
+  cargo update -p "$c" --precise 0.11.1
+done
+cargo update -p cubecl-hip-sys --precise 7.14.6085001
+```
+
+`cargo update -p cubecl-core --precise 0.11.1` alone is refused, because the other crates at 0.11.4 ask
+for 0.11.4. Checked on 2026-11-21 with an application that depends on dash-mag at 242c024 with
+`cuda`: from the lock file Cargo first wrote, this gives every CubeCL crate the version this workspace
+locks, and the application builds and runs a matmul on an RTX 5070 Ti both ways.
 
 ## On ROCm
 
