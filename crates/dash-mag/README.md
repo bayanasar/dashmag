@@ -73,25 +73,27 @@ warm-up, twelve processes of each in turn over two batches, the median of those 
 
 | | through dash-mag | dash-mlx directly |
 |---|---|---|
-| f32, the step | 2.345 (2.246-3.572) | 2.308 (2.211-2.618) |
-| building the graph | 0.264 (0.258-0.266) | 0.256 (0.251-0.261) |
-| evaluating it | 1.272 (1.176-2.459) | 1.289 (1.186-1.572) |
-| clipping, AdamW and evaluating them | 0.816 (0.801-0.851) | 0.776 (0.766-0.811) |
-| bf16, the step | 2.554 (2.397-2.748) | 2.402 (2.322-2.495) |
-| building the graph | 0.271 (0.267-0.273) | 0.262 (0.259-0.266) |
-| evaluating it | 1.443 (1.296-1.652) | 1.361 (1.301-1.448) |
-| clipping, AdamW and evaluating them | 0.817 (0.807-0.849) | 0.778 (0.765-0.786) |
+| f32, the step | 2.370 (2.248-3.627) | 2.254 (2.183-2.375) |
+| building the graph | 0.261 (0.258-0.269) | 0.253 (0.250-0.256) |
+| evaluating it | 1.328 (1.181-2.470) | 1.252 (1.151-1.368) |
+| clipping, AdamW and evaluating them | 0.810 (0.797-0.880) | 0.768 (0.754-0.783) |
+| bf16, the step | 2.452 (2.347-2.556) | 2.367 (2.334-2.487) |
+| building the graph | 0.269 (0.266-0.275) | 0.261 (0.256-0.265) |
+| evaluating it | 1.355 (1.269-1.440) | 1.357 (1.285-1.455) |
+| clipping, AdamW and evaluating them | 0.810 (0.800-0.823) | 0.761 (0.748-0.775) |
 
-A second run of eight processes each gave 2.356 against 2.257 in f32, and 2.458 against 2.381 in bf16.
-The M6 was not strictly idle: other applications were open, the load average was 2.1 to 2.8, and when
-sampled no other process used more than 6.4% of a core. The direct side was then built on dash-mlx's
-LoRA layer, since removed: `step_bench` now builds it on a local projection that computes what the
-layer computed, and these figures have not been taken again.
+Taken on 2026-11-20 UTC, the direct side on a local projection that computes what dash-mlx's removed
+LoRA layer computed. A second run of eight processes each gave 2.318 against 2.256 in f32, and 2.436
+against 2.376 in bf16. The M6 was not strictly idle: some applications were open, the load average was
+1.30 to 1.48, and when sampled no other process used more than 5.8% of a core. f32's slowest gateway
+process, 3.627 ms, was the first of all 48, its evaluation 2.470 ms against 1.181 to 1.372 for the other
+eleven. The record of 2026-11-01, through that layer under a load of 2.1 to 2.8, gave 2.345 against
+2.308 in f32 and 2.554 against 2.402 in bf16.
 
-Both ways compute the same: the loss and the norm agree to the printed digit. The update's gap is host
-time per operation. The gateway's checks and handles take an add of one shape from 0.105 µs to 0.21 µs
-to build, and 0.275 µs beside a scalar; the update's 293 binary operations, 168 of them beside a scalar,
-come to 42 µs by that, where the table's gap is 39 µs in bf16 and 40 µs in f32. Taking away the 168
-`Broadcast` nodes the gateway adds for those scalars, or its `format!`, moved nothing measurable.
-Evaluating shows no gap beyond its own spread: 82 µs of the bf16 step's 152 lie there, within ranges
-that overlap, and 11 µs of 77 in the second run.
+Both ways compute the same: in all 80 processes the first step's loss and norm are the same, gateway
+and direct alike. The update's gap is host time per operation. The gateway's checks and handles take an
+add of one shape from 0.105 µs to 0.21 µs to build, and 0.275 µs beside a scalar (2026-11-01); the
+update's 293 binary operations, 168 of them beside a scalar, come to 42 µs by that, where the table's gap
+is 42 µs in f32 and 49 µs in bf16 (41 and 34 in the second run). Taking away the 168 `Broadcast` nodes
+the gateway adds for those scalars, or its `format!`, moved nothing measurable. Evaluating shows no gap
+beyond its own spread in bf16 (1.355 against 1.357 ms).

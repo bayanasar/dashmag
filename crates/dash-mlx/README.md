@@ -304,12 +304,15 @@ bf16, rank 16), a forward and backward pass, the range over two runs:
 
 | | time | peak above the inputs |
 |---|---|---|
-| MLX's autodiff over the stack | 294.8-295.8 ms | +2337 MiB |
-| dash-mlx `checkpoint` | 369.2-369.9 ms | +920 MiB |
+| MLX's autodiff over the stack | 295.8-296.6 ms | +2337 MiB |
+| dash-mlx `checkpoint` | 375.5-376.2 ms | +914 MiB |
 
-These were measured with the blocks on dash-mlx's own LoRA layer, since removed. The bench and the
-test now build them on a local projection that computes what the layer computed; the figures have
-not been taken again.
+On an Apple M6, MLX 0.32.4 prebuilt, 2026-11-20 UTC, load average 1.30-1.48, the blocks on a local
+projection that computes what dash-mlx's removed LoRA layer computed: recompute takes 27% more time
+than plain autodiff. The run before it (MLX 0.32.3, 2026-10-28, through that layer) gave 369.2-369.9
+ms at +920 MiB for recompute and 294.8-295.8 ms at +2337 MiB for plain autodiff. Two things changed
+between the runs, MLX's version and the layer: recompute is 1.5-1.9% slower now, with 6 MiB less at
+its peak, and which of the two moved it has not been looked into.
 
     cargo run --release -p dash-mlx --example checkpoint_bench
 
