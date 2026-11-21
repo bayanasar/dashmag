@@ -85,8 +85,9 @@ impl RopeScaling {
 /// `base^exponent` taken in f64 and rounded once to f32: the correctly rounded power for the bases
 /// and widths checked, and the bits torch gave on the recordings. `f32::powf` is the platform's
 /// `powf`, which is not correctly rounded everywhere: macOS's libm gives 0x405b01d9 for
-/// 500000^(3/32) against 0x405b01d8, and glibc 2.39 and 2.41 give 0x424f2dd5 for 1e6^(32/112)
-/// against 0x424f2dd4.
+/// 500000^(3/32) against 0x405b01d8, and glibc 2.39 and 2.41 give 0x424f2dd5 for 1e6 raised to
+/// `32.0 / 112.0` in f32 against 0x424f2dd4. The exponent is always the f32 quotient, as torch's
+/// `arange / dim` gives it.
 fn power(base: f32, exponent: f32) -> f32 {
     (base as f64).powf(exponent as f64) as f32
 }
