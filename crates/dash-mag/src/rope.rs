@@ -82,6 +82,14 @@ impl RopeScaling {
     }
 }
 
+/// `base^exponent` taken in f64 and rounded once to f32: the correctly rounded power for the bases
+/// and widths checked, and the bits torch gave on the recordings. `f32::powf` is the platform's
+/// `powf`, which macOS's libm does not round correctly: at base 500000 it is one f32 unit off for
+/// some exponents (0x405b01d9 for 500000^(3/32), against 0x405b01d8).
+fn power(base: f32, exponent: f32) -> f32 {
+    (base as f64).powf(exponent as f64) as f32
+}
+
 /// The frequencies of a rotation of `dim` features at `base`, scaled by `scaling` for a rotation
 /// holding `len` positions, and the factor on its sines and cosines: transformers' `inv_freq` and
 /// `attention_scaling`, in f32 as it computes them.
@@ -89,7 +97,7 @@ pub fn frequencies(dim: usize, base: f32, scaling: RopeScaling, len: usize) -> (
     let half = dim / 2;
     let at = |base: f32| -> Vec<f32> {
         (0..half)
-            .map(|i| 1.0 / base.powf((2 * i) as f32 / dim as f32))
+            .map(|i| 1.0 / power(base, (2 * i) as f32 / dim as f32))
             .collect()
     };
     match scaling {
@@ -150,7 +158,7 @@ pub fn frequencies(dim: usize, base: f32, scaling: RopeScaling, len: usize) -> (
                 high += 0.001;
             }
             let inverse: Vec<f32> = (0..half)
-                .map(|i| base.powf((2 * i) as f32 / dim as f32))
+                .map(|i| power(base, (2 * i) as f32 / dim as f32))
                 .collect();
             let frequencies = inverse
                 .iter()
