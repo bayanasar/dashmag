@@ -40,7 +40,11 @@ pub enum RopeScaling {
     /// `yarn`: each frequency between its interpolated and extrapolated value, by how many turns it
     /// makes over `original_max_positions` (between `beta_slow` and `beta_fast`), and the sines and
     /// cosines scaled by the attention factor: `attention_factor`, or from `mscale` and
-    /// `mscale_all_dim` as transformers derives it.
+    /// `mscale_all_dim` as transformers derives it. `factor` is the one transformers uses: 5.15
+    /// takes `max_position_embeddings / original_max_position_embeddings` only where the
+    /// configuration gives no `factor` (earlier versions took that ratio whenever it gave
+    /// `original_max_position_embeddings`, as DeepSeek-V3's do); an application reading such a
+    /// configuration passes the value its transformers would use.
     Yarn {
         factor: f32,
         original_max_positions: usize,

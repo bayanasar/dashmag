@@ -260,10 +260,12 @@ fn every_rope_type_is_transformers_own() {
             println!(
                 "{name}: frequencies {off:.2e} apart, attention {attention} (transformers {theirs})"
             );
-            assert!(
-                off <= 2.0 * f32::EPSILON as f64,
-                "{name}: frequencies {off:e}"
-            );
+            // The bits, but for `dynamic`, whose base passes through a power one rounding apart.
+            let bound = match options.scaling {
+                RopeScaling::Dynamic { .. } => 2.0 * f32::EPSILON as f64,
+                _ => 0.0,
+            };
+            assert!(off <= bound, "{name}: frequencies {off:e}");
             assert_eq!(attention, theirs as f32, "{name}: attention factor");
         }
         let x = get("x");
