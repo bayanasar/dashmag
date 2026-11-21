@@ -76,8 +76,9 @@ MLX's GPU has no f64. An array operation that reads or makes f64 runs on the CPU
 side. MLX's `exp` in f64 has only f32's accuracy, so `exp`, `sigmoid`, `silu`
 and `softplus` take it from the host there; `log` and `sqrt` are exact.
 
-`Tensor::rms_norm` and `Rope` are MLX's own `fast` functions there, so that a model's numbers are the ones
-mlx-lm's stack gives. `rms_norm` comes out in the dtype `x` and its weight promote to, on every side. They differ from the f32 form and the tables Burn's side runs in low bits, which is
+`Tensor::rms_norm` and `Rope`'s default rotation are MLX's own `fast` functions there, so that a model's
+numbers are the ones mlx-lm's stack gives; `Rope`'s other layout and its scaled frequencies
+(`RopeOptions`: linear, dynamic, YaRN, Llama 3) rotate from the gateway's tables on every side. `rms_norm` comes out in the dtype `x` and its weight promote to, on every side. They differ from the f32 form and the tables Burn's side runs in low bits, which is
 what the gate's bounds cover. A read waits for its array alone: `eval_async` then pipelines, as a decoder
 wants, and `contiguous` is called only on data that needs it.
 
