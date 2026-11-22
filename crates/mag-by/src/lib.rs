@@ -11,6 +11,9 @@
 //!   devices; and what the job needs and how much it weighs against other jobs.
 //! - [`Graph::check`]: what every graph must satisfy before it is placed, refused with a typed
 //!   [`Refusal`] that names what is wrong.
+//! - [`Graph::local_only`]: which parts and edges carry data computed from an input that must
+//!   stay local, so that none of it is placed on a member marked remote unless a part releases
+//!   it.
 //!
 //! The author decides what a part is and where the graph may be divided; mag never divides a
 //! part.
@@ -20,8 +23,10 @@
 extern crate alloc;
 
 mod graph;
+mod local_only;
 
 pub use graph::{
     Backend, Blob, Chain, Edge, Graph, Input, Job, Mark, Need, Part, Pin, Refusal, Step, Tolerance,
     Unit,
 };
+pub use local_only::LocalOnly;
