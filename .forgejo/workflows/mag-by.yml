@@ -1,0 +1,48 @@
+name: mag-by
+
+# mag-by's default build is what a small processor links: no_std, depending on nothing. Cargo
+# turns a feature on for every user of a crate in one build, so the agent's files (the `graph`
+# feature) must never reach it; this checks that the default build still builds without std and
+# still has no dependencies, and runs the crate's tests, which hold the kept schema and DOT to
+# what the code generates.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  mag-by:
+    runs-on: linux-docker
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup target add thumbv7em-none-eabihf
+          rustc --version
+
+      - name: The default build is no_std
+        run: cargo build --locked -p mag-by --target thumbv7em-none-eabihf
+
+      - name: The default build depends on nothing
+        run: |
+          deps=$(cargo tree --locked -p mag-by -e normal --prefix none | tail -n +2)
+          if [ -n "$deps" ]; then
+            echo "mag-by's default build depends on:"
+            echo "$deps"
+            exit 1
+          fi
+
+      - name: Tests, with the kept schema's and DOT's checks
+        run: cargo test --locked -p mag-by
