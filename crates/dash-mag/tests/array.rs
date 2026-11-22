@@ -509,6 +509,35 @@ fn logsumexp_axis_is_its_definition_and_does_not_overflow() {
     assert!(x.logsumexp_axis(2, false).is_err());
 }
 
+/// A row with one dominant entry, as a confident model's target is among a large vocabulary: the
+/// rest's terms, each under half a unit in the last place of the dominant term's 1, add up to
+/// about 1.3e-4, and that is nearly all of the answer. A sum that adds them after the 1 loses them;
+/// this one must not, wherever the dominant entry stands and however many tie for it.
+///
+/// The bound is derived: rounding `1 + rest` to f32 (6e-8), plus the rest's own sum, at most
+/// 16384 additions in a lane each off by half a unit, relative, of a total of 1.35e-4 (1.3e-7).
+#[test]
+fn logsumexp_axis_keeps_the_rest_beside_a_dominant_entry() {
+    const N: usize = 1 << 16;
+    let rest_term = (-20.0f64).exp();
+    for (at, ties) in [(0, 1), (N / 2, 1), (N - 1, 1), (17, 2)] {
+        let mut row = vec![-20.0f32; N];
+        for i in 0..ties {
+            row[at + i * 1000] = 0.0;
+        }
+        let want = (ties as f64 + (N - ties) as f64 * rest_term).ln();
+        let got = t(&row, &[1, N])
+            .logsumexp_axis(1, false)
+            .unwrap()
+            .item()
+            .unwrap() as f64;
+        assert!(
+            (got - want).abs() <= 2e-7,
+            "dominant at {at}, {ties} tied: {got:e} against {want:e}"
+        );
+    }
+}
+
 #[test]
 fn eval_async_gives_what_eval_gives_and_memory_calls_ask_nothing_of_a_side() {
     let x = t(&[1.0, 2.0], &[2]).square().unwrap();

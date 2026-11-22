@@ -869,8 +869,20 @@ impl Tensor {
         let kept = match Selected::logsumexp(&self.0, at) {
             Some(kept) => Self::wrap(kept)?,
             None => {
+                // The largest element's own term is 1, and summed with the rest it swallows every
+                // later term under half a unit in its last place. A GPU's reduction adds each
+                // lane's elements in order, so a row with one dominant entry, as a confident
+                // model's target is among a large vocabulary, lost up to a quarter of the rest's
+                // mass: 25% of a small loss, the same on CUDA and ROCm. So the largest elements'
+                // terms and the rest are summed apart and added once. Each term still carries its
+                // own gradient.
                 let top = self.max_axis(axis, true)?.stop_gradient()?;
-                let sum = top.add(&self.sub(&top)?.exp()?.sum_axis(axis, true)?.log()?)?;
+                let terms = self.sub(&top)?.exp()?;
+                let largest = self.eq(&top)?;
+                let zero = terms.zeros_like()?;
+                let ones = largest.select(&terms, &zero)?.sum_axis(axis, true)?;
+                let rest = largest.select(&zero, &terms)?.sum_axis(axis, true)?;
+                let sum = top.add(&ones.add(&rest)?.log()?)?;
                 // `inf - inf` would make it NaN.
                 let infinity = Self::scalar(f64::INFINITY, self.dtype())?;
                 top.abs()?.eq(&infinity)?.select(&top, &sum)?
