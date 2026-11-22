@@ -1,0 +1,13 @@
+[package]
+name = "mag-by"
+description = "The words the mag- crates share to place an algorithm's work across a pool of machines: a job's graph and the checks it must pass. no_std, with no dependencies."
+readme = "README.md"
+keywords = ["scheduling", "distributed", "machine-learning"]
+categories = ["no-std"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
