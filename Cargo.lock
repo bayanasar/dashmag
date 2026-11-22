@@ -4084,6 +4084,11 @@ dependencies = [
 [[package]]
 name = "mag-by"
 version = "0.0.1"
+dependencies = [
+ "mag-by",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "maplit"

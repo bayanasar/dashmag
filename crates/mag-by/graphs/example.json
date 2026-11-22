@@ -1,0 +1,163 @@
+{
+  "format": "mag-graph",
+  "version": 1,
+  "job": {
+    "name": "label-frames",
+    "priority": 2,
+    "need": {
+      "deadline_seconds": 28800.0
+    }
+  },
+  "inputs": [
+    {
+      "name": "frames",
+      "bytes": 1200000000,
+      "local_only": true
+    },
+    {
+      "name": "classes",
+      "bytes": 4096,
+      "local_only": false
+    }
+  ],
+  "parts": [
+    {
+      "name": "decode",
+      "unit": {
+        "name": "decode-resize",
+        "version": 1
+      },
+      "mark": "replicable",
+      "step": "item",
+      "memory_bytes": 268435456,
+      "weights": [],
+      "tolerance": "exact"
+    },
+    {
+      "name": "b0",
+      "unit": {
+        "name": "block",
+        "version": 1
+      },
+      "mark": "atomic",
+      "step": "item",
+      "memory_bytes": 2147483648,
+      "weights": [
+        {
+          "hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "bytes": 1073741824
+        }
+      ],
+      "tolerance": "bf16"
+    },
+    {
+      "name": "b1",
+      "unit": {
+        "name": "block",
+        "version": 1
+      },
+      "mark": "atomic",
+      "step": "item",
+      "memory_bytes": 2147483648,
+      "weights": [
+        {
+          "hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "bytes": 1073741824
+        }
+      ],
+      "tolerance": "bf16"
+    },
+    {
+      "name": "head",
+      "unit": {
+        "name": "classify",
+        "version": 1
+      },
+      "mark": "atomic",
+      "step": "item",
+      "memory_bytes": 67108864,
+      "weights": [
+        {
+          "hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": 4194304
+        }
+      ],
+      "tolerance": "f32",
+      "pin": {
+        "backend": "cuda"
+      }
+    },
+    {
+      "name": "count",
+      "unit": {
+        "name": "count",
+        "version": 1
+      },
+      "mark": "atomic",
+      "step": "item",
+      "memory_bytes": 1048576,
+      "weights": [],
+      "tolerance": "exact",
+      "pin": {
+        "member": "member-a"
+      }
+    }
+  ],
+  "chains": [
+    {
+      "name": "model",
+      "parts": [
+        "b0",
+        "b1"
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": "frames",
+      "to": "decode",
+      "bytes": 1200000000,
+      "release": false
+    },
+    {
+      "from": "decode",
+      "to": "b0",
+      "bytes": 301056000,
+      "release": false
+    },
+    {
+      "from": "b0",
+      "to": "b1",
+      "bytes": 19267584,
+      "release": false
+    },
+    {
+      "from": "b1",
+      "to": "head",
+      "bytes": 19267584,
+      "release": false
+    },
+    {
+      "from": "classes",
+      "to": "head",
+      "bytes": 4096,
+      "release": false
+    },
+    {
+      "from": "head",
+      "to": "count",
+      "bytes": 160000,
+      "release": true
+    },
+    {
+      "from": "head",
+      "bytes": 160000,
+      "release": false
+    },
+    {
+      "from": "count",
+      "bytes": 64,
+      "release": false
+    }
+  ]
+}

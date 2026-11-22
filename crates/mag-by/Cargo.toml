@@ -1,6 +1,6 @@
 [package]
 name = "mag-by"
-description = "The words the mag- crates share to place an algorithm's work across a pool of machines: a job's graph and the checks it must pass. no_std, with no dependencies."
+description = "The words the mag- crates share to place an algorithm's work across a pool of machines: a job's graph, the checks it must pass, and the graph file. no_std, with no dependencies unless the graph file is wanted."
 readme = "README.md"
 keywords = ["scheduling", "distributed", "machine-learning"]
 categories = ["no-std"]
@@ -11,3 +11,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+serde_json = { version = "1", default-features = false, features = ["alloc"], optional = true }
+
+[features]
+# The graph file, a graph in JSON. Without it the crate depends on nothing.
+json = ["dep:serde", "dep:serde_json"]
+
+[dev-dependencies]
+# The tests read and write graph files whatever features the command line names.
+mag-by = { path = ".", features = ["json"] }
