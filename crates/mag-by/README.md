@@ -16,6 +16,9 @@ is on.
   local, so that none of it is placed on a member marked remote unless a part releases it.
 - With the `graph` feature, `Graph::from_json` and `Graph::to_json`: the graph file, a graph in
   JSON, as an agent writes, reads back and edits it (`format` `"mag-graph"`, `version` 1).
-  [`graphs/example.json`](graphs/example.json) is one.
+  [`graphs/example.json`](graphs/example.json) is one. `graph_schema` is the file's JSON
+  Schema, kept at [`schemas/mag-graph.schema.json`](schemas/mag-graph.schema.json), and
+  `Graph::to_dot` writes a graph as Graphviz DOT for a person to look at
+  ([`graphs/example.dot`](graphs/example.dot)).
 
 The author decides what a part is and where the graph may be divided; mag never divides a part.

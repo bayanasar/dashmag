@@ -16,7 +16,8 @@
 //!   it.
 //! - With the `graph` feature, `Graph::from_json` and `Graph::to_json`: the graph file, a
 //!   graph in JSON, as an agent writes, reads back and edits it (`format` `"mag-graph"`,
-//!   `version` 1).
+//!   `version` 1); `graph_schema`, its JSON Schema; and `Graph::to_dot`, the graph as Graphviz
+//!   DOT for a person to look at.
 //!
 //! The author decides what a part is and where the graph may be divided; mag never divides a
 //! part.
@@ -25,6 +26,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "graph")]
+mod dot;
 mod graph;
 #[cfg(feature = "graph")]
 mod json;
