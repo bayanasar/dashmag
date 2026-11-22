@@ -1,6 +1,6 @@
 //! Local-only carried from inputs to everything computed from them, unless released.
 
-use mag_by::{Edge, Graph, Input, Job, Mark, Need, Part, Step, Tolerance, Unit};
+use mag_by::{Dtype, Edge, Graph, Input, Job, Mark, Need, Part, Step, Tolerance, Unit};
 
 /// A graph of the given inputs (name, local-only) and parts, with edges `(from, to, release)`;
 /// `to` empty for a result of the job.
@@ -10,6 +10,7 @@ fn graph(inputs: &[(&str, bool)], parts: &[&str], edges: &[(&str, &str, bool)]) 
             name: "job".into(),
             priority: 1,
             need: Need::default(),
+            note: None,
         },
         inputs: inputs
             .iter()
@@ -33,6 +34,7 @@ fn graph(inputs: &[(&str, bool)], parts: &[&str], edges: &[(&str, &str, bool)]) 
                 weights: vec![],
                 tolerance: Tolerance::F32,
                 pin: None,
+                note: None,
             })
             .collect(),
         chains: vec![],
@@ -41,10 +43,13 @@ fn graph(inputs: &[(&str, bool)], parts: &[&str], edges: &[(&str, &str, bool)]) 
             .map(|&(from, to, release)| Edge {
                 from: from.into(),
                 to: (!to.is_empty()).then(|| to.into()),
+                dtype: Dtype::Bf16,
                 bytes: 1,
                 release,
+                note: None,
             })
             .collect(),
+        note: None,
     };
     g.check().unwrap();
     g

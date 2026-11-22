@@ -1,7 +1,7 @@
 //! The graph file: read, checked, and written back.
 
 use mag_by::{
-    Backend, Blob, Edge, Graph, Input, Job, Mark, Need, Part, Pin, ReadError, Refusal, Step,
+    Backend, Blob, Dtype, Edge, Graph, Input, Job, Mark, Need, Part, Pin, ReadError, Refusal, Step,
     Tolerance, Unit,
 };
 
@@ -193,6 +193,7 @@ fn everything() -> Graph {
                 .collect(),
             tolerance: tolerances[i % 4],
             pin,
+            note: (i % 2 == 0).then(|| format!("part {i}: why it is here")),
         })
         .collect();
     Graph {
@@ -203,6 +204,7 @@ fn everything() -> Graph {
                 rate_per_second: Some(0.1),
                 deadline_seconds: Some(1e300),
             },
+            note: Some("the job's note, with \"quotes\" and a\nnewline".into()),
         },
         inputs: vec![
             Input {
@@ -224,35 +226,46 @@ fn everything() -> Graph {
             Edge {
                 from: "local".into(),
                 to: Some("p0".into()),
+                dtype: Dtype::F64,
                 bytes: 1,
                 release: false,
+                note: None,
             },
             Edge {
                 from: "p0".into(),
                 to: Some("p1".into()),
+                dtype: Dtype::F32,
                 bytes: 2,
                 release: true,
+                note: Some("an edge's note".into()),
             },
             Edge {
                 from: "p1".into(),
                 to: Some("p2".into()),
+                dtype: Dtype::Bf16,
                 bytes: 3,
                 release: false,
+                note: None,
             },
             Edge {
                 from: "public".into(),
                 to: Some("p5".into()),
+                dtype: Dtype::F16,
                 bytes: 4,
                 release: false,
+                note: None,
             },
             Edge {
                 from: "p5".into(),
                 to: None,
+                dtype: Dtype::I64,
                 bytes: 5,
                 release: true,
+                note: None,
             },
         ],
         parts,
+        note: Some("a graph-wide note".into()),
     }
 }
 
@@ -273,7 +286,38 @@ fn every_field_and_variant_round_trips() {
         "\"backend\": \"rocm\"",
         "\"backend\": \"flex\"",
         "\"rate_per_second\": 0.1",
+        "\"dtype\": \"f64\"",
+        "\"dtype\": \"i64\"",
+        "\"note\": \"a graph-wide note\"",
     ] {
         assert!(text.contains(word), "{word} not in\n{text}");
     }
+}
+
+#[test]
+fn every_dtype_round_trips() {
+    for dtype in [
+        Dtype::F64,
+        Dtype::F32,
+        Dtype::Bf16,
+        Dtype::F16,
+        Dtype::I64,
+        Dtype::I32,
+        Dtype::U8,
+        Dtype::Bool,
+        Dtype::Bytes,
+    ] {
+        let mut g = everything();
+        g.edges[0].dtype = dtype;
+        assert_eq!(Graph::from_json(&g.to_json()).unwrap(), g, "{dtype:?}");
+    }
+}
+
+#[test]
+fn an_edge_without_a_dtype_is_refused() {
+    let missing = changed(|v| {
+        v["edges"][0].as_object_mut().unwrap().remove("dtype");
+    });
+    let err = Graph::from_json(&missing).unwrap_err();
+    assert!(err.to_string().contains("dtype"), "{err}");
 }

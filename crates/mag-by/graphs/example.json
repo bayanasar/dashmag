@@ -6,7 +6,8 @@
     "priority": 2,
     "need": {
       "deadline_seconds": 28800.0
-    }
+    },
+    "note": "overnight labelling; done by morning"
   },
   "inputs": [
     {
@@ -31,7 +32,8 @@
       "step": "item",
       "memory_bytes": 268435456,
       "weights": [],
-      "tolerance": "exact"
+      "tolerance": "exact",
+      "note": "one copy per device that can take it"
     },
     {
       "name": "b0",
@@ -116,48 +118,58 @@
     {
       "from": "frames",
       "to": "decode",
+      "dtype": "bytes",
       "bytes": 1200000000,
       "release": false
     },
     {
       "from": "decode",
       "to": "b0",
+      "dtype": "bf16",
       "bytes": 301056000,
       "release": false
     },
     {
       "from": "b0",
       "to": "b1",
+      "dtype": "bf16",
       "bytes": 19267584,
       "release": false
     },
     {
       "from": "b1",
       "to": "head",
+      "dtype": "bf16",
       "bytes": 19267584,
       "release": false
     },
     {
       "from": "classes",
       "to": "head",
+      "dtype": "i32",
       "bytes": 4096,
       "release": false
     },
     {
       "from": "head",
       "to": "count",
+      "dtype": "f32",
       "bytes": 160000,
-      "release": true
+      "release": true,
+      "note": "counts per class reveal nothing of a frame"
     },
     {
       "from": "head",
+      "dtype": "f32",
       "bytes": 160000,
       "release": false
     },
     {
       "from": "count",
+      "dtype": "i64",
       "bytes": 64,
       "release": false
     }
-  ]
+  ],
+  "note": "a sketch of a labelling job, to show the format"
 }

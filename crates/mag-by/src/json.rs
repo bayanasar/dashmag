@@ -1,7 +1,8 @@
 //! The graph file: a [`Graph`] in JSON, as an agent writes, reads back and edits it.
 //!
 //! The file is one object. `format` is `"mag-graph"` and `version` is `1`; then the graph's
-//! fields: `job`, `inputs`, `parts`, `chains` and `edges`. Enumerations are written in
+//! fields: `job`, `inputs`, `parts`, `chains`, `edges` and `note`. The file's version is its own,
+//! apart from the wire form's and from the crate's. Enumerations are written in
 //! snake case (`"replicable"`, `"optimiser_step"`, `"bf16"`), and a pin as `{"member": name}` or
 //! `{"backend": "rocm"}`. A job states no objective: its need and its priority say what it
 //! wants.
@@ -11,15 +12,15 @@
 //! misspelt field is an error and not a silent default, and then runs [`Graph::check`]. Fields
 //! with a default may be left out: `inputs`, `chains` and `edges` (empty), a job's `need`
 //! (none), a part's `mark` (atomic), `weights` (none) and `pin` (none), an edge's `to` (a result
-//! of the job) and `release` (false). An input's `local_only` has no default. An option is
-//! present or left out; `null` is refused.
+//! of the job), `release` (false) and every `note` (none). An input's `local_only` and an edge's
+//! `dtype` have no default. An option is present or left out; `null` is refused.
 //!
 //! Writing gives `format` and `version` first and the fields in a fixed order, every field but
 //! an absent option, two-space indented with a final newline, so that reading what was written
 //! and writing it again gives the same text.
 
-use alloc::string::{String, ToString};
 use core::fmt;
+use std::string::{String, ToString};
 
 use serde_json::Value;
 

@@ -1,8 +1,8 @@
 //! Each refusal of `Graph::check`, triggered once, and graphs that pass.
 
 use mag_by::{
-    Backend, Blob, Chain, Edge, Graph, Input, Job, Mark, Need, Part, Pin, Refusal, Step, Tolerance,
-    Unit,
+    Backend, Blob, Chain, Dtype, Edge, Graph, Input, Job, Mark, Need, Part, Pin, Refusal, Step,
+    Tolerance, Unit,
 };
 
 fn part(name: &str, mark: Mark) -> Part {
@@ -21,6 +21,7 @@ fn part(name: &str, mark: Mark) -> Part {
         }],
         tolerance: Tolerance::F32,
         pin: None,
+        note: None,
     }
 }
 
@@ -28,8 +29,10 @@ fn edge(from: &str, to: Option<&str>) -> Edge {
     Edge {
         from: from.into(),
         to: to.map(Into::into),
+        dtype: Dtype::Bf16,
         bytes: 8,
         release: false,
+        note: None,
     }
 }
 
@@ -43,6 +46,7 @@ fn valid() -> Graph {
                 rate_per_second: Some(20.0),
                 deadline_seconds: None,
             },
+            note: None,
         },
         inputs: vec![Input {
             name: "frames".into(),
@@ -66,6 +70,7 @@ fn valid() -> Graph {
             edge("b1", Some("b2")),
             edge("b2", None),
         ],
+        note: None,
     }
 }
 
@@ -186,6 +191,18 @@ fn edges_with_unknown_ends() {
         Refusal::EdgeIntoInput {
             edge: 0,
             name: "frames".into()
+        }
+    );
+}
+
+#[test]
+fn a_replicable_part_needs_a_source_of_items() {
+    assert_eq!(
+        refused(|g| {
+            g.edges.remove(0);
+        }),
+        Refusal::ReplicableWithoutSource {
+            part: "decode".into()
         }
     );
 }
