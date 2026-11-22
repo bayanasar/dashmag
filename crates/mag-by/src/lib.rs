@@ -35,5 +35,5 @@ pub use graph::{
     Tolerance, Unit,
 };
 #[cfg(feature = "graph")]
-pub use json::{FORMAT, ReadError, VERSION};
+pub use json::{FORMAT, ReadError, VERSION, graph_schema};
 pub use local_only::LocalOnly;

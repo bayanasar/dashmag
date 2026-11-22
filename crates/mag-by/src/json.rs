@@ -15,6 +15,11 @@
 //! of the job), `release` (false) and every `note` (none). An input's `local_only` and an edge's
 //! `dtype` have no default. An option is present or left out; `null` is refused.
 //!
+//! [`graph_schema`] is the file's JSON Schema, generated from the types it is read into, so that
+//! an agent in any language can have its output constrained to a valid file before it submits.
+//! It is kept in the repository at `schemas/mag-graph.schema.json`, and a test fails when the two
+//! differ.
+//!
 //! Writing gives `format` and `version` first and the fields in a fixed order, every field but
 //! an absent option, two-space indented with a final newline, so that reading what was written
 //! and writing it again gives the same text.
@@ -126,5 +131,66 @@ impl Graph {
             serde_json::to_string_pretty(&file).expect("a graph always serialises to JSON");
         text.push('\n');
         text
+    }
+}
+
+/// The graph file's JSON Schema (draft 2020-12), as text with a final newline: generated from the
+/// types a file is read into, with `format` and `version` as constants, unknown fields refused,
+/// and no `null` anywhere, since the reader refuses one wherever it stands.
+pub fn graph_schema() -> String {
+    let generator = schemars::generate::SchemaSettings::draft2020_12().into_generator();
+    let mut schema = generator.into_root_schema_for::<Graph>().to_value();
+    strip_null(&mut schema);
+    let root = schema
+        .as_object_mut()
+        .expect("a schema for a struct is an object");
+    root.insert(
+        "title".into(),
+        format!("{FORMAT}, version {VERSION}").into(),
+    );
+    let properties = root
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("a struct's schema has properties");
+    properties.insert("format".into(), serde_json::json!({ "const": FORMAT }));
+    properties.insert("version".into(), serde_json::json!({ "const": VERSION }));
+    let required = root
+        .get_mut("required")
+        .and_then(Value::as_array_mut)
+        .expect("a graph has required fields");
+    required.insert(0, "version".into());
+    required.insert(0, "format".into());
+    let mut text = serde_json::to_string_pretty(&schema).expect("a schema serialises");
+    text.push('\n');
+    text
+}
+
+/// Takes `null` out of every type a schema allows, as `Option<T>` puts it there.
+fn strip_null(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            if let Some(Value::Array(types)) = map.get_mut("type") {
+                types.retain(|t| t != "null");
+                if types.len() == 1 {
+                    let only = types.remove(0);
+                    map.insert("type".into(), only);
+                }
+            }
+            for key in ["anyOf", "oneOf"] {
+                if let Some(Value::Array(alternatives)) = map.get_mut(key) {
+                    alternatives.retain(|a| a.get("type").and_then(Value::as_str) != Some("null"));
+                    if alternatives.len() == 1 {
+                        let only = alternatives.remove(0);
+                        map.remove(key);
+                        if let Value::Object(inner) = only {
+                            map.extend(inner);
+                        }
+                    }
+                }
+            }
+            map.values_mut().for_each(strip_null);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_null),
+        _ => {}
     }
 }

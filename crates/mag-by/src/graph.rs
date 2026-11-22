@@ -11,7 +11,10 @@ use core::fmt;
 /// Every name in a graph (inputs, parts and chains together) is unique, and edges and chains
 /// refer to inputs and parts by name. [`Graph::check`] says whether a graph is well formed.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Graph {
     /// The job's name, its weight and its need.
@@ -44,7 +47,10 @@ pub struct Graph {
 /// Beyond its need a job wants to run as fast as it can: when jobs share the pool, an
 /// arrangement is judged by the sum over jobs of priority times each job's rate.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Job {
     pub name: String,
@@ -64,10 +70,13 @@ pub struct Job {
     pub note: Option<String>,
 }
 
-/// What an arrangement must give a job. Each part is optional, and a job with neither only
+/// What an arrangement must give a job. Each field is optional, and a job with neither only
 /// wants to run as fast as its priority allows.
 #[derive(Clone, Debug, Default, PartialEq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Need {
     /// The rate it must sustain, in its own steps per second (items, tokens or optimiser
@@ -95,7 +104,10 @@ pub struct Need {
 
 /// Data a job reads from outside its parts.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Input {
     pub name: String,
@@ -109,7 +121,10 @@ pub struct Input {
 /// The smallest piece mag places: a unit with the weights it holds, the memory it needs, and
 /// where it can stop.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Part {
     pub name: String,
@@ -150,7 +165,10 @@ pub struct Part {
 
 /// A named, versioned function.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Unit {
     pub name: String,
@@ -159,7 +177,10 @@ pub struct Unit {
 
 /// Data named by its content's hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Blob {
     pub hash: String,
@@ -168,7 +189,10 @@ pub struct Blob {
 
 /// How a part may be spread over devices.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(rename_all = "snake_case"))]
 pub enum Mark {
     /// One copy, on one device.
@@ -180,7 +204,10 @@ pub enum Mark {
 
 /// The point where a part can stop with its state written out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(rename_all = "snake_case"))]
 pub enum Step {
     /// After each item, as a map stops.
@@ -196,7 +223,10 @@ pub enum Step {
 /// The numerics a part accepts. A device takes the part only if its measured bounds for the
 /// part's operations meet it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(rename_all = "snake_case"))]
 pub enum Tolerance {
     /// The reference's bits.
@@ -208,7 +238,10 @@ pub enum Tolerance {
 
 /// Where a part must run.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(rename_all = "snake_case"))]
 pub enum Pin {
     /// On this member.
@@ -219,7 +252,10 @@ pub enum Pin {
 
 /// A backend a device runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(rename_all = "snake_case"))]
 pub enum Backend {
     Cuda,
@@ -231,7 +267,10 @@ pub enum Backend {
 
 /// What an edge carries: a tensor's element type, or opaque bytes (an encoded image, a record).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(rename_all = "snake_case"))]
 pub enum Dtype {
     F64,
@@ -252,7 +291,10 @@ pub enum Dtype {
 /// between devices is placing a chain's parts on more than one; only the edge at a division
 /// crosses between them.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Chain {
     pub name: String,
@@ -262,7 +304,10 @@ pub struct Chain {
 
 /// Data that moves from an input or a part to a part, or out of the job.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "graph", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Edge {
     /// An input or a part.
