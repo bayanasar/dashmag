@@ -24,7 +24,7 @@ fn the_example_reads_and_writes_back_byte_for_byte() {
 #[test]
 fn the_examples_counts_are_released_and_its_labels_stay_local() {
     let g = Graph::from_json(EXAMPLE).unwrap();
-    let m = g.local_only();
+    let m = g.local_only().unwrap();
     let names: Vec<_> = g.parts.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["decode", "b0", "b1", "head", "count"]);
     assert_eq!(m.parts, [true, true, true, true, false]);

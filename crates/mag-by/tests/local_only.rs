@@ -67,7 +67,7 @@ fn everything_below_a_local_only_input() {
             ("c", "", false),
         ],
     );
-    let m = g.local_only();
+    let m = g.local_only().unwrap();
     assert_eq!(m.parts, [true, true, true]);
     assert_eq!(m.edges, [true, true, true, true]);
 }
@@ -79,7 +79,7 @@ fn nothing_when_no_input_is_local_only() {
         &["a", "b"],
         &[("prompts", "a", false), ("a", "b", false), ("b", "", false)],
     );
-    let m = g.local_only();
+    let m = g.local_only().unwrap();
     assert_eq!(m.parts, [false, false]);
     assert_eq!(m.edges, [false, false, false]);
 }
@@ -95,7 +95,7 @@ fn a_release_stops_it() {
             ("count", "", false),
         ],
     );
-    let m = g.local_only();
+    let m = g.local_only().unwrap();
     assert_eq!(m.parts, [true, false]);
     assert_eq!(m.edges, [true, false, false]);
 }
@@ -111,7 +111,7 @@ fn a_release_on_one_of_two_outputs() {
             ("detect", "crop", false),
         ],
     );
-    let m = g.local_only();
+    let m = g.local_only().unwrap();
     assert_eq!(m.parts, [true, false, true]);
     assert_eq!(m.edges, [true, false, true]);
 }
@@ -127,7 +127,7 @@ fn reached_through_a_release_and_directly_stays_local_only() {
             ("frames", "merge", false),
         ],
     );
-    let m = g.local_only();
+    let m = g.local_only().unwrap();
     assert_eq!(m.parts, [true, true]);
     assert_eq!(m.edges, [true, false, true]);
 }
@@ -144,7 +144,7 @@ fn two_inputs_one_local_only() {
             ("s", "merge", false),
         ],
     );
-    let m = g.local_only();
+    let m = g.local_only().unwrap();
     assert_eq!(m.parts, [false, true, true]);
     assert_eq!(m.edges, [false, true, false, true]);
 }
@@ -163,7 +163,7 @@ fn around_a_cycle_whatever_the_edges_order() {
             ("frames", "b", false),
         ],
     );
-    let m = g.local_only();
+    let m = g.local_only().unwrap();
     assert_eq!(m.parts, [true, true, true]);
     assert_eq!(m.edges, [true, true, true, true]);
 }
@@ -183,7 +183,31 @@ fn a_released_loop_edge_lets_nothing_back_out() {
             ("rollout", "", false),
         ],
     );
-    let m = g.local_only();
+    let m = g.local_only().unwrap();
     assert_eq!(m.parts, [true, false]);
     assert_eq!(m.edges, [true, false, false, false, false]);
+}
+
+/// A graph whose local-only input was renamed while an edge still names the old name: `check`
+/// refuses it, and so does `local_only`, rather than calling everything free to move.
+#[test]
+fn a_graph_that_fails_its_check_gets_no_marks() {
+    let mut g = graph(
+        &[("frames", true)],
+        &["a", "b"],
+        &[("frames", "a", false), ("a", "b", false)],
+    );
+    g.inputs[0].name = "framez".into();
+    let refused = g.check().unwrap_err();
+    assert_eq!(g.local_only(), Err(refused));
+    // Drawn anyway, for its author to see, with the unknown edge and what it feeds marked.
+    let dot = g.to_dot();
+    assert!(
+        dot.contains("\"frames\" -> \"a\" [label=\"bf16 1 B\", color=red];"),
+        "{dot}"
+    );
+    assert!(
+        dot.contains("\"b\" [shape=box, label=\"b\\nu v1\\natomic, stops each item\", color=red];"),
+        "{dot}"
+    );
 }

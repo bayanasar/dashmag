@@ -11,7 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::Graph;
+use crate::{Graph, Refusal};
 
 /// Which parts and edges of a graph are local-only, by their index in the graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,9 +25,17 @@ pub struct LocalOnly {
 impl Graph {
     /// Which parts and edges carry data computed from a local-only input without a release.
     ///
-    /// Meant for a graph that passed [`Graph::check`]. An edge whose source names nothing it
-    /// knows is taken as not local-only, and one that enters nothing it knows marks no part.
-    pub fn local_only(&self) -> LocalOnly {
+    /// The graph is checked first, and a graph [`Graph::check`] refuses gets its refusal, not
+    /// marks: on a malformed graph the marks would say less than the author meant, and a mark
+    /// that says too little lets data move.
+    pub fn local_only(&self) -> Result<LocalOnly, Refusal> {
+        self.check()?;
+        Ok(self.marks())
+    }
+
+    /// The marks, on a graph that may not pass `check`. They fail closed: an edge whose source
+    /// names nothing known is taken as local-only, so what it feeds is too.
+    pub(crate) fn marks(&self) -> LocalOnly {
         let inputs: BTreeMap<&str, bool> = self
             .inputs
             .iter()
@@ -47,11 +55,13 @@ impl Graph {
         loop {
             let mut changed = false;
             for (i, edge) in self.edges.iter().enumerate() {
-                let from = match inputs.get(edge.from.as_str()) {
-                    Some(&local) => local,
-                    None => parts
-                        .get(edge.from.as_str())
-                        .is_some_and(|&p| marks.parts[p] && !edge.release),
+                let from = match (
+                    inputs.get(edge.from.as_str()),
+                    parts.get(edge.from.as_str()),
+                ) {
+                    (Some(&local), _) => local,
+                    (None, Some(&p)) => marks.parts[p] && !edge.release,
+                    (None, None) => true,
                 };
                 if from && !marks.edges[i] {
                     marks.edges[i] = true;

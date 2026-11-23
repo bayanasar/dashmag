@@ -56,9 +56,11 @@ fn dtype(d: crate::Dtype) -> &'static str {
 const RESULTS: &str = "job's results";
 
 impl Graph {
-    /// The graph as Graphviz DOT, for a person to look at (`dot -Tsvg`). Never read back.
+    /// The graph as Graphviz DOT, for a person to look at (`dot -Tsvg`). Never read back. A
+    /// graph that [`Graph::check`] refuses is drawn too, so that its author can see what is wrong;
+    /// its marks fail closed, and an edge from a name nothing defines is drawn local-only.
     pub fn to_dot(&self) -> String {
-        let local = self.local_only();
+        let local = self.marks();
         let mut d = String::new();
         let w = &mut d;
         let _ = writeln!(w, "digraph {} {{", quoted(&self.job.name));
