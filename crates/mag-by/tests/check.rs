@@ -141,6 +141,18 @@ fn no_parts() {
 }
 
 #[test]
+fn a_part_needs_some_memory() {
+    assert_eq!(
+        refused(|g| g.parts[2].memory_bytes = 0),
+        Refusal::ZeroMemory { part: "b1".into() }
+    );
+    // An edge may carry nothing but an order.
+    let mut g = valid();
+    g.edges[2].bytes = 0;
+    g.check().unwrap();
+}
+
+#[test]
 fn zero_priority() {
     assert_eq!(refused(|g| g.job.priority = 0), Refusal::ZeroPriority);
 }

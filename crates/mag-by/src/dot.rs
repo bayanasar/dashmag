@@ -46,6 +46,7 @@ fn dtype(d: crate::Dtype) -> &'static str {
         F16 => "f16",
         I64 => "i64",
         I32 => "i32",
+        I8 => "i8",
         U8 => "u8",
         Bool => "bool",
         Bytes => "bytes",

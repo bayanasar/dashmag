@@ -304,6 +304,7 @@ fn every_dtype_round_trips() {
         Dtype::F16,
         Dtype::I64,
         Dtype::I32,
+        Dtype::I8,
         Dtype::U8,
         Dtype::Bool,
         Dtype::Bytes,

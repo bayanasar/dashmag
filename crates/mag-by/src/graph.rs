@@ -102,7 +102,9 @@ pub struct Need {
     pub deadline_seconds: Option<f64>,
 }
 
-/// Data a job reads from outside its parts.
+/// Data a job reads from outside its parts. Version 1 of the graph file names an input and its
+/// mark; which data it is gets bound at submission, where the pool can check the data's own mark
+/// against its record of it. The mark here is only as good as that binding.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(
     feature = "graph",
@@ -134,7 +136,8 @@ pub struct Part {
     pub mark: Mark,
     /// Where the part can stop with its state written out, to move or to make way.
     pub step: Step,
-    /// The memory it needs on its device, weights and working memory together.
+    /// The memory it needs on its device, weights and working memory together. Above 0: memory
+    /// decides where a part fits, and 0 would say it fits anywhere.
     pub memory_bytes: u64,
     /// The weights it holds, fetched once per member and kept.
     #[cfg_attr(feature = "graph", serde(default))]
@@ -284,6 +287,7 @@ pub enum Dtype {
     F16,
     I64,
     I32,
+    I8,
     U8,
     Bool,
     Bytes,
@@ -329,6 +333,7 @@ pub struct Edge {
     pub to: Option<String>,
     /// What the data is: a tensor's element type, or opaque bytes.
     pub dtype: Dtype,
+    /// Its size. 0 is taken: an edge may carry nothing but the order between two parts.
     pub bytes: u64,
     /// Whether the producing part releases this output, so that it may go where its local-only
     /// inputs may not. Only a part releases; an input is never released.
@@ -355,6 +360,8 @@ pub enum Refusal {
     DuplicateName { name: String },
     /// The graph has no part.
     NoParts,
+    /// A part needs no memory.
+    ZeroMemory { part: String },
     /// The job's priority is 0.
     ZeroPriority,
     /// A need is not finite or not above 0.
@@ -393,6 +400,12 @@ impl fmt::Display for Refusal {
                 write!(f, "the name `{name}` is used more than once")
             }
             Refusal::NoParts => write!(f, "the graph has no part"),
+            Refusal::ZeroMemory { part } => {
+                write!(
+                    f,
+                    "the part `{part}` needs 0 bytes of memory; it needs some"
+                )
+            }
             Refusal::ZeroPriority => write!(f, "the job's priority is 0; it must be at least 1"),
             Refusal::BadNeed { field } => {
                 write!(f, "the need's `{field}` must be finite and above 0")
@@ -458,8 +471,8 @@ enum Named {
 }
 
 impl Graph {
-    /// Whether the graph is well formed: names unique and not empty, at least one part, a
-    /// priority of at least 1, a need that is finite and above 0, edges that leave an input or a
+    /// Whether the graph is well formed: names unique and not empty, at least one part, each part
+    /// needing some memory, a priority of at least 1, a need that is finite and above 0, edges that leave an input or a
     /// part and enter a part (or leave the job), no input released, every replicable part fed by
     /// an edge, and chains of at least 2
     /// parts that exist, are not replicable, appear in one chain only and are joined by edges in
@@ -473,6 +486,11 @@ impl Graph {
         }
         if self.job.priority == 0 {
             return Err(Refusal::ZeroPriority);
+        }
+        if let Some(p) = self.parts.iter().find(|p| p.memory_bytes == 0) {
+            return Err(Refusal::ZeroMemory {
+                part: p.name.clone(),
+            });
         }
         for (field, value) in [
             ("rate_per_second", self.job.need.rate_per_second),
