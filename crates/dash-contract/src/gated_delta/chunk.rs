@@ -27,9 +27,9 @@
 //!   products. (transformers normalises bf16 queries and keys in bf16 before casting; here, as in
 //!   fla, they are normalised in f32.) Rounding those intermediates costs accuracy where keys are
 //!   alike and `beta` is near 1, as a trained model's are: there the bf16 output is about 1% from
-//!   the f32 computation of the same inputs, in this implementation and in fla alike, and a change
-//!   of one unit in the last place of `g` moves it thousands of times more than it moves the f32
-//!   output. So two devices whose `exp` or `softplus` leave `g` one unit apart give bf16 outputs
+//!   the f32 computation of the same inputs, in dash-ops' CUDA and ROCm kernels and in fla alike
+//!   (dash-mlx's bf16 path was not measured), and a change of one unit in the last place of `g`
+//!   moves it thousands of times more than it moves the f32 output. So two devices whose `exp` or `softplus` leave `g` one unit apart give bf16 outputs
 //!   that differ well beyond bf16's rounding. For results that agree across devices, or within
 //!   bf16's rounding of f32, pass f32 inputs and round the output: `PROGRESS.md` has the
 //!   measurements.

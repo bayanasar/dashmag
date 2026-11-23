@@ -4,12 +4,14 @@
 //!
 //! ```text
 //! cargo run --release -p dash-mag --features rocm --example xcheck -- run DIR [TOKENS [CASES]]
-//! cargo run --release -p dash-mag --example xcheck -- compare DIR_A DIR_B
+//! cargo run --release -p dash-mag --example xcheck -- compare DIR_A DIR_B [bf16]
 //! cargo run --release -p dash-mag --example xcheck -- ulps DIR_BF16 DIR_REFERENCE
 //! ```
 //!
 //! `CASES` is a comma-separated list of `head`, `lse`, `proj`, `mlp`, `elementwise`, `conv`,
-//! `gated_delta`, `gda` and `attention`; all of them by default. The environment chooses the rest:
+//! `gated_delta`, `gda` and `attention`; all of them by default. `head` and `lse` have shapes of
+//! their own and ignore `TOKENS`. On Burn, `gda` prints how many of dash-ops' gated delta kernels
+//! ran, and how many of them on tensor cores and on WMMA, so that a run says which path it took. The environment chooses the rest:
 //! - `XCHECK_DTYPE`: `f32` (the default), `bf16`, or `f32r`, the inputs rounded to bf16 and then
 //!   computed in f32, the reference a bf16 run is held to (`ulps`);
 //! - `XCHECK_GDA_CORR=c`: for `gda`, keys that lean towards one direction per head, as a trained
@@ -20,8 +22,10 @@
 //! the same bits; each run prints a hash of them to check. Shapes are a 0.8B model's: width 1024,
 //! MLP 3584, vocabulary 248320, 8 query and 2 key-value heads of width 256, 16 gated delta heads
 //! of width 128, a convolution of width 4 over 6144 channels. `compare` gives, per output, the
-//! largest and mean difference and the share of equal elements; `ulps`, a bf16 run's distance
-//! from its reference in units in the last place of bf16.
+//! largest difference, the mean difference, the mean relative difference (`mean |a - b|` over
+//! `mean |b|`) and the share of equal elements; with `bf16`, both runs' values are rounded to bf16
+//! first, as a bf16 caller would round an f32 result. `ulps` gives a bf16 run's distance from its
+//! reference in units in the last place of bf16.
 
 use std::{env, fs, path::Path, time::Instant};
 
@@ -304,7 +308,11 @@ fn gated_delta_as_called(out: &mut Out, t: usize) -> R<()> {
     let corr: Option<f32> = env::var("XCHECK_GDA_CORR")
         .ok()
         .and_then(|c| c.parse().ok());
-    let directions = rng.normals(H * D, 1.0);
+    // Drawn only when asked for, so that independent keys are the same draws with or without it.
+    let directions = match corr {
+        Some(_) => rng.normals(H * D, 1.0),
+        None => Vec::new(),
+    };
     let unit = |rng: &mut Rng, scale: f32| -> Vec<f32> {
         let mut x = rng.normals(t * H * D, 1.0);
         if let Some(c) = corr {
@@ -353,6 +361,15 @@ fn gated_delta_as_called(out: &mut Out, t: usize) -> R<()> {
             out.save(name, x)?;
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    let before = {
+        use dash_ops::gated_delta::chunk::probe;
+        [
+            probe::kernel_launches(),
+            probe::tensor_core_launches(),
+            probe::wmma_launches(),
+        ]
+    };
     for (name, g) in [("gda", g), ("gda_moved", moved)] {
         let g = tensor_f32(out, g, &[1, t, H])?;
         if env::var_os("XCHECK_SAVE_INPUTS").is_some() {
@@ -366,6 +383,28 @@ fn gated_delta_as_called(out: &mut Out, t: usize) -> R<()> {
             Ok(())
         })?;
     }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use dash_ops::gated_delta::chunk::probe;
+        let now = [
+            probe::kernel_launches(),
+            probe::tensor_core_launches(),
+            probe::wmma_launches(),
+        ];
+        println!(
+            "gated delta kernel launches: {}, on tensor cores {}, on WMMA {}",
+            now[0] - before[0],
+            now[1] - before[1],
+            now[2] - before[2]
+        );
+    }
+    let (o, moved) = (load(out.dir, "gda_out")?, load(out.dir, "gda_moved_out")?);
+    let (_, _, rel, equal) = stats(&moved, &o);
+    println!(
+        "g moved one unit in its last place in 23.6% of its elements: the output moves by {rel:.2e} \
+         (mean relative), {:.2}% of its elements",
+        100.0 - equal
+    );
     Ok(())
 }
 
@@ -423,23 +462,53 @@ fn load(dir: &Path, name: &str) -> R<Vec<f32>> {
         .collect())
 }
 
-fn compare(a: &Path, b: &Path) -> R<()> {
+/// `x` against `y`: the largest difference, the mean difference, the mean relative difference
+/// (`mean |x - y|` over `mean |y|`), and the share of elements equal, in percent.
+fn stats(x: &[f32], y: &[f32]) -> (f64, f64, f64, f64) {
+    let (mut max_d, mut sum_d, mut sum_y, mut equal) = (0f64, 0f64, 0f64, 0usize);
+    for (&p, &q) in x.iter().zip(y) {
+        let d = (p as f64 - q as f64).abs();
+        max_d = max_d.max(d);
+        sum_d += d;
+        sum_y += (q as f64).abs();
+        equal += (p == q) as usize;
+    }
+    let n = x.len().max(1) as f64;
+    (
+        max_d,
+        sum_d / n,
+        sum_d / sum_y.max(f64::MIN_POSITIVE),
+        100.0 * equal as f64 / n,
+    )
+}
+
+fn compare(a: &Path, b: &Path, bf16: bool) -> R<()> {
     let mut names: Vec<String> = fs::read_dir(a)?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter_map(|n| n.strip_suffix(".f32").map(String::from))
         .collect();
     names.sort();
     println!(
-        "{:<20} {:>12} {:>12} {:>12} {:>12} {:>8}",
-        "output", "max |a-b|", "max |a|", "max rel", "mean |a-b|", "equal %"
+        "{:<20} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8}",
+        "output", "max |a-b|", "max |a|", "max rel", "mean |a-b|", "mean rel", "equal %"
     );
+    let round = |v: Vec<f32>| -> Vec<f32> {
+        if bf16 {
+            v.into_iter()
+                .map(|x| half::bf16::from_f32(x).to_f32())
+                .collect()
+        } else {
+            v
+        }
+    };
     for name in names {
-        let (x, y) = (load(a, &name)?, load(b, &name)?);
+        let (x, y) = (round(load(a, &name)?), round(load(b, &name)?));
         if x.len() != y.len() {
             println!("{name:<20} lengths differ: {} and {}", x.len(), y.len());
             continue;
         }
-        let (mut max_d, mut max_a, mut max_rel, mut sum_d, mut equal) = (0f64, 0f64, 0f64, 0f64, 0);
+        let (mut max_d, mut max_a, mut max_rel, mut sum_d, mut sum_b, mut equal) =
+            (0f64, 0f64, 0f64, 0f64, 0f64, 0);
         for (&p, &q) in x.iter().zip(&y) {
             let (p, q) = (p as f64, q as f64);
             let d = (p - q).abs();
@@ -449,11 +518,13 @@ fn compare(a: &Path, b: &Path) -> R<()> {
                 max_rel = max_rel.max(d / p.abs());
             }
             sum_d += d;
+            sum_b += q.abs();
             equal += (p == q) as usize;
         }
         println!(
-            "{name:<20} {max_d:>12.3e} {max_a:>12.3e} {max_rel:>12.3e} {:>12.3e} {:>8.2}",
+            "{name:<20} {max_d:>12.3e} {max_a:>12.3e} {max_rel:>12.3e} {:>12.3e} {:>12.3e} {:>8.2}",
             sum_d / x.len() as f64,
+            sum_d / sum_b.max(f64::MIN_POSITIVE),
             100.0 * equal as f64 / x.len() as f64
         );
     }
@@ -474,6 +545,10 @@ fn ulps(a: &Path, reference: &Path) -> R<()> {
     );
     for name in names {
         let (x, r) = (load(a, &name)?, load(reference, &name)?);
+        if x.len() != r.len() {
+            println!("{name:<20} lengths differ: {} and {}", x.len(), r.len());
+            continue;
+        }
         let (mut e0, mut e1, mut e2, mut max, mut sum, mut n) = (0, 0, 0, 0f64, 0f64, 0);
         for (&y, &r) in x.iter().zip(&r) {
             let rb = half::bf16::from_f32(r);
@@ -505,14 +580,17 @@ fn ulps(a: &Path, reference: &Path) -> R<()> {
 }
 
 fn main() -> R<()> {
+    const USAGE: &str = "usage: xcheck run DIR [TOKENS [CASES]] | xcheck compare DIR_A DIR_B [bf16] \
+                         | xcheck ulps DIR_BF16 DIR_REFERENCE";
     let args: Vec<String> = env::args().skip(1).collect();
+    let dir = |i: usize| args.get(i).map(Path::new).ok_or(USAGE);
     match args.first().map(String::as_str) {
         Some("run") => {
             let t = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(4096);
-            run(Path::new(&args[1]), t, args.get(3).map(String::as_str))
+            run(dir(1)?, t, args.get(3).map(String::as_str))
         }
-        Some("compare") => compare(Path::new(&args[1]), Path::new(&args[2])),
-        Some("ulps") => ulps(Path::new(&args[1]), Path::new(&args[2])),
-        _ => Err("usage: xcheck run DIR [TOKENS [CASES]] | xcheck compare DIR_A DIR_B".into()),
+        Some("compare") => compare(dir(1)?, dir(2)?, args.get(3).is_some_and(|m| m == "bf16")),
+        Some("ulps") => ulps(dir(1)?, dir(2)?),
+        _ => Err(USAGE.into()),
     }
 }
