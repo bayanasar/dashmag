@@ -6,6 +6,10 @@ Dashmag is a general machine-learning library in Rust. Burn beneath it supplies 
 and devices; Dashmag adds the compute layer that applications build on, and inference. Together
 they are meant to do for Rust what PyTorch does for Python.
 
+Dashmag is two families of crates. The `dash-` crates are the library, on the hardware of one
+machine. The `mag-` crates, just begun, are to make one pool of the machines a person has and
+place work across them ([below](#mag-one-pool-from-the-machines-you-have)). dash + mag = Dashmag.
+
 The compute layer is the operations Burn does not have, in forward, backward and decoding-step
 forms with kernels for Burn's backends; layers, such as LoRA; autodiff utilities, such as
 activation checkpointing; and the modules training uses (losses, optimisers, learning-rate
@@ -35,7 +39,8 @@ operations, such as attention against a key-value cache and the gated delta rule
 | [`dash-conformance`](crates/dash-conformance) | the operation-level tests of `dash-contract`'s operations, written once for every implementation of them and run through a thin adapter: the recorded fixtures, the error measures and the bounds; conv1d, the gated delta rule, the chosen-token log-probability and attention so far (not published) | dash-ops passes them on Flex, on CUDA, through wgpu and on CubeCL's CPU runtime |
 | [`dash-peft`](crates/dash-peft) | PEFT's LoRA adapter files with no tensor library: read and written back byte for byte, and applied to a backend's layers and read out of them through one trait | dash-mag's LoRA layer implements the trait; PEFT's files written back byte for byte |
 | [`dash-mlx`](crates/dash-mlx) | dash-ops' operations on MLX, with their contracts, for Apple silicon: attention, conv1d, the gated delta rule, chosen-token log-probabilities, the fused linear cross-entropy, the low-rank product, recompute and sampling, with Metal kernels where MLX's operations fall short | conv1d, the gated delta rule, the log-probability and attention pass dash-conformance's tests; the others are held to dash-ops' tests by ports of them; not published |
-| [`dash-mag`](crates/dash-mag) | the one crate an application names, the gateway to dash and, when they exist, the planned `mag-` crates: a tensor, its array operations, a vector-Jacobian product, the operations' entry points, LoRA's layer, rotary embeddings, AdamW and clipping, over `dash-ops` or `dash-mlx`, the side chosen at compile time. | on Burn and on MLX: every entry point the same bits as `dash-ops` or `dash-mlx`, one training step from one source held to one recording; LoRA's layer and AdamW held to PEFT's and torch's recordings |
+| [`dash-mag`](crates/dash-mag) | the one crate an application names, the gateway to dash and, as they are built, to the `mag-` crates (it does not reach `mag-by` yet): a tensor, its array operations, a vector-Jacobian product, the operations' entry points, LoRA's layer, rotary embeddings, AdamW and clipping, over `dash-ops` or `dash-mlx`, the side chosen at compile time. | on Burn and on MLX: every entry point the same bits as `dash-ops` or `dash-mlx`, one training step from one source held to one recording; LoRA's layer and AdamW held to PEFT's and torch's recordings |
+| [`mag-by`](crates/mag-by) | the description of a job that the `mag-` crates share: the graph of its parts, its checks with typed refusals, what its local-only inputs and weights reach, and, with the `graph` feature, the graph file in JSON with its JSON Schema and DOT for a person to look at; `no_std` with no dependencies unless `graph` is on | its tests hold the checks, the local-only marks, the reader's refusals and the kept schema and DOT to the code; CI builds the default for a `no_std` target with an empty dependency tree; nothing places work yet |
 | [`dash-image`](crates/dash-image) | image preprocessing: JPEG decode, Pillow-exact bilinear resize, normalisation | byte-exact with Pillow's resize |
 | [`dash-core`](https://crates.io/crates/dash-core) | the inference trait: tensors, capability negotiation, dispatch across runtimes | — |
 | [`dash-burn`](crates/dash-burn) | Burn behind that trait: the model built from code, weights loaded, run on Flex (pure-Rust CPU), CUDA, ROCm or Metal | runs on x86-64 (Flex) and on CUDA |
@@ -70,6 +75,52 @@ it can build, and a conformance test holds them to each other.
 The IREE, TensorRT and Edge TPU runtimes are currently **spikes** that drive their vendor tool as a
 subprocess; each crate's docs name the in-process FFI shim that replaces it. They are labelled as
 such in the source rather than presented as finished.
+
+## mag: one pool from the machines you have
+
+People who train and run models at home or in a small lab usually have several unequal
+machines: a workstation with one GPU, a second box with another vendor's card, a laptop with its
+own accelerator, now and then a rented cloud GPU for a night. Each is too small for some job, and
+most of them are idle most of the time. mag is to make them one pool.
+
+You describe a job as a graph and name no device. The graph says what the parts are (a function,
+the weights it holds, the memory it needs, where it can stop), what flows between them and how
+large it is, which parts may run as many copies, where a model may be divided between devices,
+and what the job needs: a rate or a deadline, and how much it weighs against other jobs. mag is
+to decide where each part runs, and to decide again when a machine joins, leaves or is wanted
+back by its owner.
+
+It is designed for:
+
+- many copies of one worker (rollouts, batch inference, labelling), one on every device that can
+  take it;
+- a model that no single card holds, divided along a chain across two or three;
+- a teacher and a student sharing the pool's memory;
+- a long-running service that gives a card back when something urgent arrives and takes it
+  again afterwards;
+- data that must not leave: what is computed from an input marked local-only, or by a part whose
+  weights are marked local-only, is never to be placed on a remote machine, unless a part of the
+  graph releases it.
+
+**What exists today is the description, not the pool.** [`mag-by`](crates/mag-by) reads a graph
+file, refuses one that is wrong with a reason that names what is wrong, works out what the
+local-only inputs and weights reach, and writes the graph as Graphviz DOT:
+
+![The example graph: a labelling job whose frames are local-only](crates/mag-by/graphs/example.svg)
+
+That is [`graphs/example.json`](crates/mag-by/graphs/example.json). Red is the local-only input
+and everything local-only data reaches, here from the frames and from the classifier's weights;
+the dashed edge is where a part releases its output, a count of labels. To draw your own, with
+Graphviz installed:
+
+    cargo run -p mag-by --features graph --example dot -- your-graph.json | dot -Tsvg > graph.svg
+
+Not built yet: `mag-mar`, the engine each machine is to run, offering its devices to the pool and
+running the parts placed on it; and `mag-mortar`, one per pool, which is to take jobs, place them
+and keep the record. Nothing here runs work across machines yet.
+
+The graph file is at version 1 and will change. If your job cannot be said in it, that is what
+we most want to hear: please open an issue.
 
 ## License
 

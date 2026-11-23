@@ -49,3 +49,18 @@ fn names_are_quoted() {
             .starts_with("digraph \"a \\\"quoted\\\" \\\\ name\" {")
     );
 }
+
+#[path = "../examples/dot.rs"]
+mod example;
+
+/// What the README's command prints for the example file: `graphs/example.dot`, byte for byte.
+#[test]
+fn the_dot_example_prints_the_kept_dot() {
+    let kept = Path::new(env!("CARGO_MANIFEST_DIR")).join("graphs/example.dot");
+    assert_eq!(
+        example::run(EXAMPLE).unwrap(),
+        std::fs::read_to_string(kept).unwrap()
+    );
+    let refused = example::run(&EXAMPLE.replace("\"mag-graph\"", "\"other\"")).unwrap_err();
+    assert!(refused.to_string().contains("other"), "{refused}");
+}

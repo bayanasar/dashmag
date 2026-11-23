@@ -1,7 +1,8 @@
 //! The words the `mag-` crates share.
 //!
-//! mag places the work of one algorithm across the machines of a pool. Its author, often an
-//! agent, describes the work as a graph and names no device; mag decides where each piece runs.
+//! mag is to place the work of one algorithm across the machines of a pool. Its author, often an
+//! agent, describes the work as a graph and names no device; mag is to decide where each piece
+//! runs. That part is not built yet.
 //! This crate holds the words that description is made of, so that every member of a pool,
 //! down to a small processor with no operating system, reads it the same way. It is `no_std`
 //! with `alloc`, and depends on nothing unless the `graph` feature is on.

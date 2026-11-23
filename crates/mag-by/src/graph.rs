@@ -472,11 +472,11 @@ enum Named {
 
 impl Graph {
     /// Whether the graph is well formed: names unique and not empty, at least one part, each part
-    /// needing some memory, a priority of at least 1, a need that is finite and above 0, edges that leave an input or a
-    /// part and enter a part (or leave the job), no input released, every replicable part fed by
-    /// an edge, and chains of at least 2
-    /// parts that exist, are not replicable, appear in one chain only and are joined by edges in
-    /// order. The first problem found is returned.
+    /// needing some memory, a priority of at least 1, a need that is finite and above 0, edges
+    /// that leave an input or a part and enter a part (or leave the job), no input released,
+    /// every replicable part fed by an edge, and chains of at least 2 parts that exist, are not
+    /// replicable, appear in one chain only and are joined by edges in order. The first problem
+    /// found is returned.
     ///
     /// Cycles are allowed: a loop is one.
     pub fn check(&self) -> Result<(), Refusal> {

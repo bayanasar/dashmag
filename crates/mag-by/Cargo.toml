@@ -27,3 +27,7 @@ mag-by = { path = ".", features = ["graph"] }
 # Validates files against the schema in the tests: the schema is checked as a schema, not only
 # compared as text.
 jsonschema = { version = "0.63.0", default-features = false }
+
+[[example]]
+name = "dot"
+required-features = ["graph"]
