@@ -15,7 +15,8 @@ is on.
 - `Graph::local_only`: which parts and edges carry data computed from an input that must stay
   local, so that none of it is placed on a member marked remote unless a part releases it.
 - With the `graph` feature, `Graph::from_json` and `Graph::to_json`: the graph file, a graph in
-  JSON, as an agent writes, reads back and edits it (`format` `"mag-graph"`, `version` 1).
+  JSON, as an agent writes, reads back and edits it (`format` `"mag-graph"`, `version` 1). A
+  key repeated in one object is refused: JSON would keep its last value, and a schema cannot see it.
   [`graphs/example.json`](graphs/example.json) is one. `graph_schema` is the file's JSON
   Schema, kept at [`schemas/mag-graph.schema.json`](schemas/mag-graph.schema.json), and
   `Graph::to_dot` writes a graph as Graphviz DOT for a person to look at

@@ -8,8 +8,11 @@
 //! wants.
 //!
 //! Reading checks `format` and `version` first, so that a file of a newer version is refused as
-//! that rather than for fields this reader does not know. It refuses unknown fields, so that a
-//! misspelt field is an error and not a silent default, and then runs [`Graph::check`]. Fields
+//! that rather than for fields this reader does not know. It refuses a key repeated in one object,
+//! at any depth: JSON allows one and keeps the last, so a file saying `"local_only": true` and then
+//! `false` would otherwise be read by its last word, and a schema cannot see it. It refuses
+//! unknown fields, so that a misspelt field is an error and not a silent default, and then runs
+//! [`Graph::check`]. Fields
 //! with a default may be left out: `inputs`, `chains` and `edges` (empty), a job's `need`
 //! (none), a part's `mark` (atomic), `weights` (none) and `pin` (none), an edge's `to` (a result
 //! of the job), `release` (false) and every `note` (none). An input's `local_only` and an edge's
@@ -46,6 +49,8 @@ pub enum ReadError {
     Format { found: Option<String> },
     /// `version` is not 1. The JSON found, if any.
     Version { found: Option<String> },
+    /// A key appears twice in one object. Where, as a path such as `inputs[0].local_only`.
+    RepeatedKey { at: String },
     /// The graph was read but does not pass [`Graph::check`].
     Refused(Refusal),
 }
@@ -67,6 +72,12 @@ impl fmt::Display for ReadError {
                 )
             }
             ReadError::Version { found: None } => write!(f, "the graph file has no version"),
+            ReadError::RepeatedKey { at } => {
+                write!(
+                    f,
+                    "`{at}` is given twice; a key may appear once in an object"
+                )
+            }
             ReadError::Refused(r) => write!(f, "the graph is refused: {r}"),
         }
     }
@@ -112,6 +123,10 @@ impl Graph {
                     found: other.map(|v| v.to_string()),
                 });
             }
+        }
+        let repeats: NoRepeats = serde_json::from_str(text).map_err(ReadError::Json)?;
+        if let Some(at) = repeats.0 {
+            return Err(ReadError::RepeatedKey { at });
         }
         let graph: Graph = serde_json::from_value(value).map_err(ReadError::Json)?;
         graph.check().map_err(ReadError::Refused)?;
@@ -192,5 +207,78 @@ fn strip_null(v: &mut Value) {
         }
         Value::Array(items) => items.iter_mut().for_each(strip_null),
         _ => {}
+    }
+}
+
+/// Any JSON, read for one thing: the first key repeated in an object, at any depth, with its path.
+/// Parsing into a [`Value`] keeps the last of a repeated key and says nothing, so this reads the
+/// text itself.
+struct NoRepeats(Option<String>);
+
+impl<'de> serde::Deserialize<'de> for NoRepeats {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(NoRepeatsVisitor)
+    }
+}
+
+struct NoRepeatsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NoRepeatsVisitor {
+    type Value = NoRepeats;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<NoRepeats, A::Error> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut found = None;
+        while let Some(key) = map.next_key::<String>()? {
+            let inner: NoRepeats = map.next_value()?;
+            if found.is_some() {
+                continue;
+            }
+            if !seen.insert(key.clone()) {
+                found = Some(key);
+            } else if let Some(at) = inner.0 {
+                let sep = if at.starts_with('[') { "" } else { "." };
+                found = Some(std::format!("{key}{sep}{at}"));
+            }
+        }
+        Ok(NoRepeats(found))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<NoRepeats, A::Error> {
+        let mut found = None;
+        let mut i = 0usize;
+        while let Some(inner) = seq.next_element::<NoRepeats>()? {
+            if found.is_none()
+                && let Some(at) = inner.0
+            {
+                let sep = if at.starts_with('[') { "" } else { "." };
+                found = Some(std::format!("[{i}]{sep}{at}"));
+            }
+            i += 1;
+        }
+        Ok(NoRepeats(found))
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<NoRepeats, E> {
+        Ok(NoRepeats(None))
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<NoRepeats, E> {
+        Ok(NoRepeats(None))
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<NoRepeats, E> {
+        Ok(NoRepeats(None))
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<NoRepeats, E> {
+        Ok(NoRepeats(None))
+    }
+    fn visit_str<E>(self, _: &str) -> Result<NoRepeats, E> {
+        Ok(NoRepeats(None))
+    }
+    fn visit_unit<E>(self) -> Result<NoRepeats, E> {
+        Ok(NoRepeats(None))
     }
 }

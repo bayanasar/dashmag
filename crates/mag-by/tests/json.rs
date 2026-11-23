@@ -321,3 +321,45 @@ fn an_edge_without_a_dtype_is_refused() {
     let err = Graph::from_json(&missing).unwrap_err();
     assert!(err.to_string().contains("dtype"), "{err}");
 }
+
+/// The example's text with `insert` placed just after the first occurrence of `after`.
+fn with_text(after: &str, insert: &str) -> String {
+    let at = EXAMPLE.find(after).expect("the example has it") + after.len();
+    format!("{}{insert}{}", &EXAMPLE[..at], &EXAMPLE[at..])
+}
+
+#[test]
+fn a_repeated_key_is_refused_wherever_it_stands() {
+    let cases = [
+        (
+            with_text("\"local_only\": true", ", \"local_only\": false"),
+            "inputs[0].local_only",
+        ),
+        (
+            with_text("\"local_only\": false", ", \"local_only\": true"),
+            "inputs[1].local_only",
+        ),
+        (
+            with_text("\"release\": true", ", \"release\": false"),
+            "edges[5].release",
+        ),
+        (with_text("\"version\": 1", ", \"version\": 1"), "version"),
+    ];
+    for (text, at) in cases {
+        let err = Graph::from_json(&text).unwrap_err();
+        assert!(
+            matches!(&err, ReadError::RepeatedKey { at: got } if got == at),
+            "{at}: {err}"
+        );
+    }
+}
+
+#[test]
+fn format_and_version_are_still_checked_before_a_repeated_key() {
+    let text = with_text("\"local_only\": true", ", \"local_only\": false")
+        .replace("\"version\": 1", "\"version\": 2");
+    assert!(matches!(
+        Graph::from_json(&text),
+        Err(ReadError::Version { .. })
+    ));
+}
