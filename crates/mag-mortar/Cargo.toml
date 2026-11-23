@@ -1,0 +1,14 @@
+[package]
+name = "mag-mortar"
+description = "The controller of a mag pool: the placement loop that decides where each part of each job runs, from what the pool's devices offer, and the record of every decision."
+readme = "README.md"
+keywords = ["scheduling", "distributed", "machine-learning"]
+categories = ["science"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mag-by = { workspace = true }

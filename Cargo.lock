@@ -4208,6 +4208,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mag-mortar"
+version = "0.0.1"
+dependencies = [
+ "mag-by",
+]
+
+[[package]]
 name = "maplit"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
