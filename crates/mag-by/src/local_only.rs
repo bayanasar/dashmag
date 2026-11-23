@@ -2,8 +2,10 @@
 //!
 //! An input marked local-only never goes to a member marked remote, and neither does anything
 //! computed from it, however indirectly, unless the part that computed it releases that output.
-//! So a part is local-only when any edge into it is, and an edge is local-only when it leaves a
-//! local-only input, or leaves a local-only part without a release. A part reached both through a
+//! The same holds for a blob a part holds as weights, marked local-only because it was computed
+//! from such data in an earlier job. So a part is local-only when it holds a local-only blob or
+//! any edge into it is local-only, and an edge is local-only when it leaves a local-only input, or
+//! leaves a local-only part without a release. A part reached both through a
 //! release and directly stays local-only. Loops make the graph cyclic, so the marks are taken to
 //! a fixed point rather than in one pass.
 
@@ -48,7 +50,11 @@ impl Graph {
             .map(|(i, p)| (p.name.as_str(), i))
             .collect();
         let mut marks = LocalOnly {
-            parts: vec![false; self.parts.len()],
+            parts: self
+                .parts
+                .iter()
+                .map(|p| p.weights.iter().any(|w| w.local_only))
+                .collect(),
             edges: vec![false; self.edges.len()],
         };
         // Marks only ever turn on, so this ends after at most one pass per mark.

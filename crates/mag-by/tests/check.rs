@@ -18,6 +18,7 @@ fn part(name: &str, mark: Mark) -> Part {
         weights: vec![Blob {
             hash: "h".into(),
             bytes: 4,
+            local_only: false,
         }],
         tolerance: Tolerance::F32,
         pin: None,

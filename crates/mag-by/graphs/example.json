@@ -47,7 +47,8 @@
       "weights": [
         {
           "hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-          "bytes": 1073741824
+          "bytes": 1073741824,
+          "local_only": false
         }
       ],
       "tolerance": "bf16"
@@ -64,7 +65,8 @@
       "weights": [
         {
           "hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-          "bytes": 1073741824
+          "bytes": 1073741824,
+          "local_only": false
         }
       ],
       "tolerance": "bf16"
@@ -81,13 +83,15 @@
       "weights": [
         {
           "hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-          "bytes": 4194304
+          "bytes": 4194304,
+          "local_only": true
         }
       ],
       "tolerance": "f32",
       "pin": {
         "backend": "cuda"
-      }
+      },
+      "note": "its weights were trained on local-only data in an earlier job"
     },
     {
       "name": "count",

@@ -211,3 +211,31 @@ fn a_graph_that_fails_its_check_gets_no_marks() {
         "{dot}"
     );
 }
+
+/// Weights trained on local-only data in an earlier job, served in this one: no input here is
+/// local-only, but the part holding them is, and so is what it computes unless released.
+#[test]
+fn a_local_only_blob_marks_the_part_that_holds_it() {
+    let mut g = graph(
+        &[("prompts", false)],
+        &["adapter", "serve", "count"],
+        &[
+            ("prompts", "adapter", false),
+            ("adapter", "serve", false),
+            ("serve", "", false),
+            ("adapter", "count", true),
+        ],
+    );
+    g.parts[0].weights.push(mag_by::Blob {
+        hash: "trained-at-home".into(),
+        bytes: 1 << 20,
+        local_only: true,
+    });
+    let m = g.local_only().unwrap();
+    assert_eq!(m.parts, [true, true, false]);
+    assert_eq!(m.edges, [false, true, true, false]);
+    // The same weights unmarked mark nothing.
+    g.parts[0].weights[0].local_only = false;
+    let m = g.local_only().unwrap();
+    assert_eq!(m.parts, [false, false, false]);
+}

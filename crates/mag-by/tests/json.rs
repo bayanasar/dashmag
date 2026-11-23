@@ -189,6 +189,7 @@ fn everything() -> Graph {
                 .map(|w| Blob {
                     hash: format!("h{w}"),
                     bytes: w as u64,
+                    local_only: w % 2 == 1,
                 })
                 .collect(),
             tolerance: tolerances[i % 4],
@@ -362,4 +363,16 @@ fn format_and_version_are_still_checked_before_a_repeated_key() {
         Graph::from_json(&text),
         Err(ReadError::Version { .. })
     ));
+}
+
+#[test]
+fn a_weights_blob_without_its_mark_is_refused() {
+    let missing = changed(|v| {
+        v["parts"][1]["weights"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("local_only");
+    });
+    let err = Graph::from_json(&missing).unwrap_err();
+    assert!(err.to_string().contains("local_only"), "{err}");
 }

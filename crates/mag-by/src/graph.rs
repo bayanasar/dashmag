@@ -175,7 +175,7 @@ pub struct Unit {
     pub version: u32,
 }
 
-/// Data named by its content's hash.
+/// Data named by its content's hash, such as weights a part holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
     feature = "graph",
@@ -185,6 +185,11 @@ pub struct Unit {
 pub struct Blob {
     pub hash: String,
     pub bytes: u64,
+    /// Computed from local-only data, as weights trained on it in an earlier job are: never
+    /// placed on a member marked remote, nor is the part that holds it, nor what that part
+    /// computes unless it releases it. The graph file must say it either way: left out, it is
+    /// refused, as an input's mark is.
+    pub local_only: bool,
 }
 
 /// How a part may be spread over devices.
