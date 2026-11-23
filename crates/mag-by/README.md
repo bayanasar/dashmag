@@ -1,10 +1,10 @@
 # mag-by
 
-The words the `mag-` crates share. mag is to place the work of one algorithm across the machines
-of a pool: its author describes the work as a graph and names no device, and mag is to decide
-where each piece runs; that part is not built yet. This crate holds the words that description is made of, so that every member reads
-it the same way. It is `no_std` with `alloc`, and depends on nothing unless the `graph` feature
-is on.
+The words the `mag-` crates share. mag is to place the work of one algorithm across the machines of
+a pool: its author describes the work as a graph and names no device, and mag is to decide where
+each piece runs; that part is not built yet. This crate holds the words that description is made of,
+so that every member reads it the same way. It is `no_std` with `alloc`, and depends on nothing
+unless the `graph` feature is on.
 
 - `Graph`: one job. Its parts, the smallest pieces mag places (a function with the weights it
   holds, the memory it needs, and where it can stop); the inputs it reads; the edges between

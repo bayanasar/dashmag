@@ -33,11 +33,19 @@ fn every_input_part_and_edge_is_drawn() {
         assert!(dot.contains(&format!("\"{name}\" [")), "{name} has no node");
     }
     assert_eq!(dot.matches(" -> ").count(), g.edges.len());
-    // The released count is dashed and not red; the frames' edge is red.
+    // The released count is dashed and not red; the frames' edge is red; sizes in binary units.
     assert!(
-        dot.contains("\"head\" -> \"count\" [label=\"f32 160000 B\\nreleased\", style=dashed];")
+        dot.contains(
+            "\"count\" -> \"job's results\" [label=\"i64 64 B\\nreleased\", style=dashed];"
+        )
     );
-    assert!(dot.contains("\"frames\" -> \"decode\" [label=\"bytes 1200000000 B\", color=red];"));
+    assert!(dot.contains("\"frames\" -> \"decode\" [label=\"bytes 1.12 GiB\", color=red];"));
+    for size in [
+        "4 KiB", "156 KiB", "18.4 MiB", "287 MiB", "1.12 GiB", "64 B",
+    ] {
+        assert!(dot.contains(size), "{size}");
+    }
+    assert!(dot.contains("rankdir=TB;"));
 }
 
 #[test]

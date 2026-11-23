@@ -2,7 +2,8 @@
 //!
 //! Inputs are ellipses, parts boxes (a replicable part a stack of them), a chain's parts sit in
 //! a cluster, and the job's results meet in one node. Each edge is labelled with its dtype and
-//! size. An edge carrying data computed from a local-only input is red, and a released one dashed,
+//! size, the size in binary units (`1.12 GiB`). It is laid out top to bottom, so that a graph
+//! shown in a column of text keeps its labels readable. An edge carrying data computed from a local-only input is red, and a released one dashed,
 //! so that what may leave the house can be told apart at a glance.
 
 use std::fmt::Write;
@@ -53,6 +54,33 @@ fn dtype(d: crate::Dtype) -> &'static str {
     }
 }
 
+/// `bytes` in binary units, to three significant digits: `64 B`, `4 KiB`, `1.12 GiB`.
+fn size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit + 1 < UNITS.len() {
+        v /= 1024.0;
+        unit += 1;
+    }
+    let mut n = if unit == 0 || v >= 100.0 {
+        std::format!("{v:.0}")
+    } else if v >= 10.0 {
+        std::format!("{v:.1}")
+    } else {
+        std::format!("{v:.2}")
+    };
+    if n.contains('.') {
+        while n.ends_with('0') {
+            n.pop();
+        }
+        if n.ends_with('.') {
+            n.pop();
+        }
+    }
+    std::format!("{n} {}", UNITS[unit])
+}
+
 /// The node the job's results go to; a name no input or part can take, since it holds a space.
 const RESULTS: &str = "job's results";
 
@@ -65,11 +93,11 @@ impl Graph {
         let mut d = String::new();
         let w = &mut d;
         let _ = writeln!(w, "digraph {} {{", quoted(&self.job.name));
-        let _ = writeln!(w, "  rankdir=LR;");
+        let _ = writeln!(w, "  rankdir=TB;");
         let _ = writeln!(w, "  node [fontname=\"monospace\"];");
         let _ = writeln!(w, "  edge [fontname=\"monospace\"];");
         for input in &self.inputs {
-            let mut label = std::format!("{}\n{} B", input.name, input.bytes);
+            let mut label = std::format!("{}\n{}", input.name, size(input.bytes));
             if input.local_only {
                 label.push_str("\nlocal-only");
             }
@@ -141,7 +169,7 @@ impl Graph {
             );
         }
         for (i, e) in self.edges.iter().enumerate() {
-            let mut label = std::format!("{} {} B", dtype(e.dtype), e.bytes);
+            let mut label = std::format!("{} {}", dtype(e.dtype), size(e.bytes));
             let mut style = String::new();
             if e.release {
                 label.push_str("\nreleased");

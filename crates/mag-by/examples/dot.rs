@@ -12,6 +12,8 @@ pub fn run(text: &str) -> Result<String, ReadError> {
     Ok(Graph::from_json(text)?.to_dot())
 }
 
+// The test of this example includes this file as a module, to call `run`; there `main` is never
+// called, hence the allowance.
 #[allow(dead_code)]
 fn main() {
     let Some(path) = std::env::args().nth(1) else {

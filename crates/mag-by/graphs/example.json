@@ -104,9 +104,7 @@
       "memory_bytes": 1048576,
       "weights": [],
       "tolerance": "exact",
-      "pin": {
-        "member": "member-a"
-      }
+      "note": "reads the classifier's local-only output, so it stays local; only its result, a count per class, is released"
     }
   ],
   "chains": [
@@ -159,8 +157,7 @@
       "to": "count",
       "dtype": "f32",
       "bytes": 160000,
-      "release": true,
-      "note": "counts per class reveal nothing of a frame"
+      "release": false
     },
     {
       "from": "head",
@@ -172,7 +169,8 @@
       "from": "count",
       "dtype": "i64",
       "bytes": 64,
-      "release": false
+      "release": true,
+      "note": "a count per class reveals nothing of any one frame"
     }
   ],
   "note": "a sketch of a labelling job, to show the format"

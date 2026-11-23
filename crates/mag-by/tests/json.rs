@@ -27,9 +27,10 @@ fn the_examples_counts_are_released_and_its_labels_stay_local() {
     let m = g.local_only().unwrap();
     let names: Vec<_> = g.parts.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["decode", "b0", "b1", "head", "count"]);
-    assert_eq!(m.parts, [true, true, true, true, false]);
-    // The labels leave the job unreleased; the count of them leaves released.
-    assert_eq!(m.edges[6..], [true, false]);
+    // Every part reads local-only data, the count included: it stays local.
+    assert_eq!(m.parts, [true, true, true, true, true]);
+    // The labels reach the count and leave the job unreleased; only the count leaves released.
+    assert_eq!(m.edges[5..], [true, true, false]);
 }
 
 #[test]
@@ -343,7 +344,7 @@ fn a_repeated_key_is_refused_wherever_it_stands() {
         ),
         (
             with_text("\"release\": true", ", \"release\": false"),
-            "edges[5].release",
+            "edges[7].release",
         ),
         (with_text("\"version\": 1", ", \"version\": 1"), "version"),
     ];

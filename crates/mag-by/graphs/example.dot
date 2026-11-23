@@ -1,24 +1,24 @@
 digraph "label-frames" {
-  rankdir=LR;
+  rankdir=TB;
   node [fontname="monospace"];
   edge [fontname="monospace"];
-  "frames" [shape=ellipse, label="frames\n1200000000 B\nlocal-only", color=red];
-  "classes" [shape=ellipse, label="classes\n4096 B"];
+  "frames" [shape=ellipse, label="frames\n1.12 GiB\nlocal-only", color=red];
+  "classes" [shape=ellipse, label="classes\n4 KiB"];
   "decode" [shape=box3d, label="decode\ndecode-resize v1\nreplicable, stops each item", color=red];
   "head" [shape=box, label="head\nclassify v1\natomic, stops each item", color=red];
-  "count" [shape=box, label="count\ncount v1\natomic, stops each item"];
+  "count" [shape=box, label="count\ncount v1\natomic, stops each item", color=red];
   subgraph "cluster model" {
     label="chain model";
     "b0" [shape=box, label="b0\nblock v1\natomic, stops each item", color=red];
     "b1" [shape=box, label="b1\nblock v1\natomic, stops each item", color=red];
   }
   "job's results" [shape=doublecircle, label="results"];
-  "frames" -> "decode" [label="bytes 1200000000 B", color=red];
-  "decode" -> "b0" [label="bf16 301056000 B", color=red];
-  "b0" -> "b1" [label="bf16 19267584 B", color=red];
-  "b1" -> "head" [label="bf16 19267584 B", color=red];
-  "classes" -> "head" [label="i32 4096 B"];
-  "head" -> "count" [label="f32 160000 B\nreleased", style=dashed];
-  "head" -> "job's results" [label="f32 160000 B", color=red];
-  "count" -> "job's results" [label="i64 64 B"];
+  "frames" -> "decode" [label="bytes 1.12 GiB", color=red];
+  "decode" -> "b0" [label="bf16 287 MiB", color=red];
+  "b0" -> "b1" [label="bf16 18.4 MiB", color=red];
+  "b1" -> "head" [label="bf16 18.4 MiB", color=red];
+  "classes" -> "head" [label="i32 4 KiB"];
+  "head" -> "count" [label="f32 156 KiB", color=red];
+  "head" -> "job's results" [label="f32 156 KiB", color=red];
+  "count" -> "job's results" [label="i64 64 B\nreleased", style=dashed];
 }
