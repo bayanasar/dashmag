@@ -1,8 +1,8 @@
 //! The ledger's lines: a [`Ledger`] in JSON Lines, as the host of a pool appends it and reads it
 //! back.
 //!
-//! The first line is the header: `format` `"mag-ledger"`, `version` 1, and the members and offers
-//! the pool began with. Each line after it is one [`Entry`], written when the pool takes its
+//! The first line is the header: `format` `"mag-ledger"`, `version` 1, and the time, members
+//! and offers the pool began with. Each line after it is one [`Entry`], written when the pool takes its
 //! change. A line is one JSON object and ends with its newline; JSON escapes a newline inside a
 //! string, so none can break a line. The words are written as the graph file's are.
 //!
@@ -97,6 +97,7 @@ pub struct ReadLedger {
 struct HeaderOut<'a> {
     format: &'static str,
     version: u64,
+    at: f64,
     members: &'a [Member],
     offers: &'a [Offer],
 }
@@ -105,6 +106,8 @@ struct HeaderOut<'a> {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Header {
+    /// The pool's time when it began, in seconds.
+    at: f64,
     /// The members the pool began with, as they were given to it.
     members: Vec<Member>,
     /// The offers the pool began with, in the order of the devices' ids.
@@ -121,12 +124,13 @@ enum Line {
 }
 
 impl Ledger {
-    /// The first line: the format and version, and the members and offers the pool began with,
-    /// with its newline.
+    /// The first line: the format and version, and the time, members and offers the pool began
+    /// with, with its newline.
     pub fn header_line(&self) -> String {
         let header = HeaderOut {
             format: LEDGER_FORMAT,
             version: LEDGER_VERSION,
+            at: self.at,
             members: &self.members,
             offers: &self.offers,
         };
@@ -163,7 +167,11 @@ impl Ledger {
                 None => LedgerError::Format { found: None },
             });
         };
-        let (members, offers) = header(head)?;
+        let Header {
+            at,
+            members,
+            offers,
+        } = header(head)?;
         let entries = entries
             .iter()
             .enumerate()
@@ -171,6 +179,7 @@ impl Ledger {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(ReadLedger {
             ledger: Ledger {
+                at,
                 members,
                 offers,
                 entries,
@@ -200,8 +209,8 @@ fn no_repeats(text: &str, line: usize) -> Result<(), LedgerError> {
     }
 }
 
-/// The header's members and offers, its format and version checked first.
-fn header(text: &str) -> Result<(Vec<Member>, Vec<Offer>), LedgerError> {
+/// The header, its format and version checked first.
+fn header(text: &str) -> Result<Header, LedgerError> {
     let mut value = parse(text, 1)?;
     let Value::Object(fields) = &mut value else {
         return Err(LedgerError::Format { found: None });
@@ -223,9 +232,7 @@ fn header(text: &str) -> Result<(Vec<Member>, Vec<Offer>), LedgerError> {
         }
     }
     no_repeats(text, 1)?;
-    let h: Header =
-        serde_json::from_value(value).map_err(|error| LedgerError::Json { line: 1, error })?;
-    Ok((h.members, h.offers))
+    serde_json::from_value(value).map_err(|error| LedgerError::Json { line: 1, error })
 }
 
 fn entry(text: &str, line: usize) -> Result<Entry, LedgerError> {

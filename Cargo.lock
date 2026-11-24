@@ -4212,6 +4212,7 @@ name = "mag-mortar"
 version = "0.0.1"
 dependencies = [
  "mag-by",
+ "serde_json",
 ]
 
 [[package]]

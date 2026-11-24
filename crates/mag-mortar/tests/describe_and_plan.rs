@@ -190,7 +190,10 @@ fn a_description_shows_where_each_job_is_how_long_each_waited_and_the_stricter_m
         .iter()
         .map(|f| (f.name.as_str(), f.version))
         .collect();
-    assert_eq!(formats, [("mag-graph", 1), ("mag-ledger", 1)]);
+    assert_eq!(
+        formats,
+        [("mag-graph", 1), ("mag-ledger", 1), ("mag-pool", 1)]
+    );
 }
 
 #[test]

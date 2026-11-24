@@ -60,3 +60,9 @@ jobs:
       # read back exactly through mag-by's own.
       - name: The placement loop's tests, the guard's and the ledger's among them
         run: cargo test --locked -p mag-mortar
+
+      - name: The plan command, as the README gives it, prints the kept plan
+        run: |
+          cargo run --locked -q -p mag-mortar --features files --example mag -- plan \
+            crates/mag-by/pools/example.json crates/mag-by/graphs/example.json > plan.txt
+          diff crates/mag-mortar/plans/example.txt plan.txt

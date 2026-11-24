@@ -58,7 +58,8 @@ use std::fmt;
 use mag_by::{
     Arrangement, Candidate, Change, Cost, Description, DeviceId, Dtype, Entry, Event, Format,
     GRAPH_FORMAT, GRAPH_VERSION, Graph, Held, LEDGER_FORMAT, LEDGER_VERSION, Ledger, LocalOnly,
-    Mark, Member, Move, Offer, Pin, Place, Record, Refusal, Removal, Unit,
+    Mark, Member, Move, Offer, POOL_FORMAT, POOL_VERSION, Pin, Place, Record, Refusal, Removal,
+    Unit,
 };
 
 /// The most candidates listed one by one before generation turns greedy (proposed).
@@ -122,6 +123,26 @@ impl fmt::Display for ReplayError {
 
 impl std::error::Error for ReplayError {}
 
+/// Why a pool is not begun from a description: it holds jobs, and a description has their places
+/// but not their graphs. Such a pool comes back from its ledger instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoldsJobs {
+    pub jobs: Vec<String>,
+}
+
+impl fmt::Display for HoldsJobs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the pool holds jobs ({}), whose graphs a description does not carry; replay its \
+             ledger instead",
+            self.jobs.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for HoldsJobs {}
+
 /// A job the pool holds: its graph, its marks, where its parts are, and how long it has waited.
 #[derive(Clone, Debug)]
 struct Live {
@@ -182,19 +203,35 @@ struct Built {
 }
 
 impl Pool {
-    /// A pool of these members and their devices' offers, holding no job.
-    pub fn new(members: Vec<Member>, mut offers: Vec<Offer>) -> Self {
+    /// A pool of these members and their devices' offers, holding no job, at time 0.
+    pub fn new(members: Vec<Member>, offers: Vec<Offer>) -> Self {
+        Pool::begin(members, offers, 0.0)
+    }
+
+    /// A pool begun from a description, as a pool file holds one: its members, offers and time.
+    /// A description of a pool that holds jobs is refused.
+    pub fn from_description(d: &Description) -> Result<Pool, HoldsJobs> {
+        if !d.jobs.is_empty() {
+            return Err(HoldsJobs {
+                jobs: d.jobs.iter().map(|h| h.arrangement.job.clone()).collect(),
+            });
+        }
+        Ok(Pool::begin(d.members.clone(), d.offers.clone(), d.at))
+    }
+
+    fn begin(members: Vec<Member>, mut offers: Vec<Offer>, at: f64) -> Self {
         offers.sort_by(|a, b| a.device.cmp(&b.device));
         let mut pool = Pool {
             members: Vec::new(),
             offers: offers.clone(),
             jobs: Vec::new(),
             ledger: Ledger {
+                at,
                 members: members.clone(),
                 offers,
                 entries: Vec::new(),
             },
-            now: 0.0,
+            now: at,
         };
         for m in members {
             pool.add_member(m);
@@ -202,10 +239,11 @@ impl Pool {
         pool
     }
 
-    /// The pool a ledger describes: begun with its members and offers, then told each change at
-    /// its time, each record compared with the one logged. Its own ledger is then the same.
+    /// The pool a ledger describes: begun with its time, members and offers, then told each
+    /// change at its time, each record compared with the one logged. Its own ledger is then the
+    /// same.
     pub fn replay(ledger: &Ledger) -> Result<Pool, ReplayError> {
-        let mut pool = Pool::new(ledger.members.clone(), ledger.offers.clone());
+        let mut pool = Pool::begin(ledger.members.clone(), ledger.offers.clone(), ledger.at);
         for (entry, e) in ledger.entries.iter().enumerate() {
             match pool.apply(e.change.clone(), e.at) {
                 Ok(record) if record == &e.record => {}
@@ -260,6 +298,10 @@ impl Pool {
                 Format {
                     name: LEDGER_FORMAT.into(),
                     version: LEDGER_VERSION,
+                },
+                Format {
+                    name: POOL_FORMAT.into(),
+                    version: POOL_VERSION,
                 },
             ],
         }

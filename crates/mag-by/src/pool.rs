@@ -10,6 +10,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt;
 
 #[cfg(feature = "graph")]
 use crate::graph::present;
@@ -20,6 +21,12 @@ pub const LEDGER_FORMAT: &str = "mag-ledger";
 
 /// The ledger's `version` this crate reads and writes.
 pub const LEDGER_VERSION: u64 = 1;
+
+/// The pool file's `format`: a pool's [`Description`].
+pub const POOL_FORMAT: &str = "mag-pool";
+
+/// The pool file's `version` this crate reads and writes.
+pub const POOL_VERSION: u64 = 1;
 
 /// A machine in the pool, running `mag-mar`.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +54,13 @@ pub struct Member {
 pub struct DeviceId {
     pub member: String,
     pub index: u32,
+}
+
+/// `member/index`, as `workstation/0`.
+impl fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.member, self.index)
+    }
 }
 
 /// What a device gives the pool now.
@@ -189,6 +203,40 @@ pub enum Removal {
     Guard { part: String, device: DeviceId },
     /// The job's need is not met: its rate is below the rate it declared.
     Need { job: String },
+}
+
+/// The reason in words, for a person reading a plan.
+impl fmt::Display for Removal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Removal::NoDevice { device } => write!(f, "{device} is not in the pool"),
+            Removal::Memory { device } => write!(
+                f,
+                "{device} has not the memory for the parts that would be placed on it"
+            ),
+            Removal::Tolerance { part, device } => write!(
+                f,
+                "{device}'s measured bounds do not meet {part}'s tolerance class"
+            ),
+            Removal::Dtype { part, device } => write!(
+                f,
+                "{device} does not compute in a dtype that {part}'s edges carry"
+            ),
+            Removal::Pin { part, device } => {
+                write!(
+                    f,
+                    "{part} is pinned to a member or backend that {device} is not"
+                )
+            }
+            Removal::Guard { part, device } => write!(
+                f,
+                "the guard: {part} carries local-only data, and {device}'s member is remote"
+            ),
+            Removal::Need { job } => {
+                write!(f, "{job} would run below the rate it needs")
+            }
+        }
+    }
 }
 
 /// One candidate arrangement of the jobs an event touches.
@@ -366,6 +414,8 @@ pub struct Entry {
 /// refused change is not in it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Ledger {
+    /// The pool's time when it began, in seconds: 0, or the time of the pool file it began from.
+    pub at: f64,
     pub members: Vec<Member>,
     /// In the order of the devices' ids.
     pub offers: Vec<Offer>,

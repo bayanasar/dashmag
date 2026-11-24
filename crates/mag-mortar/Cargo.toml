@@ -21,3 +21,9 @@ files = ["mag-by/graph"]
 [dev-dependencies]
 # The tests write and read the ledger's lines whatever features the command line names.
 mag-by = { workspace = true, features = ["graph"] }
+# The `mag` example prints a record as JSON.
+serde_json = "1"
+
+[[example]]
+name = "mag"
+required-features = ["files"]

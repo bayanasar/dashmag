@@ -26,13 +26,21 @@
 //! Writing gives `format` and `version` first and the fields in a fixed order, every field but
 //! an absent option, two-space indented with a final newline, so that reading what was written
 //! and writing it again gives the same text.
+//!
+//! The pool file is read and written the same way: a [`Description`] in JSON, `format`
+//! `"mag-pool"`, `version` 1, as `describe` gives it, so that a pool can be written to a file and
+//! planned against elsewhere. [`pool_schema`] is its schema, kept at
+//! `schemas/mag-pool.schema.json`.
 
 use core::fmt;
 use std::string::{String, ToString};
 
 use serde_json::Value;
 
-use crate::{GRAPH_FORMAT as FORMAT, GRAPH_VERSION as VERSION, Graph, Refusal};
+use crate::{
+    Description, GRAPH_FORMAT as FORMAT, GRAPH_VERSION as VERSION, Graph, POOL_FORMAT,
+    POOL_VERSION, Refusal,
+};
 
 /// Why a graph file was not read.
 #[derive(Debug)]
@@ -87,41 +95,115 @@ impl core::error::Error for ReadError {
     }
 }
 
+/// Why the pool file was not read.
+#[derive(Debug)]
+pub enum PoolFileError {
+    /// Not JSON, or not a pool's description: a field missing, unknown, `null` or of the wrong
+    /// type.
+    Json(serde_json::Error),
+    /// `format` is not `"mag-pool"`, or the file is not an object. The JSON found, if any.
+    Format { found: Option<String> },
+    /// `version` is not 1. The JSON found, if any.
+    Version { found: Option<String> },
+    /// A key appears twice in one object. Where, as a path such as `offers[0].memory_bytes`.
+    RepeatedKey { at: String },
+}
+
+impl fmt::Display for PoolFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PoolFileError::Json(e) => write!(f, "not a pool file: {e}"),
+            PoolFileError::Format { found: Some(found) } => {
+                write!(f, "the format is {found}, not \"{POOL_FORMAT}\"")
+            }
+            PoolFileError::Format { found: None } => {
+                write!(f, "not a pool file: no \"format\": \"{POOL_FORMAT}\"")
+            }
+            PoolFileError::Version { found: Some(found) } => write!(
+                f,
+                "the version is {found}; this reader reads version {POOL_VERSION}"
+            ),
+            PoolFileError::Version { found: None } => write!(f, "the pool file has no version"),
+            PoolFileError::RepeatedKey { at } => {
+                write!(
+                    f,
+                    "`{at}` is given twice; a key may appear once in an object"
+                )
+            }
+        }
+    }
+}
+
+impl core::error::Error for PoolFileError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            PoolFileError::Json(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Why a file was not read, before it is read as the type it holds.
+enum Bad {
+    Json(serde_json::Error),
+    Format(Option<String>),
+    Version(Option<String>),
+    RepeatedKey(String),
+}
+
+/// A file's fields after its `format` and `version`, those checked first so that a file of a
+/// newer version is refused as that rather than for fields this reader does not know; then any
+/// repeated key.
+fn read(text: &str, format: &str, version: u64) -> Result<Value, Bad> {
+    let mut value: Value = serde_json::from_str(text).map_err(Bad::Json)?;
+    let Value::Object(fields) = &mut value else {
+        return Err(Bad::Format(None));
+    };
+    match fields.remove("format") {
+        Some(Value::String(f)) if f == format => {}
+        other => return Err(Bad::Format(other.map(|v| v.to_string()))),
+    }
+    match fields.remove("version") {
+        Some(Value::Number(v)) if v.as_u64() == Some(version) => {}
+        other => return Err(Bad::Version(other.map(|v| v.to_string()))),
+    }
+    let repeats: NoRepeats = serde_json::from_str(text).map_err(Bad::Json)?;
+    if let Some(at) = repeats.0 {
+        return Err(Bad::RepeatedKey(at));
+    }
+    Ok(value)
+}
+
 #[derive(serde::Serialize)]
-struct File<'a> {
+struct File<'a, T> {
     format: &'static str,
     version: u64,
     #[serde(flatten)]
-    graph: &'a Graph,
+    body: &'a T,
+}
+
+/// A file: `format` and `version` first, then the fields in a fixed order, two-space indented
+/// with a final newline. A float that is not finite is written as null, which reading refuses.
+fn write<T: serde::Serialize>(format: &'static str, version: u64, body: &T) -> String {
+    let file = File {
+        format,
+        version,
+        body,
+    };
+    let mut text = serde_json::to_string_pretty(&file).expect("a file always serialises to JSON");
+    text.push('\n');
+    text
 }
 
 impl Graph {
     /// Reads a graph file and checks the graph.
     pub fn from_json(text: &str) -> Result<Graph, ReadError> {
-        let mut value: Value = serde_json::from_str(text).map_err(ReadError::Json)?;
-        let Value::Object(fields) = &mut value else {
-            return Err(ReadError::Format { found: None });
-        };
-        match fields.remove("format") {
-            Some(Value::String(f)) if f == FORMAT => {}
-            other => {
-                return Err(ReadError::Format {
-                    found: other.map(|v| v.to_string()),
-                });
-            }
-        }
-        match fields.remove("version") {
-            Some(Value::Number(v)) if v.as_u64() == Some(VERSION) => {}
-            other => {
-                return Err(ReadError::Version {
-                    found: other.map(|v| v.to_string()),
-                });
-            }
-        }
-        let repeats: NoRepeats = serde_json::from_str(text).map_err(ReadError::Json)?;
-        if let Some(at) = repeats.0 {
-            return Err(ReadError::RepeatedKey { at });
-        }
+        let value = read(text, FORMAT, VERSION).map_err(|bad| match bad {
+            Bad::Json(e) => ReadError::Json(e),
+            Bad::Format(found) => ReadError::Format { found },
+            Bad::Version(found) => ReadError::Version { found },
+            Bad::RepeatedKey(at) => ReadError::RepeatedKey { at },
+        })?;
         let graph: Graph = serde_json::from_value(value).map_err(ReadError::Json)?;
         graph.check().map_err(ReadError::Refused)?;
         Ok(graph)
@@ -129,49 +211,67 @@ impl Graph {
 
     /// Writes the graph as a graph file. The graph is written as it is, checked or not.
     pub fn to_json(&self) -> String {
-        let file = File {
-            format: FORMAT,
-            version: VERSION,
-            graph: self,
-        };
-        // A graph holds only strings, integers, floats and booleans. A float that is not finite
-        // (a need `check` refuses) is written as null, which reading refuses.
-        let mut text =
-            serde_json::to_string_pretty(&file).expect("a graph always serialises to JSON");
-        text.push('\n');
-        text
+        write(FORMAT, VERSION, self)
     }
 }
 
-/// The graph file's JSON Schema (draft 2020-12), as text with a final newline: generated from the
-/// types a file is read into, with `format` and `version` as constants, unknown fields refused,
-/// and no `null` anywhere, since the reader refuses one wherever it stands.
-pub fn graph_schema() -> String {
+impl Description {
+    /// Reads a pool file: a pool's description, as `describe` gives it.
+    pub fn from_json(text: &str) -> Result<Description, PoolFileError> {
+        let value = read(text, POOL_FORMAT, POOL_VERSION).map_err(|bad| match bad {
+            Bad::Json(e) => PoolFileError::Json(e),
+            Bad::Format(found) => PoolFileError::Format { found },
+            Bad::Version(found) => PoolFileError::Version { found },
+            Bad::RepeatedKey(at) => PoolFileError::RepeatedKey { at },
+        })?;
+        serde_json::from_value(value).map_err(PoolFileError::Json)
+    }
+
+    /// Writes the description as a pool file, as the graph file is written.
+    pub fn to_json(&self) -> String {
+        write(POOL_FORMAT, POOL_VERSION, self)
+    }
+}
+
+/// A file's JSON Schema (draft 2020-12), as text with a final newline: generated from the type a
+/// file is read into, with `format` and `version` as constants, unknown fields refused, and no
+/// `null` anywhere, since the reader refuses one wherever it stands.
+fn file_schema<T: schemars::JsonSchema>(format: &str, version: u64) -> String {
     let generator = schemars::generate::SchemaSettings::draft2020_12().into_generator();
-    let mut schema = generator.into_root_schema_for::<Graph>().to_value();
+    let mut schema = generator.into_root_schema_for::<T>().to_value();
     strip_null(&mut schema);
     let root = schema
         .as_object_mut()
         .expect("a schema for a struct is an object");
     root.insert(
         "title".into(),
-        format!("{FORMAT}, version {VERSION}").into(),
+        format!("{format}, version {version}").into(),
     );
     let properties = root
         .get_mut("properties")
         .and_then(Value::as_object_mut)
         .expect("a struct's schema has properties");
-    properties.insert("format".into(), serde_json::json!({ "const": FORMAT }));
-    properties.insert("version".into(), serde_json::json!({ "const": VERSION }));
+    properties.insert("format".into(), serde_json::json!({ "const": format }));
+    properties.insert("version".into(), serde_json::json!({ "const": version }));
     let required = root
         .get_mut("required")
         .and_then(Value::as_array_mut)
-        .expect("a graph has required fields");
+        .expect("a file has required fields");
     required.insert(0, "version".into());
     required.insert(0, "format".into());
     let mut text = serde_json::to_string_pretty(&schema).expect("a schema serialises");
     text.push('\n');
     text
+}
+
+/// The graph file's JSON Schema, kept at `schemas/mag-graph.schema.json`.
+pub fn graph_schema() -> String {
+    file_schema::<Graph>(FORMAT, VERSION)
+}
+
+/// The pool file's JSON Schema, kept at `schemas/mag-pool.schema.json`.
+pub fn pool_schema() -> String {
+    file_schema::<Description>(POOL_FORMAT, POOL_VERSION)
 }
 
 /// Takes `null` out of every type a schema allows, as `Option<T>` puts it there.

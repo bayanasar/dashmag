@@ -26,7 +26,9 @@
 //!   `version` 1); `graph_schema`, its JSON Schema; `Graph::to_dot`, the graph as Graphviz DOT
 //!   for a person to look at; and `Ledger::header_line`, `Ledger::line` and
 //!   `Ledger::from_lines`, the ledger as JSON Lines (`format` `"mag-ledger"`, `version` 1), for
-//!   the host of a pool to append and read back, with `ledger_schema`, the schema of a line.
+//!   the host of a pool to append and read back, with `ledger_schema`, the schema of a line;
+//!   and `Description::from_json` and `Description::to_json`, the pool file (`format`
+//!   `"mag-pool"`, `version` 1), with `pool_schema`.
 //!
 //! The author decides what a part is and where the graph may be divided; mag never divides a
 //! part.
@@ -50,11 +52,12 @@ pub use graph::{
     Part, Pin, Refusal, Step, Tolerance, Unit,
 };
 #[cfg(feature = "graph")]
-pub use json::{ReadError, graph_schema};
+pub use json::{PoolFileError, ReadError, graph_schema, pool_schema};
 #[cfg(feature = "graph")]
 pub use ledger::{LedgerError, ReadLedger, ledger_schema};
 pub use local_only::LocalOnly;
 pub use pool::{
     Arrangement, Candidate, Change, Cost, Description, DeviceId, Entry, Event, Format, Held,
-    LEDGER_FORMAT, LEDGER_VERSION, Ledger, Member, Move, Offer, Place, Record, Removal,
+    LEDGER_FORMAT, LEDGER_VERSION, Ledger, Member, Move, Offer, POOL_FORMAT, POOL_VERSION, Place,
+    Record, Removal,
 };

@@ -68,6 +68,7 @@ fn sample() -> Ledger {
         ],
     };
     Ledger {
+        at: 0.0,
         members: vec![member("a", false), member("b", false)],
         offers: vec![offer(device("a", 0))],
         entries: vec![
@@ -174,7 +175,7 @@ fn a_ledger_written_as_lines_reads_back_and_writes_back_byte_for_byte() {
     let ledger = sample();
     let text = ledger.to_lines();
     assert_eq!(text.lines().count(), 1 + ledger.entries.len());
-    assert!(text.starts_with(r#"{"format":"mag-ledger","version":1,"members":"#));
+    assert!(text.starts_with(r#"{"format":"mag-ledger","version":1,"at":0.0,"members":"#));
     let read = Ledger::from_lines(&text).unwrap();
     assert_eq!(read.dropped, None);
     assert_eq!(read.ledger, ledger);

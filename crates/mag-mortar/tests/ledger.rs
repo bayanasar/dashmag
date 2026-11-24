@@ -194,6 +194,7 @@ fn scripted() -> (Pool, Vec<State>) {
 /// The ledger with only its first `n` entries.
 fn prefix(ledger: &Ledger, n: usize) -> Ledger {
     Ledger {
+        at: ledger.at,
         members: ledger.members.clone(),
         offers: ledger.offers.clone(),
         entries: ledger.entries[..n].to_vec(),

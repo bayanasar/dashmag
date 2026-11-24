@@ -577,6 +577,11 @@
       "additionalProperties": false,
       "description": "The header's fields after `format` and `version`.",
       "properties": {
+        "at": {
+          "description": "The pool's time when it began, in seconds.",
+          "format": "double",
+          "type": "number"
+        },
         "format": {
           "const": "mag-ledger"
         },
@@ -601,6 +606,7 @@
       "required": [
         "format",
         "version",
+        "at",
         "members",
         "offers"
       ],
