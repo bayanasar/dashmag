@@ -1,4 +1,8 @@
-//! The controller of a mag pool: the placement loop.
+//! The placement library of a mag pool: the loop that decides where each part of each job runs.
+//!
+//! A [`Pool`] is run by whatever hosts the pool: a home system's control plane, which links this
+//! crate, or, on its own, the program that submits the job. mag keeps no server of its own, and
+//! this crate does no I/O.
 //!
 //! On every event (a job arrives or ends, a device joins or leaves) [`Pool`] runs the same steps
 //! over the jobs the event touches, which here are the jobs waiting:
@@ -183,8 +187,8 @@ impl Live {
     }
 }
 
-/// A pool's controller: its members, their offers, its jobs, and its ledger: what it began with
-/// and every change it was told, with the record of the loop's run on each.
+/// A pool: its members, their offers, its jobs, and its ledger: what it began with and every
+/// change it was told, with the record of the loop's run on each.
 #[derive(Clone, Debug)]
 pub struct Pool {
     members: Vec<Member>,

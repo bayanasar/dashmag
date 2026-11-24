@@ -6,9 +6,11 @@ Dashmag is a general machine-learning library in Rust. Burn beneath it supplies 
 and devices; Dashmag adds the compute layer that applications build on, and inference. Together
 they are meant to do for Rust what PyTorch does for Python.
 
-Dashmag is two families of crates. The `dash-` crates are the library, on the hardware of one
-machine. The `mag-` crates, just begun, are to make one pool of the machines a person has and
-place work across them ([below](#mag-one-pool-from-the-machines-you-have)). dash + mag = Dashmag.
+Dashmag is two families of crates. dash is the operations, the same on every platform: the
+`dash-` crates are the library, on the hardware of one machine. mag is the pathway from one
+algorithm to whatever devices are there, on every platform: the `mag-` crates, just begun, are to
+make one pool of the machines a person has and place work across them. Three crates make it
+([below](#mag-one-pool-from-the-machines-you-have)). dash + mag = Dashmag.
 
 The compute layer is the operations Burn does not have, in forward, backward and decoding-step
 forms with kernels for Burn's backends; layers, such as LoRA; autodiff utilities, such as
@@ -40,8 +42,8 @@ operations, such as attention against a key-value cache and the gated delta rule
 | [`dash-peft`](crates/dash-peft) | PEFT's LoRA adapter files with no tensor library: read and written back byte for byte, and applied to a backend's layers and read out of them through one trait | dash-mag's LoRA layer implements the trait; PEFT's files written back byte for byte |
 | [`dash-mlx`](crates/dash-mlx) | dash-ops' operations on MLX, with their contracts, for Apple silicon: attention, conv1d, the gated delta rule, chosen-token log-probabilities, the fused linear cross-entropy, the low-rank product, recompute and sampling, with Metal kernels where MLX's operations fall short | conv1d, the gated delta rule, the log-probability and attention pass dash-conformance's tests; the others are held to dash-ops' tests by ports of them; not published |
 | [`dash-mag`](crates/dash-mag) | the one crate an application names, the gateway to dash and, as they are built, to the `mag-` crates (it does not reach `mag-by` yet): a tensor, its array operations, a vector-Jacobian product, the operations' entry points, LoRA's layer, rotary embeddings, AdamW and clipping, over `dash-ops` or `dash-mlx`, the side chosen at compile time. | on Burn and on MLX: every entry point the same bits as `dash-ops` or `dash-mlx`, one training step from one source held to one recording; LoRA's layer and AdamW held to PEFT's and torch's recordings |
-| [`mag-by`](crates/mag-by) | the description of a job that the `mag-` crates share: the graph of its parts, its checks with typed refusals, what its local-only inputs and weights reach, and, with the `graph` feature, the graph file in JSON with its JSON Schema and DOT for a person to look at; `no_std` with no dependencies unless `graph` is on | its tests hold the checks, the local-only marks, the reader's refusals and the kept schema and DOT to the code; CI builds the default for a `no_std` target with an empty dependency tree; nothing places work yet |
-| [`mag-mortar`](crates/mag-mortar) | the pool's controller: the placement loop, which on each event lists the ways to place the waiting jobs, removes those that break a constraint (memory, tolerance, dtypes, a pin, a job's need, the guard on local-only data), scores the rest from the devices' measured costs and the jobs' priorities, commits the best and records every candidate; run on offers given as data | its tests hold each constraint, the guard, priorities and the record, each named for what it holds; no member, network or probe yet |
+| [`mag-by`](crates/mag-by) | the words the `mag-` crates share: the graph of a job's parts, its checks with typed refusals, what its local-only inputs and weights reach, and the pool's words (offers, arrangements, records, a pool's description and its ledger); with the `graph` feature, the files in JSON (the graph, the pool and the ledger's lines) with their JSON Schemas, and DOT for a person to look at; `no_std` with no dependencies unless `graph` is on | its tests hold the checks, the local-only marks, each file's refusals and the kept schemas and DOT to the code; CI builds the default for a `no_std` target with an empty dependency tree |
+| [`mag-mortar`](crates/mag-mortar) | the placement library of a pool: the loop, which on each event lists the ways to place the waiting jobs, removes those that break a constraint (memory, tolerance, dtypes, a pin, a job's need, the guard on local-only data), scores the rest from the devices' measured costs and the jobs' priorities, commits the best and records every candidate; `describe` and `plan` for an author; the pool's state as a ledger its host saves and replays; `mag plan`, a command over files. It does no I/O, and runs on offers given as data | its tests hold each constraint, the guard, priorities and the record, the plan against the submit, the replay of every prefix of a run, and the command's kept output; no member, network or probe yet |
 | [`dash-image`](crates/dash-image) | image preprocessing: JPEG decode, Pillow-exact bilinear resize, normalisation | byte-exact with Pillow's resize |
 | [`dash-core`](https://crates.io/crates/dash-core) | the inference trait: tensors, capability negotiation, dispatch across runtimes | — |
 | [`dash-burn`](crates/dash-burn) | Burn behind that trait: the model built from code, weights loaded, run on Flex (pure-Rust CPU), CUDA, ROCm or Metal | runs on x86-64 (Flex) and on CUDA |
@@ -84,12 +86,18 @@ machines: a workstation with one GPU, a second box with another vendor's card, a
 own accelerator, now and then a rented cloud GPU for a night. Each is too small for some job, and
 most of them are idle most of the time. mag is to make them one pool.
 
-You describe a job as a graph and name no device. The graph says what the parts are (a function,
-the weights it holds, the memory it needs, where it can stop), what flows between them and how
-large it is, which parts may run as many copies, where a model may be divided between devices,
-and what the job needs: a rate or a deadline, and how much it weighs against other jobs. mag is
-to decide where each part runs, and to decide again when a machine joins, leaves or is wanted
-back by its owner.
+The author of an algorithm, often an AI agent, deals with two things: dash's operations, and a
+graph of the job, which names no device. The graph says what the parts are (a function, the
+weights it holds, the memory it needs, where it can stop), what flows between them and how large
+it is, which parts may run as many copies, where a model may be divided between devices, and what
+the job needs: a rate or a deadline, and how much it weighs against other jobs. mag is to decide
+where each part runs, and to decide again when a machine joins, leaves or is wanted back by its
+owner.
+
+mag keeps no server of its own. `mag-mortar` is the placement library: in a home system that
+pools its devices, that system's control plane links it and runs the loop; on its own, the
+program that submits the job does. `mag-mar` is to be a library too, in whatever runs on each
+machine.
 
 It is designed for:
 
@@ -117,18 +125,48 @@ Graphviz installed:
 
     cargo run -p mag-by --features graph --example dot -- your-graph.json | dot -Tsvg > graph.svg
 
-[`mag-mortar`](crates/mag-mortar), the pool's controller, holds the placement loop, run on what
-each device offers given as data: on every arrival, end, join or leave it lists the ways to
-place the jobs waiting, removes those that break memory, a part's tolerance and dtypes, a pin,
-a job's need or the guard that keeps local-only data off remote machines, scores the rest from
-the devices' measured costs and the jobs' priorities, commits the best, and records every
-candidate with why any was left out. Its tests hold it to the cases it is designed for: a job
-on the fastest device that holds it, copies wherever they fit, a pinned job waiting for its
-backend, the higher priority of two first, and nothing local-only on a remote machine.
+[`mag-mortar`](crates/mag-mortar) holds the placement loop, run on what each device offers given
+as data: on every arrival, end, join or leave it lists the ways to place the jobs waiting,
+removes those that break memory, a part's tolerance and dtypes, a pin, a job's need or the guard
+that keeps local-only data off remote machines, scores the rest from the devices' measured costs
+and the jobs' priorities, commits the best, and records every candidate with why any was left
+out. Its tests hold it to the cases it is designed for: a job on the fastest device that holds
+it, copies wherever they fit, a pinned job waiting for its backend, the higher priority of two
+first, and nothing local-only on a remote machine.
+
+To see it decide, plan the example graph on a pool of four devices described in a file,
+[`pools/example.json`](crates/mag-by/pools/example.json), one of them a fast rented card:
+
+    cargo run -p mag-mortar --features files --example mag -- plan \
+        crates/mag-by/pools/example.json crates/mag-by/graphs/example.json
+
+```text
+label-frames would be placed, by candidate 49 of 65: score 2.000, band ±5%.
+
+  decode  copies on server/0, workstation/0
+  b0      on server/0, with chain model
+  b1      on server/0, with chain model
+  head    on workstation/0
+  count   on workstation/0
+
+Kept off a device, and why:
+  laptop/0's measured bounds do not meet decode's tolerance class
+  the guard: decode carries local-only data, and rented/0's member is remote
+  ...
+```
+
+The rented card is the fastest and gets nothing: every part reads the local-only frames. `head`
+is pinned to CUDA, and the chain's two blocks stay together. The whole output is
+[`plans/example.txt`](crates/mag-mortar/plans/example.txt); `--json` prints the loop's record.
+The command plans and keeps nothing.
+
+A pool keeps its state as a ledger of what it was told, with the record made each time. It
+writes nothing itself: its host appends each entry as a line, and a pool comes back by replaying
+them, each record checked against the one logged.
 
 Not built yet: `mag-mar`, the engine each machine is to run, offering its devices to the pool and
-running the parts placed on it; the network between them; trying candidates on the job's own
-steps; and a ledger kept on disk. Nothing here runs work across machines yet.
+running the parts placed on it; running anything; members on other machines; and trying
+candidates on the job's own steps. Nothing here runs work yet.
 
 The graph file is at version 1 and will change. If your job cannot be said in it, that is what
 we most want to hear: please open an issue.

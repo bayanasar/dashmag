@@ -1,6 +1,6 @@
 [package]
 name = "mag-mortar"
-description = "The controller of a mag pool: the placement loop that decides where each part of each job runs, from what the pool's devices offer, and the record of every decision."
+description = "The placement library of a mag pool: the loop that decides where each part of each job runs, from what the pool's devices offer, with the record of every decision and the pool's state as a ledger to replay. It does no I/O: a home system's control plane, or the program that submits a job, runs it."
 readme = "README.md"
 keywords = ["scheduling", "distributed", "machine-learning"]
 categories = ["science"]

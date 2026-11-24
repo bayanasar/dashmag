@@ -1,6 +1,6 @@
 [package]
 name = "mag-by"
-description = "The words the mag- crates share to place an algorithm's work across a pool of machines: a job's graph, the checks it must pass, and the graph file. no_std, with no dependencies unless the agent's files are wanted."
+description = "The words the mag- crates share to place an algorithm's work across a pool of machines: a job's graph and the checks it must pass, the pool's offers, records, description and ledger, and their files. no_std, with no dependencies unless the files are wanted."
 readme = "README.md"
 keywords = ["scheduling", "distributed", "machine-learning"]
 categories = ["no-std"]
