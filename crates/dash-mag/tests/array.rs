@@ -538,17 +538,20 @@ fn logsumexp_axis_keeps_the_rest_beside_a_dominant_entry() {
     }
 }
 
-/// A second element close to the largest still swallows the small terms after it in its lane, as
-/// the largest did before the two were summed apart: half a unit in the last place of its term is
-/// larger than a term of `exp(-20)`. What it may lose is derived, not measured: every term after
-/// it in a lane of at most a quarter of the row, over the row's total, plus the `2e-7` of a row
-/// with one large element. Placed first, it loses what a device whose lanes hold a quarter of the
-/// row loses; placed last, nothing.
+/// A second large element still moves the small terms after it in its lane: each addition is off
+/// by at most the smaller of the term and half a unit in the last place of the second element's
+/// term, either way. At -1e-6 and -2 half a unit exceeds a term of `exp(-20)` and they are lost,
+/// as the largest's were before the two were summed apart: the result is low. At -3 half a unit
+/// is a little smaller, each term rounds up to a whole unit, and the result is high by about 80%
+/// of them. At -4 each rounds down a little. The bound is derived and holds either way: every
+/// term after it in a lane of at most a quarter of the row, over the row's total, plus the `2e-7`
+/// of a row with one large element. Placed first, it moves what a device whose lanes hold a
+/// quarter of the row moves; placed last, nothing.
 #[test]
-fn logsumexp_axis_beside_a_second_large_entry_loses_at_most_what_follows_it_in_its_lane() {
+fn logsumexp_axis_beside_a_second_large_entry_is_off_by_at_most_what_follows_it_in_its_lane() {
     const N: usize = 1 << 16;
     let small = (-20.0f64).exp();
-    for second in [-1e-6f32, -2.0] {
+    for second in [-1e-6f32, -2.0, -3.0, -4.0] {
         for (top_at, second_at) in [(N - 1, 0), (0, 1), (N / 2, N / 4), (0, N - 1)] {
             let mut row = vec![-20.0f32; N];
             row[top_at] = 0.0;

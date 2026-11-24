@@ -863,14 +863,18 @@ impl Tensor {
     /// of the row (CUDA and ROCm through CubeCL, as measured):
     /// - One largest element, or several tied: within about `2e-7` of the definition, wherever
     ///   they stand. The rest's own sum is off by at most half a unit, relative, per addition.
-    /// - A second element within about 3.4 of the largest (its term `t` above 0.035, where half a
-    ///   unit in the last place of `t` exceeds a term of `exp(-20)`) still swallows, as the largest
-    ///   did before: every later term in its lane smaller than half a unit of the lane's sum is
-    ///   lost. The loss is at most the terms after it in its lane, a quarter of the row's small
-    ///   terms, over `count + t + rest`: `1.7e-5` with `t` near 1 and `3e-5` with `t = exp(-2)`,
-    ///   over 65536 elements with the rest at -20; four times that if a backend sums a row in one
-    ///   lane. The loss then is at least `ln(1 + t)`, so the error is under a quarter of
-    ///   `rest / t` of it, relative.
+    /// - Beside a second element with term `t`, each later addition in its lane is off by at
+    ///   most the smaller of the term added and half a unit in the last place of `t`, in either
+    ///   direction: half a unit is a step of `t`'s binade. With the rest at -20 (terms of
+    ///   `2.06e-9`): from `t = 2^-4`, the second element within 2.77 of the largest, every such
+    ///   term is lost, as the largest's were before; from `t = 2^-5` to `2^-4`, within 2.77 to
+    ///   3.47, each rounds up to a whole unit and the sum is read high by about 80% of them;
+    ///   below `2^-5` the error per term is at most half a unit of `t`, which halves with each
+    ///   binade. So the error is at most the terms after it in its lane over `count + t + rest`,
+    ///   either way. Over 65536 elements, a quarter of them in its lane: `1.7e-5` low with `t`
+    ///   near 1, `3.0e-5` low at `exp(-2)`, `2.6e-5` high at `exp(-3)` and `3.2e-6` low at
+    ///   `exp(-4)`; up to four times as much if a backend sums a row in one lane. The loss is then
+    ///   at least `ln(1 + t)`, so the error is under a quarter of `rest / t` of it, relative.
     ///
     /// While it runs it reserves about three times the input's size on the device beyond the
     /// input: `x - top`, the terms, and one masked copy at a time, the two sums taken in turn.
