@@ -207,7 +207,9 @@ struct Built {
 }
 
 impl Pool {
-    /// A pool of these members and their devices' offers, holding no job, at time 0.
+    /// A pool of these members and their devices' offers, holding no job, at time 0. Of two
+    /// reports of one member the stricter mark stands, and of two offers for one device the later,
+    /// as when they join.
     pub fn new(members: Vec<Member>, offers: Vec<Offer>) -> Self {
         Pool::begin(members, offers, 0.0)
     }
@@ -223,7 +225,13 @@ impl Pool {
         Ok(Pool::begin(d.members.clone(), d.offers.clone(), d.at))
     }
 
-    fn begin(members: Vec<Member>, mut offers: Vec<Offer>, at: f64) -> Self {
+    /// Of two offers for one device the later stands, as a join replaces the earlier offer.
+    fn begin(members: Vec<Member>, given: Vec<Offer>, at: f64) -> Self {
+        let mut offers: Vec<Offer> = Vec::new();
+        for o in given {
+            offers.retain(|x| x.device != o.device);
+            offers.push(o);
+        }
         offers.sort_by(|a, b| a.device.cmp(&b.device));
         let mut pool = Pool {
             members: Vec::new(),
@@ -327,6 +335,11 @@ impl Pool {
     /// The one way into the pool: it takes a change at `at` seconds, runs the loop, and adds the
     /// change with the loop's record to its ledger. A change it refuses leaves it as it was and is
     /// not logged.
+    ///
+    /// A time earlier than the pool's is taken as it is told, and logged as given: the pool's time
+    /// does not go back, and no job's wait grows or shrinks for it. Hosts deliver changes in the
+    /// order they happened, and a change reported a little late is still a change; refusing it
+    /// would lose a job's end or a device's leaving. A replay takes the same path.
     pub fn apply(&mut self, change: Change, at: f64) -> Result<&Record, ChangeError> {
         if !at.is_finite() {
             return Err(ChangeError::Time);

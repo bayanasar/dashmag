@@ -396,3 +396,24 @@ fn a_time_that_is_not_finite_is_refused_and_the_pool_is_unchanged() {
     assert!(matches!(change, Change::Submit { .. }));
     assert_eq!(record.event, Event::Arrival { job: "a".into() });
 }
+
+#[test]
+fn a_time_earlier_than_the_pool_s_is_taken_and_moves_nothing_back() {
+    let mut pool = three_cards();
+    pool.apply(submit(wants_everything("blocker", 1)), 0.0)
+        .unwrap();
+    pool.apply(submit(wants_everything("waits", 1)), 100.0)
+        .unwrap();
+    // Told at 50 s, after the pool reached 100 s: taken, logged at 50, the pool's time and the
+    // waiting job's wait unchanged.
+    pool.apply(end("no such job"), 50.0).unwrap();
+    let d = pool.describe();
+    assert_eq!(d.at, 100.0);
+    assert_eq!(d.jobs[1].waited_seconds, 0.0);
+    assert_eq!(pool.ledger().entries[2].at, 50.0);
+    // Time then runs on from the pool's own: 30 s later the job has waited 30 s.
+    pool.apply(end("no such job"), 130.0).unwrap();
+    assert_eq!(pool.describe().jobs[1].waited_seconds, 30.0);
+    let back = Pool::replay(pool.ledger()).unwrap();
+    assert_eq!(state(&back), state(&pool));
+}

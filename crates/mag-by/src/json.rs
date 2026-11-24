@@ -38,7 +38,7 @@ use std::string::{String, ToString};
 use serde_json::Value;
 
 use crate::{
-    Description, GRAPH_FORMAT as FORMAT, GRAPH_VERSION as VERSION, Graph, POOL_FORMAT,
+    Description, DeviceId, GRAPH_FORMAT as FORMAT, GRAPH_VERSION as VERSION, Graph, POOL_FORMAT,
     POOL_VERSION, Refusal,
 };
 
@@ -107,6 +107,10 @@ pub enum PoolFileError {
     Version { found: Option<String> },
     /// A key appears twice in one object. Where, as a path such as `offers[0].memory_bytes`.
     RepeatedKey { at: String },
+    /// A member is listed twice: a description lists each once, with the stricter of its marks.
+    RepeatedMember { name: String },
+    /// A device is offered twice: a description lists each device's offer once.
+    RepeatedDevice { device: DeviceId },
 }
 
 impl fmt::Display for PoolFileError {
@@ -129,6 +133,12 @@ impl fmt::Display for PoolFileError {
                     f,
                     "`{at}` is given twice; a key may appear once in an object"
                 )
+            }
+            PoolFileError::RepeatedMember { name } => {
+                write!(f, "member `{name}` is listed twice")
+            }
+            PoolFileError::RepeatedDevice { device } => {
+                write!(f, "device {device} is offered twice")
             }
         }
     }
@@ -216,7 +226,9 @@ impl Graph {
 }
 
 impl Description {
-    /// Reads a pool file: a pool's description, as `describe` gives it.
+    /// Reads a pool file: a pool's description, as `describe` gives it. A member listed twice,
+    /// or a device offered twice, is refused: `describe` never writes either, and which of two
+    /// would stand is not the file's to leave open.
     pub fn from_json(text: &str) -> Result<Description, PoolFileError> {
         let value = read(text, POOL_FORMAT, POOL_VERSION).map_err(|bad| match bad {
             Bad::Json(e) => PoolFileError::Json(e),
@@ -224,7 +236,22 @@ impl Description {
             Bad::Version(found) => PoolFileError::Version { found },
             Bad::RepeatedKey(at) => PoolFileError::RepeatedKey { at },
         })?;
-        serde_json::from_value(value).map_err(PoolFileError::Json)
+        let d: Description = serde_json::from_value(value).map_err(PoolFileError::Json)?;
+        for (i, m) in d.members.iter().enumerate() {
+            if d.members[..i].iter().any(|x| x.name == m.name) {
+                return Err(PoolFileError::RepeatedMember {
+                    name: m.name.clone(),
+                });
+            }
+        }
+        for (i, o) in d.offers.iter().enumerate() {
+            if d.offers[..i].iter().any(|x| x.device == o.device) {
+                return Err(PoolFileError::RepeatedDevice {
+                    device: o.device.clone(),
+                });
+            }
+        }
+        Ok(d)
     }
 
     /// Writes the description as a pool file, as the graph file is written.

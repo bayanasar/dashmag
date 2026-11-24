@@ -366,3 +366,40 @@ fn lines_the_reader_refuses_for_their_form_are_invalid() {
         assert!(!v.is_valid(&value), "the schema takes {what}");
     }
 }
+
+#[test]
+fn a_last_line_cut_short_is_dropped_and_its_number_given() {
+    let ledger = sample();
+    let text = ledger.to_lines();
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let n = lines.len();
+    let but_last = Ledger {
+        entries: ledger.entries[..ledger.entries.len() - 1].to_vec(),
+        ..ledger.clone()
+    };
+
+    // Cut in the middle of its JSON.
+    let last = lines[n - 1];
+    let cut = format!("{}{}", lines[..n - 1].concat(), &last[..last.len() / 2]);
+    let read = Ledger::from_lines(&cut).unwrap();
+    assert_eq!((read.dropped, &read.ledger), (Some(n), &but_last));
+
+    // Whole but for its newline: not written until its newline is.
+    let read = Ledger::from_lines(text.strip_suffix('\n').unwrap()).unwrap();
+    assert_eq!((read.dropped, &read.ledger), (Some(n), &but_last));
+
+    // A whole ledger drops nothing.
+    assert_eq!(Ledger::from_lines(&text).unwrap().dropped, None);
+
+    // A header alone, cut short or without its newline: there is no ledger to read.
+    let header = lines[0];
+    for torn in [
+        &header[..header.len() / 2],
+        header.strip_suffix('\n').unwrap(),
+    ] {
+        assert!(matches!(
+            Ledger::from_lines(torn),
+            Err(LedgerError::Torn { line: 1 })
+        ));
+    }
+}

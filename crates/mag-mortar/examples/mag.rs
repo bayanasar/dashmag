@@ -89,6 +89,12 @@ fn explain(graph: &Graph, record: &Record) -> String {
     let job = &graph.job.name;
     let mut out = String::new();
     let kept_off = kept_off(graph, record);
+    let all = record.candidates.len();
+    let removed = record
+        .candidates
+        .iter()
+        .filter(|c| c.removed.is_some())
+        .count();
     match record.chosen {
         Some(c) => {
             let chosen = &record.candidates[c];
@@ -96,9 +102,9 @@ fn explain(graph: &Graph, record: &Record) -> String {
             let band = chosen.band.unwrap_or(0.0);
             writeln!(
                 out,
-                "{job} would be placed, by candidate {} of {}: score {score:.3}, band ±{:.0}%.",
-                c + 1,
-                record.candidates.len(),
+                "{job} would be placed: of {all} candidates, {removed} were removed and {} \
+                 scored.\nThe best scores {score:.3}, band ±{:.0}%.",
+                all - removed,
                 band * 100.0
             )
             .unwrap();
@@ -126,8 +132,8 @@ fn explain(graph: &Graph, record: &Record) -> String {
         None => {
             writeln!(
                 out,
-                "{job} would wait: of {} candidates, none that places it is kept.",
-                record.candidates.len()
+                "{job} would wait: of {all} candidates, {removed} were removed.\nNone of the rest \
+                 scores above leaving it waiting."
             )
             .unwrap();
         }

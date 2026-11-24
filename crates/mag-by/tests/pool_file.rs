@@ -127,3 +127,23 @@ fn the_schema_takes_the_example_and_refuses_what_the_reader_refuses_for_its_form
         );
     }
 }
+
+#[test]
+fn a_member_listed_twice_or_a_device_offered_twice_is_refused() {
+    let member = changed(|v| {
+        let first = v["members"][0].clone();
+        v["members"].as_array_mut().unwrap().push(first);
+    });
+    let err = Description::from_json(&member).unwrap_err();
+    assert!(
+        matches!(&err, PoolFileError::RepeatedMember { name } if name == "workstation"),
+        "{err}"
+    );
+    let device = changed(|v| {
+        let mut again = v["offers"][3].clone();
+        again["memory_bytes"] = 1.into();
+        v["offers"].as_array_mut().unwrap().push(again);
+    });
+    let err = Description::from_json(&device).unwrap_err();
+    assert_eq!(err.to_string(), "device workstation/0 is offered twice");
+}

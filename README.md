@@ -141,7 +141,8 @@ To see it decide, plan the example graph on a pool of four devices described in 
         crates/mag-by/pools/example.json crates/mag-by/graphs/example.json
 
 ```text
-label-frames would be placed, by candidate 49 of 65: score 2.000, band ±5%.
+label-frames would be placed: of 65 candidates, 58 were removed and 7 scored.
+The best scores 2.000, band ±5%.
 
   decode  copies on server/0, workstation/0
   b0      on server/0, with chain model

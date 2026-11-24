@@ -202,7 +202,7 @@ fn a_job_that_waits_again_after_being_placed_counts_its_wait_from_zero() {
         vec![member("a", false), member("b", false)],
         vec![offer(device("a", 0), Backend::Cuda, 16, &[("u", 0.01)])],
     );
-    pool.submit(one_part("holder", 1, 12), 0.0).unwrap();
+    pool.submit(one_part("resident", 1, 12), 0.0).unwrap();
     pool.submit(one_part("late", 1, 12), 0.0).unwrap();
     // It waits 100 s, is placed when a device joins, and loses that device 10 s later.
     pool.join(
@@ -217,4 +217,45 @@ fn a_job_that_waits_again_after_being_placed_counts_its_wait_from_zero() {
     // Its wait now runs from the leave, not from its arrival.
     pool.end("no such job", 130.0).unwrap();
     assert_eq!(pool.describe().jobs[1].waited_seconds, 20.0);
+}
+
+#[test]
+fn a_plan_on_a_pool_whose_time_has_moved_ages_its_waiting_jobs_from_the_pool_s_time() {
+    let mut pool = one_device();
+    pool.submit(one_part("first", 10, 1), 0.0).unwrap();
+    pool.submit(one_part("second", 1, 1), 0.0).unwrap();
+    // The pool's time moves to 500 s; the second job has waited all of it.
+    pool.end("no such job", 500.0).unwrap();
+    assert_eq!(pool.describe().at, 500.0);
+    assert_eq!(pool.describe().jobs[1].waited_seconds, 500.0);
+    // At 500 s it weighs 1 + 500/60 and still waits; at 600 s, 1 + 600/60, and it is placed.
+    // Each plan is the record a submit at that time makes, on a copy of the pool.
+    let third = one_part("third", 1, 1);
+    for (at, placed) in [(500.0, false), (600.0, true)] {
+        let planned = pool.plan(&third, at).unwrap();
+        let mut copy = pool.clone();
+        assert_eq!(&planned, copy.submit(third.clone(), at).unwrap(), "at {at}");
+        assert_eq!(planned.chosen.is_some(), placed, "at {at}");
+    }
+    assert_eq!(pool.describe().at, 500.0);
+}
+
+#[test]
+fn of_two_offers_for_one_device_given_to_a_new_pool_the_later_stands() {
+    let pool = Pool::new(
+        vec![member("a", false)],
+        vec![
+            offer(device("a", 0), Backend::Cuda, 16, &[("u", 0.01)]),
+            offer(device("a", 1), Backend::Cuda, 8, &[("u", 0.01)]),
+            offer(device("a", 0), Backend::Cuda, 24, &[("u", 0.02)]),
+        ],
+    );
+    let d = pool.describe();
+    let offers: Vec<_> = d
+        .offers
+        .iter()
+        .map(|o| (o.device.clone(), o.memory_bytes >> 30))
+        .collect();
+    assert_eq!(offers, [(device("a", 0), 24), (device("a", 1), 8)]);
+    assert_eq!(pool.ledger().offers, d.offers);
 }

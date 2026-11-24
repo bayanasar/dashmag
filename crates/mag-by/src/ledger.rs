@@ -2,9 +2,9 @@
 //! back.
 //!
 //! The first line is the header: `format` `"mag-ledger"`, `version` 1, and the time, members
-//! and offers the pool began with. Each line after it is one [`Entry`], written when the pool takes its
-//! change. A line is one JSON object and ends with its newline; JSON escapes a newline inside a
-//! string, so none can break a line. The words are written as the graph file's are.
+//! and offers the pool began with. Each line after it is one [`Entry`], written when the pool
+//! takes its change. A line is one JSON object and ends with its newline; JSON escapes a newline
+//! inside a string, so none can break a line. The words are written as the graph file's are.
 //!
 //! This makes lines and reads them. Opening, appending and syncing a file, or keeping the lines
 //! wherever the host keeps its state, is the host's. A change is acknowledged only once its line
