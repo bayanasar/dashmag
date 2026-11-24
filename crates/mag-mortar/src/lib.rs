@@ -32,6 +32,12 @@
 //! virtual device, and [`Pool::plan`], the record a graph's arrival would make, with the pool
 //! left as it is.
 //!
+//! The pool does no I/O. Every change reaches it through [`Pool::apply`], which adds the change
+//! and the record of the loop's run to its [`Ledger`]. The pool is deterministic, so the ledger
+//! is all its host need keep: [`Pool::replay`] applies the changes again to a pool begun the same
+//! way, and compares each record with the one logged. With the `files` feature the ledger is
+//! written and read as lines (`mag_by::Ledger::line`, `mag_by::Ledger::from_lines`).
+//!
 //! What this step leaves out, and where it comes:
 //! - probing candidates whose bands overlap, which needs runs (with `mag-mar`);
 //! - the time of edges, within a device and across a link;
@@ -50,9 +56,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use mag_by::{
-    Arrangement, Candidate, Cost, Description, DeviceId, Dtype, Event, Format, GRAPH_FORMAT,
-    GRAPH_VERSION, Graph, Held, LocalOnly, Mark, Member, Move, Offer, Pin, Place, Record, Refusal,
-    Removal, Unit,
+    Arrangement, Candidate, Change, Cost, Description, DeviceId, Dtype, Entry, Event, Format,
+    GRAPH_FORMAT, GRAPH_VERSION, Graph, Held, LEDGER_FORMAT, LEDGER_VERSION, Ledger, LocalOnly,
+    Mark, Member, Move, Offer, Pin, Place, Record, Refusal, Removal, Unit,
 };
 
 /// The most candidates listed one by one before generation turns greedy (proposed).
@@ -64,27 +70,57 @@ pub const AGING_SECONDS: f64 = 60.0;
 /// The band given to an estimated cost, relative: wide, so that it is probed and not trusted.
 pub const ESTIMATE_BAND: f64 = 1.0;
 
-/// Why the pool refuses a job.
+/// Why the pool refuses a change. A refused change leaves the pool as it was, and is not in its
+/// ledger.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SubmitError {
+pub enum ChangeError {
     /// The graph fails [`Graph::check`].
     Graph(Refusal),
     /// The pool already holds a job of this name.
     Duplicate { job: String },
+    /// The time is not finite.
+    Time,
 }
 
-impl fmt::Display for SubmitError {
+impl fmt::Display for ChangeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SubmitError::Graph(r) => write!(f, "the graph is refused: {r}"),
-            SubmitError::Duplicate { job } => {
+            ChangeError::Graph(r) => write!(f, "the graph is refused: {r}"),
+            ChangeError::Duplicate { job } => {
                 write!(f, "the pool already holds a job named `{job}`")
             }
+            ChangeError::Time => write!(f, "the time is not finite"),
         }
     }
 }
 
-impl std::error::Error for SubmitError {}
+impl std::error::Error for ChangeError {}
+
+/// Why a ledger was not replayed. Entries are counted from 0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayError {
+    /// The pool refuses this entry's change.
+    Refused { entry: usize, error: ChangeError },
+    /// This entry's change made a record other than the one logged: the ledger is not this
+    /// pool's, or not this version's.
+    Differs { entry: usize },
+}
+
+impl fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReplayError::Refused { entry, error } => {
+                write!(f, "entry {entry} is refused on replay: {error}")
+            }
+            ReplayError::Differs { entry } => write!(
+                f,
+                "entry {entry} made another record on replay than the one logged"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {}
 
 /// A job the pool holds: its graph, its marks, where its parts are, and how long it has waited.
 #[derive(Clone, Debug)]
@@ -126,14 +162,14 @@ impl Live {
     }
 }
 
-/// A pool's controller: its members, their offers, its jobs, and the record of every run of the
-/// loop.
+/// A pool's controller: its members, their offers, its jobs, and its ledger: what it began with
+/// and every change it was told, with the record of the loop's run on each.
 #[derive(Clone, Debug)]
 pub struct Pool {
     members: Vec<Member>,
     offers: Vec<Offer>,
     jobs: Vec<Live>,
-    records: Vec<Record>,
+    ledger: Ledger,
     now: f64,
 }
 
@@ -151,9 +187,13 @@ impl Pool {
         offers.sort_by(|a, b| a.device.cmp(&b.device));
         let mut pool = Pool {
             members: Vec::new(),
-            offers,
+            offers: offers.clone(),
             jobs: Vec::new(),
-            records: Vec::new(),
+            ledger: Ledger {
+                members: members.clone(),
+                offers,
+                entries: Vec::new(),
+            },
             now: 0.0,
         };
         for m in members {
@@ -162,9 +202,30 @@ impl Pool {
         pool
     }
 
+    /// The pool a ledger describes: begun with its members and offers, then told each change at
+    /// its time, each record compared with the one logged. Its own ledger is then the same.
+    pub fn replay(ledger: &Ledger) -> Result<Pool, ReplayError> {
+        let mut pool = Pool::new(ledger.members.clone(), ledger.offers.clone());
+        for (entry, e) in ledger.entries.iter().enumerate() {
+            match pool.apply(e.change.clone(), e.at) {
+                Ok(record) if record == &e.record => {}
+                Ok(_) => return Err(ReplayError::Differs { entry }),
+                Err(error) => return Err(ReplayError::Refused { entry, error }),
+            }
+        }
+        Ok(pool)
+    }
+
+    /// What the pool began with, then every change it took, with the record of each. Its host
+    /// writes each entry when the change is taken, before acknowledging it, and restores the pool
+    /// with [`Pool::replay`]; the pool itself writes nothing.
+    pub fn ledger(&self) -> &Ledger {
+        &self.ledger
+    }
+
     /// Every run of the loop so far, in order.
-    pub fn records(&self) -> &[Record] {
-        &self.records
+    pub fn records(&self) -> impl ExactSizeIterator<Item = &Record> {
+        self.ledger.entries.iter().map(|e| &e.record)
     }
 
     /// Where a job's parts are, if the pool holds it.
@@ -191,33 +252,87 @@ impl Pool {
                     waited_seconds: j.waited,
                 })
                 .collect(),
-            formats: vec![Format {
-                name: GRAPH_FORMAT.into(),
-                version: GRAPH_VERSION,
-            }],
+            formats: vec![
+                Format {
+                    name: GRAPH_FORMAT.into(),
+                    version: GRAPH_VERSION,
+                },
+                Format {
+                    name: LEDGER_FORMAT.into(),
+                    version: LEDGER_VERSION,
+                },
+            ],
         }
     }
 
     /// The record [`Pool::submit`] would make of this graph at `at` seconds, or its refusal. The
     /// pool is left as it is: it holds no new job, keeps no record and does not move its time.
-    pub fn plan(&self, graph: &Graph, at: f64) -> Result<Record, SubmitError> {
+    pub fn plan(&self, graph: &Graph, at: f64) -> Result<Record, ChangeError> {
         let mut trial = Pool {
             members: self.members.clone(),
             offers: self.offers.clone(),
             jobs: self.jobs.clone(),
-            records: Vec::new(),
+            ledger: Ledger::default(),
             now: self.now,
         };
         trial.submit(graph.clone(), at).cloned()
     }
 
+    /// The one way into the pool: it takes a change at `at` seconds, runs the loop, and adds the
+    /// change with the loop's record to its ledger. A change it refuses leaves it as it was and is
+    /// not logged.
+    pub fn apply(&mut self, change: Change, at: f64) -> Result<&Record, ChangeError> {
+        if !at.is_finite() {
+            return Err(ChangeError::Time);
+        }
+        let record = match &change {
+            Change::Submit { graph } => self.arrive(graph.clone(), at)?,
+            Change::End { job } => self.finish(job, at),
+            Change::Join { member, offer } => self.add_device(member.clone(), offer.clone(), at),
+            Change::Leave { device } => self.remove_device(device, at),
+        };
+        self.ledger.entries.push(Entry { at, change, record });
+        Ok(&self.ledger.entries.last().expect("just pushed").record)
+    }
+
     /// A job arrives at `at` seconds. A graph that fails [`Graph::check`], or a second job of a
     /// name the pool holds, is refused and the pool is unchanged.
-    pub fn submit(&mut self, graph: Graph, at: f64) -> Result<&Record, SubmitError> {
-        let marks = graph.local_only().map_err(SubmitError::Graph)?;
+    pub fn submit(&mut self, graph: Graph, at: f64) -> Result<&Record, ChangeError> {
+        self.apply(Change::Submit { graph }, at)
+    }
+
+    /// A job ends at `at` seconds; the jobs waiting are placed again where they now fit.
+    pub fn end(&mut self, job: &str, at: f64) -> Result<&Record, ChangeError> {
+        self.apply(Change::End { job: job.into() }, at)
+    }
+
+    /// A device joins at `at` seconds, with its member's report. Of two reports for one member
+    /// the stricter mark stands: remote over local, the shorter time to give a device back.
+    pub fn join(
+        &mut self,
+        member: Option<Member>,
+        offer: Offer,
+        at: f64,
+    ) -> Result<&Record, ChangeError> {
+        self.apply(Change::Join { member, offer }, at)
+    }
+
+    /// A device leaves at `at` seconds: every job with a part on it waits, and is placed again
+    /// where it fits.
+    pub fn leave(&mut self, device: &DeviceId, at: f64) -> Result<&Record, ChangeError> {
+        self.apply(
+            Change::Leave {
+                device: device.clone(),
+            },
+            at,
+        )
+    }
+
+    fn arrive(&mut self, graph: Graph, at: f64) -> Result<Record, ChangeError> {
+        let marks = graph.local_only().map_err(ChangeError::Graph)?;
         let name = graph.job.name.clone();
         if self.jobs.iter().any(|j| j.graph.job.name == name) {
-            return Err(SubmitError::Duplicate { job: name });
+            return Err(ChangeError::Duplicate { job: name });
         }
         let parts = graph.parts.len();
         let mut live = Live {
@@ -236,16 +351,13 @@ impl Pool {
         Ok(self.run(Event::Arrival { job: name }, Vec::new()))
     }
 
-    /// A job ends at `at` seconds; the jobs waiting are placed again where they now fit.
-    pub fn end(&mut self, job: &str, at: f64) -> &Record {
+    fn finish(&mut self, job: &str, at: f64) -> Record {
         self.advance(at);
         self.jobs.retain(|j| j.graph.job.name != job);
         self.run(Event::End { job: job.into() }, Vec::new())
     }
 
-    /// A device joins at `at` seconds, with its member's report. Of two reports for one member
-    /// the stricter mark stands: remote over local, the shorter time to give a device back.
-    pub fn join(&mut self, member: Option<Member>, offer: Offer, at: f64) -> &Record {
+    fn add_device(&mut self, member: Option<Member>, offer: Offer, at: f64) -> Record {
         self.advance(at);
         let marked_remote = member.map(|m| self.add_member(m)).unwrap_or_default();
         let device = offer.device.clone();
@@ -256,9 +368,7 @@ impl Pool {
         self.run(Event::Join { device }, marked_remote)
     }
 
-    /// A device leaves at `at` seconds: every job with a part on it waits, and is placed again
-    /// where it fits.
-    pub fn leave(&mut self, device: &DeviceId, at: f64) -> &Record {
+    fn remove_device(&mut self, device: &DeviceId, at: f64) -> Record {
         self.advance(at);
         self.offers.retain(|o| &o.device != device);
         for j in &mut self.jobs {
@@ -323,7 +433,7 @@ impl Pool {
     }
 
     /// One run of the loop over the waiting jobs, which every event here touches.
-    fn run(&mut self, event: Event, marked_remote: Vec<String>) -> &Record {
+    fn run(&mut self, event: Event, marked_remote: Vec<String>) -> Record {
         let touched: Vec<usize> = (0..self.jobs.len())
             .filter(|&i| self.jobs[i].waiting())
             .collect();
@@ -380,14 +490,13 @@ impl Pool {
                 self.jobs[j].arrangement = placed;
             }
         }
-        self.records.push(Record {
+        Record {
             event,
             candidates,
             chosen,
             greedy,
             marked_remote,
-        });
-        self.records.last().expect("just pushed")
+        }
     }
 
     /// Every combination of the touched jobs' choices, waiting first, devices in order.
@@ -742,7 +851,7 @@ impl Pool {
             members: self.members.clone(),
             offers: self.offers.clone(),
             jobs: vec![job.clone()],
-            records: Vec::new(),
+            ledger: Ledger::default(),
             now: 0.0,
         };
         alone.jobs[0]

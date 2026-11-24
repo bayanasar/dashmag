@@ -12,13 +12,16 @@ rust-version.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
+# float_roundtrip: every f64 a ledger writes must read back to the same bits, or a replayed
+# record would differ from the one logged.
+serde_json = { version = "1", optional = true, features = ["float_roundtrip"] }
 schemars = { version = "1", optional = true }
 
 [features]
-# The agent's files: the graph file in JSON, and serde on the shared types. Needs std. Without
-# it the crate is no_std and depends on nothing; nothing a no_std member links may turn it on,
-# since a feature one crate turns on is on for every user of this crate in that build.
+# The files: the graph file in JSON, the ledger's lines, and serde on the shared types. Needs
+# std. Without it the crate is no_std and depends on nothing; nothing a no_std member links may
+# turn it on, since a feature one crate turns on is on for every user of this crate in that
+# build.
 graph = ["dep:serde", "dep:serde_json", "dep:schemars"]
 
 [dev-dependencies]

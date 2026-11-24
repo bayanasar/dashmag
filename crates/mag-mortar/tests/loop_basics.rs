@@ -69,7 +69,7 @@ fn a_graph_that_fails_its_check_is_refused_and_the_pool_is_unchanged() {
         vec![],
     );
     assert!(pool.submit(g, 0.0).is_err());
-    assert!(pool.records().is_empty() && pool.arrangement("j").is_none());
+    assert!(pool.records().len() == 0 && pool.arrangement("j").is_none());
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn the_same_events_give_the_same_records() {
             vec![edge("p", Some("q"))],
         );
         pool.submit(g, 0.0).unwrap();
-        pool.records().to_vec()
+        pool.records().cloned().collect::<Vec<_>>()
     };
     assert_eq!(run(), run());
 }

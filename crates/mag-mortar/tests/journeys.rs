@@ -198,11 +198,13 @@ fn j13_a_job_pinned_to_a_backend_no_device_offers_waits_until_one_joins() {
         })
     );
     assert_eq!(pool.arrangement("pinned").unwrap().places, [Place::Waiting]);
-    let r = pool.join(
-        Some(member("c", false)),
-        offer(device("c", 0), Backend::Mlx, 24, &[("u", 0.03)]),
-        5.0,
-    );
+    let r = pool
+        .join(
+            Some(member("c", false)),
+            offer(device("c", 0), Backend::Mlx, 24, &[("u", 0.03)]),
+            5.0,
+        )
+        .unwrap();
     assert!(r.chosen.is_some());
     assert_eq!(
         pool.arrangement("pinned").unwrap().places,
@@ -237,7 +239,7 @@ fn j14_of_two_jobs_that_each_want_every_device_the_higher_priority_runs_first() 
         Place::Waiting
     ));
     // The blocker ends: both wait, and the higher priority takes the devices.
-    pool.end("blocker", 10.0);
+    pool.end("blocker", 10.0).unwrap();
     assert!(matches!(
         pool.arrangement("high").unwrap().places[0],
         Place::Copies(_)
@@ -247,7 +249,7 @@ fn j14_of_two_jobs_that_each_want_every_device_the_higher_priority_runs_first() 
         Place::Waiting
     ));
     // It ends: the other starts at once, in the same run of the loop.
-    let r = pool.end("high", 100.0);
+    let r = pool.end("high", 100.0).unwrap();
     assert!(r.chosen.is_some());
     assert!(matches!(
         pool.arrangement("low").unwrap().places[0],
@@ -262,7 +264,7 @@ fn j14_a_waiting_job_s_priority_grows_until_it_passes_a_newer_higher_one() {
     pool.submit(wants_everything("old", 1), 0.0).unwrap();
     // Priority 2 but newly arrived, against priority 1 that has waited 300 s: 1 x (1 + 300/60).
     pool.submit(wants_everything("new", 2), 300.0).unwrap();
-    pool.end("blocker", 300.0);
+    pool.end("blocker", 300.0).unwrap();
     assert!(matches!(
         pool.arrangement("old").unwrap().places[0],
         Place::Copies(_)
@@ -377,7 +379,8 @@ fn the_guard_takes_a_member_the_pool_was_never_told_of_as_remote() {
         None,
         offer(device("stranger", 0), Backend::Cuda, 80, &[("u", 0.01)]),
         0.0,
-    );
+    )
+    .unwrap();
     let g = job(
         "label",
         1,

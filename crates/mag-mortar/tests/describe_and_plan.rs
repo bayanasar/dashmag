@@ -4,8 +4,8 @@
 mod common;
 
 use common::*;
-use mag_by::{Backend, Format, Mark, Place, Refusal};
-use mag_mortar::{Pool, SubmitError};
+use mag_by::{Backend, Mark, Place, Refusal};
+use mag_mortar::{ChangeError, Pool};
 
 /// One device of 64 GiB on which every part takes a second a step.
 fn one_device() -> Pool {
@@ -64,7 +64,7 @@ fn a_plan_leaves_the_description_and_the_records_as_they_were() {
     );
     pool.submit(one_part("running", 1, 12), 0.0).unwrap();
     pool.submit(one_part("waiting", 1, 12), 1.0).unwrap();
-    let before = (pool.describe(), pool.records().to_vec());
+    let before = (pool.describe(), pool.records().cloned().collect::<Vec<_>>());
 
     // A job that would be placed, one that would wait, and two that would be refused, each
     // planned later than the pool's time, so that a plan run on the pool would move it.
@@ -74,16 +74,19 @@ fn a_plan_leaves_the_description_and_the_records_as_they_were() {
     assert_eq!(waits.chosen, None);
     assert_eq!(
         pool.plan(&one_part("running", 1, 2), 30.0).unwrap_err(),
-        SubmitError::Duplicate {
+        ChangeError::Duplicate {
             job: "running".into()
         }
     );
     assert_eq!(
         pool.plan(&one_part("empty", 1, 0), 30.0).unwrap_err(),
-        SubmitError::Graph(Refusal::ZeroMemory { part: "p".into() })
+        ChangeError::Graph(Refusal::ZeroMemory { part: "p".into() })
     );
 
-    assert_eq!((pool.describe(), pool.records().to_vec()), before);
+    assert_eq!(
+        (pool.describe(), pool.records().cloned().collect::<Vec<_>>()),
+        before
+    );
     assert_eq!(pool.describe().at, 1.0);
     assert!(pool.arrangement("small").is_none());
 }
@@ -145,14 +148,16 @@ fn a_description_shows_where_each_job_is_how_long_each_waited_and_the_stricter_m
     );
     pool.submit(local, 10.0).unwrap();
     // `two` loses its device and waits.
-    pool.leave(&device("b", 0), 20.0);
+    pool.leave(&device("b", 0), 20.0).unwrap();
     // b comes back with another device, now reported as remote: `two` takes it, and `local`,
     // which reads local-only frames, may not.
-    let r = pool.join(
-        Some(member("b", true)),
-        offer(device("b", 1), Backend::Rocm, 16, &[("u", 0.02)]),
-        30.0,
-    );
+    let r = pool
+        .join(
+            Some(member("b", true)),
+            offer(device("b", 1), Backend::Rocm, 16, &[("u", 0.02)]),
+            30.0,
+        )
+        .unwrap();
     assert_eq!(r.marked_remote, ["b"]);
 
     let d = pool.describe();
@@ -180,13 +185,12 @@ fn a_description_shows_where_each_job_is_how_long_each_waited_and_the_stricter_m
         ]
     );
     assert!(d.jobs.iter().all(|h| h.priority == 1));
-    assert_eq!(
-        d.formats,
-        [Format {
-            name: "mag-graph".into(),
-            version: 1
-        }]
-    );
+    let formats: Vec<_> = d
+        .formats
+        .iter()
+        .map(|f| (f.name.as_str(), f.version))
+        .collect();
+    assert_eq!(formats, [("mag-graph", 1), ("mag-ledger", 1)]);
 }
 
 #[test]
@@ -202,11 +206,12 @@ fn a_job_that_waits_again_after_being_placed_counts_its_wait_from_zero() {
         None,
         offer(device("b", 0), Backend::Cuda, 16, &[("u", 0.01)]),
         100.0,
-    );
+    )
+    .unwrap();
     assert_eq!(pool.describe().jobs[1].waited_seconds, 0.0);
-    pool.leave(&device("b", 0), 110.0);
+    pool.leave(&device("b", 0), 110.0).unwrap();
     assert_eq!(pool.describe().jobs[1].waited_seconds, 0.0);
     // Its wait now runs from the leave, not from its arrival.
-    pool.end("no such job", 130.0);
+    pool.end("no such job", 130.0).unwrap();
     assert_eq!(pool.describe().jobs[1].waited_seconds, 20.0);
 }

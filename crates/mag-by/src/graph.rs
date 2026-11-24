@@ -461,7 +461,7 @@ impl core::error::Error for Refusal {}
 /// refused, so that a value that cannot be written (a need that is not finite, written as
 /// `null`) is not read back as no value at all.
 #[cfg(feature = "graph")]
-fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+pub(crate) fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::Deserialize<'de>,

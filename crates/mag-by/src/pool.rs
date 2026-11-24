@@ -1,17 +1,33 @@
 //! The words of a pool: its members and devices, what each device offers, where a job's parts
-//! are, what happens, the record of each run of the placement loop, and the pool as an author
-//! sees it.
+//! are, what happens, the record of each run of the placement loop, the pool as an author sees
+//! it, and the ledger of what the pool was told.
 //!
 //! `mag-mar` on each member reports offers and carries out placements; `mag-mortar` runs the loop
 //! and keeps the record. Both speak these words, and a ledger keeps the record.
+//!
+//! With the `graph` feature each word has serde, written as the graph file's words are: snake
+//! case, unknown fields refused, and an option present with a value or left out, never `null`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{Backend, Dtype, Tolerance, Unit};
+#[cfg(feature = "graph")]
+use crate::graph::present;
+use crate::{Backend, Dtype, Graph, Tolerance, Unit};
+
+/// The ledger's `format`.
+pub const LEDGER_FORMAT: &str = "mag-ledger";
+
+/// The ledger's `version` this crate reads and writes.
+pub const LEDGER_VERSION: u64 = 1;
 
 /// A machine in the pool, running `mag-mar`.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Member {
     pub name: String,
     /// Outside the owner's own machines, as a rented GPU is. Nothing local-only is placed on a
@@ -23,6 +39,11 @@ pub struct Member {
 
 /// A device: its member, and its index on that member.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct DeviceId {
     pub member: String,
     pub index: u32,
@@ -30,6 +51,11 @@ pub struct DeviceId {
 
 /// What a device gives the pool now.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Offer {
     pub device: DeviceId,
     pub backend: Backend,
@@ -45,6 +71,11 @@ pub struct Offer {
 
 /// A part kind's time on a device, per step, at the batch the device's memory allows.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Cost {
     pub unit: Unit,
     pub seconds_per_step: f64,
@@ -58,6 +89,11 @@ pub struct Cost {
 
 /// Where a part is.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(rename_all = "snake_case"))]
 pub enum Place {
     /// Not placed: its job waits.
     Waiting,
@@ -69,6 +105,11 @@ pub enum Place {
 
 /// Where each part of one job is, in the graph's order of parts.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Arrangement {
     pub job: String,
     pub places: Vec<Place>,
@@ -76,6 +117,14 @@ pub struct Arrangement {
 
 /// What the loop runs on.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(
+    feature = "graph",
+    serde(rename_all = "snake_case", deny_unknown_fields)
+)]
 pub enum Event {
     /// A job is submitted.
     Arrival { job: String },
@@ -95,6 +144,11 @@ pub enum Event {
 
 /// How a candidate changes the current arrangement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(rename_all = "snake_case"))]
 pub enum Move {
     /// Waiting parts onto devices with memory free.
     Fit,
@@ -111,6 +165,14 @@ pub enum Move {
 /// Why a candidate was removed before it was scored, or why a device was given no copy of a
 /// replicable part.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(
+    feature = "graph",
+    serde(rename_all = "snake_case", deny_unknown_fields)
+)]
 pub enum Removal {
     /// The device is not in the pool.
     NoDevice { device: DeviceId },
@@ -131,26 +193,68 @@ pub enum Removal {
 
 /// One candidate arrangement of the jobs an event touches.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Candidate {
     pub arrangements: Vec<Arrangement>,
     pub moves: Vec<Move>,
     /// Why it was removed, if it was.
+    #[cfg_attr(
+        feature = "graph",
+        serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )
+    )]
     pub removed: Option<Removal>,
     /// The devices given no copy of a replicable part, each with why: a candidate keeps the
     /// devices that may take a copy and have room for it, and says why it left out the rest.
     pub left_out: Vec<(String, Removal)>,
     /// Its predicted score, if it was not removed.
+    #[cfg_attr(
+        feature = "graph",
+        serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )
+    )]
     pub score: Option<f64>,
     /// The score's band, relative.
+    #[cfg_attr(
+        feature = "graph",
+        serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )
+    )]
     pub band: Option<f64>,
 }
 
 /// One run of the placement loop: the event, every candidate, and the choice.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Record {
     pub event: Event,
     pub candidates: Vec<Candidate>,
     /// The candidate committed, by index; `None` when nothing moved.
+    #[cfg_attr(
+        feature = "graph",
+        serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )
+    )]
     pub chosen: Option<usize>,
     /// Whether the candidates were too many to list and were generated greedily instead.
     pub greedy: bool,
@@ -161,6 +265,11 @@ pub struct Record {
 
 /// A file format a pool reads, at the version it reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Format {
     pub name: String,
     pub version: u64,
@@ -168,6 +277,11 @@ pub struct Format {
 
 /// A job a pool holds, as the pool's description shows it.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Held {
     /// Where its parts are. The job's name is the arrangement's.
     pub arrangement: Arrangement,
@@ -180,6 +294,11 @@ pub struct Held {
 /// offers, where each job it holds is and how long each waiting one has waited, and the file
 /// formats it reads. An author reads it before writing a graph.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Description {
     /// The pool's time, in seconds: the latest it has been told of.
     pub at: f64,
@@ -192,4 +311,63 @@ pub struct Description {
     pub jobs: Vec<Held>,
     /// The file formats it reads.
     pub formats: Vec<Format>,
+}
+
+/// What a pool is told: the only ways its state changes.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(
+    feature = "graph",
+    serde(rename_all = "snake_case", deny_unknown_fields)
+)]
+pub enum Change {
+    /// A job arrives.
+    Submit { graph: Graph },
+    /// A job finishes, or is withdrawn.
+    End { job: String },
+    /// A device joins, with its member's report if the member has one to make.
+    Join {
+        #[cfg_attr(
+            feature = "graph",
+            serde(
+                default,
+                deserialize_with = "present",
+                skip_serializing_if = "Option::is_none"
+            )
+        )]
+        member: Option<Member>,
+        offer: Offer,
+    },
+    /// A device leaves, or its owner takes it back.
+    Leave { device: DeviceId },
+}
+
+/// One change a pool took, at the time it was told of it, with the record the loop made of it.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "graph",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
+pub struct Entry {
+    /// Seconds, as the pool was told: finite.
+    pub at: f64,
+    pub change: Change,
+    pub record: Record,
+}
+
+/// A pool's ledger: the members and offers it began with, then every change it took, in order.
+///
+/// The pool is deterministic, so this is all of its state: applying the changes again to a pool
+/// begun the same way gives it back, and each entry's record checks that it went the same way. A
+/// refused change is not in it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Ledger {
+    pub members: Vec<Member>,
+    /// In the order of the devices' ids.
+    pub offers: Vec<Offer>,
+    pub entries: Vec<Entry>,
 }

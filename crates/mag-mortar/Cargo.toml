@@ -12,3 +12,12 @@ rust-version.workspace = true
 
 [dependencies]
 mag-by = { workspace = true }
+
+[features]
+# The files: the ledger as lines and the graph file, through mag-by's `graph` feature. Off, this
+# crate depends on mag-by alone.
+files = ["mag-by/graph"]
+
+[dev-dependencies]
+# The tests write and read the ledger's lines whatever features the command line names.
+mag-by = { workspace = true, features = ["graph"] }

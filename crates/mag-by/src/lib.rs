@@ -17,12 +17,16 @@
 //!   it.
 //! - The pool's words: a [`Member`] and its devices, the [`Offer`] each device makes, the
 //!   [`Arrangement`] of a job's parts, the [`Event`]s the placement loop runs on, and the
-//!   [`Record`] of each run of it, with each [`Candidate`] and why any was removed; and the
-//!   [`Description`] of a pool, as an author reads it before writing a graph.
+//!   [`Record`] of each run of it, with each [`Candidate`] and why any was removed; the
+//!   [`Description`] of a pool, as an author reads it before writing a graph; and the pool's
+//!   [`Ledger`]: what it began with, then each [`Change`] it was told, as an [`Entry`] with the
+//!   record the loop made of it, from which the pool is restored by replaying it.
 //! - With the `graph` feature, `Graph::from_json` and `Graph::to_json`: the graph file, a
 //!   graph in JSON, as an agent writes, reads back and edits it (`format` `"mag-graph"`,
-//!   `version` 1); `graph_schema`, its JSON Schema; and `Graph::to_dot`, the graph as Graphviz
-//!   DOT for a person to look at.
+//!   `version` 1); `graph_schema`, its JSON Schema; `Graph::to_dot`, the graph as Graphviz DOT
+//!   for a person to look at; and `Ledger::header_line`, `Ledger::line` and
+//!   `Ledger::from_lines`, the ledger as JSON Lines (`format` `"mag-ledger"`, `version` 1), for
+//!   the host of a pool to append and read back, with `ledger_schema`, the schema of a line.
 //!
 //! The author decides what a part is and where the graph may be divided; mag never divides a
 //! part.
@@ -36,6 +40,8 @@ mod dot;
 mod graph;
 #[cfg(feature = "graph")]
 mod json;
+#[cfg(feature = "graph")]
+mod ledger;
 mod local_only;
 mod pool;
 
@@ -45,8 +51,10 @@ pub use graph::{
 };
 #[cfg(feature = "graph")]
 pub use json::{ReadError, graph_schema};
+#[cfg(feature = "graph")]
+pub use ledger::{LedgerError, ReadLedger, ledger_schema};
 pub use local_only::LocalOnly;
 pub use pool::{
-    Arrangement, Candidate, Cost, Description, DeviceId, Event, Format, Held, Member, Move, Offer,
-    Place, Record, Removal,
+    Arrangement, Candidate, Change, Cost, Description, DeviceId, Entry, Event, Format, Held,
+    LEDGER_FORMAT, LEDGER_VERSION, Ledger, Member, Move, Offer, Place, Record, Removal,
 };

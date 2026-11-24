@@ -1,0 +1,1208 @@
+{
+  "$defs": {
+    "Arrangement": {
+      "additionalProperties": false,
+      "description": "Where each part of one job is, in the graph's order of parts.",
+      "properties": {
+        "job": {
+          "type": "string"
+        },
+        "places": {
+          "items": {
+            "$ref": "#/$defs/Place"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "job",
+        "places"
+      ],
+      "type": "object"
+    },
+    "Backend": {
+      "description": "A backend a device runs.",
+      "oneOf": [
+        {
+          "enum": [
+            "cuda",
+            "rocm",
+            "mlx"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "flex",
+          "description": "The CPU.",
+          "type": "string"
+        }
+      ]
+    },
+    "Blob": {
+      "additionalProperties": false,
+      "description": "Data named by its content's hash, such as weights a part holds.",
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hash": {
+          "type": "string"
+        },
+        "local_only": {
+          "description": "Computed from local-only data, as weights trained on it in an earlier job are: never\nplaced on a member marked remote, nor is the part that holds it, nor what that part\ncomputes unless it releases it. The graph file must say it either way: left out, it is\nrefused, as an input's mark is.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "hash",
+        "bytes",
+        "local_only"
+      ],
+      "type": "object"
+    },
+    "Candidate": {
+      "additionalProperties": false,
+      "description": "One candidate arrangement of the jobs an event touches.",
+      "properties": {
+        "arrangements": {
+          "items": {
+            "$ref": "#/$defs/Arrangement"
+          },
+          "type": "array"
+        },
+        "band": {
+          "description": "The score's band, relative.",
+          "format": "double",
+          "type": "number"
+        },
+        "left_out": {
+          "description": "The devices given no copy of a replicable part, each with why: a candidate keeps the\ndevices that may take a copy and have room for it, and says why it left out the rest.",
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/Removal"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "moves": {
+          "items": {
+            "$ref": "#/$defs/Move"
+          },
+          "type": "array"
+        },
+        "removed": {
+          "$ref": "#/$defs/Removal",
+          "description": "Why it was removed, if it was."
+        },
+        "score": {
+          "description": "Its predicted score, if it was not removed.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "arrangements",
+        "moves",
+        "left_out"
+      ],
+      "type": "object"
+    },
+    "Chain": {
+      "additionalProperties": false,
+      "description": "An ordered run of parts, such as a model's blocks, that may sit on one device or be divided\nbetween devices at any boundary between two of them.\n\nEach part's output feeds the next, so an edge joins each part to the next. Dividing a model\nbetween devices is placing a chain's parts on more than one; only the edge at a division\ncrosses between them.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "parts": {
+          "description": "The parts in order. At least 2, none replicable, none in another chain.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "parts"
+      ],
+      "type": "object"
+    },
+    "Change": {
+      "description": "What a pool is told: the only ways its state changes.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A job arrives.",
+          "properties": {
+            "submit": {
+              "additionalProperties": false,
+              "properties": {
+                "graph": {
+                  "$ref": "#/$defs/Graph"
+                }
+              },
+              "required": [
+                "graph"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "submit"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A job finishes, or is withdrawn.",
+          "properties": {
+            "end": {
+              "additionalProperties": false,
+              "properties": {
+                "job": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "job"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "end"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A device joins, with its member's report if the member has one to make.",
+          "properties": {
+            "join": {
+              "additionalProperties": false,
+              "properties": {
+                "member": {
+                  "$ref": "#/$defs/Member"
+                },
+                "offer": {
+                  "$ref": "#/$defs/Offer"
+                }
+              },
+              "required": [
+                "offer"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "join"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A device leaves, or its owner takes it back.",
+          "properties": {
+            "leave": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "$ref": "#/$defs/DeviceId"
+                }
+              },
+              "required": [
+                "device"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "leave"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Cost": {
+      "additionalProperties": false,
+      "description": "A part kind's time on a device, per step, at the batch the device's memory allows.",
+      "properties": {
+        "band": {
+          "description": "How far a measurement may be from the prediction, relative: taken from past differences\nbetween the two.",
+          "format": "double",
+          "type": "number"
+        },
+        "estimate": {
+          "description": "Not measured on this device: estimated from the part's shapes, and so to be probed, not\ntrusted.",
+          "type": "boolean"
+        },
+        "seconds_per_step": {
+          "format": "double",
+          "type": "number"
+        },
+        "unit": {
+          "$ref": "#/$defs/Unit"
+        }
+      },
+      "required": [
+        "unit",
+        "seconds_per_step",
+        "band",
+        "estimate"
+      ],
+      "type": "object"
+    },
+    "DeviceId": {
+      "additionalProperties": false,
+      "description": "A device: its member, and its index on that member.",
+      "properties": {
+        "index": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "member": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "member",
+        "index"
+      ],
+      "type": "object"
+    },
+    "Dtype": {
+      "description": "What an edge carries: a tensor's element type, or opaque bytes (an encoded image, a record).",
+      "enum": [
+        "f64",
+        "f32",
+        "bf16",
+        "f16",
+        "i64",
+        "i32",
+        "i8",
+        "u8",
+        "bool",
+        "bytes"
+      ],
+      "type": "string"
+    },
+    "Edge": {
+      "additionalProperties": false,
+      "description": "Data that moves from an input or a part to a part, or out of the job.",
+      "properties": {
+        "bytes": {
+          "description": "Its size. 0 is taken: an edge may carry nothing but the order between two parts.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dtype": {
+          "$ref": "#/$defs/Dtype",
+          "description": "What the data is: a tensor's element type, or opaque bytes."
+        },
+        "from": {
+          "description": "An input or a part.",
+          "type": "string"
+        },
+        "note": {
+          "description": "Free text: the author's reasons. mag never reads it.",
+          "type": "string"
+        },
+        "release": {
+          "default": false,
+          "description": "Whether the producing part releases this output, so that it may go where its local-only\ninputs may not. Only a part releases; an input is never released.",
+          "type": "boolean"
+        },
+        "to": {
+          "description": "A part, or `None` for a result of the job.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "dtype",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "Entry": {
+      "additionalProperties": false,
+      "description": "One change a pool took, at the time it was told of it, with the record the loop made of it.",
+      "properties": {
+        "at": {
+          "description": "Seconds, as the pool was told: finite.",
+          "format": "double",
+          "type": "number"
+        },
+        "change": {
+          "$ref": "#/$defs/Change"
+        },
+        "record": {
+          "$ref": "#/$defs/Record"
+        }
+      },
+      "required": [
+        "at",
+        "change",
+        "record"
+      ],
+      "type": "object"
+    },
+    "Event": {
+      "description": "What the loop runs on.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A job is submitted.",
+          "properties": {
+            "arrival": {
+              "additionalProperties": false,
+              "properties": {
+                "job": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "job"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "arrival"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A job finishes, or is withdrawn.",
+          "properties": {
+            "end": {
+              "additionalProperties": false,
+              "properties": {
+                "job": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "job"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "end"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A device joins the pool.",
+          "properties": {
+            "join": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "$ref": "#/$defs/DeviceId"
+                }
+              },
+              "required": [
+                "device"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "join"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A device leaves, or its owner takes it back.",
+          "properties": {
+            "leave": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "$ref": "#/$defs/DeviceId"
+                }
+              },
+              "required": [
+                "device"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "leave"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A device's offer changes.",
+          "properties": {
+            "offer_changed": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "$ref": "#/$defs/DeviceId"
+                }
+              },
+              "required": [
+                "device"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "offer_changed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A measured cost leaves its predicted band.",
+          "properties": {
+            "drift": {
+              "additionalProperties": false,
+              "properties": {
+                "job": {
+                  "type": "string"
+                },
+                "part": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "job",
+                "part"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "drift"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A job's deadline comes at risk.",
+          "properties": {
+            "deadline_at_risk": {
+              "additionalProperties": false,
+              "properties": {
+                "job": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "job"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "deadline_at_risk"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Graph": {
+      "additionalProperties": false,
+      "description": "One submitted job.\n\nEvery name in a graph (inputs, parts and chains together) is unique, and edges and chains\nrefer to inputs and parts by name. [`Graph::check`] says whether a graph is well formed.",
+      "properties": {
+        "chains": {
+          "default": [],
+          "description": "Ordered runs of parts that may be divided between devices at any part boundary.",
+          "items": {
+            "$ref": "#/$defs/Chain"
+          },
+          "type": "array"
+        },
+        "edges": {
+          "default": [],
+          "description": "What moves between inputs and parts, and out of the job.",
+          "items": {
+            "$ref": "#/$defs/Edge"
+          },
+          "type": "array"
+        },
+        "inputs": {
+          "default": [],
+          "description": "What the job reads from outside its parts.",
+          "items": {
+            "$ref": "#/$defs/Input"
+          },
+          "type": "array"
+        },
+        "job": {
+          "$ref": "#/$defs/Job",
+          "description": "The job's name, its weight and its need."
+        },
+        "note": {
+          "description": "Free text: the author's reasons. mag never reads it.",
+          "type": "string"
+        },
+        "parts": {
+          "description": "The pieces mag places. At least one.",
+          "items": {
+            "$ref": "#/$defs/Part"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "job",
+        "parts"
+      ],
+      "type": "object"
+    },
+    "Header": {
+      "additionalProperties": false,
+      "description": "The header's fields after `format` and `version`.",
+      "properties": {
+        "format": {
+          "const": "mag-ledger"
+        },
+        "members": {
+          "description": "The members the pool began with, as they were given to it.",
+          "items": {
+            "$ref": "#/$defs/Member"
+          },
+          "type": "array"
+        },
+        "offers": {
+          "description": "The offers the pool began with, in the order of the devices' ids.",
+          "items": {
+            "$ref": "#/$defs/Offer"
+          },
+          "type": "array"
+        },
+        "version": {
+          "const": 1
+        }
+      },
+      "required": [
+        "format",
+        "version",
+        "members",
+        "offers"
+      ],
+      "type": "object"
+    },
+    "Input": {
+      "additionalProperties": false,
+      "description": "Data a job reads from outside its parts. Version 1 of the graph file names an input and its\nmark; which data it is gets bound at submission, where the pool can check the data's own mark\nagainst its record of it. The mark here is only as good as that binding.",
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "local_only": {
+          "description": "Never placed on a member marked remote, nor is anything computed from it unless a stage\nreleases it. The graph file must say it either way: left out, it is refused, so that\nforgetting it never lets an input move.",
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "bytes",
+        "local_only"
+      ],
+      "type": "object"
+    },
+    "Job": {
+      "additionalProperties": false,
+      "description": "A job's name, how much it weighs against the other jobs in the pool, and what it needs.\n\nBeyond its need a job wants to run as fast as it can: when jobs share the pool, an\narrangement is judged by the sum over jobs of priority times each job's rate.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "need": {
+          "$ref": "#/$defs/Need",
+          "default": {}
+        },
+        "note": {
+          "description": "Free text: the author's reasons. mag never reads it.",
+          "type": "string"
+        },
+        "priority": {
+          "description": "The job's weight against other jobs. At least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "priority"
+      ],
+      "type": "object"
+    },
+    "Mark": {
+      "description": "How a part may be spread over devices.",
+      "oneOf": [
+        {
+          "const": "atomic",
+          "description": "One copy, on one device.",
+          "type": "string"
+        },
+        {
+          "const": "replicable",
+          "description": "As many copies as there are devices to hold them, each pulling items from one queue.",
+          "type": "string"
+        }
+      ]
+    },
+    "Member": {
+      "additionalProperties": false,
+      "description": "A machine in the pool, running `mag-mar`.",
+      "properties": {
+        "give_back_seconds": {
+          "description": "Seconds within which the member gives a device back when its owner wants it.",
+          "format": "double",
+          "type": "number"
+        },
+        "name": {
+          "type": "string"
+        },
+        "remote": {
+          "description": "Outside the owner's own machines, as a rented GPU is. Nothing local-only is placed on a\nremote member's devices.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "remote",
+        "give_back_seconds"
+      ],
+      "type": "object"
+    },
+    "Move": {
+      "description": "How a candidate changes the current arrangement.",
+      "oneOf": [
+        {
+          "const": "fit",
+          "description": "Waiting parts onto devices with memory free.",
+          "type": "string"
+        },
+        {
+          "const": "spread",
+          "description": "A chain onto more devices, or more copies of a replicable part.",
+          "type": "string"
+        },
+        {
+          "const": "share",
+          "description": "Parts into the memory another job leaves free on a device.",
+          "type": "string"
+        },
+        {
+          "const": "squeeze",
+          "description": "A running job's parts off a device, onto fewer devices or a smaller variant.",
+          "type": "string"
+        },
+        {
+          "const": "wait",
+          "description": "The arrival, or a job of lower priority, left in the queue.",
+          "type": "string"
+        }
+      ]
+    },
+    "Need": {
+      "additionalProperties": false,
+      "description": "What an arrangement must give a job. Each field is optional, and a job with neither only\nwants to run as fast as its priority allows.",
+      "properties": {
+        "deadline_seconds": {
+          "description": "Seconds from its submission by which it must finish. Finite and above 0.",
+          "format": "double",
+          "type": "number"
+        },
+        "rate_per_second": {
+          "description": "The rate it must sustain, in its own steps per second (items, tokens or optimiser\nsteps): a service's need. Finite and above 0.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "Offer": {
+      "additionalProperties": false,
+      "description": "What a device gives the pool now.",
+      "properties": {
+        "backend": {
+          "$ref": "#/$defs/Backend"
+        },
+        "costs": {
+          "description": "Its time per step for each part kind it has run or estimated.",
+          "items": {
+            "$ref": "#/$defs/Cost"
+          },
+          "type": "array"
+        },
+        "device": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "dtypes": {
+          "description": "The dtypes it computes in.",
+          "items": {
+            "$ref": "#/$defs/Dtype"
+          },
+          "type": "array"
+        },
+        "memory_bytes": {
+          "description": "The memory it can give: what is free of anything else holding it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tolerances": {
+          "description": "The tolerance classes its measured bounds meet.",
+          "items": {
+            "$ref": "#/$defs/Tolerance"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "device",
+        "backend",
+        "memory_bytes",
+        "tolerances",
+        "dtypes",
+        "costs"
+      ],
+      "type": "object"
+    },
+    "Part": {
+      "additionalProperties": false,
+      "description": "The smallest piece mag places: a unit with the weights it holds, the memory it needs, and\nwhere it can stop.",
+      "properties": {
+        "mark": {
+          "$ref": "#/$defs/Mark",
+          "default": "atomic"
+        },
+        "memory_bytes": {
+          "description": "The memory it needs on its device, weights and working memory together. Above 0: memory\ndecides where a part fits, and 0 would say it fits anywhere.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "note": {
+          "description": "Free text: the author's reasons. mag never reads it.",
+          "type": "string"
+        },
+        "pin": {
+          "$ref": "#/$defs/Pin",
+          "description": "A member or a backend it must run on."
+        },
+        "step": {
+          "$ref": "#/$defs/Step",
+          "description": "Where the part can stop with its state written out, to move or to make way."
+        },
+        "tolerance": {
+          "$ref": "#/$defs/Tolerance",
+          "description": "The numerics it accepts, which decide the devices it may run on."
+        },
+        "unit": {
+          "$ref": "#/$defs/Unit",
+          "description": "The function the part runs, already built into each member's binary."
+        },
+        "weights": {
+          "default": [],
+          "description": "The weights it holds, fetched once per member and kept.",
+          "items": {
+            "$ref": "#/$defs/Blob"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "unit",
+        "step",
+        "memory_bytes",
+        "tolerance"
+      ],
+      "type": "object"
+    },
+    "Pin": {
+      "description": "Where a part must run.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "On this member.",
+          "properties": {
+            "member": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "member"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "On a device of this backend, so that results stay comparable.",
+          "properties": {
+            "backend": {
+              "$ref": "#/$defs/Backend"
+            }
+          },
+          "required": [
+            "backend"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Place": {
+      "description": "Where a part is.",
+      "oneOf": [
+        {
+          "const": "waiting",
+          "description": "Not placed: its job waits.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "On one device.",
+          "properties": {
+            "on": {
+              "$ref": "#/$defs/DeviceId"
+            }
+          },
+          "required": [
+            "on"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A replicable part's copies, one on each device, each pulling items from one queue.",
+          "properties": {
+            "copies": {
+              "items": {
+                "$ref": "#/$defs/DeviceId"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "copies"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Record": {
+      "additionalProperties": false,
+      "description": "One run of the placement loop: the event, every candidate, and the choice.",
+      "properties": {
+        "candidates": {
+          "items": {
+            "$ref": "#/$defs/Candidate"
+          },
+          "type": "array"
+        },
+        "chosen": {
+          "description": "The candidate committed, by index; `None` when nothing moved.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "$ref": "#/$defs/Event"
+        },
+        "greedy": {
+          "description": "Whether the candidates were too many to list and were generated greedily instead.",
+          "type": "boolean"
+        },
+        "marked_remote": {
+          "description": "Members this event marked remote where an earlier report had them local: of two marks for\none member, the stricter stands.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "event",
+        "candidates",
+        "greedy",
+        "marked_remote"
+      ],
+      "type": "object"
+    },
+    "Removal": {
+      "description": "Why a candidate was removed before it was scored, or why a device was given no copy of a\nreplicable part.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The device is not in the pool.",
+          "properties": {
+            "no_device": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "$ref": "#/$defs/DeviceId"
+                }
+              },
+              "required": [
+                "device"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "no_device"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The parts placed on a device need more memory than it offers, or a copy does not fit\nbeside them.",
+          "properties": {
+            "memory": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "$ref": "#/$defs/DeviceId"
+                }
+              },
+              "required": [
+                "device"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "memory"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The device's bounds do not meet the part's tolerance class.",
+          "properties": {
+            "tolerance": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "$ref": "#/$defs/DeviceId"
+                },
+                "part": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "part",
+                "device"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "tolerance"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The device does not compute in a dtype one of the part's edges carries.",
+          "properties": {
+            "dtype": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "$ref": "#/$defs/DeviceId"
+                },
+                "part": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "part",
+                "device"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "dtype"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The part is pinned elsewhere.",
+          "properties": {
+            "pin": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "$ref": "#/$defs/DeviceId"
+                },
+                "part": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "part",
+                "device"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "pin"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The part carries local-only data and the device's member is remote.",
+          "properties": {
+            "guard": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "$ref": "#/$defs/DeviceId"
+                },
+                "part": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "part",
+                "device"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "guard"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The job's need is not met: its rate is below the rate it declared.",
+          "properties": {
+            "need": {
+              "additionalProperties": false,
+              "properties": {
+                "job": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "job"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "need"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Step": {
+      "description": "The point where a part can stop with its state written out.",
+      "oneOf": [
+        {
+          "const": "item",
+          "description": "After each item, as a map stops.",
+          "type": "string"
+        },
+        {
+          "const": "token",
+          "description": "After each token, as a decoder stops.",
+          "type": "string"
+        },
+        {
+          "const": "optimiser_step",
+          "description": "After each optimiser step, as a learner stops.",
+          "type": "string"
+        },
+        {
+          "const": "round",
+          "description": "After each round of a loop.",
+          "type": "string"
+        }
+      ]
+    },
+    "Tolerance": {
+      "description": "The numerics a part accepts. A device takes the part only if its measured bounds for the\npart's operations meet it.",
+      "oneOf": [
+        {
+          "enum": [
+            "f32",
+            "bf16",
+            "int8"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "exact",
+          "description": "The reference's bits.",
+          "type": "string"
+        }
+      ]
+    },
+    "Unit": {
+      "additionalProperties": false,
+      "description": "A named, versioned function.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/Header"
+    },
+    {
+      "$ref": "#/$defs/Entry"
+    }
+  ],
+  "description": "One line of a ledger, for its schema.",
+  "title": "mag-ledger, version 1: one line"
+}

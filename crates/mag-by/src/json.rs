@@ -175,7 +175,7 @@ pub fn graph_schema() -> String {
 }
 
 /// Takes `null` out of every type a schema allows, as `Option<T>` puts it there.
-fn strip_null(v: &mut Value) {
+pub(crate) fn strip_null(v: &mut Value) {
     match v {
         Value::Object(map) => {
             if let Some(Value::Array(types)) = map.get_mut("type") {
@@ -207,7 +207,7 @@ fn strip_null(v: &mut Value) {
 /// Any JSON, read for one thing: the first key repeated in an object, at any depth, with its path.
 /// Parsing into a [`Value`] keeps the last of a repeated key and says nothing, so this reads the
 /// text itself.
-struct NoRepeats(Option<String>);
+pub(crate) struct NoRepeats(pub(crate) Option<String>);
 
 impl<'de> serde::Deserialize<'de> for NoRepeats {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {

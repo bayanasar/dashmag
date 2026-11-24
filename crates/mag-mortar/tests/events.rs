@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use common::*;
 use mag_by::{Backend, Event, Mark, Place, Removal};
-use mag_mortar::{Pool, SubmitError};
+use mag_mortar::{ChangeError, Pool};
 
 #[test]
 fn a_second_job_of_one_name_is_refused_and_the_first_is_kept() {
@@ -27,10 +27,10 @@ fn a_second_job_of_one_name_is_refused_and_the_first_is_kept() {
     pool.submit(g(), 0.0).unwrap();
     assert_eq!(
         pool.submit(g(), 1.0).unwrap_err(),
-        SubmitError::Duplicate { job: "same".into() }
+        ChangeError::Duplicate { job: "same".into() }
     );
     assert_eq!(pool.records().len(), 1);
-    pool.end("same", 2.0);
+    pool.end("same", 2.0).unwrap();
     assert!(pool.arrangement("same").is_none());
 }
 
@@ -40,18 +40,22 @@ fn a_later_report_of_a_member_as_remote_stands_over_an_earlier_local_one() {
         vec![member("m", false)],
         vec![offer(device("m", 0), Backend::Cuda, 16, &[("u", 0.05)])],
     );
-    let r = pool.join(
-        Some(member("m", true)),
-        offer(device("m", 1), Backend::Cuda, 16, &[("u", 0.01)]),
-        0.0,
-    );
+    let r = pool
+        .join(
+            Some(member("m", true)),
+            offer(device("m", 1), Backend::Cuda, 16, &[("u", 0.01)]),
+            0.0,
+        )
+        .unwrap();
     assert_eq!(r.marked_remote, ["m"]);
     // The opposite report does not undo it.
-    let r = pool.join(
-        Some(member("m", false)),
-        offer(device("m", 2), Backend::Cuda, 16, &[("u", 0.01)]),
-        1.0,
-    );
+    let r = pool
+        .join(
+            Some(member("m", false)),
+            offer(device("m", 2), Backend::Cuda, 16, &[("u", 0.01)]),
+            1.0,
+        )
+        .unwrap();
     assert!(r.marked_remote.is_empty());
     let g = job(
         "label",
@@ -93,7 +97,7 @@ fn a_device_that_leaves_takes_nothing_with_it() {
         pool.arrangement("j").unwrap().places,
         [Place::On(device("a", 0))]
     );
-    let r = pool.leave(&device("a", 0), 5.0);
+    let r = pool.leave(&device("a", 0), 5.0).unwrap();
     assert_eq!(
         r.event,
         Event::Leave {
@@ -105,7 +109,7 @@ fn a_device_that_leaves_takes_nothing_with_it() {
         [Place::On(device("b", 0))]
     );
     // With the last device gone the job waits; it names no device that has left.
-    pool.leave(&device("b", 0), 6.0);
+    pool.leave(&device("b", 0), 6.0).unwrap();
     assert_eq!(pool.arrangement("j").unwrap().places, [Place::Waiting]);
 }
 
