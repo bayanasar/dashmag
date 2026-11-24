@@ -1,6 +1,6 @@
 //! LoRA's layer, written once over [`crate::ops::low_rank`]: a frozen base at its own precision,
 //! f32 adapters never folded into it, several by name over one base, the choice of one, and PEFT's
-//! files through [`dash_peft`].
+//! files through [`crate::peft`].
 //!
 //! `y = x Wᵀ + scale · (x Aᵀ) Bᵀ`, with PEFT's layout and arithmetic, as PEFT's `lora.Linear`
 //! computes it: the base product at the weight's dtype, the low-rank product in f32, their sum in
@@ -17,11 +17,11 @@
 
 use std::collections::BTreeMap;
 
-pub use dash_contract::lora::DEFAULT_ADAPTER;
-pub use dash_peft::{
+pub use crate::peft::{
     AdapterLayer, ApplyOptions, FactorDtype, HostTensor, LoraWeights, PeftAdapter, PeftConfig,
     PeftError,
 };
+pub use dash_contract::lora::DEFAULT_ADAPTER;
 
 use crate::arm::{Arm, Selected};
 use crate::ops::{LowRankOptions, low_rank};

@@ -2420,7 +2420,6 @@ dependencies = [
  "dash-contract",
  "dash-mlx",
  "dash-ops",
- "dash-peft",
  "half",
  "safetensors 0.8.0",
  "serde_json",
@@ -2457,15 +2456,6 @@ dependencies = [
  "burn-cubecl",
  "cubecl",
  "dash-conformance",
- "dash-contract",
- "safetensors 0.8.0",
- "serde_json",
-]
-
-[[package]]
-name = "dash-peft"
-version = "0.0.1"
-dependencies = [
  "dash-contract",
  "safetensors 0.8.0",
  "serde_json",

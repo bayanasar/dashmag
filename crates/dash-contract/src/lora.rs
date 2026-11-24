@@ -4,7 +4,7 @@
 //! is_trainable)`).
 //!
 //! The files themselves (`adapter_config.json`, `adapter_model.safetensors`) are read and written
-//! by `dash-peft`, whose configuration keeps the JSON as it was read.
+//! by dash-mag's `peft` module, whose configuration keeps the JSON as it was read.
 
 /// PEFT's default adapter name: the adapter `get_peft_model` and `PeftModel.from_pretrained`
 /// create unless told otherwise, and the one `save_pretrained` writes at the top of its directory

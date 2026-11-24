@@ -1,12 +1,12 @@
-//! PEFT's files with no tensor library: the `peft_*` fixtures in dash-mag's `tests/fixtures/lora`
+//! PEFT's files with no tensor library: the `peft_*` fixtures in `tests/fixtures/lora`
 //! (written by PEFT 0.20's `save_pretrained`) read and written back byte for byte, and an adapter
 //! applied to layers and read out of them again through [`AdapterLayer`], here a layer that keeps
 //! the host data it is given; per-module scales as PEFT computes them; a new configuration as PEFT
-//! writes one; variants this crate does not implement refused.
+//! writes one; variants `dash_mag::peft` does not implement refused.
 //!
-//!   cargo test -p dash-peft
+//!   cargo test -p dash-mag --test peft_format
 
-use dash_peft::{
+use dash_mag::peft::{
     AdapterLayer, ApplyOptions, CONFIG_FILE, DEFAULT_ADAPTER, LoraWeights, PeftAdapter, PeftConfig,
     PeftError, WEIGHTS_FILE,
 };
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 fn fixture(dir: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../dash-mag/tests/fixtures/lora")
+        .join("tests/fixtures/lora")
         .join(dir)
 }
 
@@ -243,7 +243,7 @@ fn a_layer_whose_scale_the_config_does_not_give_is_refused() {
 
 #[test]
 fn a_host_tensor_holds_exactly_its_shape() {
-    use dash_peft::{FactorDtype, HostTensor};
+    use dash_mag::peft::{FactorDtype, HostTensor};
     assert!(HostTensor::new(FactorDtype::Bf16, vec![2, 3], vec![0; 12]).is_ok());
     for (shape, bytes) in [(vec![2, 3], 11), (vec![2, 3], 13), (vec![usize::MAX, 2], 0)] {
         let err = HostTensor::new(FactorDtype::Bf16, shape.clone(), vec![0; bytes]).unwrap_err();
@@ -263,7 +263,7 @@ fn written_through_the_file_system_is_byte_identical() {
         let (config, weights) = files(dir);
         let adapter = PeftAdapter::read(fixture(dir)).unwrap();
         let out = std::env::temp_dir().join(format!(
-            "dash-peft-round-trip-{}-{}",
+            "dash-mag-peft-round-trip-{}-{}",
             dir.replace('/', "-"),
             std::process::id()
         ));
@@ -333,7 +333,8 @@ fn two_adapters_through_one_set_of_layers_are_written_back_as_peft_wrote_them() 
         assert_eq!(names, expect, "{path}");
     }
 
-    let out = std::env::temp_dir().join(format!("dash-peft-two-adapters-{}", std::process::id()));
+    let out =
+        std::env::temp_dir().join(format!("dash-mag-peft-two-adapters-{}", std::process::id()));
     for ((name, dir), read) in dirs.iter().zip(&adapters) {
         let named = layers.iter().map(|(p, l)| (p.as_str(), l));
         let back = PeftAdapter::from_layers_named(read.config.clone(), name, named).unwrap();
@@ -516,7 +517,7 @@ fn pattern_keys_match_whole_path_components() {
 /// through its files byte for byte.
 #[test]
 fn an_empty_adapter_goes_through_and_back() {
-    use dash_peft::{HostTensor, PeftConfig};
+    use dash_mag::peft::{HostTensor, PeftConfig};
     let mut adapter = PeftAdapter::new(PeftConfig::new(0, 1.0, &["m"]));
     adapter.insert(
         "m",

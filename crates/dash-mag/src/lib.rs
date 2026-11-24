@@ -54,6 +54,7 @@ mod autodiff;
 pub mod lora;
 pub mod ops;
 pub mod optim;
+pub mod peft;
 pub mod rope;
 mod tensor;
 
