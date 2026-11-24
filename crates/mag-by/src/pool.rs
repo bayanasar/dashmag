@@ -1,5 +1,6 @@
 //! The words of a pool: its members and devices, what each device offers, where a job's parts
-//! are, what happens, and the record of each run of the placement loop.
+//! are, what happens, the record of each run of the placement loop, and the pool as an author
+//! sees it.
 //!
 //! `mag-mar` on each member reports offers and carries out placements; `mag-mortar` runs the loop
 //! and keeps the record. Both speak these words, and a ledger keeps the record.
@@ -156,4 +157,39 @@ pub struct Record {
     /// Members this event marked remote where an earlier report had them local: of two marks for
     /// one member, the stricter stands.
     pub marked_remote: Vec<String>,
+}
+
+/// A file format a pool reads, at the version it reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Format {
+    pub name: String,
+    pub version: u64,
+}
+
+/// A job a pool holds, as the pool's description shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Held {
+    /// Where its parts are. The job's name is the arrangement's.
+    pub arrangement: Arrangement,
+    pub priority: u32,
+    /// Seconds it has waited since it arrived or last lost its place: 0 while it is placed.
+    pub waited_seconds: f64,
+}
+
+/// The pool as an author sees it, as one virtual device: its members and what each device
+/// offers, where each job it holds is and how long each waiting one has waited, and the file
+/// formats it reads. An author reads it before writing a graph.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Description {
+    /// The pool's time, in seconds: the latest it has been told of.
+    pub at: f64,
+    /// Its members, each with the stricter of the marks it was reported with.
+    pub members: Vec<Member>,
+    /// What each device offers, with the costs measured or estimated on it, in the order of the
+    /// devices' ids.
+    pub offers: Vec<Offer>,
+    /// The jobs it holds, in the order they arrived.
+    pub jobs: Vec<Held>,
+    /// The file formats it reads.
+    pub formats: Vec<Format>,
 }

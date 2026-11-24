@@ -6,6 +6,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+/// The graph file's `format`.
+pub const GRAPH_FORMAT: &str = "mag-graph";
+
+/// The graph file's `version` this crate reads and writes. It is the file's own, apart from the
+/// wire form's and from the crate's.
+pub const GRAPH_VERSION: u64 = 1;
+
 /// One submitted job.
 ///
 /// Every name in a graph (inputs, parts and chains together) is unique, and edges and chains

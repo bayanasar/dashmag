@@ -28,8 +28,12 @@
 //! takes per step, and a replicable part's copies share its items in proportion to their speed.
 //! Edges are not timed, so a part others wait on is placed for its own time, not for theirs.
 //!
+//! An author asks the pool two things before submitting: [`Pool::describe`], the pool as one
+//! virtual device, and [`Pool::plan`], the record a graph's arrival would make, with the pool
+//! left as it is.
+//!
 //! What this step leaves out, and where it comes:
-//! - probing candidates whose bands overlap, which needs runs (M-1.3, with `mag-mar`);
+//! - probing candidates whose bands overlap, which needs runs (with `mag-mar`);
 //! - the time of edges, within a device and across a link;
 //! - dividing a device's time between the jobs on it by priority, as the design has it, rather
 //!   than summing it; and a replicable job's copies taking more items where others are busy,
@@ -46,8 +50,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use mag_by::{
-    Arrangement, Candidate, Cost, DeviceId, Dtype, Event, Graph, LocalOnly, Mark, Member, Move,
-    Offer, Pin, Place, Record, Refusal, Removal, Unit,
+    Arrangement, Candidate, Cost, Description, DeviceId, Dtype, Event, Format, GRAPH_FORMAT,
+    GRAPH_VERSION, Graph, Held, LocalOnly, Mark, Member, Move, Offer, Pin, Place, Record, Refusal,
+    Removal, Unit,
 };
 
 /// The most candidates listed one by one before generation turns greedy (proposed).
@@ -168,6 +173,42 @@ impl Pool {
             .iter()
             .find(|j| j.graph.job.name == job)
             .map(|j| &j.arrangement)
+    }
+
+    /// The pool as an author sees it: its members and offers, where each job is and how long each
+    /// waiting one has waited, at the pool's time, and the file formats it reads.
+    pub fn describe(&self) -> Description {
+        Description {
+            at: self.now,
+            members: self.members.clone(),
+            offers: self.offers.clone(),
+            jobs: self
+                .jobs
+                .iter()
+                .map(|j| Held {
+                    arrangement: j.arrangement.clone(),
+                    priority: j.graph.job.priority,
+                    waited_seconds: j.waited,
+                })
+                .collect(),
+            formats: vec![Format {
+                name: GRAPH_FORMAT.into(),
+                version: GRAPH_VERSION,
+            }],
+        }
+    }
+
+    /// The record [`Pool::submit`] would make of this graph at `at` seconds, or its refusal. The
+    /// pool is left as it is: it holds no new job, keeps no record and does not move its time.
+    pub fn plan(&self, graph: &Graph, at: f64) -> Result<Record, SubmitError> {
+        let mut trial = Pool {
+            members: self.members.clone(),
+            offers: self.offers.clone(),
+            jobs: self.jobs.clone(),
+            records: Vec::new(),
+            now: self.now,
+        };
+        trial.submit(graph.clone(), at).cloned()
     }
 
     /// A job arrives at `at` seconds. A graph that fails [`Graph::check`], or a second job of a

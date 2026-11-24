@@ -17,7 +17,8 @@
 //!   it.
 //! - The pool's words: a [`Member`] and its devices, the [`Offer`] each device makes, the
 //!   [`Arrangement`] of a job's parts, the [`Event`]s the placement loop runs on, and the
-//!   [`Record`] of each run of it, with each [`Candidate`] and why any was removed.
+//!   [`Record`] of each run of it, with each [`Candidate`] and why any was removed; and the
+//!   [`Description`] of a pool, as an author reads it before writing a graph.
 //! - With the `graph` feature, `Graph::from_json` and `Graph::to_json`: the graph file, a
 //!   graph in JSON, as an agent writes, reads back and edits it (`format` `"mag-graph"`,
 //!   `version` 1); `graph_schema`, its JSON Schema; and `Graph::to_dot`, the graph as Graphviz
@@ -39,12 +40,13 @@ mod local_only;
 mod pool;
 
 pub use graph::{
-    Backend, Blob, Chain, Dtype, Edge, Graph, Input, Job, Mark, Need, Part, Pin, Refusal, Step,
-    Tolerance, Unit,
+    Backend, Blob, Chain, Dtype, Edge, GRAPH_FORMAT, GRAPH_VERSION, Graph, Input, Job, Mark, Need,
+    Part, Pin, Refusal, Step, Tolerance, Unit,
 };
 #[cfg(feature = "graph")]
-pub use json::{FORMAT, ReadError, VERSION, graph_schema};
+pub use json::{ReadError, graph_schema};
 pub use local_only::LocalOnly;
 pub use pool::{
-    Arrangement, Candidate, Cost, DeviceId, Event, Member, Move, Offer, Place, Record, Removal,
+    Arrangement, Candidate, Cost, Description, DeviceId, Event, Format, Held, Member, Move, Offer,
+    Place, Record, Removal,
 };

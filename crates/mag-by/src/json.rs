@@ -32,13 +32,7 @@ use std::string::{String, ToString};
 
 use serde_json::Value;
 
-use crate::{Graph, Refusal};
-
-/// The graph file's `format`.
-pub const FORMAT: &str = "mag-graph";
-
-/// The graph file's `version` this crate reads and writes.
-pub const VERSION: u64 = 1;
+use crate::{GRAPH_FORMAT as FORMAT, GRAPH_VERSION as VERSION, Graph, Refusal};
 
 /// Why a graph file was not read.
 #[derive(Debug)]
