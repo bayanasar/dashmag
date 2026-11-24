@@ -100,6 +100,79 @@ fn j1_a_replicable_job_runs_a_copy_on_every_device_that_holds_it() {
 }
 
 #[test]
+fn j1_copies_go_where_they_fit_beside_what_runs_and_the_rest_is_recorded() {
+    // An atomic job of 12 GiB fills the 16 GiB card; a replicable job of 12 GiB a copy then
+    // runs on the other two, and the record says why the first was left out.
+    let mut pool = three_cards();
+    let g = job(
+        "first",
+        1,
+        vec![],
+        vec![part("p", "u", Mark::Atomic, 12)],
+        vec![],
+    );
+    pool.submit(g, 0.0).unwrap();
+    let g = job(
+        "map",
+        1,
+        vec![input("items", false)],
+        vec![part("r", "r", Mark::Replicable, 12)],
+        vec![edge("items", Some("r"))],
+    );
+    let r = pool.submit(g, 1.0).unwrap();
+    let chosen = &r.candidates[r.chosen.unwrap()];
+    assert!(chosen.left_out.contains(&(
+        "r".into(),
+        Removal::Memory {
+            device: device("a", 0)
+        }
+    )));
+    assert_eq!(
+        pool.arrangement("map").unwrap().places,
+        [Place::Copies(vec![device("b", 0), device("c", 0)])]
+    );
+}
+
+#[test]
+fn j1_a_copy_and_an_atomic_part_share_two_cards_between_them() {
+    let mut pool = Pool::new(
+        vec![member("a", false), member("b", false)],
+        vec![
+            offer(
+                device("a", 0),
+                Backend::Cuda,
+                16,
+                &[("r", 0.01), ("u", 0.01)],
+            ),
+            offer(
+                device("b", 0),
+                Backend::Cuda,
+                16,
+                &[("r", 0.01), ("u", 0.01)],
+            ),
+        ],
+    );
+    let g = job(
+        "mixed",
+        1,
+        vec![input("items", false)],
+        vec![
+            part("r", "r", Mark::Replicable, 10),
+            part("p", "u", Mark::Atomic, 10),
+        ],
+        vec![edge("items", Some("r")), edge("r", Some("p"))],
+    );
+    pool.submit(g, 0.0).unwrap();
+    assert_eq!(
+        pool.arrangement("mixed").unwrap().places,
+        [
+            Place::Copies(vec![device("b", 0)]),
+            Place::On(device("a", 0))
+        ]
+    );
+}
+
+#[test]
 fn j13_a_job_pinned_to_a_backend_no_device_offers_waits_until_one_joins() {
     let mut pool = Pool::new(
         vec![member("a", false)],
@@ -137,13 +210,14 @@ fn j13_a_job_pinned_to_a_backend_no_device_offers_waits_until_one_joins() {
     );
 }
 
-/// A job that wants every device: a copy on each, too large for two to share one.
+/// A job that wants every device it can have: copies of 17 GiB, one on each card of 24 and
+/// 32 GiB and none on the card of 16, so that two such jobs cannot run at once.
 fn wants_everything(name: &str, priority: u32) -> mag_by::Graph {
     job(
         name,
         priority,
         vec![input("items", false)],
-        vec![part("r", "r", Mark::Replicable, 12)],
+        vec![part("r", "r", Mark::Replicable, 17)],
         vec![edge("items", Some("r"))],
     )
 }
@@ -271,6 +345,58 @@ fn the_guard_holds_for_a_part_whose_weights_are_local_only() {
 }
 
 #[test]
+fn the_guard_keeps_a_replicable_part_s_copies_off_a_remote_member_and_says_so() {
+    let mut pool = house_and_rented();
+    let g = job(
+        "map",
+        1,
+        vec![input("frames", true)],
+        vec![part("r", "u", Mark::Replicable, 4)],
+        vec![edge("frames", Some("r"))],
+    );
+    let r = pool.submit(g, 0.0).unwrap();
+    let chosen = &r.candidates[r.chosen.unwrap()];
+    assert!(chosen.left_out.contains(&(
+        "r".into(),
+        Removal::Guard {
+            part: "r".into(),
+            device: device("rented", 0)
+        }
+    )));
+    assert_eq!(
+        pool.arrangement("map").unwrap().places,
+        [Place::Copies(vec![device("house", 0)])]
+    );
+}
+
+#[test]
+fn the_guard_takes_a_member_the_pool_was_never_told_of_as_remote() {
+    let mut pool = Pool::new(vec![], vec![]);
+    // A device joins with no report of its member.
+    pool.join(
+        None,
+        offer(device("stranger", 0), Backend::Cuda, 80, &[("u", 0.01)]),
+        0.0,
+    );
+    let g = job(
+        "label",
+        1,
+        vec![input("frames", true)],
+        vec![part("detect", "u", Mark::Atomic, 4)],
+        vec![edge("frames", Some("detect"))],
+    );
+    let r = pool.submit(g, 1.0).unwrap();
+    assert_eq!(r.chosen, None);
+    assert_eq!(
+        r.candidates[1].removed,
+        Some(Removal::Guard {
+            part: "detect".into(),
+            device: device("stranger", 0)
+        })
+    );
+}
+
+#[test]
 fn a_released_output_s_consumer_may_go_to_the_remote_member() {
     let mut pool = house_and_rented();
     let mut released = edge("detect", Some("count"));
@@ -302,7 +428,8 @@ fn a_released_output_s_consumer_may_go_to_the_remote_member() {
 #[test]
 fn work_others_wait_on_lands_on_the_fastest_device() {
     // Two parts fit a card. The hub feeds the other two; on the fast card it is a third of the
-    // time it is on the slow one.
+    // time it is on the slow one. Edges are not timed in this step, so the hub lands there for
+    // its own time: a leaf as slow would land the same way.
     let mut pool = Pool::new(
         vec![member("a", false), member("b", false)],
         vec![
