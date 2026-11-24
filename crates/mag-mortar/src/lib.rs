@@ -245,6 +245,7 @@ impl Pool {
                 arrangements,
                 moves,
                 removed,
+                left_out: Vec::new(),
                 score,
                 band,
             });
@@ -262,6 +263,7 @@ impl Pool {
             candidates,
             chosen,
             greedy,
+            marked_remote: Vec::new(),
         });
         self.records.last().expect("just pushed")
     }

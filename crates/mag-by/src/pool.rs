@@ -107,10 +107,14 @@ pub enum Move {
     Wait,
 }
 
-/// Why a candidate was removed before it was scored.
+/// Why a candidate was removed before it was scored, or why a device was given no copy of a
+/// replicable part.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Removal {
-    /// The parts placed on a device need more memory than it offers.
+    /// The device is not in the pool.
+    NoDevice { device: DeviceId },
+    /// The parts placed on a device need more memory than it offers, or a copy does not fit
+    /// beside them.
     Memory { device: DeviceId },
     /// The device's bounds do not meet the part's tolerance class.
     Tolerance { part: String, device: DeviceId },
@@ -131,6 +135,9 @@ pub struct Candidate {
     pub moves: Vec<Move>,
     /// Why it was removed, if it was.
     pub removed: Option<Removal>,
+    /// The devices given no copy of a replicable part, each with why: a candidate keeps the
+    /// devices that may take a copy and have room for it, and says why it left out the rest.
+    pub left_out: Vec<(String, Removal)>,
     /// Its predicted score, if it was not removed.
     pub score: Option<f64>,
     /// The score's band, relative.
@@ -146,4 +153,7 @@ pub struct Record {
     pub chosen: Option<usize>,
     /// Whether the candidates were too many to list and were generated greedily instead.
     pub greedy: bool,
+    /// Members this event marked remote where an earlier report had them local: of two marks for
+    /// one member, the stricter stands.
+    pub marked_remote: Vec<String>,
 }

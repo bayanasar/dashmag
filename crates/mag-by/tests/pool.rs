@@ -53,6 +53,13 @@ fn a_record_of_one_run() {
         arrangements: vec![a.clone()],
         moves: vec![Move::Fit],
         removed: None,
+        left_out: vec![(
+            "r".into(),
+            Removal::Guard {
+                part: "r".into(),
+                device: device("rented", 0),
+            },
+        )],
         score: Some(1.0),
         band: Some(0.05),
     };
@@ -63,6 +70,7 @@ fn a_record_of_one_run() {
             part: "decode".into(),
             device: device("rented", 0),
         }),
+        left_out: vec![],
         score: None,
         band: None,
     };
@@ -71,6 +79,7 @@ fn a_record_of_one_run() {
         candidates: vec![kept, removed],
         chosen: Some(0),
         greedy: false,
+        marked_remote: vec!["member-b".into()],
     };
     assert_eq!(r.candidates.len(), 2);
     for e in [
@@ -97,6 +106,9 @@ fn a_record_of_one_run() {
     }
     // Each reason a candidate can be removed for.
     let removals = [
+        Removal::NoDevice {
+            device: device("gone", 0),
+        },
         Removal::Memory {
             device: device("a", 0),
         },
@@ -114,5 +126,5 @@ fn a_record_of_one_run() {
         },
         Removal::Need { job: "j".into() },
     ];
-    assert_eq!(removals.len(), 5);
+    assert_eq!(removals.len(), 6);
 }
