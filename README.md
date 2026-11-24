@@ -41,6 +41,7 @@ operations, such as attention against a key-value cache and the gated delta rule
 | [`dash-mlx`](crates/dash-mlx) | dash-ops' operations on MLX, with their contracts, for Apple silicon: attention, conv1d, the gated delta rule, chosen-token log-probabilities, the fused linear cross-entropy, the low-rank product, recompute and sampling, with Metal kernels where MLX's operations fall short | conv1d, the gated delta rule, the log-probability and attention pass dash-conformance's tests; the others are held to dash-ops' tests by ports of them; not published |
 | [`dash-mag`](crates/dash-mag) | the one crate an application names, the gateway to dash and, as they are built, to the `mag-` crates (it does not reach `mag-by` yet): a tensor, its array operations, a vector-Jacobian product, the operations' entry points, LoRA's layer, rotary embeddings, AdamW and clipping, over `dash-ops` or `dash-mlx`, the side chosen at compile time. | on Burn and on MLX: every entry point the same bits as `dash-ops` or `dash-mlx`, one training step from one source held to one recording; LoRA's layer and AdamW held to PEFT's and torch's recordings |
 | [`mag-by`](crates/mag-by) | the description of a job that the `mag-` crates share: the graph of its parts, its checks with typed refusals, what its local-only inputs and weights reach, and, with the `graph` feature, the graph file in JSON with its JSON Schema and DOT for a person to look at; `no_std` with no dependencies unless `graph` is on | its tests hold the checks, the local-only marks, the reader's refusals and the kept schema and DOT to the code; CI builds the default for a `no_std` target with an empty dependency tree; nothing places work yet |
+| [`mag-mortar`](crates/mag-mortar) | the pool's controller: the placement loop, which on each event lists the ways to place the waiting jobs, removes those that break a constraint (memory, tolerance, dtypes, a pin, a job's need, the guard on local-only data), scores the rest from the devices' measured costs and the jobs' priorities, commits the best and records every candidate; run on offers given as data | its tests hold each constraint, the guard, priorities and the record, each named for what it holds; no member, network or probe yet |
 | [`dash-image`](crates/dash-image) | image preprocessing: JPEG decode, Pillow-exact bilinear resize, normalisation | byte-exact with Pillow's resize |
 | [`dash-core`](https://crates.io/crates/dash-core) | the inference trait: tensors, capability negotiation, dispatch across runtimes | — |
 | [`dash-burn`](crates/dash-burn) | Burn behind that trait: the model built from code, weights loaded, run on Flex (pure-Rust CPU), CUDA, ROCm or Metal | runs on x86-64 (Flex) and on CUDA |
@@ -102,9 +103,10 @@ It is designed for:
   weights are marked local-only, is never to be placed on a remote machine, unless a part of the
   graph releases it.
 
-**What exists today is the description, not the pool.** [`mag-by`](crates/mag-by) reads a graph
-file, refuses one that is wrong with a reason that names what is wrong, works out what the
-local-only inputs and weights reach, and writes the graph as Graphviz DOT:
+**What exists today is the description and the loop that places it, not the pool.**
+[`mag-by`](crates/mag-by) reads a graph file, refuses one that is wrong with a reason that names
+what is wrong, works out what the local-only inputs and weights reach, and writes the graph as
+Graphviz DOT:
 
 ![The example graph: a labelling job whose frames are local-only](crates/mag-by/graphs/example.svg)
 
@@ -115,9 +117,18 @@ Graphviz installed:
 
     cargo run -p mag-by --features graph --example dot -- your-graph.json | dot -Tsvg > graph.svg
 
+[`mag-mortar`](crates/mag-mortar), the pool's controller, holds the placement loop, run on what
+each device offers given as data: on every arrival, end, join or leave it lists the ways to
+place the jobs waiting, removes those that break memory, a part's tolerance and dtypes, a pin,
+a job's need or the guard that keeps local-only data off remote machines, scores the rest from
+the devices' measured costs and the jobs' priorities, commits the best, and records every
+candidate with why any was left out. Its tests hold it to the cases it is designed for: a job
+on the fastest device that holds it, copies wherever they fit, a pinned job waiting for its
+backend, the higher priority of two first, and nothing local-only on a remote machine.
+
 Not built yet: `mag-mar`, the engine each machine is to run, offering its devices to the pool and
-running the parts placed on it; and `mag-mortar`, one per pool, which is to take jobs, place them
-and keep the record. Nothing here runs work across machines yet.
+running the parts placed on it; the network between them; trying candidates on the job's own
+steps; and a ledger kept on disk. Nothing here runs work across machines yet.
 
 The graph file is at version 1 and will change. If your job cannot be said in it, that is what
 we most want to hear: please open an issue.

@@ -46,3 +46,6 @@ jobs:
 
       - name: Tests, with the kept schema's and DOT's checks
         run: cargo test --locked -p mag-by
+
+      - name: The placement loop's tests, the guard's among them
+        run: cargo test --locked -p mag-mortar

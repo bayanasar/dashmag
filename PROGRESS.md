@@ -22,7 +22,8 @@ harness.
 
 Dashmag is two families of crates: the `dash-` crates, the library above, on one machine; and the
 `mag-` crates, just begun, which are to pool several machines and place work across them.
-`mag-by`, the description of a job that they share, is the first.
+`mag-by`, the description of a job that they share, is the first, and `mag-mortar`, the pool's
+controller, has its placement loop.
 
 Built so far: one model family, MobileNetV3-Small with any number of heads (`dash-models`),
 trained with `dash-train`'s loss, optimiser and schedule and run by Burn or by other runtimes
@@ -34,14 +35,15 @@ Where it is going: models defined once in Rust on Burn, trained by the applicati
 them, on dashmag's operations and training modules, and run by dashmag, with ONNX and int8
 tflite written from Rust only as exits to NPU vendors' compilers. `dash-train` keeps its
 modules; its training loop, data and cache handling, `predict` and command line move to the
-application that uses them. Beyond one machine, one pool of several: `mag-mar`, the engine each
-machine is to run, and `mag-mortar`, which is to take a pool's jobs and place them; neither is
-built.
+application that uses them. Beyond one machine, one pool of several: `mag-mortar`'s placement
+loop exists on offers given as data; `mag-mar`, the engine each machine is to run, the network
+between them, trying candidates on a job's own steps and a ledger kept on disk are not built.
 
 ## Sealed
 On `main`, and re-runnable by anyone who checks it out.
 
 - `mag-by` holds the description of a job to its rules — `cargo test --locked -p mag-by`, 45 green (2026-11-23), and CI's `mag-by` job: every refusal of `Graph::check` triggered by a test; the local-only marks carried from inputs and from weights to everything they reach unless released, through cycles, and no marks at all for a graph that fails its check; the graph file read and written back byte for byte, a repeated key, an unknown field, a `null`, a wrong format and a newer version each refused; `schemas/mag-graph.schema.json` equal to the schema the types generate, and checked by a validator against the files the reader takes and refuses; `graphs/example.dot` equal to `to_dot` of `graphs/example.json` and to what the `dot` example prints; the default build compiled for `thumbv7em-none-eabihf` with an empty dependency tree (CI).
+- `mag-mortar`'s placement loop holds to its constraints on offers given as data — `cargo test --locked -p mag-mortar`, 30 green (2026-11-24), and CI: an atomic job on the fastest device that holds it; a replicable part's copies wherever they may go and fit, the devices left out recorded with why; a job pinned to an absent backend waiting until one joins; of two jobs that each want every device the higher priority first, and waiting raising a job past a newer one; nothing local-only, from inputs or weights, on a remote member or one the pool was never told of, a later remote report standing over an earlier local one; a tolerance, a dtype, a pin to a member, a rate need for an arriving or a running job, a chain kept together and a second job of one name each refused with its reason; an unmeasured cost estimated as the slowest measured, flagged; a device leaving taking nothing with it; past 500 candidates, greedy placement of twelve parts on four devices in under a second. Seventeen planted mutants of the loop each fail at least one of these tests.
 
 - tract runs MobileNetV3-Small to class 258 @ logit 11.7283 on x86-64, Coral (Cortex-A53), Jetson Nano (A57), Jetson TX2, Orin Nano (A78AE) — `dash` from one static aarch64-musl binary on each board.
 - IREE agrees with tract per logit (1e-3) on x86-64 CPU, Tesla T4, RTX 2060, Orin Nano CPU and GPU (sm_87) — conformance test, `DASH_IREE_REQUIRE_CUDA=1` on the board run.
