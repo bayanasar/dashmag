@@ -852,9 +852,30 @@ impl Tensor {
         self.reduce_axis(Reduce::Min, axis, keep)
     }
 
-    /// `ln(sum(exp(self)))` over `axis`, without overflowing where the sum would. Where the largest element
-    /// is infinite that is the answer, and the gradient along that row is NaN on every side. An empty
-    /// tensor is refused.
+    /// `ln(sum(exp(self)))` over `axis`, without overflowing where the sum would. Where the largest
+    /// element is infinite that is the answer, and the gradient along that row is NaN on every side.
+    /// An empty tensor is refused.
+    ///
+    /// On Burn, each row is `top + ln(count + rest)`: `top` its largest element, `count` how many
+    /// elements equal it, and `rest` the sum of `exp(x - top)` over the others, summed apart from
+    /// the largest so that their terms of 1 swallow nothing. What that guarantees in f32, where a
+    /// device's reduction adds each lane's elements in order and no lane holds more than a quarter
+    /// of the row (CUDA and ROCm through CubeCL, as measured):
+    /// - One largest element, or several tied: within about `2e-7` of the definition, wherever
+    ///   they stand. The rest's own sum is off by at most half a unit, relative, per addition.
+    /// - A second element within about 3.4 of the largest (its term `t` above 0.035, where half a
+    ///   unit in the last place of `t` exceeds a term of `exp(-20)`) still swallows, as the largest
+    ///   did before: every later term in its lane smaller than half a unit of the lane's sum is
+    ///   lost. The loss is at most the terms after it in its lane, a quarter of the row's small
+    ///   terms, over `count + t + rest`: `1.7e-5` with `t` near 1 and `3e-5` with `t = exp(-2)`,
+    ///   over 65536 elements with the rest at -20; four times that if a backend sums a row in one
+    ///   lane. The loss then is at least `ln(1 + t)`, so the error is under a quarter of
+    ///   `rest / t` of it, relative.
+    ///
+    /// While it runs it reserves about three times the input's size on the device beyond the
+    /// input: `x - top`, the terms, and one masked copy at a time, the two sums taken in turn.
+    /// A single sum reserves twice. Measured through Burn's allocator, 1024 rows of 248320 in
+    /// f32: 3.06 GB against 2.05 GB, on CUDA and on ROCm alike.
     pub fn logsumexp_axis(&self, axis: isize, keep: bool) -> Result<Self> {
         if !self.dtype().is_floating() {
             return refuse(format!(
@@ -879,7 +900,9 @@ impl Tensor {
                 let top = self.max_axis(axis, true)?.stop_gradient()?;
                 let terms = self.sub(&top)?.exp()?;
                 let largest = self.eq(&top)?;
-                let zero = terms.zeros_like()?;
+                // Broadcast, not a buffer the size of the input. The largest elements' terms are
+                // each 1, and are summed for their gradient: their count, with each one's own.
+                let zero = Self::scalar(0.0, self.dtype())?;
                 let ones = largest.select(&terms, &zero)?.sum_axis(axis, true)?;
                 let rest = largest.select(&zero, &terms)?.sum_axis(axis, true)?;
                 let sum = top.add(&ones.add(&rest)?.log()?)?;

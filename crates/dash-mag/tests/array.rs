@@ -538,6 +538,39 @@ fn logsumexp_axis_keeps_the_rest_beside_a_dominant_entry() {
     }
 }
 
+/// A second element close to the largest still swallows the small terms after it in its lane, as
+/// the largest did before the two were summed apart: half a unit in the last place of its term is
+/// larger than a term of `exp(-20)`. What it may lose is derived, not measured: every term after
+/// it in a lane of at most a quarter of the row, over the row's total, plus the `2e-7` of a row
+/// with one large element. Placed first, it loses what a device whose lanes hold a quarter of the
+/// row loses; placed last, nothing.
+#[test]
+fn logsumexp_axis_beside_a_second_large_entry_loses_at_most_what_follows_it_in_its_lane() {
+    const N: usize = 1 << 16;
+    let small = (-20.0f64).exp();
+    for second in [-1e-6f32, -2.0] {
+        for (top_at, second_at) in [(N - 1, 0), (0, 1), (N / 2, N / 4), (0, N - 1)] {
+            let mut row = vec![-20.0f32; N];
+            row[top_at] = 0.0;
+            row[second_at] = second;
+            let term = (second as f64).exp();
+            let total = 1.0 + term + (N - 2) as f64 * small;
+            let bound = (N / 4) as f64 * small / total + 2e-7;
+            let got = t(&row, &[1, N])
+                .logsumexp_axis(1, false)
+                .unwrap()
+                .item()
+                .unwrap() as f64;
+            assert!(
+                (got - total.ln()).abs() <= bound,
+                "second {second} at {second_at}, largest at {top_at}: {got:e} against {:e}, \
+                 bound {bound:e}",
+                total.ln()
+            );
+        }
+    }
+}
+
 #[test]
 fn eval_async_gives_what_eval_gives_and_memory_calls_ask_nothing_of_a_side() {
     let x = t(&[1.0, 2.0], &[2]).square().unwrap();
