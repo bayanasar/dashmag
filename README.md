@@ -103,18 +103,20 @@ machine.
 
 The placement algorithm is not yours to write: it is `mag-mortar`'s. Who may use which machine is
 not mag's: mag places within the pool it is handed, and a home system decides that pool by its own
-rules. So what you write on your own is two files, the graph and the pool, and what runs today is
-the planning, not the running. In this table "is to" marks what is not built.
+rules. What you write on your own is each part's function, with dash's operations, and two files,
+the graph and the pool. What runs today is the planning, not the running. In this table "is to"
+marks what is not built.
 
 | thing | whose | in a home system that pools its devices | on your own |
 |---|---|---|---|
+| each part's function | yours to write, with dash's operations; the graph names it as a `Unit` (a name and a version), and it is to be built into whatever runs on each machine; how a unit's code reaches a machine is not built, nor decided | the same | the same |
 | the job's graph | yours to write; `mag-by` reads and checks it (`Graph::from_json`, `Graph::check`, [`schemas/mag-graph.schema.json`](crates/mag-by/schemas/mag-graph.schema.json)) | the same | the same |
 | the pool: its members, whether each is `remote`, how soon it gives a device back, and each device's backend, memory, tolerance classes, dtypes and costs | the format is `mag-by`'s (`Description`, the pool file, [`schemas/mag-pool.schema.json`](crates/mag-by/schemas/mag-pool.schema.json)) | is to come from that system's registry and each machine's report; not built | you write the pool file from your own machines, as [`pools/example.json`](crates/mag-by/pools/example.json) is written |
 | the costs in an offer: seconds per step of each part's unit on each device | the format is `mag-by`'s (`Cost`); nothing measures them yet | is to be measured by `mag-mar` on each machine; not built | you time one step of each unit on each device yourself, at the batch its memory allows, after warm-up and on an idle device, and write it with a band, how far a later measurement may fall from it; a cost you leave out is taken as the slowest any other device measured for that unit, or 1 s if none did, flagged `estimate` with a band of 100% |
 | the placement loop: list the arrangements, remove those that break a constraint, score, commit, record | `mag-mortar`'s `Pool`, public; probing candidates, the time of edges, dividing a chain and moving a running job are not built | is to be linked by that system's control plane | nothing to program; `mag plan` shows its decision on your two files |
 | which machines a job may use | **not mag's**; mag takes it as given: the pool it is handed, a member's `remote`, an input's or weights' `local_only`, a part's `pin` | that system's own authorization decides the pool before mag sees it | the pool file is your policy: list only the machines you allow, and mark a rented one `remote` |
-| running the loop over time and keeping its ledger | the host's; `mag-mortar` does no I/O and hands its state over (`Pool::apply`, `Pool::ledger`, `Ledger::line`, `Pool::replay`) | is to be that system's control plane | is to be the program that submits the job, linking `mag-mortar`; the library exists, the program is not built |
-| carrying a placement out on the machines | `mag-mar`'s; not built | is to be linked by whatever runs on each machine | is to be a small program on each machine; not built |
+| running the loop over time and keeping its ledger | the host's; `mag-mortar` does no I/O and hands its state over (`Pool::apply`, `Pool::ledger`, `Ledger::line`, `Pool::replay`) | is to be that system's control plane | mag's, not built: outside a home system the loop is to run in mag's own fallback; the library exists, and until that program does, nothing runs a pool over time |
+| carrying a placement out on the machines | `mag-mar`'s; not built | is to be linked by whatever runs on each machine | mag's, not built: `mag-mar` is to run on each machine; until it does, nothing carries a placement out |
 | finding machines, waking a sleeping one, keeping it awake for a job | **not mag's** | that system's | your pool file lists them; they must be on |
 | authorization between several people | **not mag's** | that system's | one owner is assumed |
 
