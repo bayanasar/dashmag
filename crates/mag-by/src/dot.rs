@@ -3,8 +3,9 @@
 //! Inputs are ellipses, parts boxes (a replicable part a stack of them), a chain's parts sit in
 //! a cluster, and the job's results meet in one node. Each edge is labelled with its dtype and
 //! size, the size in binary units (`1.12 GiB`). It is laid out top to bottom, so that a graph
-//! shown in a column of text keeps its labels readable. An edge carrying data computed from a local-only input is red, and a released one dashed,
-//! so that what may leave the house can be told apart at a glance.
+//! shown in a column of text keeps its labels readable. An edge carrying data computed from a
+//! local-only input is red, and a released one dashed, so that what may leave the house can be told
+//! apart at a glance.
 
 use std::fmt::Write;
 use std::string::String;

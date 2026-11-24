@@ -36,3 +36,13 @@ jobs:
             echo "$bad"
             exit 1
           fi
+
+      # rustfmt leaves comments alone. A comment line this pull request adds or changes is
+      # refused over 100 columns; older lines are rewrapped crate by crate, and once they all are
+      # this checks the whole tree (`tools/comment-width.sh` with no arguments).
+      - name: comment lines this pull request adds or changes are at most 100 columns
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: tools/comment-width.sh "origin/$BASE_REF" "$PR_HEAD"

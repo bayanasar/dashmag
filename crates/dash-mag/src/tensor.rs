@@ -853,8 +853,8 @@ impl Tensor {
     }
 
     /// `ln(sum(exp(self)))` over `axis`, without overflowing where the sum would. Where the largest
-    /// element is infinite that is the answer, and the gradient along that row is NaN on every side.
-    /// An empty tensor is refused.
+    /// element is infinite that is the answer, and the gradient along that row is NaN on every
+    /// side. An empty tensor is refused.
     ///
     /// On Burn, each row is `top + ln(count + rest)`: `top` its largest element, `count` how many
     /// elements equal it, and `rest` the sum of `exp(x - top)` over the others, summed apart from
@@ -873,8 +873,9 @@ impl Tensor {
     ///   binade. So the error is at most the terms after it in its lane over `count + t + rest`,
     ///   either way. Over 65536 elements, a quarter of them in its lane: `1.7e-5` low with `t`
     ///   near 1, `3.0e-5` low at `exp(-2)`, `2.6e-5` high at `exp(-3)` and `3.2e-6` low at
-    ///   `exp(-4)`; up to four times as much if a backend sums a row in one lane. The loss is then
-    ///   at least `ln(1 + t)`, so the error is under a quarter of `rest / t` of it, relative.
+    ///   `exp(-4)`; up to four times as much if a backend sums a row in one lane. A cross-entropy
+    ///   whose target is the largest element is then `ln(count + t + rest)`, at least `ln(1 + t)`,
+    ///   so the error is under a quarter of `rest / t` of it, relative.
     ///
     /// While it runs it reserves about three times the input's size on the device beyond the
     /// input: `x - top`, the terms, and one masked copy at a time, the two sums taken in turn.

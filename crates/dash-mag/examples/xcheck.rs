@@ -11,7 +11,8 @@
 //! `CASES` is a comma-separated list of `head`, `lse`, `proj`, `mlp`, `elementwise`, `conv`,
 //! `gated_delta`, `gda` and `attention`; all of them by default. `head` and `lse` have shapes of
 //! their own and ignore `TOKENS`. On Burn, `gda` prints how many of dash-ops' gated delta kernels
-//! ran, and how many of them on tensor cores and on WMMA, so that a run says which path it took. The environment chooses the rest:
+//! ran, and how many of them on tensor cores and on WMMA, so that a run says which path it took.
+//! The environment chooses the rest:
 //! - `XCHECK_DTYPE`: `f32` (the default), `bf16`, or `f32r`, the inputs rounded to bf16 and then
 //!   computed in f32, the reference a bf16 run is held to (`ulps`);
 //! - `XCHECK_GDA_CORR=c`: for `gda`, keys that lean towards one direction per head, as a trained
@@ -294,9 +295,9 @@ fn gated_delta(out: &mut Out, t: usize) -> R<()> {
 }
 
 /// The chunked gated delta rule as an application calls it: queries and keys normalised and scaled
-/// by the caller (`qk_l2norm` off, scale 1), `g` in f32 beside the other inputs in the mode's dtype.
-/// Run twice: as given, and with `g` one unit in its last place off in about a quarter of its
-/// elements, as two devices' `exp` and `softplus` leave it, to see how much that alone moves.
+/// by the caller (`qk_l2norm` off, scale 1), `g` in f32 beside the other inputs in the mode's
+/// dtype. Run twice: as given, and with `g` one unit in its last place off in about a quarter of
+/// its elements, as two devices' `exp` and `softplus` leave it, to see how much that alone moves.
 fn gated_delta_as_called(out: &mut Out, t: usize) -> R<()> {
     const H: usize = 16;
     const D: usize = 128;
