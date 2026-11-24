@@ -20,6 +20,11 @@ on a pool described in a file:
     cargo run -p mag-mortar --features files --example mag -- plan \
         crates/mag-by/pools/example.json crates/mag-by/graphs/example.json
 
+What mag covers and what it leaves to you, in a home system and on your own, is set out in the
+workspace README: [What mag covers, and what it leaves to
+you](../../README.md#what-mag-covers-and-what-it-leaves-to-you). In short: you write the graph and
+the pool file; the placement is this crate's; who may use which machine is not mag's.
+
 This step runs on offers given as data: no member, network or device yet. It does not probe
 candidates, count the time of edges between machines, divide a chain across devices or move a
 running job; those come with the steps that measure them.
