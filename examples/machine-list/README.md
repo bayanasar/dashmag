@@ -148,10 +148,13 @@ a member.
   nothing runs on any machine. Each command prints the coordinator's answer as JSON, and a line
   for you on standard error. Run by hand on one machine, the three members on loopback, the
   pool file above in each start file:
-  - `status` says `3 members, 5 devices, 0 jobs`, and prints the pool as one virtual device: the
-    three members at `owner`, and the devices as their start files offer them, in name order:
-    `laptop/0` (MLX), `server/0` (ROCm), `server/1` (CPU), `workstation/0` (CUDA) and
-    `workstation/1` (CPU).
+  - `status` says `3 members, 5 devices, 0 jobs; wants no device; would give back no member`,
+    and prints the pool as one virtual device: the three members at `owner`, and the devices as
+    their start files offer them, in name order: `laptop/0` (MLX), `server/0` (ROCm), `server/1`
+    (CPU), `workstation/0` (CUDA) and `workstation/1` (CPU). Its `asks` are what the pool asks
+    of you: `wants`, the kind of device it most wants while a job waits, and `gives_back`, the
+    members that have held no part for the coordinator's start file's `idle_seconds`, never the
+    coordinator. You poll it and decide; the pool never calls you.
   - `submit` says `` `label-frames` is placed `` and exits 0, once the job is in the ledger. It
     prints the loop's record, every candidate with why any was removed, which is long, and the
     job's arrangement: the parts where [`plan.txt`](plan.txt) puts them, `decode` in copies on
@@ -162,10 +165,18 @@ a member.
     having waited 0 s.
   - `end label-frames` ends it, in the ledger before it answers, and `status` shows no job again.
     Ending it a second time is refused, with exit 4: the pool holds no job of that name.
+  - The same graph with each of the model's two blocks at 20 GiB (`memory_bytes`
+    21474836480), named `label-large`, waits, with exit 3: the chain's 40 GiB fits no device.
+    `status` then says `wants a device {"memory_bytes":42949672960,"trust":"owner",
+    "tolerances":["bf16"],"dtypes":["bf16"]}`: a device with 40 GiB for the chain, of a member
+    trusted at `owner`, since the frames are kept there, meeting `bf16` and computing in it.
+  - With `idle_seconds` 10 in the coordinator's start file, `status` 10 s after the members
+    joined says `would give back server, laptop`, longest idle first; with `label-frames`
+    placed on every member, `would give back no member`; and 10 s after it ended, `laptop,
+    server`, equal in time and so in name order.
   - With no coordinator running, each command fails at once with exit 5.
 
-  The pool's asks in `status`, the kind of device it most wants and the members it would give
-  back, are to come, and so is taking a device back by need at the door.
+  Taking a device back by need at the door is to come.
 - Three containers on CPU: two jobs submitted to the coordinator's door and placed against each
   other, and one machine taken back with SIGTERM. This needs the members to run the parts placed
   on them, in `mag-mar`.
