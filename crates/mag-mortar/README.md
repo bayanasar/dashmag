@@ -53,7 +53,19 @@ with the devices of the kind whose members are too slow. It too is a pure functi
 state and the time of asking, so a replayed pool chooses the same; the leave itself is a change
 the pool is then told.
 
+When a coordinator stops, the one that takes up its ledger begins the pool again from it. Of
+the same version, it replays it. A ledger replays only on the version that wrote it, since
+another version's loop may decide otherwise, so a coordinator of another version begins a pool
+that follows it, `Pool::follow`: from what the old ledger was told, and none of its decisions.
+The members, each at the lowest trust and shortest time to give back it was reported with, and
+the devices that joined and have not left begin it; each job submitted and not ended is
+submitted again, with its graph and stamp, in the order it arrived. The new ledger's header names
+the old one, and its entries are those submissions, so it replays by itself. A job this version
+refuses is left out and returned with why.
+
 This step runs on offers given as data: no member, network or device yet. It does not probe
 candidates, count the time of edges between machines, divide a chain across devices or move a
-running job; those come with the steps that measure them. Nor does it yet begin from the
-arrangement its members hold after a coordinator stops.
+running job; those come with the steps that measure them. A pool that follows an old ledger
+places its jobs afresh, each waiting from 0, rather than holding each where its members say it
+runs, with its time waited: no part runs on a member yet, and the ledger's words carry neither,
+so a pool begun that way could not be replayed from its own ledger.

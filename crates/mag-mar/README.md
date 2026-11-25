@@ -2,8 +2,10 @@
 
 The program every member of a mag pool is to run. So far it is the link between members, and
 the program's skeleton: it reads `MAG_START`, joins the pool at the coordinator, and gives its
-devices back on SIGTERM within its time. On the member that coordinates, it takes the members'
-joins and leaves into the pool and writes the pool's ledger, and serves the door, where a command
+devices back on SIGTERM within its time; when its coordinator stops, it runs on and joins again
+once one answers. On the member that coordinates, it takes the members' joins and leaves into the
+pool and writes the pool's ledger, takes up the ledger of a coordinator that stopped, and serves
+the door, where a command
 run on its machine submits a job, ends one, asks the pool's status, or takes a device back by
 need, which the member holding it is told to give back. Running the parts placed on a member is
 not built yet.
@@ -24,7 +26,15 @@ start file (`mag-by`'s `Start`):
   name, which no job may have. On it, it says `mag_by::Control::Join`, with itself as its start
   file describes it (its trust and its `give_back_seconds`, as the host wrote them) and what its
   devices offer. The offers are those the start file's pool gives for its devices, until the
-  member measures its own. While the coordinator cannot be reached, it dials again every second.
+  member measures its own. The coordinator answers `mag_by::Control::Joined` once the join is in
+  its ledger. While the coordinator cannot be reached, it dials again, after 250 ms, then twice
+  as long each time, up to 2 s.
+- **It joins again.** When its control channel ends and it is not leaving, as when the
+  coordinator stops or the network between them fails, it runs on, dials again the same way, and
+  joins again, offering the devices it still holds. A coordinator that comes back, or one that
+  takes up its ledger, takes it back in with them. A join the coordinator refuses for good, which
+  it answers by closing the channel without `Joined`, it does not make again: it stays out of the
+  pool until the host ends its lease. After SIGTERM it dials no more.
 - **On SIGTERM it gives back.** It says `mag_by::Control::Leave`, closes its way of the control
   channel, and waits for the coordinator to close the other way, the sign that the leaving is
   recorded. Then it exits 0. With no control channel open, before it joined or after the channel
@@ -37,8 +47,8 @@ start file (`mag-by`'s `Start`):
 - **What it does goes to standard error**, a line at a time. It exits 2 when it cannot start:
   `MAG_START` unset, a start file that cannot be read or is refused, credentials refused, an
   address it cannot bind, an argument it does not take, or, as coordinator, a door another
-  coordinator serves or a ledger it cannot begin. It exits 3 when, as coordinator, it could not
-  write a line of its ledger.
+  coordinator serves or a ledger it cannot begin or take up. It exits 3 when, as coordinator, it
+  could not write a line of its ledger.
 
 The library entry is `mag_mar::member::run`; the binary takes SIGTERM as its notice
 (`member::Notice::sigterm`, on Unix), reads the start file and calls it.
@@ -48,11 +58,33 @@ The library entry is `mag_mar::member::run`; the binary takes SIGTERM as its not
 The member a start file names as `coordinator` dials no one. It runs the coordinator, in the same
 program (`mag_mar::coordinator`):
 
-- **It begins a new ledger** at the start file's `ledger`. The pool (`mag_mortar::Pool`) begins
-  with the coordinator's own member and devices, at the time it starts, in seconds since 1970.
-  The ledger's header is written and synced before any member is taken. A file already at that
-  place is refused, and the program exits 2: taking up the ledger of a coordinator that stopped
-  is not built yet.
+- **It begins a ledger, or takes one up**, at the start file's `ledger`. With nothing there, the
+  pool (`mag_mortar::Pool`) begins with the coordinator's own member and devices, at the time it
+  starts, in seconds since 1970, and the ledger's header is written and synced before any member
+  is taken. A ledger already there is one a coordinator left when it stopped, killed or ended,
+  and this one takes it up (`coordinator::take_up`):
+  - **Written by this version of `mag-mortar`**, it is replayed (`Pool::replay`), each record
+    checked against the one logged, and appended to. A record that differs, or a change the pool
+    refuses, is a defect: the program says which entry and exits 2, and the ledger is left as it
+    is.
+  - **Written by another version**, or by one that did not say (a ledger of version 1), it is
+    read for its facts alone: the members, the devices that joined and have not left, and the
+    jobs submitted and not ended. It is copied beside its place, at the first free name with
+    `.1`, `.2`, ... added, and a new ledger takes its place whose header names the copy as the
+    ledger it follows (`Pool::follow`), with each job it held submitted again, placed afresh
+    and waiting from 0. The new one is written beside its place, with `.new`, and renamed in, so
+    that, stopped at any point, the old ledger is still at its place.
+  - **A last line cut short**, the one a coordinator was writing as it died, was never
+    acknowledged: it is dropped, the program says so, and the file is cut back to its whole
+    lines before anything is appended.
+  - Anything else at that place, a file that is no ledger, is refused and left as it is.
+
+  Its own devices then join again as a member's do (below), and every other member the ledger
+  holds a device of is awaited for its grace.
+- **One coordinator on a ledger.** While it writes the ledger, the coordinator holds a lock on
+  the ledger's path and `.lock`, a file beside it that is never removed. A second coordinator on
+  the same ledger, even at another door, is refused, with exit status 2, and the ledger is left
+  as it is.
 - **It takes a control channel from any member of the pool.** `Link::accept_any` takes whoever
   holds a certificate the pool's authority signed naming exactly one member, and reports that
   member. A member that joins later than the coordinator began is named by nothing the
@@ -60,26 +92,43 @@ program (`mag_mar::coordinator`):
   placed yet.
 - **It checks a join.** The member a `Join` names, and the member of every device it offers, must
   be the member the certificate names. That member may hold no other live control channel, and
-  may not be the coordinator itself. A join that fails is refused, and the channel ended without
-  a close, so the member never reads it as an acknowledgement.
-- **It records a join.** One `Change::Join` per offer is applied to the pool, and the new lines are
-  written to the ledger and synced. The member is recorded as the coordinator's start file lists
-  it, at the lower of the two trusts and the shorter of the two times to give a device back. A
-  member the coordinator's start file does not list is recorded at `outside`, whatever its join
-  says (below).
+  may not be the coordinator itself. A join refused for good, as another member's name or device
+  or the coordinator's, is answered by closing the coordinator's way of the channel without
+  `Joined`, and the member dials no more. A join refused for now, of a member that holds another
+  channel the coordinator has not yet found ended, or a second join on one channel, ends the
+  channel cut short, unclosed, and the member dials again.
+- **It records a join, then says `Joined`.** For each device offered that the pool does not hold
+  as it is offered, a `Change::Join`; for each device of the member the pool holds and the join
+  no longer offers, a `Change::Leave`; for a device the pool holds as offered, nothing. So a
+  member that comes back is taken back in without a second `Join` for any of its devices. The
+  changes are applied to the pool, the new lines written to the ledger and synced, and only then
+  does the coordinator say `Control::Joined`. The member is recorded as the coordinator's start
+  file lists it, at the lower of the two trusts and the shorter of the two times to give a device
+  back; a member recorded lower than the pool holds it joins each device again, so that the pool
+  lowers it. A member the coordinator's start file does not list is recorded at `outside`,
+  whatever its join says (below).
 - **A member with no offers is recorded nowhere.** The pool is told of devices, not of members,
-  and `Change::Join` carries one offer. Such a member holds its control channel, and its leave is
-  answered at once.
+  and `Change::Join` carries one offer. Such a member holds its control channel, is told it
+  joined, and its leave is answered at once.
 - **It records a leave, then acknowledges it.** On `Leave`, one `Change::Leave` per device the
   member joined with is applied, the lines are written and synced, and only then does the
   coordinator close its way of the channel. That close is what the member waits for, within its
   `give_back_seconds`.
-- **A member gone without leaving is recorded as left.** Its control channel ended without
-  `Leave`: the member died, or its machine went away, and the coordinator can place nothing there.
+- **A member gone without leaving is awaited for its grace.** Its control channel ended without
+  `Leave`: the member died, its machine went away, or the network between them failed. Its
+  devices stay in the pool for its grace (`coordinator::grace`): its `give_back_seconds` as the
+  pool holds them, and at least 5 s. A member that joins again within it keeps them, and nothing
+  is written; at its end, the leave of each of its devices the pool still holds is recorded. The
+  grace is what the host already gives the member to let a device go after its notice, so the
+  pool holds a device it lost touch with no longer than the host would wait for it; and at least
+  5 s, more than twice a member's longest wait between dials, so that a member waiting that long
+  when the coordinator returns still comes back in time. A member the ledger holds when a
+  coordinator takes it up is awaited the same way, from the moment it is taken up.
 - **It serves the door** (below), opened before the ledger is begun, so that a coordinator
   refused its door leaves no ledger behind.
 - **On its own notice**, SIGTERM, it records its own devices' leave the same way, closes its
-  door and exits 0.
+  door and exits 0. Its members' channels end without a close, and their leaves are not
+  recorded: they run on and dial again, and a coordinator that takes up the ledger awaits them.
 - **A ledger line that cannot be written stops it**, with exit status 3. Nothing after the last
   line written was acknowledged or answered, and the members find their channels cut short.
 - **One thread keeps the pool.** Each member's channel and each connection at the door is heard
@@ -296,6 +345,31 @@ again; of two devices holding nothing, a member's larger one given up before the
 smaller one; and, against a stand-in coordinator, a member told to give back another member's
 device giving back nothing for it, and only its own.
 
+And a coordinator that stops and is started again. Killed (SIGKILL) with two members joined
+and a job placed: the members run on and dial again, the door answers no one meanwhile (exit
+5), and the coordinator started again on the same ledger and address replays its four entries,
+the members join again within their grace, nothing is written, and the door's status is the
+pool as it was before, the job where it was; the ledger then goes on, and replays to the same
+lines. A last line cut short is dropped and said, the file cut back to its whole lines, and the
+next line follows them. A ledger whose header says another version wrote it is kept beside its
+place as `.1`, and a new ledger of this version follows it, the members and devices as they were
+and the job held submitted again, placed where it was, the ended one not, the members joining
+again with nothing written; started again on that, it replays it. A ledger of this version that
+does not replay, a submission written twice, is refused with the entry, and left as it is; so
+are a file that is no ledger, an empty one, a header cut short and lines that are not text. A
+second coordinator on a ledger another one writes, at another door, is refused. Started again
+with a device of its own offered otherwise and one new, it records both, and a member that does
+not come back is recorded as left at the end of its grace, counted from when the ledger was
+taken up. A member whose channel is cut joins again within its grace and keeps its device with
+nothing written, even past the end of the grace it had; back with another device in place of
+its first, the first leaves and the other joins; gone past its grace, its leave is recorded at
+its end, 5 s, and not before. A member killed is recorded as left only then. On Linux, with the
+coordinator's files held by `prlimit` to its ledger's header, a join is never told `Joined`,
+and the coordinator exits 3. Against a stand-in coordinator, a member whose channel is cut,
+before `Joined` or after it, dials again within 2 s and joins again with the same offers, and
+one whose join is closed without `Joined` dials no more, and exits 0 at once on SIGTERM. A member
+that cannot reach the coordinator says it dials again in 0.25 s, 0.5 s and 1 s.
+
 `loopback` sends one tensor of any size and reports the rate and the memory the link took beyond
 the two buffers:
 
@@ -312,7 +386,13 @@ sending (2026-11-25, three runs).
 - The door's own take-back by name of a single device, which SIGTERM cannot say, since it ends
   the whole lease.
 - The coordinator's words to members: announcing a member to its peers, and sending placements.
-- Taking up the ledger of a coordinator that stopped, and members joining again when one starts.
+- Once parts run, a member cut off from the coordinator for its grace stopping them at a step
+  and writing their state, so that the pool, placing them again at the grace's end, never has a
+  part live on two devices; and the member reporting, when it joins again, what it measured
+  while the coordinator was gone.
+- A coordinator of another version holding each job where the members say it runs, with its time
+  waited, rather than placing it afresh: the ledger's words do not carry that, and a pool begun
+  so could not be replayed from its own ledger.
 - Running the parts placed on a member, channels to other members for their jobs, and giving
   back with the parts' state at a step.
 - Refusing a member whose lease ended until it has a new certificate.

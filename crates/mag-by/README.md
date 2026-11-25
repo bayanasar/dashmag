@@ -78,7 +78,11 @@ the files kept in [`tests/v1`](tests/v1) show:
   follow it on the channel. A member's control channel to the coordinator is opened for no job,
   `CONTROL`, the empty name, which no job may have; on it the member says `Control::Join`, with
   itself as its start file describes it and its devices' offers, when its lease begins, and
-  `Control::Leave` when it ends. The coordinator says `Control::GiveBack` on it, with a device
+  `Control::Leave` when it ends. The coordinator says `Control::Joined` once the join is in its
+  ledger, so that the member knows it is in; a join it refuses it ends by closing its way of the
+  channel without it, and the member does not join again. `WIRE_VERSION` stays 1 with it, as with
+  the other control words: no published program speaks them yet. The coordinator says
+  `Control::GiveBack` on it, with a device
   and a deadline, when the host takes that device back by need, and the member answers
   `Control::GaveBack` once it offers the device no longer. With the `graph` feature they are
   JSON, as the files' words are.

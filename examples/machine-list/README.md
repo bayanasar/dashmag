@@ -10,7 +10,8 @@ the pool would place a graph on it, and why. The program each machine runs (`mag
 joins the pool at the coordinator, which records the join in the pool's ledger, and gives its
 machine back on SIGTERM; and at the coordinator's door you submit a job to the running pool,
 which places it and writes it to the ledger, and take a device back by need, which the pool
-chooses and its member gives back. Nothing runs on any machine yet: running the parts placed on
+chooses and its member gives back. A coordinator killed and started again takes up its ledger,
+and the members join it again. Nothing runs on any machine yet: running the parts placed on
 a member is not built.
 
 ## The files
@@ -127,9 +128,10 @@ a member.
       MAG_START=server.json cargo run --release -q -p mag-mar
 
   This runs today, as far as it goes. The coordinator begins the ledger at the start file's
-  `ledger`, which must not exist yet: a coordinator does not take up an old ledger, so move the
-  last one away before you start it again. Each other member reads its start file, binds its
-  `listen` address, dials the coordinator, every second until it answers, and joins. The coordinator records one entry
+  `ledger`, or takes up the one there (below). Each other member reads its start file, binds its
+  `listen` address, dials the coordinator until it answers, waiting 250 ms and then twice as long
+  each time, up to 2 s, and joins; it says `joined the pool` once the coordinator has the join in
+  its ledger. The coordinator records one entry
   in the ledger for each device the member offers, from the offers its start file's pool gives
   for it, so write an offer for each device there: a member with none is recorded nowhere.
   `kill -TERM` on a member ends it with status 0 within its `give_back_seconds`, once the
@@ -201,6 +203,37 @@ a member.
   The door answers once the member says it gave the device back, or at the deadline, when the
   device is yours whatever the member says. Taking a machine back by name is not the door's:
   send its program SIGTERM.
+- Stopping the coordinator, and starting it again. The ledger is the pool's state, and the
+  coordinator takes up the ledger it finds at its start file's `ledger`. Of the same version of
+  `mag-mortar`, it replays it, each record checked against the one logged, and goes on writing
+  it; a ledger that does not replay is refused, exit 2, and left as it is. Written by another
+  version, it is kept beside its place as `ledger.jsonl.1`, and a new ledger begins that follows
+  it, with the jobs it held submitted again. A last line a crash cut short is dropped. Those three
+  are held by `mag-mar`'s tests. While no coordinator runs, the members run on and dial it again,
+  and each door command fails at once with exit 5. Run by hand on one machine, the three members on loopback, with `label-frames`
+  placed:
+  - `kill -KILL` on the coordinator. `status` fails at once with exit 5, `no coordinator
+    answers at the door`. The server and the laptop each say `the control channel ended ...; it
+    runs on, and dials the coordinator again`, dial again 0.25 s later, and, refused, wait 0.5,
+    1 and 2 s before the next dials.
+  - The coordinator started again, the same start file and the same command. It says `takes up
+    the ledger ledger.jsonl, which this version wrote: its 4 entries replayed, each record as
+    logged, and appended to`, and `awaits` the laptop for 5 s and the server for 30 s. Each
+    joins again (`` `server` joined again with 2 devices, at trust owner: 2 held already, 0
+    joined, 0 left ``), and says `joined the pool`. Nothing is written to the ledger, and
+    `status` prints what it printed before the kill, `label-frames` where it was.
+  - `kill -TERM` on the server, the laptop and then the coordinator: each exits 0, and the
+    ledger holds the five devices' leaves. `kill -TERM` is how you stop the coordinator for
+    good: it writes its own devices' leave. Killed, it writes nothing more, and the next one
+    awaits its members.
+
+  The coordinator waits for a member no longer than its grace: a member that has not joined
+  again within its `give_back_seconds`, and at least 5 s, from when the coordinator took up the
+  ledger or found its channel gone, has its devices' leave written then (held by the tests).
+
+  Starting the coordinator on another machine, with the ledger copied to its start file's place
+  and the other members' start files giving its address, is what you do when the coordinator's
+  machine is gone; that has not been tried yet.
 - Three containers on CPU: two jobs submitted to the coordinator's door and placed against each
   other, and one machine taken back with SIGTERM. This needs the members to run the parts placed
   on them, in `mag-mar`.
