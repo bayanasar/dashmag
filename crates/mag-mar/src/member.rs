@@ -9,31 +9,39 @@
 //!    it only dials, as a member behind address translation does.
 //! 3. Unless it is the coordinator, it dials the coordinator and opens a control channel, for no
 //!    job (`mag_by::CONTROL`), and joins: `mag_by::Control::Join`, with itself as its start file
-//!    describes it and what each of its devices offers. While the coordinator cannot be reached
-//!    it dials again every [`REDIAL`]; the host tells the coordinator nothing, so the join is
-//!    this member's to make.
-//! 4. When the coordinator tells it to give a device back (`mag_by::Control::GiveBack`), the
+//!    describes it and what each of its devices offers. The coordinator says
+//!    `mag_by::Control::Joined` once the join is in its ledger. While the coordinator cannot be
+//!    reached it dials again, after [`REDIAL_FIRST`] and then twice as long each time, up to
+//!    [`REDIAL`]; the host tells the coordinator nothing, so the join is this member's to make.
+//! 4. **It joins again.** When the control channel ends and the member is not leaving, as when
+//!    the coordinator stops or the network between them fails, it runs on, and dials the
+//!    coordinator again the same way and joins again, offering the devices it still holds. A
+//!    coordinator that comes back, or another that takes up its ledger, takes it back in with
+//!    them. A join the coordinator refuses for good, closing the channel without `Joined`, it
+//!    does not make again: it stays out of the pool until its lease ends.
+//! 5. When the coordinator tells it to give a device back (`mag_by::Control::GiveBack`), the
 //!    host having taken a device back by need at the door, it stops offering that device at
 //!    once, since no part runs on it yet, and says it has (`mag_by::Control::GaveBack`). It keeps
 //!    its other devices and its lease: a member whose last device is taken stays a member with
 //!    none until the host ends its lease, which is the host's to do by name.
-//! 5. On notice, SIGTERM from the host ([`Notice`]), it says `mag_by::Control::Leave`, closes its
+//! 6. On notice, SIGTERM from the host ([`Notice`]), it says `mag_by::Control::Leave`, closes its
 //!    way of the control channel, and waits for the coordinator to close the other way, the sign
-//!    that the leaving is recorded. Then it returns, and the program exits 0.
+//!    that the leaving is recorded. Then it returns, and the program exits 0. It dials no more.
 //!
 //! The member the start file names as coordinator dials no one: it runs the coordinator
 //! ([`crate::coordinator`]), which takes the other members' joins and leaves into the pool and its
 //! ledger, until its own notice.
 //!
-//! The member's `give_back_seconds` bound step 5 whatever any peer does. The notice sets a
+//! The member's `give_back_seconds` bound step 6 whatever any peer does. The notice sets a
 //! deadline on a thread of its own, at a tenth of them before their end and never more than 1 s
 //! before it ([`deadline`]), and at that deadline the process exits 0, wherever [`run`] is
 //! waiting: on a coordinator that stopped answering, on a dial, on anything. A link's keepalive
 //! cannot promise this, since TCP does not probe while data is unacknowledged.
 //!
 //! Not built yet: running the parts placed on it, channels to other members for their jobs,
-//! giving back with the parts' state, and joining again after the coordinator returns, which
-//! would offer only the devices it still holds.
+//! giving back with the parts' state, reporting what it measured while the coordinator was gone,
+//! and stopping its parts once it has been cut off from the coordinator for as long as the
+//! coordinator keeps its devices for it.
 
 use std::fmt;
 use std::io;
@@ -50,8 +58,14 @@ use crate::{TlsReceiver, TlsSender};
 /// The environment variable that names a member's start file.
 pub const MAG_START: &str = "MAG_START";
 
-/// How long a member waits before dialling the coordinator again after a dial failed.
-pub const REDIAL: Duration = Duration::from_secs(1);
+/// How long a member waits before it dials the coordinator again, after its control channel
+/// ended or a dial failed. Each dial that fails doubles it, up to [`REDIAL`].
+pub const REDIAL_FIRST: Duration = Duration::from_millis(250);
+
+/// The longest a member waits between two dials to the coordinator: so that it comes back soon
+/// after the coordinator does, well within the grace the coordinator gives it
+/// ([`crate::coordinator::grace`]).
+pub const REDIAL: Duration = Duration::from_secs(2);
 
 /// When, after its notice, a member with `give_back` to give its devices back ends itself: a
 /// tenth of `give_back` before its end, and never more than 1 s before it, so that the process
@@ -98,8 +112,14 @@ pub enum MemberError {
     /// The member's credentials, or binding its `listen` address.
     Link(LinkError),
     /// The coordinator could not begin its ledger at the start file's `ledger`: the path, and
-    /// why. A file already there is refused, not overwritten.
+    /// why. A file that comes there meanwhile is refused, not overwritten.
     Ledger { path: String, error: io::Error },
+    /// The coordinator did not take up the ledger at the start file's `ledger`, left by one that
+    /// stopped: the path, and why. It is left as it is.
+    TakeUp {
+        path: String,
+        error: crate::coordinator::TakeUpError,
+    },
     /// The coordinator could not write a line of its ledger, and stopped: the path, and why.
     /// Nothing after the last line written was acknowledged.
     LedgerUnwritten { path: String, error: io::Error },
@@ -128,10 +148,12 @@ impl fmt::Display for MemberError {
                 write!(f, "the coordinator `{name}` has no address to dial")
             }
             MemberError::Link(e) => write!(f, "{e}"),
-            MemberError::Ledger { path, error } => write!(
+            MemberError::Ledger { path, error } => {
+                write!(f, "the ledger {path} cannot be begun ({error})")
+            }
+            MemberError::TakeUp { path, error } => write!(
                 f,
-                "the ledger {path} cannot be begun ({error}); a coordinator begins a new one, \
-                 and taking up an old one is not built yet"
+                "the ledger {path} is not taken up, and is left as it is: {error}"
             ),
             MemberError::LedgerUnwritten { path, error } => write!(
                 f,
@@ -155,6 +177,7 @@ impl std::error::Error for MemberError {
                 Some(error)
             }
             MemberError::Door { error, .. } => Some(error),
+            MemberError::TakeUp { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -340,7 +363,9 @@ pub(crate) fn give_back_by(
     });
 }
 
-/// Dials the coordinator on a thread of its own until a control channel opens, after `wait`.
+/// Dials the coordinator on a thread of its own until a control channel opens, after `wait`,
+/// and after each dial that fails waits [`REDIAL_FIRST`], then twice as long each time, up to
+/// [`REDIAL`].
 fn dial(
     link: Arc<TlsLink>,
     member: String,
@@ -351,6 +376,7 @@ fn dial(
 ) {
     thread::spawn(move || {
         thread::sleep(wait);
+        let mut wait = REDIAL_FIRST;
         loop {
             match link.open(&coordinator, &address, CONTROL) {
                 Ok(channel) => {
@@ -362,11 +388,12 @@ fn dial(
                     format_args!(
                         "the coordinator `{coordinator}` at {address} is not reached ({e}); \
                          dialling again in {} s",
-                        REDIAL.as_secs_f64()
+                        wait.as_secs_f64()
                     ),
                 ),
             }
-            thread::sleep(REDIAL);
+            thread::sleep(wait);
+            wait = (wait * 2).min(REDIAL);
         }
     });
 }
@@ -458,6 +485,8 @@ pub fn run(start: &Start, mut offers: Vec<Offer>, notice: Notice) -> Result<Ende
     redial(Duration::ZERO);
 
     let mut control: Option<TlsSender> = None;
+    // Whether the coordinator said the join on this control channel is in.
+    let mut joined = false;
     loop {
         match next() {
             Event::Notice => {
@@ -475,19 +504,32 @@ pub fn run(start: &Start, mut offers: Vec<Offer>, notice: Notice) -> Result<Ende
                         say(
                             &name,
                             format_args!(
-                                "joined the pool at the coordinator `{}`, offering {} devices",
+                                "asks to join the pool at the coordinator `{}`, offering {} \
+                                 devices",
                                 start.coordinator,
                                 offers.len()
                             ),
                         );
                         hear(receiving, events_tx.clone());
                         control = Some(sending);
+                        joined = false;
                     }
                     Err(e) => {
                         say(&name, format_args!("the join was not sent ({e})"));
-                        redial(REDIAL);
+                        redial(REDIAL_FIRST);
                     }
                 }
+            }
+            Event::Heard(Control::Joined) => {
+                joined = true;
+                say(
+                    &name,
+                    format_args!(
+                        "joined the pool at the coordinator `{}`, offering {} devices",
+                        start.coordinator,
+                        offers.len()
+                    ),
+                );
             }
             Event::Heard(Control::GiveBack {
                 device,
@@ -531,9 +573,26 @@ pub fn run(start: &Start, mut offers: Vec<Offer>, notice: Notice) -> Result<Ende
                 &name,
                 format_args!("a word from the coordinator this member does not take: {word:?}"),
             ),
-            Event::Ended(e) => {
-                say(&name, format_args!("the control channel ended ({e})"));
+            // Closed before `Joined`: the coordinator refused the join for good.
+            Event::Ended(LinkError::Closed) if !joined => {
+                say(
+                    &name,
+                    "the coordinator refused its join, closing the control channel: it dials no \
+                     more, and stays out of the pool until its lease ends",
+                );
                 control = None;
+            }
+            Event::Ended(e) => {
+                say(
+                    &name,
+                    format_args!(
+                        "the control channel ended ({e}); it runs on, and dials the coordinator \
+                         again"
+                    ),
+                );
+                control = None;
+                joined = false;
+                redial(REDIAL_FIRST);
             }
         }
     }

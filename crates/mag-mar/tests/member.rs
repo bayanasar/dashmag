@@ -297,6 +297,18 @@ impl Program {
     fn said(&self, what: &str) -> bool {
         self.said.iter().any(|l| l.contains(what))
     }
+
+    /// Waits until it has said a line that holds `what` `times` times.
+    fn says_times(&mut self, what: &str, times: usize) {
+        let limit = Instant::now() + Duration::from_secs(20);
+        while self.said.iter().filter(|l| l.contains(what)).count() < times {
+            let left = limit.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => self.said.push(line),
+                Err(_) => panic!("not {times} lines with `{what}`; it said {:#?}", self.said),
+            }
+        }
+    }
 }
 
 impl Drop for Program {
@@ -328,8 +340,8 @@ enum Seen {
 }
 
 /// A stand-in for the coordinator's program: `workstation`, answering on loopback, which takes
-/// one control channel from one of `from` and reports each word on it. Its address, and what it
-/// saw.
+/// one control channel from one of `from`, reports each word on it, and answers a join with
+/// `Joined`. Its address, and what it saw.
 fn stand_in(
     pool: &Pool,
     from: &'static [&'static str],
@@ -348,8 +360,11 @@ fn stand_in(
             let Ok(word) = channel.recv_word::<Control>() else {
                 return;
             };
-            let leave = word == Control::Leave;
+            let (join, leave) = (matches!(word, Control::Join { .. }), word == Control::Leave);
             let _ = tx.send(Seen::Word(word));
+            if join && channel.send_word(&Control::Joined).is_err() {
+                return;
+            }
             if leave {
                 break;
             }
@@ -761,10 +776,27 @@ fn open_as(pool: &Pool, member: &str, at: &str, job: &str) -> mag_mar::TlsChanne
         .unwrap()
 }
 
-/// What the channel hears next: a join refused ends it unclosed, never as an acknowledgement.
+/// The same, as a join the coordinator takes: it says `Joined` next.
+fn join_as(pool: &Pool, member: &str, at: &str, word: &Control) -> mag_mar::TlsChannel {
+    let mut channel = say_as(pool, member, at, CONTROL, word);
+    assert_eq!(channel.recv_word::<Control>().unwrap(), Control::Joined);
+    channel
+}
+
+/// What the channel hears next: a join refused for now ends it unclosed, so that the member dials
+/// again.
 fn cut_short(channel: &mut mag_mar::TlsChannel) {
     match channel.recv() {
         Err(LinkError::Truncated) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+/// What the channel hears next: a join refused for good ends it closed, without `Joined`, so that
+/// the member dials no more.
+fn closed(channel: &mut mag_mar::TlsChannel) {
+    match channel.recv() {
+        Err(LinkError::Closed) => {}
         other => panic!("{other:?}"),
     }
 }
@@ -778,7 +810,8 @@ fn a_join_whose_names_are_not_its_certificates_or_whose_member_is_held_is_refuse
         offers: devices.iter().map(|(m, i)| offer(m, *i, 1 << 30)).collect(),
     };
 
-    // The server's certificate, joining as the laptop.
+    // Refused for good, each closed without `Joined`. The server's certificate, joining as the
+    // laptop.
     let mut c = say_as(
         &pool,
         "server",
@@ -786,7 +819,7 @@ fn a_join_whose_names_are_not_its_certificates_or_whose_member_is_held_is_refuse
         CONTROL,
         &join("laptop", &[("laptop", 0)]),
     );
-    cut_short(&mut c);
+    closed(&mut c);
     coordinating.says("it joins as `laptop`, and its certificate names `server`");
     // As itself, offering the laptop's device beside its own.
     let mut c = say_as(
@@ -796,13 +829,8 @@ fn a_join_whose_names_are_not_its_certificates_or_whose_member_is_held_is_refuse
         CONTROL,
         &join("server", &[("server", 0), ("laptop", 0)]),
     );
-    cut_short(&mut c);
+    closed(&mut c);
     coordinating.says("it offers laptop/0");
-    // On a channel for a job, not the control channel. Nothing is said on it: the coordinator
-    // does not read it, and a word sent may meet the cut first and fail.
-    let mut c = open_as(&pool, "server", &at, "j");
-    cut_short(&mut c);
-    coordinating.says("no job is placed yet");
     // As the coordinator itself.
     let mut c = say_as(
         &pool,
@@ -811,20 +839,21 @@ fn a_join_whose_names_are_not_its_certificates_or_whose_member_is_held_is_refuse
         CONTROL,
         &join("workstation", &[("workstation", 1)]),
     );
+    closed(&mut c);
+    coordinating.says("`workstation` is the coordinator");
+    // On a channel for a job, not the control channel: cut short as it opens, before any join.
+    // Nothing is said on it: the coordinator does not read it, and a word sent may meet the cut
+    // first and fail.
+    let mut c = open_as(&pool, "server", &at, "j");
     cut_short(&mut c);
-    coordinating.says("`workstation` is in the pool already");
+    coordinating.says("no job is placed yet");
     assert_eq!(read_ledger(&pool).0.entries.len(), 0);
 
-    // As itself, with its own device: taken.
-    let mut held = say_as(
-        &pool,
-        "server",
-        &at,
-        CONTROL,
-        &join("server", &[("server", 0)]),
-    );
-    ledger_of(&pool, 1);
-    // Again, on a second channel while the first is live: the member is held.
+    // As itself, with its own device: taken, and told so.
+    let mut held = join_as(&pool, "server", &at, &join("server", &[("server", 0)]));
+    assert_eq!(read_ledger(&pool).0.entries.len(), 1);
+    // Again, on a second channel while the first is live: the member is held, for now, since
+    // the first may be gone without the coordinator knowing yet; cut short, to dial again.
     let mut c = say_as(
         &pool,
         "server",
@@ -833,21 +862,17 @@ fn a_join_whose_names_are_not_its_certificates_or_whose_member_is_held_is_refuse
         &join("server", &[("server", 1)]),
     );
     cut_short(&mut c);
-    coordinating.says("`server` is in the pool already");
+    coordinating.says("`server` is in the pool already, on another channel; it may dial again");
     // Again, on the same channel.
-    let mut twice = say_as(
-        &pool,
-        "laptop",
-        &at,
-        CONTROL,
-        &join("laptop", &[("laptop", 0)]),
-    );
+    let mut twice = join_as(&pool, "laptop", &at, &join("laptop", &[("laptop", 0)]));
     ledger_of(&pool, 2);
     twice.send_word(&join("laptop", &[("laptop", 1)])).unwrap();
     cut_short(&mut twice);
     coordinating.says("it joined already on this channel");
     drop(twice);
-    // The laptop's channel gone, its device leaves; the server's one join stands.
+    // The laptop's channel gone, its device leaves at the end of its grace; the server's one
+    // join stands.
+    coordinating.says("`laptop` went without leaving");
     let ledger = ledger_of(&pool, 3);
     assert_eq!(
         changes(&ledger),
@@ -953,28 +978,43 @@ fn a_member_joins_at_once_while_peers_that_say_nothing_hold_connections_to_the_c
 }
 
 #[test]
-fn a_member_gone_without_leaving_is_recorded_as_left() {
+fn a_member_gone_without_leaving_is_recorded_as_left_at_the_end_of_its_grace() {
     let pool = Pool::new("gone");
     let (mut coordinating, at) = coordinator(&pool);
     let mut laptop = joined(&pool, "laptop", &at, description());
     ledger_of(&pool, 1);
     laptop.child.kill().unwrap();
-    let ledger = ledger_of(&pool, 2);
-    assert_eq!(changes(&ledger)[1], (None, device("laptop", 0), false));
     coordinating.says("`laptop` went without leaving");
+    let gone = Instant::now();
+    // Kept for its grace: its time to give back is 2 s, so the least grace, 5 s.
+    assert_eq!(mag_mar::coordinator::LEAST_GRACE, Duration::from_secs(5));
+    let ledger = ledger_of(&pool, 2);
+    let took = gone.elapsed();
+    assert!(took >= Duration::from_millis(4900), "{took:?}");
+    assert!(took < Duration::from_secs(8), "{took:?}");
+    assert_eq!(changes(&ledger)[1], (None, device("laptop", 0), false));
+    coordinating.says("`laptop` did not join again within its grace");
 }
 
 #[test]
-fn a_coordinator_does_not_overwrite_a_ledger_already_at_its_place() {
+fn a_coordinator_does_not_take_up_or_overwrite_what_is_not_a_ledger_at_its_place() {
     let pool = Pool::new("ledger-there");
     let path = pool.dir.join("ledger.jsonl");
-    std::fs::write(&path, "kept\n").unwrap();
     let start = pool.start("workstation", Some("127.0.0.1:0"), None);
-    let mut program = Program::start(Some(&start));
-    let (status, _) = program.exits(Duration::from_secs(10));
-    assert_eq!(status.code(), Some(2));
-    program.says("cannot be begun");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
+    for kept in [
+        &b"kept\n"[..],
+        b"",
+        b"{\"format\": \"mag-ledger\"",
+        b"\xff\xfe\n",
+    ] {
+        std::fs::write(&path, kept).unwrap();
+        let mut program = Program::start(Some(&start));
+        let (status, _) = program.exits(Duration::from_secs(10));
+        assert_eq!(status.code(), Some(2), "{:#?}", program.said);
+        program.says("is not taken up, and is left as it is");
+        assert_eq!(std::fs::read(&path).unwrap(), kept);
+        assert!(!pool.dir.join("ledger.jsonl.1").exists());
+    }
 }
 
 /// A leave whose ledger line cannot be written is never acknowledged: the coordinator stops with
@@ -1774,11 +1814,10 @@ fn a_member_that_does_not_say_it_gave_a_device_back_is_answered_for_at_the_deadl
     let start = pool.start("workstation", Some("127.0.0.1:0"), None);
     let (mut coordinating, at) = coordinator_from(Program::command(Some(&start)));
     // A member held by the test, which joins and then never answers.
-    let mut server = say_as(
+    let mut server = join_as(
         &pool,
         "server",
         &at,
-        CONTROL,
         &Control::Join {
             member: member("server", Trust::Owner, GIVE_BACK),
             offers: vec![offer("server", 0, 16 << 30)],
@@ -1832,11 +1871,10 @@ fn a_member_that_does_not_say_it_gave_a_device_back_is_answered_for_at_the_deadl
     // A member told to give a device back that leaves instead gives it back with the rest: the
     // door is answered at once. Its devices are larger than the coordinator's, which, holding
     // nothing either, would be given up first but for being the coordinator's.
-    let mut laptop = say_as(
+    let mut laptop = join_as(
         &pool,
         "laptop",
         &at,
-        CONTROL,
         &Control::Join {
             member: member("laptop", Trust::Site, GIVE_BACK),
             offers: vec![offer("laptop", 0, 16 << 30), offer("laptop", 1, 16 << 30)],
@@ -1886,6 +1924,7 @@ fn a_member_told_to_give_back_a_device_it_does_not_offer_gives_back_nothing_for_
         channel.recv_word::<Control>().unwrap(),
         Control::Join { .. }
     ));
+    channel.send_word(&Control::Joined).unwrap();
     // The laptop's device, then one of its own.
     for d in [device("laptop", 0), device("server", 1)] {
         channel
@@ -1909,4 +1948,366 @@ fn a_member_told_to_give_back_a_device_it_does_not_offer_gives_back_nothing_for_
     let (status, _) = program.terminate(limit() * 3);
     assert_eq!(status.code(), Some(0), "{:#?}", program.said);
     assert_eq!(channel.recv_word::<Control>().unwrap(), Control::Leave);
+}
+
+// A coordinator that stops, and one that takes up its ledger.
+
+/// The coordinator started again at `at`, the address the members dial, on its start file with
+/// that address: it and its start file.
+fn again(pool: &Pool, at: &str) -> (Program, PathBuf) {
+    let start = pool.start("workstation", Some(at), None);
+    let (program, answers) = coordinator_from(Program::command(Some(&start)));
+    assert_eq!(answers, at);
+    (program, start)
+}
+
+/// Kills the coordinator: no notice, nothing more written.
+fn kill(program: &mut Program) {
+    program.child.kill().unwrap();
+    program.child.wait().unwrap();
+}
+
+/// The ledger's place in the pool's directory.
+fn ledger_path(pool: &Pool) -> PathBuf {
+    pool.dir.join("ledger.jsonl")
+}
+
+#[test]
+fn a_coordinator_killed_and_started_again_takes_up_its_ledger_and_its_members_join_again() {
+    let pool = Pool::new("restart");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (mut first, at) = coordinator_from(Program::command(Some(&start)));
+    let mut server = joined(&pool, "server", &at, description());
+    let mut laptop = joined(&pool, "laptop", &at, description());
+    ledger_of(&pool, 3);
+    let graph = graph_file(&pool, "sums", false);
+    let asked = door(&start, &["submit", path(&graph)]);
+    assert_eq!(asked.code, Some(0), "{}", asked.said);
+    let before = status_at(&start);
+    assert_eq!(before.jobs.len(), 1);
+    assert_eq!(before.offers.len(), 4);
+    let (_, text) = read_ledger(&pool);
+
+    // Killed with its members joined and a job placed. The members run on, and dial again; the
+    // door answers no one meanwhile.
+    kill(&mut first);
+    for member in [&mut server, &mut laptop] {
+        member.says("the control channel ended");
+        member.says("is not reached");
+    }
+    assert_eq!(door(&start, &["status"]).code, Some(5));
+    assert_eq!(read_ledger(&pool).1, text);
+
+    // Started again on the same ledger: replayed, each record as logged, and the members join
+    // again, each with the devices the pool holds, so nothing is written.
+    let (mut second, start) = again(&pool, &at);
+    second.says("takes up the ledger");
+    second.says("its 4 entries replayed");
+    second.says("awaits `laptop`");
+    second.says("awaits `server`");
+    second.says("`server` joined again with 2 devices, at trust owner: 2 held already, 0 joined");
+    second.says("`laptop` joined again with 1 devices, at trust site: 1 held already, 0 joined");
+    server.says_times("joined the pool", 2);
+    laptop.says_times("joined the pool", 2);
+    assert_eq!(read_ledger(&pool).1, text);
+    // The job still held where it was, and the door answering as before.
+    assert_eq!(status_at(&start), before);
+
+    // Appended to, as before: the server leaves on SIGTERM, then the coordinator on its own.
+    let (status, _) = server.terminate(limit() * 3);
+    assert_eq!(status.code(), Some(0), "{:#?}", server.said);
+    assert!(server.said("left: the coordinator recorded it"));
+    let (status, _) = second.terminate(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "{:#?}", second.said);
+    let (ledger, text) = read_ledger(&pool);
+    assert_eq!(ledger.entries.len(), 7, "{text}");
+    let replayed = mag_mortar::Pool::replay(&ledger).unwrap();
+    assert_eq!(replayed.ledger().to_lines(), text);
+}
+
+#[test]
+fn a_last_ledger_line_cut_short_is_dropped_said_and_cut_away_before_the_ledger_goes_on() {
+    let pool = Pool::new("torn");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (mut first, at) = coordinator_from(Program::command(Some(&start)));
+    let mut laptop = joined(&pool, "laptop", &at, description());
+    ledger_of(&pool, 1);
+    kill(&mut first);
+    laptop.says("the control channel ended");
+
+    // A line the coordinator was writing as it died: never acknowledged.
+    let whole = std::fs::read(ledger_path(&pool)).unwrap();
+    let mut torn = whole.clone();
+    torn.extend_from_slice(b"{\"at\":17");
+    std::fs::write(ledger_path(&pool), &torn).unwrap();
+
+    let (mut second, start) = again(&pool, &at);
+    second.says("last line, line 3, was cut short and so never acknowledged: dropped");
+    second.says("its 1 entries replayed");
+    second.says("`laptop` joined again");
+    laptop.says_times("joined the pool", 2);
+    assert_eq!(std::fs::read(ledger_path(&pool)).unwrap(), whole);
+    // The next line follows the whole ones.
+    let graph = graph_file(&pool, "sums", false);
+    assert_eq!(door(&start, &["submit", path(&graph)]).code, Some(0));
+    let (ledger, text) = read_ledger(&pool);
+    assert_eq!(ledger.entries.len(), 2, "{text}");
+    assert_eq!(
+        mag_mortar::Pool::replay(&ledger)
+            .unwrap()
+            .ledger()
+            .to_lines(),
+        text
+    );
+}
+
+#[test]
+fn a_ledger_another_version_wrote_is_read_for_its_facts_and_a_new_one_follows_it() {
+    let pool = Pool::new("other-version");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (mut first, at) = coordinator_from(Program::command(Some(&start)));
+    let mut server = joined(&pool, "server", &at, description());
+    let mut laptop = joined(&pool, "laptop", &at, description());
+    ledger_of(&pool, 3);
+    for (job, code) in [("sums", 0), ("ended", 0)] {
+        let graph = graph_file(&pool, job, false);
+        assert_eq!(door(&start, &["submit", path(&graph)]).code, Some(code));
+    }
+    assert_eq!(door(&start, &["end", "ended"]).code, Some(0));
+    let before = status_at(&start);
+    ledger_of(&pool, 6);
+    kill(&mut first);
+
+    // Written, it says, by another version of mag-mortar.
+    let text = std::fs::read_to_string(ledger_path(&pool)).unwrap();
+    let (head, rest) = text.split_once('\n').unwrap();
+    let mut header: serde_json::Value = serde_json::from_str(head).unwrap();
+    header["written_by"] = "0.0.0-elsewhere".into();
+    let faked = format!("{header}\n{rest}");
+    std::fs::write(ledger_path(&pool), &faked).unwrap();
+
+    let (mut second, start) = again(&pool, &at);
+    let moved = pool.dir.join("ledger.jsonl.1");
+    second.says("was written by mag-mortar 0.0.0-elsewhere");
+    second.says(&format!("kept as {}", moved.display()));
+    second.says("with 1 jobs it held submitted again");
+    // The old one kept as it was; the new one in its place, following it.
+    assert_eq!(std::fs::read_to_string(&moved).unwrap(), faked);
+    let (ledger, text) = read_ledger(&pool);
+    assert_eq!(ledger.written_by.as_deref(), Some(mag_mortar::VERSION));
+    assert_eq!(ledger.follows.as_deref(), Some(moved.to_str().unwrap()));
+    let names: Vec<&str> = ledger.members.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["workstation", "server", "laptop"]);
+    assert_eq!(ledger.offers, before.offers);
+    // The job it held submitted again, the ended one not; nothing else.
+    match &ledger.entries[..] {
+        [e] => match &e.change {
+            Change::Submit { graph, .. } => assert_eq!(graph.job.name, "sums"),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+    // The members join again, holding the devices the new ledger began with: nothing written.
+    second.says("`server` joined again with 2 devices");
+    second.says("`laptop` joined again with 1 devices");
+    server.says_times("joined the pool", 2);
+    laptop.says_times("joined the pool", 2);
+    assert_eq!(read_ledger(&pool).1, text);
+    // The job held, placed afresh where it was, and the new ledger replays by itself.
+    let after = status_at(&start);
+    assert_eq!(after.offers, before.offers);
+    assert_eq!(after.jobs.len(), 1);
+    assert_eq!(after.jobs[0].arrangement, before.jobs[0].arrangement);
+    assert_eq!(
+        mag_mortar::Pool::replay(&ledger)
+            .unwrap()
+            .ledger()
+            .to_lines(),
+        text
+    );
+
+    // Started again on the new ledger, by this version: replayed and appended to.
+    kill(&mut second);
+    let (mut third, _) = again(&pool, &at);
+    third.says("its 1 entries replayed");
+    assert!(!pool.dir.join("ledger.jsonl.2").exists());
+}
+
+#[test]
+fn a_ledger_this_version_wrote_that_does_not_replay_is_refused_and_left_as_it_is() {
+    let pool = Pool::new("no-replay");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (mut first, at) = coordinator_from(Program::command(Some(&start)));
+    let graph = graph_file(&pool, "sums", false);
+    assert_eq!(door(&start, &["submit", path(&graph)]).code, Some(0));
+    ledger_of(&pool, 1);
+    kill(&mut first);
+    // The submission written twice: the pool refuses the second on replay.
+    let text = std::fs::read_to_string(ledger_path(&pool)).unwrap();
+    let submit = text.lines().nth(1).unwrap();
+    let doubled = format!("{text}{submit}\n");
+    std::fs::write(ledger_path(&pool), &doubled).unwrap();
+
+    let start = pool.start("workstation", Some(&at), None);
+    let mut second = Program::start(Some(&start));
+    let (status, _) = second.exits(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(2), "{:#?}", second.said);
+    second.says("is not taken up, and is left as it is");
+    second.says("entry 1 is refused on replay: the pool already holds a job named `sums`");
+    assert_eq!(
+        std::fs::read_to_string(ledger_path(&pool)).unwrap(),
+        doubled
+    );
+}
+
+#[test]
+fn a_member_that_joins_again_within_its_grace_keeps_its_devices_and_one_gone_past_it_leaves() {
+    let pool = Pool::new("grace");
+    let (mut coordinating, at) = coordinator(&pool);
+    let join = |devices: &[u32]| Control::Join {
+        member: member("laptop", Trust::Site, GIVE_BACK),
+        offers: devices
+            .iter()
+            .map(|&i| offer("laptop", i, 4 << 30))
+            .collect(),
+    };
+    let laptop = join_as(&pool, "laptop", &at, &join(&[0]));
+    assert_eq!(read_ledger(&pool).0.entries.len(), 1);
+
+    // Its channel cut without a leave: kept for its grace.
+    drop(laptop);
+    coordinating.says("`laptop` went without leaving");
+    // Back within it, as it was: taken back in, nothing written; and still nothing once the
+    // grace it had would have ended.
+    let laptop = join_as(&pool, "laptop", &at, &join(&[0]));
+    coordinating.says("`laptop` joined again with 1 devices, at trust site: 1 held already");
+    thread::sleep(mag_mar::coordinator::LEAST_GRACE + Duration::from_secs(1));
+    assert_eq!(read_ledger(&pool).0.entries.len(), 1);
+
+    // Back with another device in place of its first: the first leaves, the other joins.
+    drop(laptop);
+    coordinating.says_times("`laptop` went without leaving", 2);
+    let laptop = join_as(&pool, "laptop", &at, &join(&[1]));
+    coordinating.says("0 held already, 1 joined, 1 left");
+    assert_eq!(
+        changes(&read_ledger(&pool).0)[1..],
+        [
+            (None, device("laptop", 0), false),
+            (
+                Some(member("laptop", Trust::Site, GIVE_BACK)),
+                device("laptop", 1),
+                true
+            ),
+        ]
+    );
+
+    // Gone past its grace: its device's leave recorded at its end, and not before.
+    drop(laptop);
+    coordinating.says_times("`laptop` went without leaving", 3);
+    let gone = Instant::now();
+    let ledger = ledger_of(&pool, 4);
+    let took = gone.elapsed();
+    assert!(took >= Duration::from_millis(4900), "{took:?}");
+    assert_eq!(changes(&ledger)[3], (None, device("laptop", 1), false));
+    coordinating.says("`laptop` did not join again within its grace: its 1 devices");
+}
+
+#[test]
+fn a_member_whose_channel_is_cut_dials_again_and_joins_again() {
+    let pool = Pool::new("redial");
+    let link = TlsLink::bind(pool.credentials("workstation"), "127.0.0.1:0").unwrap();
+    let address = link.local_addr().unwrap().to_string();
+    let start = pool.start("server", None, Some(&address));
+    let mut program = Program::start(Some(&start));
+    let join = |channel: &mut mag_mar::TlsChannel| match channel.recv_word::<Control>().unwrap() {
+        Control::Join { offers, .. } => offers,
+        other => panic!("{other:?}"),
+    };
+
+    // Cut before `Joined`, as by a coordinator that died before its line was written: it dials
+    // again, soon.
+    let mut channel = link.accept(&["server"]).unwrap();
+    let offered = join(&mut channel);
+    drop(channel);
+    let cut = Instant::now();
+    let mut channel = link.accept(&["server"]).unwrap();
+    assert!(
+        cut.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        cut.elapsed()
+    );
+    assert_eq!(join(&mut channel), offered);
+    channel.send_word(&Control::Joined).unwrap();
+    program.says("joined the pool");
+    // Cut after `Joined`: the same.
+    drop(channel);
+    let mut channel = link.accept(&["server"]).unwrap();
+    assert_eq!(join(&mut channel), offered);
+    channel.send_word(&Control::Joined).unwrap();
+    program.says_times("joined the pool", 2);
+    assert!(
+        program.said("it runs on, and dials the coordinator again"),
+        "{:#?}",
+        program.said
+    );
+
+    // Leaving, it dials no more.
+    // The program has exited by the time its leave is read, so the channel is not closed from
+    // here: its other end may be gone already.
+    let (status, _) = program.terminate(limit() * 3);
+    assert_eq!(channel.recv_word::<Control>().unwrap(), Control::Leave);
+    assert_eq!(status.code(), Some(0), "{:#?}", program.said);
+}
+
+#[test]
+fn a_member_whose_join_is_refused_for_good_dials_no_more() {
+    let pool = Pool::new("refused-for-good");
+    let link = TlsLink::bind(pool.credentials("workstation"), "127.0.0.1:0").unwrap();
+    let address = link.local_addr().unwrap().to_string();
+    let start = pool.start("server", None, Some(&address));
+    let mut program = Program::start(Some(&start));
+    let mut channel = link.accept(&["server"]).unwrap();
+    assert!(matches!(
+        channel.recv_word::<Control>().unwrap(),
+        Control::Join { .. }
+    ));
+    // Closed without `Joined`: the coordinator's refusal.
+    channel.close().unwrap();
+    program.says("the coordinator refused its join");
+    // Nothing more comes, for more than twice the longest wait between dials.
+    let (tx, dialled) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(link.accept(&["server"]).is_ok());
+    });
+    assert!(
+        dialled
+            .recv_timeout(mag_mar::member::REDIAL * 2 + Duration::from_secs(1))
+            .is_err()
+    );
+    assert!(!program.said("joined the pool"), "{:#?}", program.said);
+    // It keeps its lease until SIGTERM, with no one to tell.
+    let (status, took) = program.terminate(limit() * 3);
+    assert_eq!(status.code(), Some(0), "{:#?}", program.said);
+    assert!(took < limit(), "{took:?}");
+    assert!(program.said("no one to tell"), "{:#?}", program.said);
+}
+
+#[test]
+fn a_second_coordinator_on_a_ledger_another_one_writes_is_refused() {
+    let pool = Pool::new("ledger-held");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (_first, at) = coordinator_from(Program::command(Some(&start)));
+    let _laptop = joined(&pool, "laptop", &at, description());
+    ledger_of(&pool, 1);
+    let (_, text) = read_ledger(&pool);
+    // Its own door and address, the same ledger.
+    let second = pool.dir.join("second.json");
+    let mut s = Start::from_json(&std::fs::read_to_string(&start).unwrap()).unwrap();
+    s.door = pool.dir.join("second.sock").to_str().unwrap().into();
+    std::fs::write(&second, s.to_json()).unwrap();
+    let mut refused = Program::start(Some(&second));
+    let (status, _) = refused.exits(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(2), "{:#?}", refused.said);
+    refused.says("another coordinator holds its lock, and writes it still");
+    assert_eq!(read_ledger(&pool).1, text);
 }
