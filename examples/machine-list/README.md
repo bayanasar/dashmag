@@ -82,9 +82,23 @@ a member.
 
 ## Next
 
-- A start file for each of the three members, named by `MAG_START`: the member, the pool, its
-  peers and their keys, which member coordinates, the ledger, the door, the idle time and the
-  key's path, as `mag-by`'s [start file](../../crates/mag-by/starts/example.json) has them.
+- The pool's certificate authority, and a certificate for each member. You make them once, on
+  the machine you keep the pool from, from the repository's root:
+
+      cargo run --locked -q -p mag-mar --features issue --example certs -- \
+          new pool-certs workstation server laptop
+
+  This runs today. It writes `authority.pem` and `authority.key` into `pool-certs`, and for each
+  member `MEMBER.pem` and `MEMBER.key`, and prints each member's certificate serial. Keep
+  `authority.key` where you run this, and give it to no member. Copy each member's two files to
+  that machine, readable only by the user the program runs as. For a machine you add later, or
+  one that comes back after you took it out, run the same with `add` in place of `new`: the
+  same authority signs a new certificate, and the pool needs no other word of it.
+- A start file for each of the three members, named by `MAG_START`: the member, the pool, the
+  authority's certificate (the text of `authority.pem`), its peers and their addresses, which
+  member coordinates, the ledger, the door, the idle time, and the paths of the member's
+  certificate and key, as `mag-by`'s [start file](../../crates/mag-by/starts/example.json) has
+  them.
 - The member program on three containers on CPU: two jobs submitted to the coordinator's door
   and placed against each other, and one machine taken back with SIGTERM. This needs `mag-mar`.
 - The same on three real machines with CUDA, ROCm and MLX.

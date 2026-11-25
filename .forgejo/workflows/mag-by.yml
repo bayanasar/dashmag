@@ -4,7 +4,8 @@ name: mag-by
 # turns a feature on for every user of a crate in one build, so the agent's files (the `graph`
 # feature) must never reach it; this checks that the default build still builds without std and
 # still has no dependencies, and runs the crate's tests, which hold the kept schemas and DOT to
-# what the code generates; and that mag-mortar, without its files, depends on mag-by alone.
+# what the code generates; that mag-mortar, without its files, depends on mag-by alone; and
+# mag-mar's link between two members over loopback.
 
 on:
   pull_request:
@@ -60,6 +61,11 @@ jobs:
       # read back exactly through mag-by's own.
       - name: The placement loop's tests, the guard's and the ledger's among them
         run: cargo test --locked -p mag-mortar
+
+      # Alone too: two members over loopback with TLS 1.3, each refusal, one channel per job,
+      # and a tensor of 64 MiB byte for byte.
+      - name: The link between members
+        run: cargo test --locked -p mag-mar
 
       - name: The plan command, as the README gives it, prints the kept plan
         run: |

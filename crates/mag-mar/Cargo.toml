@@ -1,0 +1,43 @@
+[package]
+name = "mag-mar"
+description = "The program every member of a mag pool runs. So far its link: one channel per job to another member, over TCP with TLS 1.3, both ends holding certificates from the pool's own authority, carrying mag-by's words and tensors of any size."
+readme = "README.md"
+keywords = ["scheduling", "distributed", "machine-learning", "tls"]
+categories = ["network-programming"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The words on a link, and serde on them.
+mag-by = { workspace = true, features = ["graph"] }
+# TLS 1.3 only, with ring as the provider: no C toolchain beyond ring's own, and no cmake.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+# The certificate checks rustls makes, called directly to read who a certificate names.
+webpki = { package = "rustls-webpki", version = "0.103.16", default-features = false, features = ["ring", "std"] }
+serde = "1"
+serde_json = "1"
+# Making a pool's authority and its members' certificates: the host's, not every member's.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "crypto", "x509-parser"], optional = true }
+ring = { version = "0.17.14", optional = true }
+time = { version = "0.3.47", default-features = false, optional = true }
+
+[features]
+# Issuing certificates: what the host runs, for the `certs` command. Off, a member links no
+# certificate generator.
+issue = ["dep:rcgen", "dep:ring", "dep:time"]
+
+[dev-dependencies]
+mag-mar = { path = ".", features = ["issue"] }
+# A client that offers TLS 1.2 only, to see it refused.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+
+[[example]]
+name = "certs"
+required-features = ["issue"]
+
+[[example]]
+name = "loopback"
+required-features = ["issue"]
