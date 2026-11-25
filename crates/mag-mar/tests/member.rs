@@ -1857,3 +1857,40 @@ fn a_member_that_does_not_say_it_gave_a_device_back_is_answered_for_at_the_deadl
         ]
     );
 }
+
+#[test]
+fn a_member_told_to_give_back_a_device_it_does_not_offer_gives_back_nothing_for_it() {
+    let pool = Pool::new("give-back-other");
+    let link = TlsLink::bind(pool.credentials("workstation"), "127.0.0.1:0").unwrap();
+    let address = link.local_addr().unwrap().to_string();
+    let start = pool.start("server", None, Some(&address));
+    let mut program = Program::start(Some(&start));
+    let mut channel = link.accept(&["server"]).unwrap();
+    assert!(matches!(
+        channel.recv_word::<Control>().unwrap(),
+        Control::Join { .. }
+    ));
+    // The laptop's device, then one of its own.
+    for d in [device("laptop", 0), device("server", 1)] {
+        channel
+            .send_word(&Control::GiveBack {
+                device: d,
+                deadline_seconds: 10.0,
+            })
+            .unwrap();
+    }
+    // It says it gave back its own, and only that.
+    assert_eq!(
+        channel.recv_word::<Control>().unwrap(),
+        Control::GaveBack {
+            device: device("server", 1)
+        }
+    );
+    program.says("is told to give laptop/0 back, which it does not offer");
+    program.says("gives server/1 back at the coordinator's word");
+    // It keeps its other device, and its lease.
+    assert!(!program.said("offers no device now"), "{:#?}", program.said);
+    let (status, _) = program.terminate(limit() * 3);
+    assert_eq!(status.code(), Some(0), "{:#?}", program.said);
+    assert_eq!(channel.recv_word::<Control>().unwrap(), Control::Leave);
+}
