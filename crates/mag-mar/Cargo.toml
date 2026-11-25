@@ -1,6 +1,6 @@
 [package]
 name = "mag-mar"
-description = "The program every member of a mag pool runs. So far its link: one channel per job to another member, over TCP with TLS 1.3, both ends holding certificates from the pool's own authority, carrying mag-by's words and tensors of any size."
+description = "The program every member of a mag pool runs. So far its link, one channel per job to another member over TCP with TLS 1.3, both ends holding certificates from the pool's own authority, carrying mag-by's words and tensors of any size; and the program's skeleton, which joins the pool and gives its devices back on SIGTERM within its time."
 readme = "README.md"
 keywords = ["scheduling", "distributed", "machine-learning", "tls"]
 categories = ["network-programming"]
@@ -26,6 +26,11 @@ socket2 = { version = "0.6.5", features = ["all"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "crypto", "x509-parser"], optional = true }
 ring = { version = "0.17.14", optional = true }
 time = { version = "0.3.47", default-features = false, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# SIGTERM, the host's notice that a member's lease ends: a handler that writes a byte to a pipe.
+# Already in the tree through socket2, so it adds no crate; signal-hook would add two.
+libc = "0.2.189"
 
 [features]
 # Issuing certificates: what the host runs, for the `certs` command. Off, a member links no

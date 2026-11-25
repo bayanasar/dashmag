@@ -1,8 +1,46 @@
 # mag-mar
 
-The program every member of a mag pool is to run. So far it is the link between members; the
-program that reads `MAG_START`, runs the parts placed on its member and, on the member that
-coordinates, serves the pool, is not built yet.
+The program every member of a mag pool is to run. So far it is the link between members, and
+the program's skeleton: it reads `MAG_START`, joins the pool at the coordinator, and gives its
+devices back on SIGTERM within its time. Running the parts placed on its member, and serving the
+pool on the member that coordinates, are not built yet.
+
+## The member program
+
+The host starts `mag-mar` on each member, with the environment variable `MAG_START` naming its
+start file (`mag-by`'s `Start`):
+
+    MAG_START=/etc/mag/server.json cargo run --release -p mag-mar
+
+- **It loads its credentials** from the certificate and key files the start file names, and
+  refuses a key file its group or others can reach.
+- **It binds its `listen` address**, where the other members are to dial it. A start file with
+  no `listen` gives a member that only dials, as one behind address translation does.
+- **It joins.** Unless it is the coordinator, it dials the coordinator at the address its peer
+  entry gives, and opens a control channel: a channel for no job, `mag_by::CONTROL`, the empty
+  name, which no job may have. On it, it says `mag_by::Control::Join`, with itself as its start
+  file describes it (its trust and its `give_back_seconds`, as the host wrote them) and what its
+  devices offer. The offers are those the start file's pool gives for its devices, until the
+  member measures its own. While the coordinator cannot be reached, it dials again every second.
+- **On SIGTERM it gives back.** It says `mag_by::Control::Leave`, closes its way of the control
+  channel, and waits for the coordinator to close the other way, the sign that the leaving is
+  recorded. Then it exits 0. With no control channel open, before it joined or after the channel
+  ended, it exits 0 at once.
+- **Its `give_back_seconds` hold whatever any peer does.** The signal sets a deadline on a thread
+  of its own, a tenth of the time before its end and never more than 1 s before it, and at that
+  deadline the process exits 0, wherever the program is waiting: on a coordinator that stopped
+  answering, or on a dial that has not opened. A link's keepalive cannot promise this, since TCP
+  does not probe while data is unacknowledged.
+- **What it does goes to standard error**, a line at a time. It exits 2 when it cannot start:
+  `MAG_START` unset, a start file that cannot be read or is refused, credentials refused, or an
+  address it cannot bind.
+
+The library entry is `mag_mar::member::run`; the binary takes SIGTERM as its notice
+(`member::Notice::sigterm`, on Unix), reads the start file and calls it.
+
+The coordinator's own program is not built: a member that coordinates binds its address and waits
+for its notice, and a member that dials it waits in its opening until the opening gives up, and
+dials again.
 
 ## The link
 
@@ -74,8 +112,12 @@ anything new. `certs help` says the same.
 ## Measured
 
 `cargo test -p mag-mar` runs two members over loopback, each refusal, two jobs' channels, a
-tensor of 64 MiB byte for byte, and both ends of one channel sending 64 MiB at the same moment. `loopback` sends one tensor of any size and reports the rate
-and the memory the link took beyond the two buffers:
+tensor of 64 MiB byte for byte, and both ends of one channel sending 64 MiB at the same moment.
+It runs the member program as a process of its own against a stand-in coordinator: the member
+joins with its offers and leaves on SIGTERM; it exits 0 within its give-back time when the
+coordinator stops answering, and when it is still opening its channel to one that never answers;
+a start file without `listen` dials only. `loopback` sends one tensor of any size and reports the
+rate and the memory the link took beyond the two buffers:
 
     cargo run --release -p mag-mar --features issue --example loopback -- 4
 
@@ -85,7 +127,9 @@ sending (2026-11-25, three runs).
 
 ## Not built yet
 
-- The member program, the coordinator and the door.
+- The coordinator and the door; joining again after the coordinator comes back.
+- Running the parts placed on a member, channels to other members for their jobs, and giving
+  back with the parts' state at a step.
 - Refusing a member whose lease ended until it has a new certificate.
 - A second transport over RDMA, which is to wait until a run under Slurm shows the link limiting.
 - Which member may open which job's channel: a member takes a channel for any job from any member

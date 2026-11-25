@@ -5,7 +5,7 @@ name: mag-by
 # feature) must never reach it; this checks that the default build still builds without std and
 # still has no dependencies, and runs the crate's tests, which hold the kept schemas and DOT to
 # what the code generates; that mag-mortar, without its files, depends on mag-by alone; and
-# mag-mar's link between two members over loopback.
+# mag-mar's link between two members over loopback, and its member program.
 
 on:
   pull_request:
@@ -63,8 +63,9 @@ jobs:
         run: cargo test --locked -p mag-mortar
 
       # Alone too: two members over loopback with TLS 1.3, each refusal, one channel per job,
-      # and a tensor of 64 MiB byte for byte.
-      - name: The link between members
+      # and a tensor of 64 MiB byte for byte; and the member program, as a process of its own,
+      # joining a stand-in coordinator and ending on SIGTERM within its time.
+      - name: The link between members, and the member program
         run: cargo test --locked -p mag-mar
 
       - name: The plan command, as the README gives it, prints the kept plan

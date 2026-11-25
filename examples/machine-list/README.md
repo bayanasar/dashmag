@@ -6,8 +6,9 @@ over ssh, as `mpirun` runs from a hostfile. The target is one job's graph run ac
 unequal machines: one with a CUDA card, one with a ROCm card, and a Mac with MLX.
 
 What runs today is the first step, planning. You write the pool file, and `mag plan` shows where
-the pool would place a graph on it, and why. Nothing is started on any machine and nothing
-crosses a network: the program each machine runs (`mag-mar`) is not built yet.
+the pool would place a graph on it, and why. Nothing is placed on any machine yet: the program
+each machine runs (`mag-mar`) starts, dials the coordinator and gives its machine back on
+SIGTERM, but the coordinator's side of it is not built, so no member joins a pool yet.
 
 ## The files
 
@@ -68,7 +69,7 @@ a member. For each device on it that you give the pool, write an offer.
 |---|---|---|
 | member `name` | a name for the machine, used in every device's name, in the plan and in the machine's certificate | a DNS name in lower case: letters `a` to `z`, digits and `-`, in labels joined by `.`, the last not all digits; the pool file refuses any other. A role (`workstation`) keeps your hostnames out of files you share. |
 | member `trust` | how far you trust the machine: `owner`, `site` or `outside`. Data kept at a level never goes to a machine trusted less. | yours. Your own machines are `owner`. A machine on your site that is not yours is `site`. A rented one is `outside`. |
-| member `give_back_seconds` | how soon the machine gives its devices back when you take it back | yours: how long you will wait. The member program is to honour it; it is not built. |
+| member `give_back_seconds` | how soon the machine gives its devices back when you take it back | yours: how long you will wait. The member program holds to it: on SIGTERM it exits 0 within it, whatever the other machines do. |
 | offer `device` | the member and an index, one per device | number each machine's devices from 0. Here the card is 0 and the CPU is 1. |
 | offer `backend` | `cuda`, `rocm`, `mlx` or `flex` (the CPU) | the build of dash you run on that device |
 | offer `memory_bytes` | the memory the device gives the pool: what is free of anything else holding it, in bytes | for a card, its total less what other programs keep (`nvidia-smi --query-gpu=memory.total,memory.used --format=csv`, `rocm-smi --showmeminfo vram`). On a Mac the card and the CPU share one memory (`sysctl -n hw.memsize` gives the total), so give the pool only what you can spare, and offer the CPU and MLX together no more than that. |
@@ -108,11 +109,23 @@ a member.
   copy its two new files over the old on that machine, and start its program again. The other
   members need nothing new, since they trust the authority and not one certificate. When the
   authority itself ends, make a new pool with `new`. `certs help` says the same.
-- A start file for each of the three members, named by `MAG_START`: the member, the pool, the
-  authority's certificate (the text of `authority.pem`), its peers and their addresses, which
-  member coordinates, the ledger, the door, the idle time, and the paths of the member's
-  certificate and key, as `mag-by`'s [start file](../../crates/mag-by/starts/example.json) has
-  them.
-- The member program on three containers on CPU: two jobs submitted to the coordinator's door
-  and placed against each other, and one machine taken back with SIGTERM. This needs `mag-mar`.
+- A start file for each of the three members, named by `MAG_START`: the member, where it
+  answers the others (`listen`, such as `0.0.0.0:7340`; leave it out for a machine behind
+  address translation, which only dials), the pool, the authority's certificate (the text of
+  `authority.pem`), its peers and their addresses, which member coordinates, the ledger, the
+  door, the idle time, and the paths of the member's certificate and key, as `mag-by`'s
+  [start file](../../crates/mag-by/starts/example.json) has them. The coordinator needs a
+  `listen` address, and every other member's start file gives it as the coordinator's address,
+  since every member dials it.
+- The member program on each machine, from the repository's root:
+
+      MAG_START=server.json cargo run --release -q -p mag-mar
+
+  This runs today, as far as it goes. The member reads its start file, binds its `listen`
+  address and dials the coordinator; the coordinator's member binds its address and waits. Since
+  the coordinator's side is not built, a member's dial is not answered: it gives up after 10 s
+  and dials again, saying so on standard error. `kill -TERM` ends it with status 0 within its
+  `give_back_seconds`.
+- Three containers on CPU: two jobs submitted to the coordinator's door and placed against each
+  other, and one machine taken back with SIGTERM. This needs the coordinator in `mag-mar`.
 - The same on three real machines with CUDA, ROCm and MLX.

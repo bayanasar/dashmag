@@ -1,4 +1,5 @@
-//! The program every member of a mag pool runs. So far, its link to the other members.
+//! The program every member of a mag pool runs: so far its link to the other members, and the
+//! program's skeleton, which joins the pool and gives its devices back on notice.
 //!
 //! A host gives a pool its machines; on each, it starts this program with a start file
 //! (`mag_by::Start`). The members then link to each other, and this crate holds that link:
@@ -30,12 +31,17 @@
 //! - With the `issue` feature, `issue`: the pool's authority and its members' certificates,
 //!   as the host makes them; the `certs` example is the command.
 //!
-//! The member program itself, which reads `MAG_START`, runs the parts placed on it and serves
-//! the coordinator, is not built yet.
+//!
+//! And the program on the link, [`member::run`], which the crate's binary calls: it reads the
+//! start file `MAG_START` names, binds the member's own address if it has one, dials the
+//! coordinator unless it is the coordinator, and joins over a control channel with its offers.
+//! On SIGTERM it says it leaves and exits 0 within its `give_back_seconds`, whatever any peer
+//! does. Running the parts placed on it, and serving the pool as coordinator, are not built yet.
 
 mod frame;
 #[cfg(feature = "issue")]
 pub mod issue;
+pub mod member;
 mod tls;
 
 use std::fmt;

@@ -4257,6 +4257,7 @@ dependencies = [
 name = "mag-mar"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "mag-by",
  "mag-mar",
  "rcgen",
