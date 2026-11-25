@@ -72,7 +72,10 @@
 //!   squeezing a running job (M-6). Running jobs are not moved here, so moving costs nothing;
 //! - memory over time: a device's parts are summed as if all resident at once;
 //! - a deadline: a job states no length yet;
-//! - beginning a pool from the arrangement its members hold, after its coordinator stops.
+//! - beginning a pool from the arrangement its members hold, after its coordinator stops. A
+//!   coordinator of the same version replays the ledger; one of another version begins a pool
+//!   that follows it ([`Pool::follow`]), from the members, devices and jobs it was told of, and
+//!   places the jobs afresh, since no part runs on a member yet for it to ask where it is.
 //!
 //! The same members, offers and events give the same records: devices are taken in the order of
 //! their [`DeviceId`], and the first of equal scores wins.
@@ -369,6 +372,65 @@ impl Pool {
             }
         }
         Ok(pool)
+    }
+
+    /// A pool that follows `old`, a ledger another version of this crate wrote, begun at `at` from
+    /// its facts alone; its ledger's header names the ledger it follows, `follows`.
+    ///
+    /// A ledger replays only on the version that wrote it, since another version's loop may
+    /// decide otherwise (`ReplayError::Differs`). So the old ledger's decisions are not taken:
+    /// only what it was told. The new pool begins with the members as the old one knew them, each
+    /// at the lowest trust and the shortest time to give a device back it was reported with, and
+    /// the devices it held when the old ledger ends, every device that joined and has not left.
+    /// Then each job it held, submitted and not ended, is submitted again at `at`, with its graph
+    /// and its stamp, in the order it arrived, and the loop places it as on any arrival. Each
+    /// submission is an entry of the new ledger, so that the new ledger replays by itself.
+    ///
+    /// A job submitted again starts waiting from 0, and is placed afresh: the ledger's words
+    /// carry no job held where it was, nor its time waited, so a pool beginning from them could
+    /// not be replayed from its own ledger. A job this version refuses, as a graph its check now
+    /// refuses, is left out and returned, with why.
+    pub fn follow(old: &Ledger, follows: &str, at: f64) -> (Pool, Vec<(String, ChangeError)>) {
+        let mut members: Vec<Member> = Vec::new();
+        let mut report = |m: &Member| match members.iter_mut().find(|x| x.name == m.name) {
+            Some(known) => {
+                known.trust = known.trust.min(m.trust);
+                known.give_back_seconds = known.give_back_seconds.min(m.give_back_seconds);
+            }
+            None => members.push(m.clone()),
+        };
+        old.members.iter().for_each(&mut report);
+        let mut offers: BTreeMap<DeviceId, Offer> = old
+            .offers
+            .iter()
+            .map(|o| (o.device.clone(), o.clone()))
+            .collect();
+        let mut jobs: Vec<(Graph, Stamp)> = Vec::new();
+        for e in &old.entries {
+            match &e.change {
+                Change::Join { member, offer } => {
+                    if let Some(m) = member {
+                        report(m);
+                    }
+                    offers.insert(offer.device.clone(), offer.clone());
+                }
+                Change::Leave { device } => {
+                    offers.remove(device);
+                }
+                Change::Submit { graph, stamp } => jobs.push((graph.clone(), stamp.clone())),
+                Change::End { job } => jobs.retain(|(g, _)| &g.job.name != job),
+            }
+        }
+        let mut pool = Pool::begin(members, offers.into_values().collect(), at);
+        pool.ledger.follows = Some(follows.into());
+        let mut refused = Vec::new();
+        for (graph, stamp) in jobs {
+            let job = graph.job.name.clone();
+            if let Err(e) = pool.apply(Change::Submit { graph, stamp }, at) {
+                refused.push((job, e));
+            }
+        }
+        (pool, refused)
     }
 
     /// What the pool began with, then every change it took, with the record of each. Its host
