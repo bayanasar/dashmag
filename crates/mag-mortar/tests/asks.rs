@@ -407,6 +407,35 @@ fn a_kinds_device_takes_only_what_the_kind_names() {
 }
 
 #[test]
+fn only_the_waiting_jobs_parts_make_the_kinds_asked_for() {
+    // `placed` holds the pool's one device with an exact part and a bf16 one; its whole job's
+    // kind, of 2 GiB meeting both, comes before `waits`'s, of 2 GiB meeting bf16, and would take
+    // it as well. It is no waiting job's, so it is not asked for.
+    let mut both = offer(device("a", 0), Backend::Cuda, 2, &[("u", 0.01)]);
+    both.tolerances.push(Tolerance::Exact);
+    let mut pool = Pool::new(vec![member("a", Owner)], vec![both]);
+    let mut exact = part("e", "u", Mark::Atomic, 1);
+    exact.tolerance = Tolerance::Exact;
+    pool.submit(
+        job(
+            "placed",
+            1,
+            vec![],
+            vec![exact, part("b", "u", Mark::Atomic, 1)],
+            vec![],
+        ),
+        Stamp::default(),
+        0.0,
+    )
+    .unwrap();
+    assert!(!waits(&pool, "placed"));
+    pool.submit(one_part("waits", 1, 2), Stamp::default(), 0.0)
+        .unwrap();
+    assert!(waits(&pool, "waits"));
+    assert_eq!(pool.wants(0.0), Some(kind(2, false)));
+}
+
+#[test]
 fn a_job_the_pool_would_place_on_its_own_devices_asks_for_no_new_one() {
     // `low` waits beside `high`, which it would halve, and is stamped to that device alone. By
     // 600 s its wait has raised it past half of `high`, so the loop, run then, would place it
@@ -585,6 +614,19 @@ fn idle_time_is_counted_from_when_a_part_left_or_a_member_joined() {
         .unwrap();
     assert_eq!(pool.gives_back("a", 100.0, 499.0), ["d"]);
     assert_eq!(pool.gives_back("a", 100.0, 500.0), ["d", "b"]);
+}
+
+#[test]
+fn a_change_told_late_counts_idle_time_from_the_pools_time() {
+    let mut pool = three();
+    pool.submit(one_part("j", 1, 2), Stamp::default(), 10.0)
+        .unwrap();
+    pool.join(None, offer(device("c", 1), Backend::Cuda, 1, &[]), 100.0)
+        .unwrap();
+    // The end is told at 100's pool time with the time 50: `b` held the part until 100.
+    pool.end("j", 50.0).unwrap();
+    assert_eq!(pool.gives_back("a", 50.0, 149.0), ["c"]);
+    assert_eq!(pool.gives_back("a", 50.0, 150.0), ["c", "b"]);
 }
 
 #[test]
