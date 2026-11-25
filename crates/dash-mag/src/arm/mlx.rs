@@ -19,7 +19,7 @@ use super::{
 };
 use crate::ops::{
     AttentionOptions, CausalConv1dOptions, CausalConv1dStepOptions, ChunkGatedDeltaOptions,
-    GatedDeltaStepOptions, LogprobOptions, LowRankOptions, SampleOptions,
+    Conv2dOptions, GatedDeltaStepOptions, LogprobOptions, LowRankOptions, SampleOptions,
 };
 use crate::{DType, Error, Result, refuse};
 
@@ -571,6 +571,15 @@ impl Arm for Mlx {
         Ok(dash_mlx::conv1d::causal_conv1d_update(
             x, weight, bias, state, options,
         )?)
+    }
+
+    fn conv2d(
+        x: &Array,
+        weight: &Array,
+        bias: Option<&Array>,
+        options: Conv2dOptions,
+    ) -> Result<Array> {
+        Ok(dash_mlx::conv2d::conv2d(x, weight, bias, options)?)
     }
 
     fn chunk_gated_delta_rule(

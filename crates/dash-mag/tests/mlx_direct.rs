@@ -10,9 +10,9 @@ mod common;
 use common::values;
 use dash_mag::ops::{
     Activation, AttentionMask, AttentionOptions, CausalConv1dOptions, CausalConv1dStepOptions,
-    ChunkGatedDeltaOptions, GatedDeltaStepOptions, LogprobOptions, LowRankOptions, SampleOptions,
-    attention, attention_decode, causal_conv1d, causal_conv1d_update, chosen_logprob,
-    chunk_gated_delta_rule, gated_delta_step, low_rank, sample,
+    ChunkGatedDeltaOptions, Conv2dOptions, GatedDeltaStepOptions, LogprobOptions, LowRankOptions,
+    SampleOptions, attention, attention_decode, causal_conv1d, causal_conv1d_update,
+    chosen_logprob, chunk_gated_delta_rule, conv2d, gated_delta_step, low_rank, sample,
 };
 use dash_mag::{DType, Tensor, vjp};
 use dash_mlx::mlx::error::Result;
@@ -128,6 +128,69 @@ fn conv1d() {
         dash_mlx::conv1d::probe::kernel_launches() > 0,
         "the conv1d kernels ran"
     );
+}
+
+/// conv2d in f32, the one dtype it takes: grouped, strided, dilated and padded, with a bias, and
+/// a plain one without.
+#[test]
+fn conv2d_is_mlxs() {
+    let (n, c, h, w) = (2usize, 4usize, 9usize, 8usize);
+    for (o, k, options, bias) in [
+        (
+            6usize,
+            3usize,
+            Conv2dOptions::default()
+                .with_stride([2, 1])
+                .with_padding([1, 2])
+                .with_dilation([1, 2])
+                .with_groups(2),
+            true,
+        ),
+        (5, 3, Conv2dOptions::default(), false),
+    ] {
+        let cg = c / options.groups;
+        let i = |shape: &[usize]| shape.iter().map(|&d| d as i32).collect::<Vec<_>>();
+        let shape = options
+            .output_shape(&[n, c, h, w], &[o, cg, k, k], bias.then_some(o))
+            .unwrap();
+        let mut primals = vec![
+            front(81, &[n, c, h, w], DType::F32),
+            front(82, &[o, cg, k, k], DType::F32),
+        ];
+        let mut plains = vec![
+            plain(81, &i(&[n, c, h, w]), Dtype::Float32),
+            plain(82, &i(&[o, cg, k, k]), Dtype::Float32),
+        ];
+        if bias {
+            primals.push(front(83, &[o], DType::F32));
+            plains.push(plain(83, &i(&[o]), Dtype::Float32));
+        }
+        let (outs, grads) = vjp(
+            |p| Ok(vec![conv2d(&p[0], &p[1], p.get(2), options)?]),
+            &primals,
+            &[Some(front(84, &shape, DType::F32))],
+        )
+        .unwrap();
+        let (y, g) = fallible_vjp(
+            |p: &[Array]| {
+                Ok(vec![dash_mlx::conv2d::conv2d(
+                    &p[0],
+                    &p[1],
+                    p.get(2),
+                    options,
+                )?])
+            },
+            &plains,
+            &[cotangent(84, &i(&shape), Dtype::Float32)],
+        )
+        .unwrap();
+        same("conv2d output", &outs[0], &y[0]);
+        same("conv2d x", &grads[0], &g[0]);
+        same("conv2d weight", &grads[1], &g[1]);
+        if bias {
+            same("conv2d bias", &grads[2], &g[2]);
+        }
+    }
 }
 
 #[test]

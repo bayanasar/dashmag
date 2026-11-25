@@ -4,7 +4,7 @@
 
 use crate::ops::{
     AttentionOptions, CausalConv1dOptions, CausalConv1dStepOptions, ChunkGatedDeltaOptions,
-    GatedDeltaStepOptions, LogprobOptions, LowRankOptions, SampleOptions,
+    Conv2dOptions, GatedDeltaStepOptions, LogprobOptions, LowRankOptions, SampleOptions,
 };
 use crate::{DType, Result};
 
@@ -255,6 +255,14 @@ pub(crate) trait Arm {
         state: &Self::Array,
         options: CausalConv1dStepOptions,
     ) -> Result<(Self::Array, Self::Array)>;
+    /// `x` `[N, C, H, W]`, `weight` `[O, C / G, KH, KW]` and `bias` `[O]`, f32, checked by the
+    /// caller against the options.
+    fn conv2d(
+        x: &Self::Array,
+        weight: &Self::Array,
+        bias: Option<&Self::Array>,
+        options: Conv2dOptions,
+    ) -> Result<Self::Array>;
     #[allow(clippy::too_many_arguments)]
     fn chunk_gated_delta_rule(
         q: &Self::Array,

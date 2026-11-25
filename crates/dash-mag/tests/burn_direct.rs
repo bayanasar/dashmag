@@ -11,9 +11,9 @@ use burn::tensor::{DType as BurnDType, Device, Gradients, Int, Tensor as Burn, T
 use common::values;
 use dash_mag::ops::{
     Activation, AttentionMask, AttentionOptions, CausalConv1dOptions, CausalConv1dStepOptions,
-    ChunkGatedDeltaOptions, GatedDeltaStepOptions, LogprobOptions, LowRankOptions, SampleOptions,
-    attention, attention_decode, causal_conv1d, causal_conv1d_update, chosen_logprob,
-    chunk_gated_delta_rule, gated_delta_step, low_rank, sample,
+    ChunkGatedDeltaOptions, Conv2dOptions, GatedDeltaStepOptions, LogprobOptions, LowRankOptions,
+    SampleOptions, attention, attention_decode, causal_conv1d, causal_conv1d_update,
+    chosen_logprob, chunk_gated_delta_rule, conv2d, gated_delta_step, low_rank, sample,
 };
 use dash_mag::{DType, Tensor, vjp};
 use dash_ops::attention as direct_attention;
@@ -142,6 +142,56 @@ fn conv1d() {
         dash_ops::conv1d::probe::kernel_launches() > 0,
         "the conv1d kernels ran"
     );
+}
+
+/// conv2d in f32, the one dtype it takes: grouped, strided, dilated and padded, with a bias, and
+/// a plain one without.
+#[test]
+fn conv2d_is_burns() {
+    let (n, c, h, w) = (2, 4, 9, 8);
+    for (o, k, options, bias) in [
+        (
+            6,
+            3,
+            Conv2dOptions::default()
+                .with_stride([2, 1])
+                .with_padding([1, 2])
+                .with_dilation([1, 2])
+                .with_groups(2),
+            true,
+        ),
+        (5, 3, Conv2dOptions::default(), false),
+    ] {
+        let cg = c / options.groups;
+        let mut primals = vec![
+            front(81, &[n, c, h, w], DType::F32),
+            front(82, &[o, cg, k, k], DType::F32),
+        ];
+        if bias {
+            primals.push(front(83, &[o], DType::F32));
+        }
+        let shape = options
+            .output_shape(&[n, c, h, w], &[o, cg, k, k], bias.then_some(o))
+            .unwrap();
+        let (outs, grads) = vjp(
+            |p| Ok(vec![conv2d(&p[0], &p[1], p.get(2), options)?]),
+            &primals,
+            &[Some(front(84, &shape, DType::F32))],
+        )
+        .unwrap();
+
+        let x = leaf(81, [n, c, h, w], BurnDType::F32);
+        let wt = leaf(82, [o, cg, k, k], BurnDType::F32);
+        let b = bias.then(|| leaf(83, [o], BurnDType::F32));
+        let y = dash_ops::conv2d::conv2d(x.clone(), wt.clone(), b.clone(), options);
+        let g = term(&y, 84).backward();
+        same("conv2d output", &outs[0], f32s(y));
+        same("conv2d x", &grads[0], grad(&x, &g));
+        same("conv2d weight", &grads[1], grad(&wt, &g));
+        if let Some(b) = b {
+            same("conv2d bias", &grads[2], grad(&b, &g));
+        }
+    }
 }
 
 #[test]
@@ -478,5 +528,6 @@ fn a_wrong_rank_is_refused_here_rather_than_a_panic_below() {
         .is_err()
     );
     assert!(causal_conv1d(&x, &x, None, None, None, CausalConv1dOptions::default()).is_err());
+    assert!(conv2d(&x, &x, None, Conv2dOptions::default()).is_err());
     assert!(sample(&front(62, &[3], DType::F32), &SampleOptions::greedy()).is_err());
 }

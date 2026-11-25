@@ -16,6 +16,7 @@ use burn::tensor::{
 };
 use dash_ops::attention::{AttentionMask, attention, attention_decode};
 use dash_ops::conv1d::{causal_conv1d, causal_conv1d_update};
+use dash_ops::conv2d::conv2d;
 use dash_ops::gated_delta::chunk::chunk_gated_delta_rule;
 use dash_ops::gated_delta::recurrent::gated_delta_step;
 use dash_ops::logprob::chosen_logprob;
@@ -26,7 +27,7 @@ use dash_ops::sample::sample;
 use super::{Arm, Binary, Compare, Drawn, Logical, Mask, Reduce, Unary, VjpFn, VjpOut};
 use crate::ops::{
     AttentionOptions, CausalConv1dOptions, CausalConv1dStepOptions, ChunkGatedDeltaOptions,
-    GatedDeltaStepOptions, LogprobOptions, LowRankOptions, SampleOptions,
+    Conv2dOptions, GatedDeltaStepOptions, LogprobOptions, LowRankOptions, SampleOptions,
 };
 use crate::{DType, Result, refuse};
 
@@ -935,6 +936,21 @@ impl Arm for Burn {
             options,
         );
         Ok((wrap(out), wrap(state)))
+    }
+
+    fn conv2d(
+        x: &Array,
+        weight: &Array,
+        bias: Option<&Array>,
+        options: Conv2dOptions,
+    ) -> Result<Array> {
+        let on = x.is_autodiff() || weight.is_autodiff() || bias.is_some_and(Array::is_autodiff);
+        Ok(wrap(conv2d(
+            ad(x.t::<4>(), on),
+            ad(weight.t::<4>(), on),
+            bias.map(|b| ad(b.t::<1>(), on)),
+            options,
+        )))
     }
 
     fn chunk_gated_delta_rule(

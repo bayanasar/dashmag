@@ -4,6 +4,7 @@
 
 pub use dash_contract::attention::{AttentionOptions, Window};
 pub use dash_contract::conv1d::{Activation, CausalConv1dOptions, CausalConv1dStepOptions};
+pub use dash_contract::conv2d::Conv2dOptions;
 pub use dash_contract::gated_delta::chunk::ChunkGatedDeltaOptions;
 pub use dash_contract::gated_delta::recurrent::GatedDeltaStepOptions;
 pub use dash_contract::logprob::LogprobOptions;
@@ -182,6 +183,49 @@ pub fn causal_conv1d_update(
     let (out, state) =
         Selected::causal_conv1d_update(&x.0, &weight.0, option(bias), &state.0, options)?;
     Ok((Tensor(out), Tensor(state)))
+}
+
+/// 2-D convolution, torch's `F.conv2d` (`dash_contract::conv2d`): `x` `[N, C, H, W]`, `weight`
+/// `[O, C / G, KH, KW]`, `bias` `[O]`; returns `[N, O, HO, WO]`. Every shape, the options and the
+/// dtypes are checked here, so that each side refuses alike: f32 alone, which is what both sides
+/// are held to so far. Inside [`crate::vjp`], `x`, the weight and the bias take their gradients by
+/// the side's own backward pass, Burn's or MLX's.
+pub fn conv2d(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    options: Conv2dOptions,
+) -> Result<Tensor> {
+    let op = "conv2d";
+    rank(op, "x", x, 4)?;
+    rank(op, "weight", weight, 4)?;
+    if let Some(bias) = bias {
+        rank(op, "bias", bias, 1)?;
+    }
+    contract_dtypes(
+        op,
+        [("x", x), ("weight", weight)]
+            .into_iter()
+            .chain(bias.map(|t| ("bias", t))),
+    )?;
+    let dtype = x.dtype();
+    if weight.dtype() != dtype || bias.is_some_and(|b| b.dtype() != dtype) {
+        return refuse(format!(
+            "{op}: x, the weight and the bias share one dtype, got {dtype:?}, {:?} and {:?}",
+            weight.dtype(),
+            bias.map(Tensor::dtype)
+        ));
+    }
+    if dtype != DType::F32 {
+        return refuse(format!(
+            "{op}: {dtype:?} is not implemented: only f32 is held to the contract yet"
+        ));
+    }
+    if let Err(why) = options.output_shape(&x.shape(), &weight.shape(), bias.map(|b| b.shape()[0]))
+    {
+        return refuse(why);
+    }
+    Tensor::wrap(Selected::conv2d(&x.0, &weight.0, option(bias), options))
 }
 
 /// The chunked gated delta rule: `q`, `k`, `v` `[B, T, H, D]`, `g`, `beta` `[B, T, H]`; returns the
