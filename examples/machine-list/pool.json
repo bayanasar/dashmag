@@ -1,0 +1,148 @@
+{
+  "format": "mag-pool",
+  "version": 2,
+  "at": 0.0,
+  "members": [
+    {
+      "name": "workstation",
+      "trust": "owner",
+      "give_back_seconds": 5.0
+    },
+    {
+      "name": "server",
+      "trust": "owner",
+      "give_back_seconds": 30.0
+    },
+    {
+      "name": "laptop",
+      "trust": "owner",
+      "give_back_seconds": 2.0
+    }
+  ],
+  "offers": [
+    {
+      "device": {
+        "member": "workstation",
+        "index": 0
+      },
+      "backend": "cuda",
+      "memory_bytes": 15032385536,
+      "tolerances": [
+        "f32",
+        "bf16"
+      ],
+      "dtypes": [
+        "f32",
+        "bf16",
+        "i32",
+        "i64"
+      ],
+      "costs": []
+    },
+    {
+      "device": {
+        "member": "workstation",
+        "index": 1
+      },
+      "backend": "flex",
+      "memory_bytes": 17179869184,
+      "tolerances": [
+        "exact",
+        "f32"
+      ],
+      "dtypes": [
+        "f64",
+        "f32",
+        "bf16",
+        "i32",
+        "i64"
+      ],
+      "costs": []
+    },
+    {
+      "device": {
+        "member": "server",
+        "index": 0
+      },
+      "backend": "rocm",
+      "memory_bytes": 32212254720,
+      "tolerances": [
+        "f32",
+        "bf16"
+      ],
+      "dtypes": [
+        "f32",
+        "bf16",
+        "i32",
+        "i64"
+      ],
+      "costs": []
+    },
+    {
+      "device": {
+        "member": "server",
+        "index": 1
+      },
+      "backend": "flex",
+      "memory_bytes": 17179869184,
+      "tolerances": [
+        "exact",
+        "f32"
+      ],
+      "dtypes": [
+        "f64",
+        "f32",
+        "bf16",
+        "i32",
+        "i64"
+      ],
+      "costs": []
+    },
+    {
+      "device": {
+        "member": "laptop",
+        "index": 0
+      },
+      "backend": "mlx",
+      "memory_bytes": 17179869184,
+      "tolerances": [
+        "f32",
+        "bf16"
+      ],
+      "dtypes": [
+        "f32",
+        "bf16",
+        "i32",
+        "i64"
+      ],
+      "costs": []
+    }
+  ],
+  "jobs": [],
+  "formats": [
+    {
+      "name": "mag-graph",
+      "version": 1
+    },
+    {
+      "name": "mag-graph",
+      "version": 2
+    },
+    {
+      "name": "mag-ledger",
+      "version": 1
+    },
+    {
+      "name": "mag-ledger",
+      "version": 2
+    },
+    {
+      "name": "mag-pool",
+      "version": 1
+    },
+    {
+      "name": "mag-pool",
+      "version": 2
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+label-frames would be placed: of 126 candidates, 119 were removed and 7 scored.
+The best scores 2.000, band ±100%.
+
+  decode  copies on server/1, workstation/1
+  b0      on laptop/0, with chain model
+  b1      on laptop/0, with chain model
+  head    on workstation/0
+  count   on server/1
+
+Kept off a device, and why:
+  laptop/0's measured bounds do not meet decode's tolerance class
+  server/0's measured bounds do not meet decode's tolerance class
+  workstation/0's measured bounds do not meet decode's tolerance class
+  server/1's measured bounds do not meet b0's tolerance class
+  workstation/1's measured bounds do not meet b0's tolerance class
+  head is pinned to a member or backend that laptop/0 is not
+  head is pinned to a member or backend that server/0 is not
+  head is pinned to a member or backend that server/1 is not
+  head is pinned to a member or backend that workstation/1 is not
+  laptop/0's measured bounds do not meet count's tolerance class
+  server/0's measured bounds do not meet count's tolerance class
+  workstation/0's measured bounds do not meet count's tolerance class

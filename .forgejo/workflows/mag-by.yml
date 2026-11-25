@@ -66,3 +66,9 @@ jobs:
           cargo run --locked -q -p mag-mortar --features files --example mag -- plan \
             crates/mag-by/pools/example.json crates/mag-by/graphs/example.json > plan.txt
           diff crates/mag-mortar/plans/example.txt plan.txt
+
+      - name: The list-of-machines recipe's command prints its kept plan
+        run: |
+          cargo run --locked -q -p mag-mortar --features files --example mag -- plan \
+            examples/machine-list/pool.json crates/mag-by/graphs/example.json > recipe-plan.txt
+          diff examples/machine-list/plan.txt recipe-plan.txt
