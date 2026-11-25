@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{Resumption, WebPkiServerVerifier};
@@ -29,8 +29,9 @@ use rustls::{
 
 use crate::{Channel, Identity, Incoming, Link, LinkError, Rate, Refused, check_name, frame};
 
-/// How long the handshake and the opening of a channel may take before the channel is given up.
-const OPENING: Duration = Duration::from_secs(10);
+/// How long the handshake and the opening of a channel may take, together, before the channel
+/// is given up: the default of [`TlsLink::with_opening`].
+pub const OPENING: Duration = Duration::from_secs(10);
 
 /// A member's credentials on its links: the pool's authority certificate, the member's own
 /// certificate, signed by it and naming the member, and the member's private key.
@@ -264,10 +265,54 @@ pub(crate) fn from_tls(e: rustls::Error) -> LinkError {
     }
 }
 
+/// The socket under a channel. While the channel opens, each read and write may take only what
+/// is left of one deadline for the whole opening, so a peer that sends a byte now and then
+/// cannot hold the opening, and with it `accept`, for longer than that. Once the channel is
+/// open, nothing is bounded.
+struct Sock {
+    tcp: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl Sock {
+    fn bound(&self) -> io::Result<()> {
+        let Some(deadline) = self.deadline else {
+            return Ok(());
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the channel did not open in the time allowed",
+            ));
+        }
+        self.tcp.set_read_timeout(Some(left))?;
+        self.tcp.set_write_timeout(Some(left))
+    }
+}
+
+impl Read for Sock {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.bound()?;
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for Sock {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bound()?;
+        self.tcp.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
 /// The stream under a channel, as the end that dialled or the end that answered holds it.
 enum Stream {
-    Dialled(StreamOwned<ClientConnection, TcpStream>),
-    Answered(StreamOwned<ServerConnection, TcpStream>),
+    Dialled(StreamOwned<ClientConnection, Sock>),
+    Answered(StreamOwned<ServerConnection, Sock>),
 }
 
 impl Stream {
@@ -295,10 +340,17 @@ impl Stream {
         .and_then(|chain| chain.first())
     }
 
-    fn sock(&self) -> &TcpStream {
+    fn sock(&self) -> &Sock {
         match self {
             Stream::Dialled(s) => &s.sock,
             Stream::Answered(s) => &s.sock,
+        }
+    }
+
+    fn sock_mut(&mut self) -> &mut Sock {
+        match self {
+            Stream::Dialled(s) => &mut s.sock,
+            Stream::Answered(s) => &mut s.sock,
         }
     }
 
@@ -309,7 +361,7 @@ impl Stream {
             Stream::Answered(s) => s.conn.send_close_notify(),
         }
         self.flush()?;
-        self.sock().shutdown(Shutdown::Write)?;
+        self.sock().tcp.shutdown(Shutdown::Write)?;
         Ok(())
     }
 }
@@ -339,16 +391,21 @@ impl Write for Stream {
     }
 }
 
-fn prepare(sock: &TcpStream) -> Result<(), LinkError> {
-    sock.set_nodelay(true)?;
-    sock.set_read_timeout(Some(OPENING))?;
-    sock.set_write_timeout(Some(OPENING))?;
-    Ok(())
+/// A socket whose opening must end within `opening` from now.
+fn prepare(tcp: TcpStream, opening: Duration) -> Result<Sock, LinkError> {
+    tcp.set_nodelay(true)?;
+    Ok(Sock {
+        tcp,
+        deadline: Some(Instant::now() + opening),
+    })
 }
 
-fn opened(sock: &TcpStream) -> Result<(), LinkError> {
-    sock.set_read_timeout(None)?;
-    sock.set_write_timeout(None)?;
+/// The channel is open: from now on nothing is bounded.
+fn opened(stream: &mut Stream) -> Result<(), LinkError> {
+    let sock = stream.sock_mut();
+    sock.deadline = None;
+    sock.tcp.set_read_timeout(None)?;
+    sock.tcp.set_write_timeout(None)?;
     Ok(())
 }
 
@@ -389,6 +446,7 @@ pub struct TlsLink {
     client: Arc<ClientConfig>,
     server: Arc<ServerConfig>,
     listener: Option<TcpListener>,
+    opening: Duration,
     rates: Arc<Mutex<BTreeMap<String, Rate>>>,
 }
 
@@ -400,8 +458,16 @@ impl TlsLink {
             server: Arc::new(server_config(&credentials)?),
             credentials,
             listener: None,
+            opening: OPENING,
             rates: Arc::default(),
         })
+    }
+
+    /// The same end, giving each channel `opening` to open, its handshake and its opening words
+    /// together, before it is given up; [`OPENING`] unless set.
+    pub fn with_opening(mut self, opening: Duration) -> TlsLink {
+        self.opening = opening;
+        self
     }
 
     /// An end that dials and answers at `address`, such as `0.0.0.0:7340`.
@@ -443,8 +509,7 @@ impl Link for TlsLink {
         check_name(member)?;
         let name =
             ServerName::try_from(member.to_string()).map_err(|_| LinkError::Name(member.into()))?;
-        let sock = TcpStream::connect(address)?;
-        prepare(&sock)?;
+        let sock = prepare(TcpStream::connect(address)?, self.opening)?;
         let conn = ClientConnection::new(self.client.clone(), name).map_err(LinkError::Tls)?;
         let mut stream = Stream::Dialled(StreamOwned::new(conn, sock));
         // The other end's certificate is checked here, its name with it. This end's is checked
@@ -456,7 +521,7 @@ impl Link for TlsLink {
             serial: serial(&stream)?,
         };
         frame::open_as_dialler(&mut stream, job, mag_by::WIRE_VERSION)?;
-        opened(stream.sock())?;
+        opened(&mut stream)?;
         Ok(self.channel(stream, peer, job.into()))
     }
 
@@ -471,7 +536,7 @@ impl Link for TlsLink {
             ))
         })?;
         let (sock, _) = listener.accept()?;
-        prepare(&sock)?;
+        let sock = prepare(sock, self.opening)?;
         let conn = ServerConnection::new(self.server.clone()).map_err(LinkError::Tls)?;
         let mut stream = Stream::Answered(StreamOwned::new(conn, sock));
         stream.handshake()?;
@@ -490,7 +555,7 @@ impl Link for TlsLink {
             serial: serial(&stream)?,
         };
         let job = frame::open_as_acceptor(&mut stream, mag_by::WIRE_VERSION)?;
-        opened(stream.sock())?;
+        opened(&mut stream)?;
         Ok(self.channel(stream, peer, job))
     }
 

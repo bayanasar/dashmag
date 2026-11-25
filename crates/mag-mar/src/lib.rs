@@ -41,7 +41,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 pub use frame::MAX_HEADER;
-pub use tls::{Credentials, TlsChannel, TlsLink};
+pub use tls::{Credentials, OPENING, TlsChannel, TlsLink};
 
 /// One end of the links between members: the replaceable interface. A member holds one, and
 /// opens or accepts a channel for each job it shares with another member.
@@ -54,7 +54,14 @@ pub trait Link {
 
     /// Takes the next channel another member opens to this one, if it is one of `expected`: the
     /// coordinator, or a peer the coordinator has announced. A channel from any other member is
-    /// refused and closed, and the refusal returned; the caller accepts again.
+    /// refused and closed, and the refusal returned; the caller accepts again. A certificate
+    /// that names more than one of `expected` is refused too, since it could stand for either;
+    /// one that names exactly one of them is taken as that member.
+    ///
+    /// It takes one connection at a time, and returns once that one is open or given up: a
+    /// member that must answer several peers at once accepts on a thread of its own and hands
+    /// each channel on. An opening that does not finish in the time the implementation allows
+    /// is given up, so a peer that stalls cannot hold it.
     fn accept(&self, expected: &[&str]) -> Result<Self::Channel, LinkError>;
 
     /// The rate measured on every channel to `member` so far, for the placement loop's cost

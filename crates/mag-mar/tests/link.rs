@@ -230,6 +230,157 @@ fn a_member_that_is_not_the_one_expected_is_refused_at_either_end() {
     assert!(accepted.is_err());
 }
 
+/// Credentials for `member` from a certificate the pool's authority signs naming every one of
+/// `names`.
+fn credentials_naming(pool: &Authority, member: &str, names: &[&str]) -> Credentials {
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair};
+    let issuer =
+        Issuer::from_ca_cert_pem(pool.certificate(), KeyPair::from_pem(&pool.key()).unwrap())
+            .unwrap();
+    let mut params =
+        CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap();
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    params.use_authority_key_identifier_extension = true;
+    let key = KeyPair::generate().unwrap();
+    let certificate = params.signed_by(&key, &issuer).unwrap().pem();
+    Credentials::from_pem(
+        member,
+        pool.certificate(),
+        &certificate,
+        &key.serialize_pem(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_certificate_naming_two_expected_members_is_refused_and_one_naming_one_is_taken_as_it() {
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server");
+
+    // Signed by the pool's authority, naming both the workstation and the laptop: to an end that
+    // expects both, it could stand for either, and is refused.
+    let at = address(&server);
+    let both = TlsLink::new(credentials_naming(
+        &pool,
+        "laptop",
+        &["workstation", "laptop"],
+    ))
+    .unwrap();
+    let (accepted, dialled) = meet(&server, &["workstation", "laptop"], move || {
+        both.open("server", &at, "j")
+    });
+    match accepted {
+        Err(LinkError::Refused(Refused::WrongMember { expected, named })) => {
+            assert_eq!(expected, ["workstation", "laptop"]);
+            assert_eq!(named, ["workstation", "laptop"]);
+        }
+        other => panic!("{:?}", other.err()),
+    }
+    assert!(dialled.is_err());
+
+    // To an end that expects only the laptop, it names exactly one member expected, and is
+    // taken as the laptop.
+    let at = address(&server);
+    let both = TlsLink::new(credentials_naming(
+        &pool,
+        "laptop",
+        &["workstation", "laptop"],
+    ))
+    .unwrap();
+    let (accepted, dialled) = meet(&server, &["laptop"], move || {
+        both.open("server", &at, "j").map(|c| (c, both))
+    });
+    assert_eq!(accepted.unwrap().peer().member, "laptop");
+    assert!(dialled.is_ok());
+}
+
+#[test]
+fn a_peer_that_stalls_cannot_hold_the_opening_past_its_deadline() {
+    use std::time::{Duration, Instant};
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server").with_opening(Duration::from_millis(300));
+    let at = address(&server);
+    // Before any certificate: the header of a handshake record of 16 KiB, then its body a byte
+    // every 100 ms, which keeps each read within any per-read timeout, for two seconds.
+    let started = Instant::now();
+    let (accepted, ()) = meet(&server, &["laptop"], move || {
+        let mut sock = TcpStream::connect(&at).unwrap();
+        sock.write_all(&[0x16, 0x03, 0x01, 0x40, 0x00]).unwrap();
+        for _ in 0..20 {
+            if sock.write_all(&[0]).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let took = started.elapsed();
+    match accepted {
+        Err(LinkError::Io(e)) => assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ),
+            "{e:?}"
+        ),
+        other => panic!("{:?}", other.err()),
+    }
+    // Given up at the deadline, not when the peer stopped: 0.3 s and a read's slack, not 2 s.
+    assert!(took < Duration::from_millis(1200), "{took:?}");
+}
+
+#[test]
+fn a_peer_that_says_nothing_is_given_up_at_the_deadline() {
+    use std::time::{Duration, Instant};
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server").with_opening(Duration::from_millis(300));
+    let at = address(&server);
+    let silent = thread::spawn(move || {
+        let _sock = TcpStream::connect(&at).unwrap();
+        thread::sleep(Duration::from_secs(3));
+    });
+    let started = Instant::now();
+    let accepted = server.accept(&["laptop"]);
+    let took = started.elapsed();
+    assert!(
+        matches!(accepted, Err(LinkError::Io(_))),
+        "{:?}",
+        accepted.err()
+    );
+    // At the deadline, not when the peer leaves three seconds later, nor after the default.
+    assert!(took < Duration::from_millis(1200), "{took:?}");
+    silent.join().unwrap();
+}
+
+#[test]
+fn an_open_channel_is_not_bounded_by_the_opening_s_deadline() {
+    use std::time::Duration;
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server").with_opening(Duration::from_millis(200));
+    let laptop = TlsLink::new(credentials(&pool, "laptop"))
+        .unwrap()
+        .with_opening(Duration::from_millis(200));
+    let at = address(&server);
+    let (accepted, dialled) = meet(&server, &["laptop"], move || {
+        laptop.open("server", &at, "j").map(|c| (c, laptop))
+    });
+    let mut on_server = accepted.unwrap();
+    let (mut on_laptop, _laptop) = dialled.unwrap();
+    // Well past both deadlines, a word still goes each way.
+    thread::sleep(Duration::from_millis(500));
+    let back = TakeBack::Member {
+        member: "laptop".into(),
+        deadline_seconds: 2.0,
+    };
+    on_server.send_word(&back).unwrap();
+    assert_eq!(on_laptop.recv_word::<TakeBack>().unwrap(), back);
+    on_laptop.send_word(&back).unwrap();
+    assert_eq!(on_server.recv_word::<TakeBack>().unwrap(), back);
+}
+
 #[test]
 fn a_certificate_signed_by_a_member_is_refused() {
     // A member's certificate cannot sign another: the laptop's key signs one naming the
