@@ -36,7 +36,18 @@
 //!    written to the ledger and synced, before it is answered; one the pool refuses is answered
 //!    with why, and nothing is written. Ending a job the pool does not hold is refused, rather
 //!    than written as an end of nothing.
-//! 7. **On its own notice** it records its own devices' leave the same way, and returns. Its
+//! 7. **It takes a device back by need**, for a take-back at the door: a kind of device within a
+//!    deadline. The pool chooses the device ([`mag_mortar::Pool::give_up`]): of those of the kind
+//!    whose members give a device back within the deadline, the one whose loss costs it least,
+//!    the coordinator's own last. Its `mag_by::Change::Leave` is applied and written to the
+//!    ledger and synced first, so nothing is placed on it from then on; then its member is told
+//!    on its control channel (`mag_by::Control::GiveBack`), and the door is answered with the
+//!    device once the member says it gave it back (`mag_by::Control::GaveBack`), or once the
+//!    deadline passes, the device being the host's then whatever the member says. A device of
+//!    the coordinator's own it stops offering itself. A need nothing meets is refused with the
+//!    devices of the kind too slow to give one back, and nothing is written; a take-back by
+//!    name is refused, since it is the host's SIGTERM.
+//! 8. **On its own notice** it records its own devices' leave the same way, and returns. Its
 //!    members' channels end without a close: their leave is not recorded by this coordinator.
 //!
 //! **One thread keeps the pool.** The members' channels and the door's connections are each heard
@@ -49,10 +60,9 @@
 //! A ledger line that cannot be written stops the coordinator at once, with nothing after the
 //! last line written acknowledged or answered.
 //!
-//! Not built yet: taking a device back by need; taking a
-//! job's channel; announcing a member to its peers; sending placements; refusing a member's old
-//! certificate by its serial; and a coordinator that takes up the ledger of one that stopped,
-//! with its members joining again.
+//! Not built yet: taking a job's channel; announcing a member to its peers; sending placements;
+//! refusing a member's old certificate by its serial; and a coordinator that takes up the ledger
+//! of one that stopped, with its members joining again.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -60,11 +70,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mag_by::{
     CONTROL, Change, Control, Description, DeviceId, DoorAnswer, DoorRefusal, DoorRequest, Ledger,
-    Member, Offer, Record, Trust,
+    Member, Offer, Record, TakeBack, Trust,
 };
 use mag_mortar::{ChangeError, Pool};
 
@@ -249,6 +259,45 @@ enum Event {
     },
 }
 
+/// A device the coordinator told its member to give back, for a take-back at the door, and the
+/// door's answer, which waits until the member says it has or the deadline passes.
+struct Giving {
+    /// The member's control channel.
+    id: u64,
+    device: DeviceId,
+    /// The deadline, unless it is too far to be kept as an instant.
+    by: Option<Instant>,
+    /// The record of the device's leave, in the ledger already.
+    record: Record,
+    reply: mpsc::Sender<DoorAnswer>,
+}
+
+impl Giving {
+    /// Answers the door: the device is taken back, given back or not.
+    fn answer(self, name: &str, given_back: bool) {
+        let answer = DoorAnswer::TakenBack {
+            device: self.device,
+            record: self.record,
+            given_back,
+        };
+        say(name, format_args!("the door: {}", told(&answer)));
+        let _ = self.reply.send(answer);
+    }
+}
+
+/// What the coordinator does with a request at the door, once what it changes is in the ledger.
+enum Answering {
+    /// Answers it now.
+    Now(DoorAnswer),
+    /// Tells the member holding the device chosen for a take-back to give it back, or stops
+    /// offering it if it is the coordinator's own; then answers.
+    GiveBack {
+        device: DeviceId,
+        deadline_seconds: f64,
+        record: Record,
+    },
+}
+
 /// A member's control channel, as the coordinator holds it.
 struct Attached {
     peer: Identity,
@@ -357,14 +406,16 @@ impl Keeper {
         Ok(Ok(record))
     }
 
-    /// The answer to a request at the door, once what it changes is in the ledger.
-    fn door(&mut self, request: DoorRequest) -> Result<DoorAnswer, MemberError> {
+    /// The answer to a request at the door, once what it changes is in the ledger; for a
+    /// take-back, the device chosen, whose leave is in the ledger, and which its member is to
+    /// be told to give back before the door is answered.
+    fn door(&mut self, request: DoorRequest) -> Result<Answering, MemberError> {
         let refused = |e: ChangeError| DoorAnswer::Refused {
             refusal: DoorRefusal::Pool {
                 reason: e.to_string(),
             },
         };
-        Ok(match request {
+        Ok(Answering::Now(match request {
             DoorRequest::Submit { graph, stamp } => {
                 let job = graph.job.name.clone();
                 match self.take(Change::Submit { graph, stamp })? {
@@ -392,7 +443,40 @@ impl Keeper {
                 pool: self.pool.describe(),
                 asks: Some(self.pool.asks(&self.name, self.idle_seconds, now())),
             },
-        })
+            DoorRequest::TakeBack(TakeBack::Need {
+                kind,
+                deadline_seconds,
+            }) => {
+                let device = match self
+                    .pool
+                    .give_up(&self.name, &kind, deadline_seconds, now())
+                {
+                    Ok(chosen) => chosen.device,
+                    Err(unmet) => {
+                        return Ok(Answering::Now(DoorAnswer::Refused {
+                            refusal: DoorRefusal::Unmet { slow: unmet.slow },
+                        }));
+                    }
+                };
+                match self.take(Change::Leave {
+                    device: device.clone(),
+                })? {
+                    Ok(record) => {
+                        return Ok(Answering::GiveBack {
+                            device,
+                            deadline_seconds,
+                            record,
+                        });
+                    }
+                    Err(e) => refused(e),
+                }
+            }
+            DoorRequest::TakeBack(TakeBack::Device { .. } | TakeBack::Member { .. }) => {
+                DoorAnswer::Refused {
+                    refusal: DoorRefusal::ByName,
+                }
+            }
+        }))
     }
 }
 
@@ -413,6 +497,15 @@ fn told(answer: &DoorAnswer) -> String {
             other => format!("{other:?} written"),
         },
         DoorAnswer::Status { .. } => "status given".into(),
+        DoorAnswer::TakenBack {
+            device,
+            given_back: true,
+            ..
+        } => format!("{device} taken back, written, and given back"),
+        DoorAnswer::TakenBack { device, .. } => format!(
+            "{device} taken back and written; its member did not say it gave it back before the \
+             deadline, and it is the host's now"
+        ),
         DoorAnswer::Refused { refusal } => format!("refused: {refusal}"),
     }
 }
@@ -447,7 +540,7 @@ pub(crate) fn run(
     give_back: Duration,
 ) -> Result<Ended, MemberError> {
     let name = me.name.clone();
-    let mine: Vec<DeviceId> = offers.iter().map(|o| o.device.clone()).collect();
+    let mut mine: Vec<DeviceId> = offers.iter().map(|o| o.device.clone()).collect();
     // The door first: a coordinator refused its door begins no ledger.
     #[cfg(unix)]
     let door = crate::door::Door::open(&start.door).map_err(|error| MemberError::Door {
@@ -506,8 +599,30 @@ pub(crate) fn run(
     take(link, name.clone(), events_tx);
 
     let mut members: BTreeMap<u64, Attached> = BTreeMap::new();
+    let mut giving: Vec<Giving> = Vec::new();
     loop {
-        match events.recv().expect("the taking thread holds a sender") {
+        // The next event, or the first deadline of a device being given back.
+        let event = match giving.iter().filter_map(|g| g.by).min() {
+            None => events.recv().expect("the taking thread holds a sender"),
+            Some(by) => match events.recv_timeout(by.saturating_duration_since(Instant::now())) {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let now = Instant::now();
+                    let (passed, waiting) = giving
+                        .into_iter()
+                        .partition(|g| g.by.is_some_and(|by| by <= now));
+                    giving = waiting;
+                    for g in passed {
+                        g.answer(&name, false);
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    unreachable!("the taking thread holds a sender")
+                }
+            },
+        };
+        match event {
             Event::Notice => {
                 say(&name, "has its notice: records its own devices' leave");
                 keeper.record(leaves(&mine))?;
@@ -606,6 +721,12 @@ pub(crate) fn run(
                 let sending = m.sending.take();
                 // Written and synced first: the close below is the acknowledgement.
                 keeper.record(leaves(&devices))?;
+                // Leaving, it gives back every device, the one it was told to give back too.
+                let (left, waiting) = giving.into_iter().partition(|g| g.id == id);
+                giving = waiting;
+                for g in left {
+                    g.answer(&name, true);
+                }
                 match sending.map(Sender::close) {
                     Some(Ok(())) => say(
                         &name,
@@ -619,10 +740,120 @@ pub(crate) fn run(
                 }
             }
             Event::Door { request, reply } => {
-                // Written and synced first: the answer is sent only once `door` returns.
-                let answer = keeper.door(request)?;
-                say(&name, format_args!("the door: {}", told(&answer)));
-                let _ = reply.send(answer);
+                // Written and synced first: the answer is sent, and a member told to give a
+                // device back, only once `door` returns.
+                let (device, deadline_seconds, record) = match keeper.door(request)? {
+                    Answering::Now(answer) => {
+                        say(&name, format_args!("the door: {}", told(&answer)));
+                        let _ = reply.send(answer);
+                        continue;
+                    }
+                    Answering::GiveBack {
+                        device,
+                        deadline_seconds,
+                        record,
+                    } => (device, deadline_seconds, record),
+                };
+                let by = Duration::try_from_secs_f64(deadline_seconds)
+                    .ok()
+                    .and_then(|d| Instant::now().checked_add(d));
+                let holder = members
+                    .iter_mut()
+                    .find(|(_, m)| m.joined.as_ref().is_some_and(|d| d.contains(&device)));
+                let mut g = Giving {
+                    id: 0,
+                    device: device.clone(),
+                    by,
+                    record,
+                    reply,
+                };
+                let Some((&id, m)) = holder else {
+                    // Its own: nothing runs on it, so it stops offering it at once, and does not
+                    // record its leave again on its notice.
+                    let own = mine.contains(&device);
+                    mine.retain(|d| d != &device);
+                    if own {
+                        say(&name, format_args!("gives its own {device} back"));
+                    } else {
+                        say(
+                            &name,
+                            format_args!("holds no channel to {device}'s member, to tell it"),
+                        );
+                    }
+                    g.answer(&name, own);
+                    continue;
+                };
+                // Its leave is in the ledger: neither it nor this coordinator's notice records it
+                // again.
+                if let Some(joined) = m.joined.as_mut() {
+                    joined.retain(|d| d != &device);
+                }
+                let word = Control::GiveBack {
+                    device: device.clone(),
+                    deadline_seconds,
+                };
+                match m.sending.as_mut().map(|s| s.send_word(&word)) {
+                    Some(Ok(())) => {
+                        say(
+                            &name,
+                            format_args!(
+                                "tells `{}` to give {device} back within {deadline_seconds} s",
+                                m.peer.member
+                            ),
+                        );
+                        g.id = id;
+                        giving.push(g);
+                    }
+                    told => {
+                        say(
+                            &name,
+                            format_args!(
+                                "could not tell `{}` to give {device} back ({})",
+                                m.peer.member,
+                                match told {
+                                    Some(Err(e)) => e.to_string(),
+                                    _ => "its channel is closed".into(),
+                                }
+                            ),
+                        );
+                        g.answer(&name, false);
+                    }
+                }
+            }
+            Event::Said {
+                id,
+                word: Control::GaveBack { device },
+            } => {
+                let who = members.get(&id).map(|m| m.peer.member.clone());
+                match giving.iter().position(|g| g.id == id && g.device == device) {
+                    Some(i) => {
+                        say(
+                            &name,
+                            format_args!("`{}` gave {device} back", who.unwrap_or_default()),
+                        );
+                        giving.swap_remove(i).answer(&name, true);
+                    }
+                    None => say(
+                        &name,
+                        format_args!(
+                            "`{}` says it gave {device} back, which no take-back waits for",
+                            who.unwrap_or_default()
+                        ),
+                    ),
+                }
+            }
+            Event::Said {
+                id,
+                word: Control::GiveBack { device, .. },
+            } => {
+                let who = members.get(&id).map(|m| m.peer.member.clone());
+                say(
+                    &name,
+                    format_args!(
+                        "`{}` says to give {device} back, a coordinator's word: not taken",
+                        who.unwrap_or_default()
+                    ),
+                );
             }
             Event::Ended { id, error } => {
                 let Some(m) = members.remove(&id) else {

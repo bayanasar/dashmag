@@ -8,19 +8,22 @@
 //! ledger it cannot begin; 3 when the coordinator stopped because a line of its ledger could not
 //! be written.
 //!
-//! `mag-mar door submit GRAPH.json [--stamp STAMP.json] | end JOB | status`, run on the
-//! coordinator's machine, asks the coordinator at the door of the start file `MAG_START` names,
-//! and prints its answer as JSON (`mag_mar::door::command`). Exit status: 0 answered (the job
-//! placed, ended, or the status given); 2 it could not ask; 3 the job is submitted and waits; 4
-//! the request is refused; 5 no coordinator answered.
+//! `mag-mar door submit GRAPH.json [--stamp STAMP.json] | end JOB | status | take-back KIND
+//! SECONDS`, run on the coordinator's machine, asks the coordinator at the door of the start file
+//! `MAG_START` names, and prints its answer as JSON (`mag_mar::door::command`). Exit status: 0
+//! answered (the job placed, ended, the status given, or a device taken back); 2 it could not
+//! ask; 3 the job is submitted and waits; 4 the request is refused; 5 no coordinator answered.
 
 use std::process::ExitCode;
 
 use mag_mar::door;
 use mag_mar::member::{self, Notice};
 
-const USAGE: &str = "usage: mag-mar, with MAG_START naming the member's start file\n       \
-                     mag-mar door submit GRAPH.json [--stamp STAMP.json] | end JOB | status";
+const USAGE: &str = concat!(
+    "usage: mag-mar, with MAG_START naming the member's start file\n",
+    "       mag-mar door submit GRAPH.json [--stamp STAMP.json] | end JOB | status\n",
+    "       mag-mar door take-back KIND SECONDS"
+);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

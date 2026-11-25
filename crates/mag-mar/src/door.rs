@@ -1,5 +1,6 @@
 //! The door: a local socket on the coordinator's machine, at the start file's `door`, where a
-//! command run there asks the pool to take a job, to end one, or for its status.
+//! command run there asks the pool to take a job, to end one, for its status, or to give a device
+//! back for the host's need.
 //!
 //! - **The coordinator serves it** ([`Door::open`]). It is a Unix socket of mode 0600, so that
 //!   only the coordinator's user can connect to it. It is bound inside a new directory of mode
@@ -14,6 +15,12 @@
 //!   coordinator answers with one [`DoorAnswer`] as a line of JSON, and closes. A request that
 //!   changes the pool is applied to it and written to its ledger, and synced, before the answer
 //!   is written. A coordinator that stops before then closes the connection with no answer.
+//! - **Taking a device back by need.** The pool chooses the device of the kind asked for whose
+//!   loss costs it least (`mag_mortar::Pool::give_up`), the coordinator's own last; its leave is
+//!   written to the ledger; its member is told to give it back within the deadline
+//!   (`mag_by::Control::GiveBack`); and the door answers once the member says it has, or at the
+//!   deadline, when the device is the host's whatever the member says. A need nothing in the pool
+//!   meets is refused, and so is a take-back by name, which is the host's SIGTERM to the member.
 //! - **The command** ([`command`], `mag-mar door`) finds the door by the start file `MAG_START`
 //!   names, asks, prints the answer and exits with a status that says what it was. With no
 //!   coordinator at the door it fails at once.
@@ -22,7 +29,7 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 
-use mag_by::{Asks, DoorAnswer, DoorRequest, Graph, Stamp};
+use mag_by::{Asks, DeviceKind, DoorAnswer, DoorRequest, Graph, Stamp, TakeBack};
 
 /// The longest request line the coordinator reads, in bytes: a graph is a few kilobytes, and
 /// even a large one far less than this.
@@ -31,8 +38,21 @@ pub const REQUEST_LIMIT: u64 = 64 << 20;
 /// How long the coordinator waits for a request's line once a command has connected.
 pub const REQUEST_WAIT: Duration = Duration::from_secs(10);
 
-/// How long the command waits for the coordinator's answer once its request is written.
+/// How long the command waits for the coordinator's answer once its request is written; for a
+/// take-back, this beyond its deadline, since the answer waits for the device's member.
 pub const ANSWER_WAIT: Duration = Duration::from_secs(60);
+
+/// How long the command waits for the answer to `request` once it is written: [`ANSWER_WAIT`],
+/// and for a take-back its deadline besides, since the answer waits for the device's member.
+pub fn answer_wait(request: &DoorRequest) -> Duration {
+    let deadline = match request {
+        DoorRequest::TakeBack(t) => {
+            Duration::try_from_secs_f64(t.deadline_seconds()).unwrap_or(Duration::MAX)
+        }
+        _ => Duration::ZERO,
+    };
+    ANSWER_WAIT.saturating_add(deadline)
+}
 
 /// Why the coordinator cannot serve its door.
 #[derive(Debug)]
@@ -130,7 +150,7 @@ mod unix {
 
     use mag_by::{DoorAnswer, DoorRefusal, DoorRequest};
 
-    use super::{ANSWER_WAIT, AskError, DoorError, REQUEST_LIMIT, REQUEST_WAIT};
+    use super::{AskError, DoorError, REQUEST_LIMIT, REQUEST_WAIT};
     use crate::member::say;
 
     /// The door, as the coordinator serves it: its socket, bound and of mode 0600, and its lock,
@@ -295,7 +315,8 @@ mod unix {
     }
 
     /// Asks the coordinator at the door at `path`, and returns its answer. Fails at once when no
-    /// coordinator answers there, and waits at most [`ANSWER_WAIT`] for the answer.
+    /// coordinator answers there, and waits at most [`ANSWER_WAIT`] for the answer, beyond the
+    /// deadline of a take-back.
     pub fn ask(path: &str, request: &DoorRequest) -> Result<DoorAnswer, AskError> {
         let mut stream = UnixStream::connect(path).map_err(AskError::NoCoordinator)?;
         let mut line = serde_json::to_vec(request).expect("a request always serialises");
@@ -305,7 +326,7 @@ mod unix {
             .shutdown(std::net::Shutdown::Write)
             .map_err(AskError::Io)?;
         stream
-            .set_read_timeout(Some(ANSWER_WAIT))
+            .set_read_timeout(Some(super::answer_wait(request)))
             .map_err(AskError::Io)?;
         let mut text = Vec::new();
         stream.read_to_end(&mut text).map_err(AskError::Io)?;
@@ -316,7 +337,8 @@ mod unix {
     }
 }
 
-/// The command's exit status: answered, and the job placed, ended, or the status given.
+/// The command's exit status: answered, and the job placed, ended, the status given, or a device
+/// taken back.
 pub const ANSWERED: u8 = 0;
 /// The command could not ask: its arguments, `MAG_START`, the start file, or the graph or stamp
 /// file.
@@ -329,11 +351,16 @@ pub const REFUSED: u8 = 4;
 pub const NO_ANSWER: u8 = 5;
 
 const USAGE: &str = "usage: mag-mar door submit GRAPH.json [--stamp STAMP.json]\n       \
-                     mag-mar door end JOB\n       mag-mar door status";
+                     mag-mar door end JOB\n       mag-mar door status\n       \
+                     mag-mar door take-back KIND SECONDS";
 
 /// `mag-mar door`, with the arguments after `door`: asks the coordinator at the door of the start
 /// file `MAG_START` names, prints its answer as JSON on standard output and a line for a person
 /// on standard error, and returns the exit status.
+///
+/// `take-back KIND SECONDS` takes a device back by need: KIND is a kind of device in JSON, as
+/// `mag_by::DeviceKind` writes it and as status prints the kind the pool wants, `{}` for any
+/// device; SECONDS is the deadline.
 pub fn command(args: &[String]) -> u8 {
     let request = match request(args) {
         Ok(request) => request,
@@ -382,6 +409,18 @@ pub fn command(args: &[String]) -> u8 {
                 asks.as_ref().map(asked).unwrap_or_default()
             ),
         ),
+        DoorAnswer::TakenBack {
+            device,
+            given_back: true,
+            ..
+        } => (ANSWERED, format!("{device} is given back")),
+        DoorAnswer::TakenBack { device, .. } => (
+            ANSWERED,
+            format!(
+                "{device} is taken back: its member did not say it gave it back before the \
+                 deadline, and it is yours now"
+            ),
+        ),
         DoorAnswer::Refused { refusal } => (REFUSED, format!("refused: {refusal}")),
     };
     eprintln!("mag-mar door: {said}");
@@ -412,6 +451,19 @@ fn request(args: &[String]) -> Result<DoorRequest, String> {
     match args {
         [status] if status == "status" => Ok(DoorRequest::Status),
         [end, job] if end == "end" => Ok(DoorRequest::End { job: job.clone() }),
+        [take, kind, seconds] if take == "take-back" => {
+            let kind: DeviceKind = serde_json::from_str(kind)
+                .map_err(|e| format!("{kind}: not a kind of device ({e})"))?;
+            let deadline_seconds = seconds
+                .parse::<f64>()
+                .ok()
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .ok_or_else(|| format!("{seconds}: not a number of seconds, 0 or more"))?;
+            Ok(DoorRequest::TakeBack(TakeBack::Need {
+                kind,
+                deadline_seconds,
+            }))
+        }
         [submit, graph, rest @ ..] if submit == "submit" => {
             let stamp = match rest {
                 [] => Stamp::default(),
@@ -435,6 +487,22 @@ mod tests {
     }
 
     #[test]
+    fn the_command_waits_for_a_take_backs_answer_beyond_its_deadline() {
+        assert_eq!(answer_wait(&DoorRequest::Status), ANSWER_WAIT);
+        let back = |deadline_seconds| {
+            DoorRequest::TakeBack(TakeBack::Need {
+                kind: DeviceKind::default(),
+                deadline_seconds,
+            })
+        };
+        assert_eq!(
+            answer_wait(&back(120.5)),
+            ANSWER_WAIT + Duration::from_secs_f64(120.5)
+        );
+        assert_eq!(answer_wait(&back(1e300)), Duration::MAX);
+    }
+
+    #[test]
     fn the_arguments_name_one_request_and_anything_else_is_its_usage() {
         assert_eq!(request(&args(&["status"])), Ok(DoorRequest::Status));
         assert_eq!(
@@ -443,8 +511,38 @@ mod tests {
                 job: "tally".into()
             })
         );
+        assert_eq!(
+            request(&args(&["take-back", r#"{"backend":"cuda"}"#, "30"])),
+            Ok(DoorRequest::TakeBack(TakeBack::Need {
+                kind: DeviceKind {
+                    backend: Some(mag_by::Backend::Cuda),
+                    ..DeviceKind::default()
+                },
+                deadline_seconds: 30.0
+            }))
+        );
+        assert_eq!(
+            request(&args(&["take-back", "{}", "0.5"])),
+            Ok(DoorRequest::TakeBack(TakeBack::Need {
+                kind: DeviceKind::default(),
+                deadline_seconds: 0.5
+            }))
+        );
+        for (kind, seconds, says) in [
+            ("cuda", "30", "not a kind of device"),
+            (r#"{"cores":8}"#, "30", "not a kind of device"),
+            ("{}", "-1", "not a number of seconds"),
+            ("{}", "inf", "not a number of seconds"),
+            ("{}", "NaN", "not a number of seconds"),
+            ("{}", "soon", "not a number of seconds"),
+        ] {
+            let refused = request(&args(&["take-back", kind, seconds])).unwrap_err();
+            assert!(refused.contains(says), "{kind} {seconds}: {refused}");
+        }
         for bad in [
             &[][..],
+            &["take-back", "{}"],
+            &["take-back", "{}", "1", "2"],
             &["status", "now"],
             &["end"],
             &["end", "a", "b"],

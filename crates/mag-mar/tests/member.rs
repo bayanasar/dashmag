@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use mag_by::{
     Asks, Backend, CONTROL, Change, Control, Description, DeviceId, DeviceKind, DoorAnswer,
-    DoorRefusal, Dtype, Ledger, Member, Offer, Peer, Place, Start, Tolerance, Trust,
+    DoorRefusal, Dtype, Ledger, Member, Offer, Peer, Place, Record, Start, Tolerance, Trust,
 };
 use mag_mar::issue::Authority;
 use mag_mar::{ChannelEnd, Credentials, Link, LinkError, Receiver, Sender, TlsLink};
@@ -1550,4 +1550,310 @@ fn a_submission_is_not_answered_until_its_ledger_line_is_written() {
     let (status, _) = coordinating.exits(Duration::from_secs(10));
     assert_eq!(status.code(), Some(3), "{:#?}", coordinating.said);
     assert_eq!(read_ledger(&pool).1, text);
+}
+
+// Taking a device back by need, at the door.
+
+/// What `mag-mar door take-back KIND SECONDS` was answered: the device taken back, the record
+/// of its leave, and whether its member said it gave it back; with the line for a person and the
+/// time it took.
+fn take_back(
+    start: &Path,
+    kind: &str,
+    seconds: &str,
+) -> (DeviceId, Record, bool, String, Duration) {
+    match door(start, &["take-back", kind, seconds]) {
+        Asked {
+            code: Some(0),
+            answer:
+                Some(DoorAnswer::TakenBack {
+                    device,
+                    record,
+                    given_back,
+                }),
+            said,
+            took,
+        } => (device, record, given_back, said, took),
+        Asked { code, said, .. } => panic!("{code:?}: {said}"),
+    }
+}
+
+/// What the door refused, with exit 4.
+fn refused_at(start: &Path, args: &[&str]) -> DoorRefusal {
+    match door(start, args) {
+        Asked {
+            code: Some(4),
+            answer: Some(DoorAnswer::Refused { refusal }),
+            ..
+        } => refusal,
+        Asked { code, said, .. } => panic!("{code:?}: {said}"),
+    }
+}
+
+/// The devices a pool's status offers.
+fn offered(d: &Description) -> Vec<DeviceId> {
+    d.offers.iter().map(|o| o.device.clone()).collect()
+}
+
+#[test]
+fn a_device_taken_back_by_need_is_written_its_member_told_and_the_door_answered() {
+    let pool = Pool::new("take-back");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (mut coordinating, at) = coordinator_from(Program::command(Some(&start)));
+    let mut server = joined(&pool, "server", &at, description());
+    let mut laptop = joined(&pool, "laptop", &at, description());
+    ledger_of(&pool, 3);
+    // A job kept at `owner`, so not on the laptop: on the first of the server's devices.
+    let graph = graph_file(&pool, "tally", false);
+    assert_eq!(door(&start, &["submit", path(&graph)]).code, Some(0));
+    let (ledger, _) = read_ledger(&pool);
+    assert_eq!(ledger.entries.len(), 4);
+    assert_eq!(
+        status_at(&start).jobs[0].arrangement.places,
+        [Place::On(device("server", 0))]
+    );
+
+    // Any device within 10 s: of those that lose the pool nothing, the laptop's, which offers
+    // least memory. Its leave is in the ledger, as the record the door answers with; the laptop
+    // is told, and says it gave it back, before the deadline.
+    let (taken, record, given_back, said, took) = take_back(&start, "{}", "10");
+    assert_eq!(taken, device("laptop", 0));
+    assert!(given_back, "{said}");
+    assert!(said.contains("laptop/0 is given back"), "{said}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    let (ledger, _) = read_ledger(&pool);
+    assert_eq!(ledger.entries.len(), 5);
+    assert_eq!(
+        ledger.entries[4].change,
+        Change::Leave {
+            device: device("laptop", 0)
+        }
+    );
+    assert_eq!(ledger.entries[4].record, record);
+    coordinating.says("tells `laptop` to give laptop/0 back within 10 s");
+    coordinating.says("`laptop` gave laptop/0 back");
+    laptop.says("gives laptop/0 back at the coordinator's word, within 2 s");
+    // Its only device: it stays a member, with none, until its lease ends.
+    laptop.says("offers no device now, and stays a member until its lease ends");
+    assert!(laptop.child.try_wait().unwrap().is_none());
+    assert!(!offered(&status_at(&start)).contains(&device("laptop", 0)));
+
+    // A device of 16 GiB or more: the server's two are of the kind, and the coordinator's is not.
+    // Every cost is the same estimate, so losing the server's first, which holds the job, costs
+    // nothing: the job is placed again, and of equal losses the smaller device is given up.
+    let (taken, record, given_back, said, _) =
+        take_back(&start, r#"{"memory_bytes":17179869184}"#, "10");
+    assert_eq!(taken, device("server", 0));
+    assert!(given_back, "{said}");
+    assert!(record.chosen.is_some());
+    let now = status_at(&start);
+    assert_eq!(
+        now.jobs[0].arrangement.places,
+        [Place::On(device("server", 1))]
+    );
+    assert_eq!(
+        offered(&now),
+        [device("server", 1), device("workstation", 0)]
+    );
+    server.says("gives server/0 back at the coordinator's word");
+    assert!(!server.said("offers no device now"), "{:#?}", server.said);
+
+    // The ledger replays to the pool the door shows.
+    let (ledger, text) = read_ledger(&pool);
+    assert_eq!(ledger.entries.len(), 6);
+    let replayed = mag_mortar::Pool::replay(&ledger).unwrap();
+    assert_eq!(replayed.ledger().to_lines(), text);
+    assert_eq!(offered(&replayed.describe()), offered(&now));
+
+    // The laptop's lease ends with no device to record; the server's with the one it kept.
+    let (status, _) = laptop.terminate(limit() * 3);
+    assert_eq!(status.code(), Some(0), "{:#?}", laptop.said);
+    assert!(laptop.said("left: the coordinator recorded it"));
+    let (status, _) = server.terminate(limit() * 3);
+    assert_eq!(status.code(), Some(0), "{:#?}", server.said);
+    let (ledger, _) = read_ledger(&pool);
+    assert_eq!(
+        ledger.entries[6..]
+            .iter()
+            .map(|e| e.change.clone())
+            .collect::<Vec<_>>(),
+        [Change::Leave {
+            device: device("server", 1)
+        }]
+    );
+}
+
+#[test]
+fn a_need_nothing_meets_and_a_take_back_by_name_are_refused_and_the_coordinators_own_is_last() {
+    let pool = Pool::new("take-back-refused");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (mut coordinating, _) = coordinator_from(Program::command(Some(&start)));
+    coordinating.says("serves the door at");
+
+    // No device of the kind.
+    assert_eq!(
+        refused_at(&start, &["take-back", r#"{"backend":"cuda"}"#, "60"]),
+        DoorRefusal::Unmet { slow: vec![] }
+    );
+    // Of the kind, but the coordinator's member gives a device back within 30 s, not 1.
+    let asked = door(&start, &["take-back", "{}", "1"]);
+    assert_eq!(asked.code, Some(4), "{}", asked.said);
+    assert!(
+        asked
+            .said
+            .contains("(workstation/0) are each of a member that takes longer"),
+        "{}",
+        asked.said
+    );
+    assert_eq!(
+        refused_at(&start, &["take-back", "{}", "1"]),
+        DoorRefusal::Unmet {
+            slow: vec![device("workstation", 0)]
+        }
+    );
+    // By name, which the command does not say, sent to the socket by hand.
+    for by_name in [
+        r#"{"take_back":{"member":{"member":"workstation","deadline_seconds":60}}}"#,
+        concat!(
+            r#"{"take_back":{"device":{"device":{"member":"workstation","index":0},"#,
+            r#""deadline_seconds":60}}}"#
+        ),
+    ] {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(pool.dir.join("door.sock")).unwrap();
+        stream.write_all(format!("{by_name}\n").as_bytes()).unwrap();
+        let mut answer = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut answer).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DoorAnswer>(&answer).unwrap(),
+            DoorAnswer::Refused {
+                refusal: DoorRefusal::ByName
+            }
+        );
+    }
+    // A kind or a time the command cannot say.
+    assert_eq!(door(&start, &["take-back", "cuda", "60"]).code, Some(2));
+    assert_eq!(door(&start, &["take-back", "{}", "-1"]).code, Some(2));
+    // Nothing written.
+    assert!(read_ledger(&pool).0.entries.is_empty());
+
+    // With no other member, the coordinator's own device is given up: it stops offering it.
+    let (taken, record, given_back, said, _) = take_back(&start, "{}", "30");
+    assert_eq!(taken, device("workstation", 0));
+    assert!(given_back, "{said}");
+    coordinating.says("gives its own workstation/0 back");
+    let (ledger, _) = read_ledger(&pool);
+    assert_eq!(ledger.entries.len(), 1);
+    assert_eq!(ledger.entries[0].record, record);
+    assert!(status_at(&start).offers.is_empty());
+    // On its notice it records no second leave of it.
+    let (status, _) = coordinating.terminate(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "{:#?}", coordinating.said);
+    assert_eq!(read_ledger(&pool).0.entries.len(), 1);
+}
+
+#[test]
+fn a_member_that_does_not_say_it_gave_a_device_back_is_answered_for_at_the_deadline() {
+    let pool = Pool::new("take-back-late");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (mut coordinating, at) = coordinator_from(Program::command(Some(&start)));
+    // A member held by the test, which joins and then never answers.
+    let mut server = say_as(
+        &pool,
+        "server",
+        &at,
+        CONTROL,
+        &Control::Join {
+            member: member("server", Trust::Owner, GIVE_BACK),
+            offers: vec![offer("server", 0, 16 << 30)],
+        },
+    );
+    ledger_of(&pool, 1);
+
+    // Within its time to give back: the server's device, since the coordinator's own member
+    // takes 30 s.
+    let asking = {
+        let start = start.clone();
+        thread::spawn(move || take_back(&start, "{}", "2"))
+    };
+    // The member is told, once the leave is in the ledger.
+    assert_eq!(
+        server.recv_word::<Control>().unwrap(),
+        Control::GiveBack {
+            device: device("server", 0),
+            deadline_seconds: 2.0
+        }
+    );
+    let (ledger, _) = read_ledger(&pool);
+    assert_eq!(
+        ledger.entries[1].change,
+        Change::Leave {
+            device: device("server", 0)
+        }
+    );
+    // It says nothing: the door is answered at the deadline, the device taken back but not
+    // said to be given back.
+    let (taken, record, given_back, said, took) = asking.join().unwrap();
+    assert_eq!(taken, device("server", 0));
+    assert!(!given_back);
+    assert!(said.contains("it is yours now"), "{said}");
+    assert!(took >= Duration::from_millis(1900), "{took:?}");
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    assert_eq!(read_ledger(&pool).0.entries[1].record, record);
+    coordinating.says("did not say it gave it back before the deadline");
+
+    // Said late, it is only noted; its leave is not written again.
+    server
+        .send_word(&Control::GaveBack {
+            device: device("server", 0),
+        })
+        .unwrap();
+    coordinating.says("which no take-back waits for");
+    server.send_word(&Control::Leave).unwrap();
+    coordinating.says("`server` left, its 0 devices recorded");
+    assert_eq!(read_ledger(&pool).0.entries.len(), 2);
+
+    // A member told to give a device back that leaves instead gives it back with the rest: the
+    // door is answered at once. Its devices are larger than the coordinator's, which, holding
+    // nothing either, would be given up first but for being the coordinator's.
+    let mut laptop = say_as(
+        &pool,
+        "laptop",
+        &at,
+        CONTROL,
+        &Control::Join {
+            member: member("laptop", Trust::Site, GIVE_BACK),
+            offers: vec![offer("laptop", 0, 16 << 30), offer("laptop", 1, 16 << 30)],
+        },
+    );
+    ledger_of(&pool, 4);
+    let asking = {
+        let start = start.clone();
+        thread::spawn(move || take_back(&start, "{}", "30"))
+    };
+    assert!(matches!(
+        laptop.recv_word::<Control>().unwrap(),
+        Control::GiveBack { device: d, .. } if d == device("laptop", 0)
+    ));
+    laptop.send_word(&Control::Leave).unwrap();
+    let (taken, _, given_back, said, took) = asking.join().unwrap();
+    assert_eq!(taken, device("laptop", 0));
+    assert!(given_back, "{said}");
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    // Its other device's leave, and not the first's again.
+    let (ledger, _) = read_ledger(&pool);
+    assert_eq!(
+        ledger.entries[4..]
+            .iter()
+            .map(|e| e.change.clone())
+            .collect::<Vec<_>>(),
+        [
+            Change::Leave {
+                device: device("laptop", 0)
+            },
+            Change::Leave {
+                device: device("laptop", 1)
+            }
+        ]
+    );
 }

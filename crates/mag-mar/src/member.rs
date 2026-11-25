@@ -12,7 +12,12 @@
 //!    describes it and what each of its devices offers. While the coordinator cannot be reached
 //!    it dials again every [`REDIAL`]; the host tells the coordinator nothing, so the join is
 //!    this member's to make.
-//! 4. On notice, SIGTERM from the host ([`Notice`]), it says `mag_by::Control::Leave`, closes its
+//! 4. When the coordinator tells it to give a device back (`mag_by::Control::GiveBack`), the
+//!    host having taken a device back by need at the door, it stops offering that device at
+//!    once, since no part runs on it yet, and says it has (`mag_by::Control::GaveBack`). It keeps
+//!    its other devices and its lease: a member whose last device is taken stays a member with
+//!    none until the host ends its lease, which is the host's to do by name.
+//! 5. On notice, SIGTERM from the host ([`Notice`]), it says `mag_by::Control::Leave`, closes its
 //!    way of the control channel, and waits for the coordinator to close the other way, the sign
 //!    that the leaving is recorded. Then it returns, and the program exits 0.
 //!
@@ -20,14 +25,15 @@
 //! ([`crate::coordinator`]), which takes the other members' joins and leaves into the pool and its
 //! ledger, until its own notice.
 //!
-//! The member's `give_back_seconds` bound step 4 whatever any peer does. The notice sets a
+//! The member's `give_back_seconds` bound step 5 whatever any peer does. The notice sets a
 //! deadline on a thread of its own, at a tenth of them before their end and never more than 1 s
 //! before it ([`deadline`]), and at that deadline the process exits 0, wherever [`run`] is
 //! waiting: on a coordinator that stopped answering, on a dial, on anything. A link's keepalive
 //! cannot promise this, since TCP does not probe while data is unacknowledged.
 //!
 //! Not built yet: running the parts placed on it, channels to other members for their jobs,
-//! giving back with the parts' state, and joining again after the coordinator returns.
+//! giving back with the parts' state, and joining again after the coordinator returns, which
+//! would offer only the devices it still holds.
 
 use std::fmt;
 use std::io;
@@ -298,8 +304,8 @@ enum Event {
     Notice,
     /// A control channel to the coordinator, open.
     Dialled(Box<TlsChannel>),
-    /// A word from the coordinator, as its header: none is expected yet.
-    Heard(Vec<u8>),
+    /// A word from the coordinator.
+    Heard(Control),
     /// The control channel ended, as its receiving half found it.
     Ended(LinkError),
 }
@@ -369,9 +375,9 @@ fn dial(
 fn hear(mut receiving: TlsReceiver, events: mpsc::Sender<Event>) {
     thread::spawn(move || {
         loop {
-            match receiving.recv() {
-                Ok(incoming) => {
-                    if events.send(Event::Heard(incoming.header)).is_err() {
+            match receiving.recv_word::<Control>() {
+                Ok(word) => {
+                    if events.send(Event::Heard(word)).is_err() {
                         return;
                     }
                 }
@@ -390,7 +396,7 @@ fn hear(mut receiving: TlsReceiver, events: mpsc::Sender<Event>) {
 /// by the [`deadline`] the notice sets, the process exits 0 there, from the notice's own thread,
 /// and this never returns. Fails only before the notice can come: on credentials, binding,
 /// or a start file that does not hold together.
-pub fn run(start: &Start, offers: Vec<Offer>, notice: Notice) -> Result<Ended, MemberError> {
+pub fn run(start: &Start, mut offers: Vec<Offer>, notice: Notice) -> Result<Ended, MemberError> {
     let name = start.member.clone();
     let me = start
         .pool
@@ -483,12 +489,47 @@ pub fn run(start: &Start, offers: Vec<Offer>, notice: Notice) -> Result<Ended, M
                     }
                 }
             }
-            Event::Heard(header) => say(
+            Event::Heard(Control::GiveBack {
+                device,
+                deadline_seconds,
+            }) => {
+                if !offers.iter().any(|o| o.device == device) {
+                    say(
+                        &name,
+                        format_args!("is told to give {device} back, which it does not offer"),
+                    );
+                    continue;
+                }
+                // No part runs on it yet: it is given back by offering it no longer, at once,
+                // well within the deadline and this member's own time to give back.
+                offers.retain(|o| o.device != device);
+                let within = deadline_seconds.min(me.give_back_seconds);
+                let said = match control.as_mut() {
+                    Some(sending) => sending.send_word(&Control::GaveBack {
+                        device: device.clone(),
+                    }),
+                    None => Err(LinkError::Closed),
+                };
+                say(
+                    &name,
+                    format_args!(
+                        "gives {device} back at the coordinator's word, within {within} s{}",
+                        match &said {
+                            Ok(()) => String::new(),
+                            Err(e) => format!(", and could not say so ({e})"),
+                        }
+                    ),
+                );
+                if offers.is_empty() {
+                    say(
+                        &name,
+                        "offers no device now, and stays a member until its lease ends",
+                    );
+                }
+            }
+            Event::Heard(word) => say(
                 &name,
-                format_args!(
-                    "a word from the coordinator this member does not take yet: {}",
-                    String::from_utf8_lossy(&header)
-                ),
+                format_args!("a word from the coordinator this member does not take: {word:?}"),
             ),
             Event::Ended(e) => {
                 say(&name, format_args!("the control channel ended ({e})"));
