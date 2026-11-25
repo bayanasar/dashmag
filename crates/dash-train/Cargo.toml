@@ -1,6 +1,6 @@
 [package]
 name = "dash-train"
-description = "Training modules for Burn, reproduced as PyTorch computes them: a masked, class-weighted multi-head cross-entropy, AdamW with beta1 set per step, OneCycleLR, gradient clipping by the global norm, macro-F1, logit calibration. The training loop and command line the crate still holds are moving to the application that uses them."
+description = "A training loop for multi-head classifiers on Burn modules, reproducing a PyTorch recipe with dash-mag's training modules and the Burn-tensor loss and AdamW it still needs. The loop and command line are moving to the application that uses them."
 readme = "README.md"
 keywords = ["burn", "training", "classification", "machine-learning"]
 categories = ["science"]
@@ -28,8 +28,10 @@ autotune = ["burn/autotune"]
 
 [dependencies]
 burn = { workspace = true, features = ["autodiff", "optim"] }
-dash-contract = { workspace = true }
 dash-core = { workspace = true }
+# The training modules written once: the schedule, the class weights and the targets' mask, the
+# metrics and the choice of a calibration shift.
+dash-mag = { workspace = true }
 dash-image = { workspace = true }
 # The published PyTorch checkpoint a run starts from is read directly.
 dash-models = { workspace = true, features = ["pytorch"] }

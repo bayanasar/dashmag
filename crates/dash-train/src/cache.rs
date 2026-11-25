@@ -19,7 +19,7 @@ use dash_image::{decode_jpeg, resize_bilinear};
 use serde_json::{Value, json};
 
 use crate::data::npy_header_bytes;
-use crate::loss::IGNORE;
+use dash_mag::loss::IGNORE;
 
 #[cfg(unix)]
 fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {

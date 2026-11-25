@@ -7,6 +7,9 @@
 //!
 //! [`OneCycleAdamW`] is the optimiser as a run steps it, its schedules attached; it is
 //! checked against PyTorch over a whole schedule, not only the update over a few steps.
+//!
+//! A Burn optimiser over the module the loop trains, kept until the loop moves onto `dash-mag`,
+//! whose `dash_mag::optim::AdamW` is held to the same recordings.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +21,9 @@ use burn::optim::{
 };
 use burn::tensor::{Device, Tensor};
 
-use crate::schedule::{OneCycle, OneCycleLr};
+use dash_mag::schedule::OneCycle;
+
+use crate::schedule::OneCycleLr;
 
 /// beta1, shared by the optimiser and whatever sets it each step.
 #[derive(Clone, Debug)]
@@ -217,8 +222,8 @@ mod tests {
         z ^ (z >> 31)
     }
 
-    /// `reference/adamw_torch.json`, recorded from torch 2.13 on the CPU in float32: two
-    /// groups as a run builds them, `AdamW([{backbone, lr 3e-4}, {heads, lr 1e-3}],
+    /// `dash-mag`'s `tests/fixtures/adamw_torch.json`, recorded from torch 2.13 on the CPU in
+    /// float32: two groups as a run builds them, `AdamW([{backbone, lr 3e-4}, {heads, lr 1e-3}],
     /// weight_decay=0.05, foreach=False)` under `OneCycleLR(max_lr=[3e-4, 1e-3],
     /// total_steps=1875, pct_start=0.1)`, each step `opt.step()`, `sched.step()`,
     /// `opt.zero_grad()`; the parameters after each step in `checkpoints`.
@@ -236,8 +241,10 @@ mod tests {
     /// correction (0.064) or under the root (0.56), the two groups' rates swapped (0.38).
     #[test]
     fn the_whole_schedule_is_pytorchs() {
-        let j: serde_json::Value =
-            serde_json::from_str(include_str!("../reference/adamw_torch.json")).unwrap();
+        let j: serde_json::Value = serde_json::from_str(include_str!(
+            "../../dash-mag/tests/fixtures/adamw_torch.json"
+        ))
+        .unwrap();
         let ints = |key: &str| -> Vec<usize> {
             let v = j[key].as_array().unwrap();
             v.iter().map(|x| x.as_u64().unwrap() as usize).collect()

@@ -208,7 +208,7 @@ fn calibrate_cmd(mut a: Args) -> Result<(), String> {
         &PathBuf::from(required(cache, "--cache")?),
         &required(head, "--head")?,
         &required(class, "--class")?,
-        &calibrate::grid(lo, hi, step),
+        &dash_mag::calibrate::grid(lo, hi, step),
         &PathBuf::from(required(out, "--out")?),
         &device(&dev)?,
     )?;

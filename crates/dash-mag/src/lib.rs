@@ -13,6 +13,10 @@
 //! sides implement one internal trait, so that every method here exists on both or does not
 //! compile; the gateway itself, its checks, its broadcasting and its dtype rules, is written once.
 //!
+//! Beside them, the modules training uses, each written once: [`loss`], a multi-head classifier's
+//! masked, class-weighted cross-entropy over [`Tensor`]; [`schedule`], `OneCycleLR`; and on the
+//! host, [`metrics`] and [`calibrate`].
+//!
 //! This crate holds no model, generation loop or training algorithm: those are the application's.
 //!
 //! # Conventions
@@ -51,11 +55,15 @@
 
 mod arm;
 mod autodiff;
+pub mod calibrate;
 pub mod lora;
+pub mod loss;
+pub mod metrics;
 pub mod ops;
 pub mod optim;
 pub mod peft;
 pub mod rope;
+pub mod schedule;
 mod tensor;
 
 pub use autodiff::vjp;

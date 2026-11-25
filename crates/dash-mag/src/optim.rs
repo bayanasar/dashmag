@@ -79,9 +79,9 @@ pub fn clip_grad_norm(grads: &mut [Tensor], options: &ClipGradNormOptions) -> Re
 /// parameters each step: nothing here walks a model.
 ///
 /// One rate per [`Self::update`] call and one `betas` for every parameter, set between steps, so
-/// a schedule and parameter groups with their own rates need no more. One weight decay per
-/// optimiser: groups that decay differently, such as none on norms and biases, are two instances,
-/// each over its own parameters' names, since the state is keyed by name.
+/// a schedule ([`crate::schedule`]) and parameter groups with their own rates need no more. One
+/// weight decay per optimiser: groups that decay differently, such as none on norms and biases,
+/// are two instances, each over its own parameters' names, since the state is keyed by name.
 #[derive(Clone, Debug)]
 pub struct AdamW {
     pub betas: (f64, f64),

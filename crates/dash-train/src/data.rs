@@ -3,7 +3,7 @@
 //! A split is two files in a cache directory, as [`crate::cache`] writes them:
 //! `<split>.npy`, an `N x H x W x 3` array of `uint8` RGB (NumPy's format, so either side
 //! can read the other's), and `<split>.jsonl`, one row per frame in the same order with
-//! `targets`: one class index per head, [`IGNORE`](crate::loss::IGNORE) where the frame has
+//! `targets`: one class index per head, [`IGNORE`](dash_mag::loss::IGNORE) where the frame has
 //! no label for it. Frames are read from the file as they are needed, so several runs on
 //! one machine share the page cache rather than each holding a copy.
 

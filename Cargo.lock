@@ -2484,9 +2484,9 @@ version = "0.0.1"
 dependencies = [
  "burn",
  "dash-cli",
- "dash-contract",
  "dash-core",
  "dash-image",
+ "dash-mag",
  "dash-models",
  "rayon",
  "safetensors 0.8.0",

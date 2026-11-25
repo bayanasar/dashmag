@@ -1,4 +1,6 @@
-//! Cross-entropy for several heads, each with its own class weights and masked targets.
+//! Cross-entropy for several heads, each with its own class weights and masked targets, on Burn
+//! tensors: `dash_mag::loss` for the Burn module the loop trains, kept until the loop moves onto
+//! `dash-mag`. The targets' mask and the class weights are `dash-mag`'s.
 //!
 //! Written out rather than taken from Burn, because its normalisation is the point:
 //! PyTorch's `CrossEntropyLoss(weight=w, ignore_index=-100)` divides the weighted sum by the
@@ -8,52 +10,7 @@
 
 use burn::tensor::activation::log_softmax;
 use burn::tensor::{Int, Tensor, TensorData};
-
-/// The target of a head with no label on a frame.
-pub const IGNORE: i64 = -100;
-
-/// How a head's classes are weighted against their frequency on the training split.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClassWeight {
-    None,
-    /// Inverse square root of the frequency.
-    Sqrt,
-    /// Inverse frequency.
-    Inv,
-}
-
-impl std::str::FromStr for ClassWeight {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "none" => Ok(ClassWeight::None),
-            "sqrt" => Ok(ClassWeight::Sqrt),
-            "inv" => Ok(ClassWeight::Inv),
-            other => Err(format!("class weighting {other:?} is none, sqrt or inv")),
-        }
-    }
-}
-
-/// Each class's weight, normalised to a mean of 1 over the head's classes: `(total / (n *
-/// count)) ^ p`, a count of 0 taken as 1. `targets` is one head's column.
-pub fn class_weights(targets: &[i64], classes: usize, mode: ClassWeight) -> Vec<f32> {
-    let mut counts = vec![0f32; classes];
-    for &t in targets.iter().filter(|&&t| t != IGNORE) {
-        counts[t as usize] += 1.0;
-    }
-    let counts: Vec<f32> = counts.into_iter().map(|c| c.max(1.0)).collect();
-    let total: f32 = counts.iter().sum();
-    let w: Vec<f32> = counts
-        .iter()
-        .map(|&c| match mode {
-            ClassWeight::None => 1.0,
-            ClassWeight::Sqrt => (total / (classes as f32 * c)).powf(0.5),
-            ClassWeight::Inv => total / (classes as f32 * c),
-        })
-        .collect();
-    let mean = w.iter().sum::<f32>() / classes as f32;
-    w.into_iter().map(|x| x / mean).collect()
-}
+use dash_mag::loss::IGNORE;
 
 /// One head's loss, or `None` when every target in the batch is masked.
 pub fn head_loss(logits: Tensor<2>, targets: &[i64], weights: &[f32]) -> Option<Tensor<1>> {
@@ -153,14 +110,5 @@ mod tests {
         assert!(head_loss(l2.clone(), &targets[2], &weights[2]).is_none());
         let all = scalar(loss(vec![l0, l1, l2], &targets, &weights));
         assert!((all - 0.6490249633789062).abs() < 1e-6, "{all}");
-    }
-
-    #[test]
-    fn weights_have_mean_one_and_favour_the_rare_class() {
-        let t = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, IGNORE];
-        let w = class_weights(&t, 2, ClassWeight::Sqrt);
-        assert!((w[0] + w[1] - 2.0).abs() < 1e-6);
-        assert!((w[1] / w[0] - 3.0).abs() < 1e-5, "sqrt(9 / 1): {w:?}");
-        assert_eq!(class_weights(&t, 2, ClassWeight::None), [1.0, 1.0]);
     }
 }

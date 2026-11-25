@@ -18,15 +18,16 @@ use burn::optim::GradientsParams;
 use burn::tensor::{Device, Tensor, TensorData};
 use dash_cli::model_json;
 use dash_core::ModelSpec;
+use dash_mag::loss::{ClassWeight, IGNORE, class_weights};
+use dash_mag::metrics::{argmax, macro_f1, round4};
+use dash_mag::schedule::OneCycle;
 use dash_models::{MobileNetV3Small, weights};
 use serde_json::{Value, json};
 
 use crate::data::{Augment, Batch, Split, batch};
-use crate::loss::{self, ClassWeight, IGNORE};
-use crate::metrics::{argmax, macro_f1, round4};
+use crate::loss;
 use crate::optim::OneCycleAdamW;
 use crate::rng::Rng;
-use crate::schedule::OneCycle;
 
 /// The recipe. Defaults are the PyTorch recipe this crate reproduces.
 #[derive(Clone, Debug)]
@@ -339,7 +340,7 @@ pub fn train(run: &Run) -> Result<Outcome, String> {
         .outputs
         .iter()
         .enumerate()
-        .map(|(h, o)| loss::class_weights(&train_split.column(h), o.classes.len(), r.class_weight))
+        .map(|(h, o)| class_weights(&train_split.column(h), o.classes.len(), r.class_weight))
         .collect();
 
     run.device.seed(r.seed);
