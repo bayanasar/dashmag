@@ -22,7 +22,7 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 
-use mag_by::{DoorAnswer, DoorRequest, Graph, Stamp};
+use mag_by::{Asks, DoorAnswer, DoorRequest, Graph, Stamp};
 
 /// The longest request line the coordinator reads, in bytes: a graph is a few kilobytes, and
 /// even a large one far less than this.
@@ -372,19 +372,38 @@ pub fn command(args: &[String]) -> u8 {
             _ => (WAITS, format!("`{}` waits", arrangement.job)),
         },
         DoorAnswer::Ended { .. } => (ANSWERED, "the job has ended".into()),
-        DoorAnswer::Status { pool, .. } => (
+        DoorAnswer::Status { pool, asks } => (
             ANSWERED,
             format!(
-                "{} members, {} devices, {} jobs",
+                "{} members, {} devices, {} jobs{}",
                 pool.members.len(),
                 pool.offers.len(),
-                pool.jobs.len()
+                pool.jobs.len(),
+                asks.as_ref().map(asked).unwrap_or_default()
             ),
         ),
         DoorAnswer::Refused { refusal } => (REFUSED, format!("refused: {refusal}")),
     };
     eprintln!("mag-mar door: {said}");
     code
+}
+
+/// What the pool asks of its host, for a person: the kind of device it wants, as JSON, and the
+/// members it would give back.
+fn asked(asks: &Asks) -> String {
+    let wants = match &asks.wants {
+        Some(kind) => format!(
+            "wants a device {}",
+            serde_json::to_string(kind).expect("a kind always serialises")
+        ),
+        None => "wants no device".into(),
+    };
+    let back = if asks.gives_back.is_empty() {
+        "would give back no member".into()
+    } else {
+        format!("would give back {}", asks.gives_back.join(", "))
+    };
+    format!("; {wants}; {back}")
 }
 
 /// The request the arguments ask, its files read.

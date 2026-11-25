@@ -126,9 +126,11 @@ machine, with the coordinator's start file, asks the pool there:
     end of nothing.
   - **`status`** answers `Pool::describe`: the pool as one virtual device, its members, each
     device's offer, and its jobs, where each is, its priority as held to its stamp's ceiling and
-    how long each waiting one has waited. The pool's asks, the kind of device it most wants and
-    the members it would give back, have their place in the answer (`asks`), and are left out:
-    they are not built.
+    how long each waiting one has waited; and what the pool asks of its host at that moment
+    (`asks`, `Pool::asks`): `wants`, the kind of device it most wants while jobs wait, left out
+    when it wants none, and `gives_back`, the members that have held no part for the start
+    file's `idle_seconds`, never the coordinator's own. The host polls it and decides; the
+    coordinator calls no one. The command's line for a person ends with both.
   - A change the pool refuses, such as a graph that fails its check, a stamp with a ceiling of
     0, or a second job of one name, is answered with why, and nothing is written.
 - **The command prints the answer** as JSON on standard output, and a line for a person on
@@ -244,8 +246,13 @@ same lines; the command with no coordinator failing at once, with exit 5, at a p
 and at a socket no one answers; an argument other than `door` refused, with exit 2; a second
 coordinator at the door refused, by its lock with the socket moved away, and by the socket
 answering with the lock removed, its ledger not begun; a door a killed coordinator left
-replaced; something other than a socket at the path refused and left; and, on Linux, a submission
-whose ledger line cannot be written never answered.
+replaced; something other than a socket at the path refused and left; on Linux, a submission
+whose ledger line cannot be written never answered; and the status's asks, with an idle time of
+0: before any job, no device wanted and both members offered back, never the coordinator; a job
+pinned to CUDA, which no member offers, asking for a CUDA device of its memory, of a member
+trusted at `owner` as its input is kept, meeting its tolerance class and computing its edges'
+dtype; a job placed taking its member out of those offered back; and the ledger replayed to the
+same asks.
 
 `loopback` sends one tensor of any size and reports the rate and the memory the link took beyond
 the two buffers:
@@ -258,8 +265,7 @@ sending (2026-11-25, three runs).
 
 ## Not built yet
 
-- At the door: taking a device back by need, and the pool's asks in its status, the kind of
-  device it most wants and the members it would give back.
+- At the door: taking a device back by need.
 - The coordinator's words to members: announcing a member to its peers, and sending placements.
 - Taking up the ledger of a coordinator that stopped, and members joining again when one starts.
 - Running the parts placed on a member, channels to other members for their jobs, and giving

@@ -28,11 +28,14 @@
 //! 6. **It serves the door** ([`crate::door`]), at the start file's `door`, opened before the
 //!    ledger is begun, so that a coordinator refused its door leaves no ledger behind. A command
 //!    there submits a job with its stamp (`mag_by::Change::Submit`), ends one
-//!    (`mag_by::Change::End`), or asks the pool's status (`mag_mortar::Pool::describe`). A
-//!    submission or an end is applied to the pool, and its line written to the ledger and
-//!    synced, before it is answered; one the pool refuses is answered with why, and nothing is
-//!    written. Ending a job the pool does not hold is refused, rather than written as an end of
-//!    nothing.
+//!    (`mag_by::Change::End`), or asks the pool's status (`mag_mortar::Pool::describe`), with
+//!    what the pool asks of its host at that moment (`mag_mortar::Pool::asks`): the kind of
+//!    device it most wants while jobs wait, and the members it would give back after the start
+//!    file's `idle_seconds`, never the coordinator's own. The host polls the status, and decides;
+//!    the coordinator calls no one. A submission or an end is applied to the pool, and its line
+//!    written to the ledger and synced, before it is answered; one the pool refuses is answered
+//!    with why, and nothing is written. Ending a job the pool does not hold is refused, rather
+//!    than written as an end of nothing.
 //! 7. **On its own notice** it records its own devices' leave the same way, and returns. Its
 //!    members' channels end without a close: their leave is not recorded by this coordinator.
 //!
@@ -46,7 +49,7 @@
 //! A ledger line that cannot be written stops the coordinator at once, with nothing after the
 //! last line written acknowledged or answered.
 //!
-//! Not built yet: the pool's asks in the door's status; taking a device back by need; taking a
+//! Not built yet: taking a device back by need; taking a
 //! job's channel; announcing a member to its peers; sending placements; refusing a member's old
 //! certificate by its serial; and a coordinator that takes up the ledger of one that stopped,
 //! with its members joining again.
@@ -312,6 +315,8 @@ struct Keeper {
     name: String,
     pool: Pool,
     ledger: LedgerFile,
+    /// The start file's idle time, after which the pool offers a member back.
+    idle_seconds: f64,
 }
 
 impl Keeper {
@@ -385,7 +390,7 @@ impl Keeper {
             },
             DoorRequest::Status => DoorAnswer::Status {
                 pool: self.pool.describe(),
-                asks: None,
+                asks: Some(self.pool.asks(&self.name, self.idle_seconds, now())),
             },
         })
     }
@@ -474,6 +479,7 @@ pub(crate) fn run(
         name: name.clone(),
         pool,
         ledger,
+        idle_seconds: start.idle_seconds,
     };
 
     let (events_tx, events) = mpsc::channel();

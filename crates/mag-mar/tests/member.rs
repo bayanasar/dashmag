@@ -15,8 +15,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mag_by::{
-    Backend, CONTROL, Change, Control, Description, DeviceId, DoorAnswer, DoorRefusal, Dtype,
-    Ledger, Member, Offer, Peer, Place, Start, Tolerance, Trust,
+    Asks, Backend, CONTROL, Change, Control, Description, DeviceId, DeviceKind, DoorAnswer,
+    DoorRefusal, Dtype, Ledger, Member, Offer, Peer, Place, Start, Tolerance, Trust,
 };
 use mag_mar::issue::Authority;
 use mag_mar::{ChannelEnd, Credentials, Link, LinkError, Receiver, Sender, TlsLink};
@@ -1083,12 +1083,23 @@ fn door(start: &Path, args: &[&str]) -> Asked {
 }
 
 fn status_at(start: &Path) -> Description {
+    asks_at(start).0
+}
+
+/// The status, with what the pool asks, which the coordinator always says, and the line the
+/// command said for a person.
+fn asks_at(start: &Path) -> (Description, Asks, String) {
     match door(start, &["status"]) {
         Asked {
             code: Some(0),
-            answer: Some(DoorAnswer::Status { pool, asks: None }),
+            answer:
+                Some(DoorAnswer::Status {
+                    pool,
+                    asks: Some(asks),
+                }),
+            said,
             ..
-        } => pool,
+        } => (pool, asks, said),
         Asked { code, said, .. } => panic!("{code:?}: {said}"),
     }
 }
@@ -1286,6 +1297,68 @@ fn the_door_refuses_what_the_pool_refuses_writes_nothing_for_it_and_says_when_a_
     assert_eq!(asked.code, Some(2));
     assert!(asked.said.contains("usage"), "{}", asked.said);
     assert_eq!(read_ledger(&pool).0.entries.len(), 1);
+}
+
+#[test]
+fn the_status_asks_for_the_kind_of_device_a_waiting_job_wants_and_gives_back_idle_members() {
+    let pool = Pool::new("door-asks");
+    // An idle time of 0: a member holding no part is offered back at once.
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let mut file = Start::from_json(&std::fs::read_to_string(&start).unwrap()).unwrap();
+    file.idle_seconds = 0.0;
+    std::fs::write(&start, file.to_json()).unwrap();
+    let (_coordinating, at) = coordinator_from(Program::command(Some(&start)));
+    let _server = joined(&pool, "server", &at, description());
+    let _laptop = joined(&pool, "laptop", &at, description());
+    ledger_of(&pool, 3);
+
+    // Before: nothing waits, so nothing is wanted; both members hold nothing, and are offered
+    // back, the coordinator never.
+    let (_, asks, said) = asks_at(&start);
+    assert_eq!(asks.wants, None);
+    let mut back = asks.gives_back.clone();
+    back.sort();
+    assert_eq!(back, ["laptop", "server"]);
+    assert!(said.contains("wants no device"), "{said}");
+
+    // A job pinned to CUDA, which no device offers, waits; the status then asks for a CUDA
+    // device with its memory, a member trusted as far as its input is kept, its tolerance class
+    // and its edges' dtype.
+    let waiting = graph_file(&pool, "on-cuda", true);
+    let asked = door(&start, &["submit", path(&waiting)]);
+    assert_eq!(asked.code, Some(3), "{}", asked.said);
+    let wanted = DeviceKind {
+        backend: Some(Backend::Cuda),
+        memory_bytes: Some(1 << 20),
+        trust: Some(Trust::Owner),
+        tolerances: vec![Tolerance::Exact],
+        dtypes: vec![Dtype::F32],
+    };
+    let (status, asks, said) = asks_at(&start);
+    assert_eq!(asks.wants.as_ref(), Some(&wanted));
+    assert!(
+        said.contains("wants a device {\"backend\":\"cuda\""),
+        "{said}"
+    );
+    // A device of that kind, not one the pool has.
+    assert!(!status.offers.iter().any(|o| wanted.admits(o, Trust::Owner)));
+
+    // A job that is placed: the member holding it is no longer offered back.
+    let placed = graph_file(&pool, "tally", false);
+    let asked = door(&start, &["submit", path(&placed)]);
+    assert_eq!(asked.code, Some(0), "{}", asked.said);
+    let (status, asks, said) = asks_at(&start);
+    let holder = &status.jobs[1].arrangement.places[0];
+    // Kept at `owner`, so not on the laptop, trusted at `site`.
+    assert_eq!(holder, &Place::On(device("server", 0)));
+    assert_eq!(asks.gives_back, ["laptop"]);
+    assert_eq!(asks.wants.as_ref(), Some(&wanted));
+    assert!(said.ends_with("would give back laptop\n"), "{said}");
+
+    // The pool the ledger replays to asks the same, at the status's time.
+    let (ledger, _) = read_ledger(&pool);
+    let replayed = mag_mortar::Pool::replay(&ledger).unwrap();
+    assert_eq!(replayed.asks("workstation", 0.0, status.at), asks);
 }
 
 #[test]
