@@ -29,8 +29,20 @@ host](../../README.md#what-mag-covers-and-what-it-leaves-to-the-host). In short:
 part's function and the graph; the placement, the queue of jobs and the priority between them are
 this crate's; which machines are in the pool is the host's.
 
+The pool asks its host two things, which the host polls at the coordinator's door; the pool never
+calls it. `Pool::wants` is the kind of device it most wants while jobs wait: a `DeviceKind` that
+names what a device must be to take a waiting job's parts (their memory, the backend a part is
+pinned to, the trust the guard asks of its member, their tolerance classes and dtypes). Each kind
+the waiting jobs' parts make, for each group, each replicable part's copy and the whole job, is
+tried as one device joining the pool, and the one the loop would place parts on for the greatest
+gain in score is asked for; of equal gains, the smallest: less memory, then a lower trust, then no
+backend before one named. `Pool::gives_back` is the members that have held no part for the
+host's idle time, longest idle first, never the coordinator's own. When each member last held a
+part is kept from the changes the pool is told, so a replayed pool asks the same, and the ledger
+is unchanged.
+
 This step runs on offers given as data: no member, network or device yet. It does not probe
 candidates, count the time of edges between machines, divide a chain across devices or move a
 running job; those come with the steps that measure them. Nor does it yet choose which device to
-give up when the host takes one back by need, say which kind of device it most wants, or begin
-from the arrangement its members hold after a coordinator stops.
+give up when the host takes one back by need, or begin from the arrangement its members hold after
+a coordinator stops.

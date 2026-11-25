@@ -39,6 +39,16 @@
 //! virtual device, and [`Pool::plan`], the record a graph's arrival would make, with the pool
 //! left as it is.
 //!
+//! The pool asks its host two things, [`Pool::asks`], which the host polls; the pool never calls
+//! it. Both are pure functions of the pool's state and the time of asking, and leave it as it is:
+//! - [`Pool::wants`], the kind of device it most wants while jobs wait: of the kinds that would
+//!   take a waiting job's parts (their memory, a pinned backend, the trust the guard asks for,
+//!   their tolerance classes and dtypes), the one whose device, joining, the loop would place
+//!   parts on for the greatest gain in score, and of equal gains the smallest;
+//! - [`Pool::gives_back`], the members that have held no part for the host's idle time, never
+//!   the coordinator's own. When each member last held a part is kept from the changes the pool
+//!   was told, so a replay keeps it, and the ledger is unchanged.
+//!
 //! The pool does no I/O. Every change reaches it through [`Pool::apply`], which adds the change
 //! and the record of the loop's run to its [`Ledger`]. The pool is deterministic, so the ledger
 //! is all its host need keep: [`Pool::replay`] applies the changes again to a pool begun the same
@@ -55,21 +65,20 @@
 //!   squeezing a running job (M-6). Running jobs are not moved here, so moving costs nothing;
 //! - memory over time: a device's parts are summed as if all resident at once;
 //! - a deadline: a job states no length yet;
-//! - which device to give up when the host takes one back by need, and which kind of device the
-//!   pool most wants and which members it would give back (`mag_by::Asks`); and beginning a pool
-//!   from the arrangement its members hold, after its coordinator stops.
+//! - which device to give up when the host takes one back by need; and beginning a pool from the
+//!   arrangement its members hold, after its coordinator stops.
 //!
 //! The same members, offers and events give the same records: devices are taken in the order of
 //! their [`DeviceId`], and the first of equal scores wins.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use mag_by::{
-    Arrangement, Candidate, Change, Cost, Description, DeviceId, Dtype, Entry, Event, Format,
-    GRAPH_FORMAT, GRAPH_VERSION, Graph, Held, Keeps, LEDGER_FORMAT, LEDGER_VERSION, Ledger, Mark,
-    Member, Move, Offer, POOL_FORMAT, POOL_VERSION, Pin, Place, Record, Refusal, Removal, Stamp,
-    Trust, Unit,
+    Arrangement, Asks, Backend, Candidate, Change, Cost, Description, DeviceId, DeviceKind, Dtype,
+    Entry, Event, Format, GRAPH_FORMAT, GRAPH_VERSION, Graph, Held, Keeps, LEDGER_FORMAT,
+    LEDGER_VERSION, Ledger, Mark, Member, Move, Offer, POOL_FORMAT, POOL_VERSION, Pin, Place,
+    Record, Refusal, Removal, Stamp, Trust, Unit,
 };
 
 /// This crate's version, which a ledger it begins records as `written_by`.
@@ -83,6 +92,11 @@ pub const AGING_SECONDS: f64 = 60.0;
 
 /// The band given to an estimated cost, relative: wide, so that it is probed and not trusted.
 pub const ESTIMATE_BAND: f64 = 1.0;
+
+/// The member of the device a trial of a wanted kind adds: no member's name, since a member is
+/// named in lower case, and after every one of them in order, so that of equal scores a device
+/// the pool has wins.
+const WANTED: &str = "~";
 
 /// Why the pool refuses a change. A refused change leaves the pool as it was, and is not in its
 /// ledger.
@@ -226,6 +240,13 @@ pub struct Pool {
     jobs: Vec<Live>,
     ledger: Ledger,
     now: f64,
+    /// For each member with a device in the pool, the pool's time when it last held a part, or,
+    /// if it has held none since its devices joined, when they did. Kept from the changes alone,
+    /// so a replay keeps it the same.
+    held: BTreeMap<String, f64>,
+    /// In a trial of a wanted kind that names no backend, the device added for it: no pin to a
+    /// backend is met on it, since the kind does not say which it has.
+    unnamed_backend: Option<DeviceId>,
 }
 
 /// One candidate under construction: the jobs as they would be, and what was left out.
@@ -276,9 +297,14 @@ impl Pool {
                 entries: Vec::new(),
             },
             now: at,
+            held: BTreeMap::new(),
+            unnamed_backend: None,
         };
         for m in members {
             pool.add_member(m);
+        }
+        for m in pool.present() {
+            pool.held.insert(m, at);
         }
         pool
     }
@@ -362,8 +388,97 @@ impl Pool {
             jobs: self.jobs.clone(),
             ledger: Ledger::default(),
             now: self.now,
+            held: self.held.clone(),
+            unnamed_backend: None,
         };
         trial.submit(graph.clone(), stamp.clone(), at).cloned()
+    }
+
+    /// What the pool asks of its host at `at` seconds: the kind of device it most wants
+    /// ([`Pool::wants`]), and the members it would give back after `idle_seconds`
+    /// ([`Pool::gives_back`]), never `coordinator`. The host polls it and decides; the pool is
+    /// left as it is.
+    pub fn asks(&self, coordinator: &str, idle_seconds: f64, at: f64) -> Asks {
+        Asks {
+            wants: self.wants(at),
+            gives_back: self.gives_back(coordinator, idle_seconds, at),
+        }
+    }
+
+    /// The kind of device the pool most wants at `at` seconds, while jobs wait: of the kinds that
+    /// would take a waiting job's parts, the one whose device, joining now, the loop would place
+    /// parts on for the greatest gain in score. `None` when no job waits, or when no such device
+    /// would take any. The pool is left as it is.
+    ///
+    /// **The kinds tried.** For each waiting job, one kind for each of its groups (a chain's
+    /// parts, or an atomic part outside a chain), one for each replicable part, as one copy, and
+    /// one for the whole job on one device. A kind for some parts asks what the loop's
+    /// constraints ask of a device for them all: their memory together; the backend a part is
+    /// pinned to, if one is; the highest level any of them is kept at, as its member's trust,
+    /// left out when it is `outside`; their tolerance classes; and the dtypes of the edges into
+    /// and out of them, opaque bytes aside. A pin to a member, a stamp's devices and a rate the
+    /// job needs are not a kind's to name: no new device meets the first two, and the third is
+    /// for the loop's estimate of its time to settle.
+    ///
+    /// **The gain.** Each kind is tried as one device of exactly that kind joining the pool at
+    /// `at`: its member trusted at the kind's trust (else `outside`), its memory, tolerance
+    /// classes and dtypes the kind's and no more, no pin to a backend met on it unless the kind
+    /// names that backend, and every cost on it estimated. The loop then runs on the waiting
+    /// jobs as on a join, their priorities grown by their wait until `at`. The gain is the
+    /// chosen candidate's score less the score of leaving things as they are; a kind whose
+    /// device the chosen candidate puts nothing on, or for which nothing is chosen, gains
+    /// nothing.
+    ///
+    /// **The order, and ties.** The greatest gain wins. Of equal gains, the smaller kind: less
+    /// memory, then a lower trust, then no backend before one named, then the backends, the
+    /// tolerance classes and the dtypes in the order `mag-by` declares them. A host that adds
+    /// the device asked for, and polls again, is asked for the next.
+    pub fn wants(&self, at: f64) -> Option<DeviceKind> {
+        let mut kinds: Vec<DeviceKind> = Vec::new();
+        for j in self.jobs.iter().filter(|j| j.waiting()) {
+            let mut sets = j.groups();
+            sets.extend(
+                (0..j.graph.parts.len())
+                    .filter(|&p| j.graph.parts[p].mark == Mark::Replicable)
+                    .map(|p| vec![p]),
+            );
+            sets.push((0..j.graph.parts.len()).collect());
+            for set in sets {
+                let kind = kind_for(j, &set);
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+        }
+        kinds.sort_by_key(kind_order);
+        let mut best: Option<(DeviceKind, f64)> = None;
+        for kind in kinds {
+            if let Some(gain) = self.gain(&kind, at)
+                && best.as_ref().is_none_or(|(_, top)| gain > *top)
+            {
+                best = Some((kind, gain));
+            }
+        }
+        best.map(|(kind, _)| kind)
+    }
+
+    /// The members the pool would give back at `at` seconds: each member with a device in the
+    /// pool, other than `coordinator`, that holds no part now and has held none for at least
+    /// `idle_seconds`, counted from when it last held one, or from when its devices joined if it
+    /// has held none since. Longest idle first, then by name. The time is the pool's if `at` is
+    /// earlier. The pool is left as it is.
+    pub fn gives_back(&self, coordinator: &str, idle_seconds: f64, at: f64) -> Vec<String> {
+        let now = self.now.max(at);
+        let holding = self.holders();
+        let mut idle: Vec<(&String, f64)> = self
+            .held
+            .iter()
+            .filter(|(m, _)| m.as_str() != coordinator && !holding.contains(*m))
+            .filter(|&(_, &since)| now - since >= idle_seconds)
+            .map(|(m, &since)| (m, since))
+            .collect();
+        idle.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(b.0)));
+        idle.into_iter().map(|(m, _)| m.clone()).collect()
     }
 
     /// The one way into the pool: it takes a change at `at` seconds, runs the loop, and adds the
@@ -378,12 +493,24 @@ impl Pool {
         if !at.is_finite() {
             return Err(ChangeError::Time);
         }
+        let (holding, present) = (self.holders(), self.present());
         let record = match &change {
             Change::Submit { graph, stamp } => self.arrive(graph.clone(), stamp.clone(), at)?,
             Change::End { job } => self.finish(job, at),
             Change::Join { member, offer } => self.add_device(member.clone(), offer.clone(), at),
             Change::Leave { device } => self.remove_device(device, at),
         };
+        // A member that held a part held it until now: one that holds a part after this change is
+        // among those holding before the next, and is not idle meanwhile. A member whose first
+        // device joins starts its idle time now, and one with no device left is no longer kept.
+        let now_present = self.present();
+        for m in holding {
+            self.held.insert(m, self.now);
+        }
+        for m in now_present.difference(&present) {
+            self.held.insert(m.clone(), self.now);
+        }
+        self.held.retain(|m, _| now_present.contains(m));
         self.ledger.entries.push(Entry { at, change, record });
         Ok(&self.ledger.entries.last().expect("just pushed").record)
     }
@@ -510,6 +637,65 @@ impl Pool {
                 Vec::new()
             }
         }
+    }
+
+    /// The members with a device in the pool.
+    fn present(&self) -> BTreeSet<String> {
+        self.offers
+            .iter()
+            .map(|o| o.device.member.clone())
+            .collect()
+    }
+
+    /// The members a part of a job is placed on now.
+    fn holders(&self) -> BTreeSet<String> {
+        self.jobs
+            .iter()
+            .flat_map(|j| j.arrangement.places.iter().flat_map(devices_of))
+            .map(|d| d.member.clone())
+            .collect()
+    }
+
+    /// The gain in score of a device of `kind` joining at `at`, if the loop would place a part
+    /// on it: see [`Pool::wants`].
+    fn gain(&self, kind: &DeviceKind, at: f64) -> Option<f64> {
+        let device = DeviceId {
+            member: WANTED.into(),
+            index: 0,
+        };
+        let mut trial = Pool {
+            members: self.members.clone(),
+            offers: self.offers.clone(),
+            jobs: self.jobs.clone(),
+            ledger: Ledger::default(),
+            now: self.now,
+            held: BTreeMap::new(),
+            unnamed_backend: kind.backend.is_none().then(|| device.clone()),
+        };
+        trial.advance(at);
+        trial.members.push(Member {
+            name: WANTED.into(),
+            trust: kind.trust.unwrap_or(Trust::Outside),
+            give_back_seconds: 0.0,
+        });
+        trial.offers.push(Offer {
+            device: device.clone(),
+            backend: kind.backend.unwrap_or(Backend::Flex),
+            memory_bytes: kind.memory_bytes.unwrap_or(0),
+            tolerances: kind.tolerances.clone(),
+            dtypes: kind.dtypes.clone(),
+            costs: Vec::new(),
+        });
+        trial.rebase();
+        let (current, _) = trial.score(&trial.jobs);
+        let record = trial.run(Event::Join { device }, Vec::new());
+        let chosen = &record.candidates[record.chosen?];
+        let on_it = chosen
+            .arrangements
+            .iter()
+            .flat_map(|a| a.places.iter().flat_map(devices_of))
+            .any(|d| d.member == WANTED);
+        on_it.then(|| chosen.score.expect("a chosen candidate is scored") - current)
     }
 
     /// Each job's best rate alone, again, after the pool's devices change: a job that no device
@@ -829,7 +1015,9 @@ impl Pool {
         }
         let pinned_elsewhere = match &part.pin {
             Some(Pin::Member(m)) => &d.member != m,
-            Some(Pin::Backend(b)) => &offer.backend != b,
+            Some(Pin::Backend(b)) => {
+                &offer.backend != b || self.unnamed_backend.as_ref() == Some(d)
+            }
             None => false,
         };
         if pinned_elsewhere {
@@ -967,6 +1155,8 @@ impl Pool {
             jobs: vec![job.clone()],
             ledger: Ledger::default(),
             now: 0.0,
+            held: BTreeMap::new(),
+            unnamed_backend: None,
         };
         alone.jobs[0]
             .arrangement
@@ -987,6 +1177,57 @@ impl Pool {
             .map(|b| alone.rates(&b.jobs)[name].0)
             .fold(0.0, f64::max)
     }
+}
+
+/// The kind of device that takes the parts `set` of job `j` together: see [`Pool::wants`].
+fn kind_for(j: &Live, set: &[usize]) -> DeviceKind {
+    let parts = &j.graph.parts;
+    let backend = set.iter().find_map(|&p| match &parts[p].pin {
+        Some(Pin::Backend(b)) => Some(*b),
+        _ => None,
+    });
+    let trust = set
+        .iter()
+        .map(|&p| j.keeps.parts[p])
+        .max()
+        .filter(|&t| t > Trust::Outside);
+    let mut tolerances: Vec<_> = set.iter().map(|&p| parts[p].tolerance).collect();
+    tolerances.sort_by_key(|&t| t as u8);
+    tolerances.dedup();
+    let names: Vec<&str> = set.iter().map(|&p| parts[p].name.as_str()).collect();
+    let mut dtypes: Vec<Dtype> = j
+        .graph
+        .edges
+        .iter()
+        .filter(|e| {
+            names.contains(&e.from.as_str()) || e.to.as_deref().is_some_and(|t| names.contains(&t))
+        })
+        .map(|e| e.dtype)
+        .filter(|&d| d != Dtype::Bytes)
+        .collect();
+    dtypes.sort_by_key(|&d| d as u8);
+    dtypes.dedup();
+    DeviceKind {
+        backend,
+        memory_bytes: Some(set.iter().map(|&p| parts[p].memory_bytes).sum()),
+        trust,
+        tolerances,
+        dtypes,
+    }
+}
+
+/// A kind's place in the order: its memory, trust, backend, tolerance classes and dtypes.
+type KindKey = (Option<u64>, Option<Trust>, Option<u8>, Vec<u8>, Vec<u8>);
+
+/// The order kinds are tried in, so that of equal gains the smaller wins: see [`Pool::wants`].
+fn kind_order(k: &DeviceKind) -> KindKey {
+    (
+        k.memory_bytes,
+        k.trust,
+        k.backend.map(|b| b as u8),
+        k.tolerances.iter().map(|&t| t as u8).collect(),
+        k.dtypes.iter().map(|&d| d as u8).collect(),
+    )
 }
 
 /// The devices a place uses.
@@ -1030,4 +1271,94 @@ fn device_tuples(devices: usize, groups: usize) -> Vec<Vec<usize>> {
         out.clear();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mag_by::Tolerance;
+
+    #[test]
+    fn kinds_are_tried_smallest_first_memory_then_trust_then_backend_then_classes() {
+        let k = |memory: u64, trust: Option<Trust>, backend: Option<Backend>| DeviceKind {
+            memory_bytes: Some(memory),
+            trust,
+            backend,
+            ..DeviceKind::default()
+        };
+        let mut kinds = vec![
+            k(2, None, None),
+            k(1, Some(Trust::Owner), None),
+            k(1, Some(Trust::Site), None),
+            k(1, None, Some(Backend::Flex)),
+            k(1, None, Some(Backend::Cuda)),
+            k(1, None, None),
+            DeviceKind {
+                tolerances: vec![Tolerance::Bf16],
+                ..k(1, None, None)
+            },
+            DeviceKind {
+                tolerances: vec![Tolerance::Exact],
+                ..k(1, None, None)
+            },
+            DeviceKind {
+                dtypes: vec![Dtype::F64],
+                ..k(1, None, None)
+            },
+        ];
+        kinds.sort_by_key(kind_order);
+        assert_eq!(
+            kinds,
+            [
+                k(1, None, None),
+                DeviceKind {
+                    dtypes: vec![Dtype::F64],
+                    ..k(1, None, None)
+                },
+                DeviceKind {
+                    tolerances: vec![Tolerance::Exact],
+                    ..k(1, None, None)
+                },
+                DeviceKind {
+                    tolerances: vec![Tolerance::Bf16],
+                    ..k(1, None, None)
+                },
+                k(1, None, Some(Backend::Cuda)),
+                k(1, None, Some(Backend::Flex)),
+                k(1, Some(Trust::Site), None),
+                k(1, Some(Trust::Owner), None),
+                k(2, None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pool_begins_with_each_member_with_a_device_idle_from_its_time() {
+        let member = |name: &str| Member {
+            name: name.into(),
+            trust: Trust::Owner,
+            give_back_seconds: 1.0,
+        };
+        let offer = Offer {
+            device: DeviceId {
+                member: "a".into(),
+                index: 0,
+            },
+            backend: Backend::Flex,
+            memory_bytes: 1,
+            tolerances: vec![],
+            dtypes: vec![],
+            costs: vec![],
+        };
+        let pool = Pool::from_description(&Description {
+            at: 7.0,
+            members: vec![member("a"), member("none")],
+            offers: vec![offer],
+            jobs: vec![],
+            formats: vec![],
+        })
+        .unwrap();
+        assert_eq!(pool.held, BTreeMap::from([("a".to_string(), 7.0)]));
+        assert!(pool.holders().is_empty());
+    }
 }
