@@ -180,7 +180,7 @@ fn a_start_file_is_refused_for_its_form_as_every_file_is() {
 
 #[test]
 fn a_start_file_that_does_not_hold_together_is_refused() {
-    let cases: [(String, &str); 8] = [
+    let cases: [(String, &str); 9] = [
         (
             changed(|v| v["member"] = "nobody".into()),
             "`member` names `nobody`, which is no member of the pool",
@@ -218,6 +218,11 @@ fn a_start_file_that_does_not_hold_together_is_refused() {
                 v["pool"]["members"].as_array_mut().unwrap().push(first);
             }),
             "the pool: member `workstation` is listed twice",
+        ),
+        (
+            changed(|v| v["pool"]["members"][1]["name"] = "Server".into()),
+            "the pool: member name `Server` is not a DNS name in lower case, as a certificate \
+             carries it",
         ),
     ];
     for (text, reason) in cases {

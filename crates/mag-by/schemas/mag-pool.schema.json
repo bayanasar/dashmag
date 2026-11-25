@@ -157,6 +157,10 @@
           "type": "number"
         },
         "name": {
+          "description": "A DNS name in lower case, as [`is_member_name`] takes it: the member's certificate\ncarries it so.",
+          "maxLength": 253,
+          "minLength": 1,
+          "pattern": "^(?!(.*\\.)?[0-9]+$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$",
           "type": "string"
         },
         "trust": {

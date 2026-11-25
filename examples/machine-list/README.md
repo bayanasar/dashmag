@@ -66,7 +66,7 @@ a member. For each device on it that you give the pool, write an offer.
 
 | field | what it is | how you find it |
 |---|---|---|
-| member `name` | a name for the machine, used in every device's name and in the plan | any name. A role (`workstation`) keeps your hostnames out of files you share. |
+| member `name` | a name for the machine, used in every device's name, in the plan and in the machine's certificate | a DNS name in lower case: letters `a` to `z`, digits and `-`, in labels joined by `.`, the last not all digits; the pool file refuses any other. A role (`workstation`) keeps your hostnames out of files you share. |
 | member `trust` | how far you trust the machine: `owner`, `site` or `outside`. Data kept at a level never goes to a machine trusted less. | yours. Your own machines are `owner`. A machine on your site that is not yours is `site`. A rented one is `outside`. |
 | member `give_back_seconds` | how soon the machine gives its devices back when you take it back | yours: how long you will wait. The member program is to honour it; it is not built. |
 | offer `device` | the member and an index, one per device | number each machine's devices from 0. Here the card is 0 and the CPU is 1. |

@@ -65,6 +65,8 @@ the files kept in [`tests/v1`](tests/v1) show:
   authority signed that names the member expected, so a member that joins later proves itself
   by its certificate. [`starts/example.json`](starts/example.json) is one; `mag-mar`'s `certs`
   command makes an authority and its members' certificates.
+- `is_member_name`: a member's name is a DNS name in lower case, the last label not all digits,
+  since its certificate carries it as one. The pool file and the start file refuse any other.
 - The words of a link between two members, at `WIRE_VERSION` 1: `Open`, which each end says
   once on a channel for one job, and `Tensor`, the value of one edge at one step, whose bytes
   follow it on the channel. With the `graph` feature they are JSON, as the files' words are.

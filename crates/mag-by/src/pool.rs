@@ -43,11 +43,46 @@ pub const POOL_VERSION: u64 = 2;
 )]
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Member {
+    /// A DNS name in lower case, as [`is_member_name`] takes it: the member's certificate
+    /// carries it so.
+    #[cfg_attr(
+        feature = "graph",
+        schemars(
+            regex(
+                pattern = r"^(?!(.*\.)?[0-9]+$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
+            ),
+            length(min = 1, max = 253)
+        )
+    )]
     pub name: String,
     /// How far the host trusts it. Nothing kept at a higher level is placed on its devices.
     pub trust: Trust,
     /// Seconds within which the member gives a device back when the host takes it back.
     pub give_back_seconds: f64,
+}
+
+/// Whether `name` may name a member: a DNS name in lower case, since the member's certificate
+/// carries its name as a DNS name, and DNS names are compared without regard to case. Labels of
+/// `a` to `z`, `0` to `9` and `-`, each of 1 to 63 bytes and neither beginning nor ending with
+/// `-`, joined by `.`, at most 253 bytes in all, the last label not all digits, so that no name
+/// reads as an address. The pool file and the start file refuse any other.
+pub fn is_member_name(name: &str) -> bool {
+    let label = |l: &str| {
+        let b = l.as_bytes();
+        !b.is_empty()
+            && b.len() <= 63
+            && b[0] != b'-'
+            && b[b.len() - 1] != b'-'
+            && b.iter()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+    };
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(label)
+        && name
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| !last.bytes().all(|c| c.is_ascii_digit()))
 }
 
 /// A device: its member, and its index on that member.

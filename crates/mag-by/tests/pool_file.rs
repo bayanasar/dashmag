@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use mag_by::{Description, DeviceId, PoolFileError, Removal, Trust, pool_schema};
+use mag_by::{Description, DeviceId, PoolFileError, Removal, Trust, is_member_name, pool_schema};
 use serde_json::{Value, json};
 
 const EXAMPLE: &str = include_str!("../pools/example.json");
@@ -170,4 +170,74 @@ fn a_member_listed_twice_or_a_device_offered_twice_is_refused() {
     });
     let err = Description::from_json(&device).unwrap_err();
     assert_eq!(err.to_string(), "device workstation/0 is offered twice");
+}
+
+#[test]
+fn a_member_name_is_a_dns_name_in_lower_case() {
+    let long_label = "a".repeat(63);
+    let long_name = [
+        &*"b".repeat(63),
+        &*"c".repeat(63),
+        &*"d".repeat(63),
+        &*"e".repeat(61),
+    ]
+    .join(".");
+    assert_eq!(long_name.len(), 253);
+    for name in [
+        "workstation",
+        "gpu-1",
+        "a",
+        "7a",
+        "x.7.y",
+        "box.lab",
+        "x9.y-8.z",
+        &*long_label,
+        &*long_name,
+    ] {
+        assert!(is_member_name(name), "{name} refused");
+    }
+    let too_long_label = "a".repeat(64);
+    let too_long_name = format!("{long_name}f");
+    for name in [
+        "",
+        "Workstation",
+        "WORKSTATION",
+        "gpu_1",
+        "-gpu",
+        "gpu-",
+        "box..lab",
+        "box.",
+        ".box",
+        "laptop ",
+        "café",
+        "1.2.3.4",
+        "7",
+        "box.42",
+        "::1",
+        &*too_long_label,
+        &*too_long_name,
+    ] {
+        assert!(!is_member_name(name), "{name:?} taken");
+    }
+}
+
+#[test]
+fn a_pool_file_naming_a_member_as_a_certificate_could_not_is_refused() {
+    let member = changed(|v| v["members"][0]["name"] = "Workstation".into());
+    let err = Description::from_json(&member).unwrap_err();
+    assert!(
+        matches!(&err, PoolFileError::MemberName { name } if name == "Workstation"),
+        "{err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "member name `Workstation` is not a DNS name in lower case, as a certificate carries it"
+    );
+    // A device offered on a member so named is refused too, even with no such member listed.
+    let device = changed(|v| v["offers"][0]["device"]["member"] = "lap_top".into());
+    let err = Description::from_json(&device).unwrap_err();
+    assert!(
+        matches!(&err, PoolFileError::MemberName { name } if name == "lap_top"),
+        "{err}"
+    );
 }

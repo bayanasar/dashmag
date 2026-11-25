@@ -343,18 +343,11 @@ impl std::error::Error for LinkError {
     }
 }
 
-/// Refuses a member name that a certificate cannot carry exactly: it is put in the certificate
-/// as a DNS name, and DNS names are compared without regard to case, so only lower case is
-/// taken.
+/// Refuses a member name that a certificate cannot carry exactly: `mag-by`'s rule,
+/// [`mag_by::is_member_name`], a DNS name in lower case, which the pool file and the start file
+/// hold too.
 pub fn check_name(name: &str) -> Result<(), LinkError> {
-    let dns = matches!(
-        rustls::pki_types::ServerName::try_from(name),
-        Ok(rustls::pki_types::ServerName::DnsName(_))
-    );
-    let lower = name
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.');
-    if dns && lower {
+    if mag_by::is_member_name(name) {
         Ok(())
     } else {
         Err(LinkError::Name(name.into()))

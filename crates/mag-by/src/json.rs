@@ -117,6 +117,9 @@ pub enum PoolFileError {
     RepeatedMember { name: String },
     /// A device is offered twice: a description lists each device's offer once.
     RepeatedDevice { device: DeviceId },
+    /// A member's name, or the member a device is offered on, is not a lower-case DNS name
+    /// ([`crate::is_member_name`]): a certificate could not carry it.
+    MemberName { name: String },
 }
 
 impl fmt::Display for PoolFileError {
@@ -146,6 +149,10 @@ impl fmt::Display for PoolFileError {
             PoolFileError::RepeatedDevice { device } => {
                 write!(f, "device {device} is offered twice")
             }
+            PoolFileError::MemberName { name } => write!(
+                f,
+                "member name `{name}` is not a DNS name in lower case, as a certificate carries it"
+            ),
         }
     }
 }
@@ -170,7 +177,8 @@ pub enum StartFileError {
     Version { found: Option<String> },
     /// A key appears twice in one object. Where, as a path such as `peers[0].address`.
     RepeatedKey { at: String },
-    /// The pool lists a member twice, or offers a device twice, as a pool file may not.
+    /// The pool lists a member twice, offers a device twice, or names a member as a certificate
+    /// could not, as a pool file may not.
     Pool(PoolFileError),
     /// `member`, `coordinator` or a peer names no member of the pool.
     NotInPool { field: &'static str, name: String },
@@ -318,7 +326,8 @@ impl Description {
     /// Reads a pool file: a pool's description, as `describe` gives it. A file of version 1 is
     /// read to the same meaning. A member listed twice, or a device offered twice, is refused:
     /// `describe` never writes either, and which of two would stand is not the file's to leave
-    /// open.
+    /// open. So is a member's name that is not a lower-case DNS name ([`crate::is_member_name`]),
+    /// since its certificate could not carry it.
     pub fn from_json(text: &str) -> Result<Description, PoolFileError> {
         let (mut value, version) =
             read(text, POOL_FORMAT, POOL_VERSION).map_err(|bad| match bad {
@@ -335,8 +344,15 @@ impl Description {
         Ok(d)
     }
 
-    /// A member listed twice, or a device offered twice, refused.
+    /// A member listed twice, a device offered twice, or a member's name that is not a
+    /// lower-case DNS name, refused.
     fn each_once(&self) -> Result<(), PoolFileError> {
+        let names = self.members.iter().map(|m| &m.name);
+        for name in names.chain(self.offers.iter().map(|o| &o.device.member)) {
+            if !crate::is_member_name(name) {
+                return Err(PoolFileError::MemberName { name: name.clone() });
+            }
+        }
         for (i, m) in self.members.iter().enumerate() {
             if self.members[..i].iter().any(|x| x.name == m.name) {
                 return Err(PoolFileError::RepeatedMember {
@@ -362,10 +378,10 @@ impl Description {
 
 impl Start {
     /// Reads a start file. Besides what every file's reader refuses, it refuses a pool that lists
-    /// a member twice or offers a device twice; a `member`, `coordinator` or peer that names no
-    /// member of the pool; a peer that is this member or is listed twice; a coordinator that is
-    /// another member but no peer, since this member could not reach it; and an `idle_seconds`
-    /// that is not finite or is below 0.
+    /// a member twice, offers a device twice or names a member as a certificate could not; a
+    /// `member`, `coordinator` or peer that names no member of the pool; a peer that is this
+    /// member or is listed twice; a coordinator that is another member but no peer, since this
+    /// member could not reach it; and an `idle_seconds` that is not finite or is below 0.
     pub fn from_json(text: &str) -> Result<Start, StartFileError> {
         let (value, _) = read(text, START_FORMAT, START_VERSION).map_err(|bad| match bad {
             Bad::Json(e) => StartFileError::Json(e),

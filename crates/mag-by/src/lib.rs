@@ -72,5 +72,5 @@ pub use link::{Open, Tensor, WIRE_VERSION};
 pub use pool::{
     Arrangement, Candidate, Change, Cost, Description, DeviceId, Entry, Event, Format, Held,
     LEDGER_FORMAT, LEDGER_VERSION, Ledger, Member, Move, Offer, POOL_FORMAT, POOL_VERSION, Place,
-    Record, Removal,
+    Record, Removal, is_member_name,
 };

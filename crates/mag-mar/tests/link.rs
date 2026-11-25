@@ -516,6 +516,61 @@ fn a_name_a_certificate_cannot_carry_exactly_is_refused_before_dialling() {
     }
 }
 
+/// Every name `mag-by`'s rule takes for a member, rustls reads as a DNS name, and a certificate
+/// carries it and gives it back as itself; and the names a certificate would carry other than
+/// as written, or as an address, it refuses. (rustls also reads `_` in a name; the rule, as DNS
+/// host names are, is stricter.)
+#[test]
+fn the_member_name_rule_is_what_a_certificate_carries() {
+    let pool = Authority::new(1).unwrap();
+    let long = "a".repeat(63);
+    let longer = "a".repeat(64);
+    let taken = [
+        "workstation",
+        "gpu-1",
+        "a",
+        "7a",
+        "x.7.y",
+        "box.lab",
+        "x9.y-8.z",
+        &*long,
+    ];
+    for name in taken {
+        assert!(mag_by::is_member_name(name), "{name:?}");
+        assert!(
+            matches!(ServerName::try_from(name), Ok(ServerName::DnsName(_))),
+            "{name:?}: rustls does not read it as a DNS name"
+        );
+        assert_eq!(pool.issue(name, 1).unwrap().member, name);
+    }
+    let refused = [
+        "",
+        "Workstation",
+        "-gpu",
+        "gpu-",
+        "box..lab",
+        "box.",
+        ".box",
+        "7",
+        "42",
+        "box.42",
+        "1.2.3",
+        "1.2.3.4",
+        "01.2.3.4",
+        "::1",
+        "café",
+        "gpu_1",
+        &*longer,
+    ];
+    for name in refused {
+        assert!(!mag_by::is_member_name(name), "{name:?}");
+        assert!(
+            matches!(pool.issue(name, 1), Err(LinkError::Name(_))),
+            "{name:?}"
+        );
+    }
+}
+
 #[test]
 fn each_job_has_its_own_channel_and_none_hears_another() {
     let pool = Authority::new(1).unwrap();
