@@ -496,6 +496,184 @@ fn a_dialler_whose_peer_says_nothing_is_given_up_at_the_deadline() {
 }
 
 #[test]
+fn peers_that_connect_and_say_nothing_do_not_delay_a_member_s_opening() {
+    let pool = Authority::new(1).unwrap();
+    // The default deadline, 10 s: taken one at a time, five silent peers would hold the next
+    // opening for 50 s.
+    let server = Arc::new(bound(&pool, "server"));
+    let at = address(&server);
+    let _silent: Vec<TcpStream> = (0..5).map(|_| TcpStream::connect(&at).unwrap()).collect();
+
+    // `accept_any`, as the coordinator takes its members, and `accept`, each behind the five.
+    for any in [true, false] {
+        let s = server.clone();
+        let accepting = thread::spawn(move || {
+            if any {
+                s.accept_any()
+            } else {
+                s.accept(&["laptop"])
+            }
+        });
+        let laptop = TlsLink::new(credentials(&pool, "laptop"))
+            .unwrap()
+            .with_opening(Duration::from_secs(2));
+        let started = Instant::now();
+        let dialled = laptop.open("server", &at, mag_by::CONTROL);
+        let took = started.elapsed();
+        assert_eq!(dialled.unwrap().peer().member, "server");
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        assert_eq!(accepting.join().unwrap().unwrap().peer().member, "laptop");
+    }
+}
+
+#[test]
+fn past_its_limit_an_answering_end_closes_new_connections_at_once() {
+    let pool = Authority::new(1).unwrap();
+    let server = Arc::new(
+        bound(&pool, "server")
+            .with_opening(Duration::from_secs(30))
+            .with_answering(2),
+    );
+    let at = address(&server);
+    let (taken_tx, taken) = std::sync::mpsc::channel();
+    let s = server.clone();
+    thread::spawn(
+        move || {
+            while taken_tx.send(s.accept(&["laptop"])).is_ok() {}
+        },
+    );
+    // Two peers that say nothing are held while they open, up to the limit.
+    let silent: Vec<TcpStream> = (0..2).map(|_| TcpStream::connect(&at).unwrap()).collect();
+    // A third is closed at once, not held until a deadline 30 s away.
+    let mut third = TcpStream::connect(&at).unwrap();
+    third
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let started = Instant::now();
+    match third.read(&mut [0; 1]) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    // The two are still held.
+    for mut held in &silent {
+        held.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let e = held.read(&mut [0; 1]).unwrap_err();
+        assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "{e:?}"
+        );
+    }
+    // One goes: its failure is returned, and its place is free for a member.
+    let mut silent = silent;
+    drop(silent.remove(0));
+    match taken.recv_timeout(Duration::from_secs(5)).unwrap() {
+        Err(LinkError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+        other => panic!("{:?}", other.err()),
+    }
+    let laptop = TlsLink::new(credentials(&pool, "laptop")).unwrap();
+    assert_eq!(
+        laptop.open("server", &at, "j").unwrap().peer().member,
+        "server"
+    );
+    let accepted = taken.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(accepted.unwrap().peer().member, "laptop");
+}
+
+#[test]
+fn an_opening_no_caller_takes_by_its_deadline_is_given_up_and_a_refusal_comes_first() {
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server").with_opening(Duration::from_millis(300));
+    let at = address(&server);
+    // The first accept starts the thread that takes connections.
+    let a = at.clone();
+    let (accepted, ()) = meet(&server, &["laptop"], move || {
+        drop(TcpStream::connect(&a).unwrap());
+    });
+    assert!(accepted.is_err());
+
+    // A member's opening goes as far as it can with no caller, then waits past its deadline.
+    let laptop = TlsLink::new(credentials(&pool, "laptop"))
+        .unwrap()
+        .with_opening(Duration::from_secs(5));
+    let a = at.clone();
+    let dialling = thread::spawn(move || laptop.open("server", &a, "j"));
+    thread::sleep(Duration::from_millis(600));
+    match server.accept(&["laptop"]) {
+        Err(LinkError::OpeningTimedOut { after, side }) => {
+            assert_eq!((after, side), (Duration::from_millis(300), Side::Answering));
+        }
+        other => panic!("{:?}", other.err()),
+    }
+    assert!(dialling.join().unwrap().is_err());
+
+    // A member not expected, whose opening is not one: refused as that member, as before.
+    let laptop = pool.issue("laptop", 1).unwrap();
+    let config = raw_client(
+        &pool,
+        &rustls::version::TLS13,
+        Some((
+            vec![CertificateDer::from_pem_slice(laptop.certificate.as_bytes()).unwrap()],
+            PrivateKeyDer::from_pem_slice(laptop.key.as_bytes()).unwrap(),
+        )),
+    );
+    let (accepted, dialled) = meet(&server, &["workstation"], move || raw_dial(config, &at));
+    match accepted {
+        Err(LinkError::Refused(Refused::WrongMember { expected, named })) => {
+            assert_eq!(
+                (expected, named),
+                (vec!["workstation".into()], vec!["laptop".into()])
+            );
+        }
+        other => panic!("{:?}", other.err()),
+    }
+    assert!(dialled.is_err());
+}
+
+#[test]
+fn an_answering_end_dropped_frees_its_address_and_takes_new_settings_after_an_accept() {
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server");
+    let at = address(&server);
+    let (accepted, ()) = meet(&server, &["laptop"], move || {
+        drop(TcpStream::connect(&at).unwrap());
+    });
+    assert!(accepted.is_err());
+
+    // The opening's deadline set after an accept is the one the next connection is given.
+    let server = server.with_opening(Duration::from_millis(300));
+    let at = address(&server);
+    let silent = TcpStream::connect(&at).unwrap();
+    let started = Instant::now();
+    match server.accept(&["laptop"]) {
+        Err(LinkError::OpeningTimedOut { after, side }) => {
+            assert_eq!((after, side), (Duration::from_millis(300), Side::Answering));
+        }
+        other => panic!("{:?}", other.err()),
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(silent);
+
+    // Dropped, the end holds its address no longer, though a thread of its took connections.
+    let at = server.local_addr().unwrap();
+    drop(server);
+    std::net::TcpListener::bind(at).unwrap();
+}
+
+#[test]
 fn an_opening_dropped_or_refused_is_not_said_to_have_timed_out() {
     use std::io::ErrorKind;
     use std::time::Duration;

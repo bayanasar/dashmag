@@ -24,7 +24,10 @@
 //!   the caller's buffer, never held twice.
 //! - An open channel is watched: TCP keepalive finds a peer whose machine went away
 //!   ([`Keepalive`]), and a receive may be given a limit on silence
-//!   ([`TlsLink::with_silence`]). Dialling and the opening are bounded by one deadline.
+//!   ([`TlsLink::with_silence`]). Dialling and the opening are bounded by one deadline. The
+//!   connections an end answers open apart, each on a thread of its own, so that a peer that
+//!   connects and says nothing holds no other's opening, and at most so many at once
+//!   ([`TlsLink::with_answering`]).
 //! - [`Identity`]: who the other end is, by the member its certificate names and the
 //!   certificate's serial, which tells a certificate the host issued after a lease ended from
 //!   the one it ended on.
@@ -60,7 +63,8 @@ use serde::de::DeserializeOwned;
 
 pub use frame::MAX_HEADER;
 pub use tls::{
-    Credentials, KEEPALIVE, Keepalive, OPENING, TlsChannel, TlsLink, TlsReceiver, TlsSender,
+    ANSWERING, Credentials, KEEPALIVE, Keepalive, OPENING, TlsChannel, TlsLink, TlsReceiver,
+    TlsSender,
 };
 
 /// One end of the links between members: the replaceable interface. A member holds one, and
@@ -78,10 +82,14 @@ pub trait Link {
     /// that names more than one of `expected` is refused too, since it could stand for either;
     /// one that names exactly one of them is taken as that member.
     ///
-    /// It takes one connection at a time, and returns once that one is open or given up: a
-    /// member that must answer several peers at once accepts on a thread of its own and hands
-    /// each channel on. An opening that does not finish in the time the implementation allows
-    /// is given up, so a peer that stalls cannot hold it.
+    /// Connections open apart from each other, and from the caller: a peer that stalls its
+    /// opening holds no other's, so a member's channel opens while others wait, and `accept`
+    /// returns whichever opening finishes first. An opening that does not finish in the time the
+    /// implementation allows is given up, and that failure returned to a caller as a refusal is.
+    /// An implementation holds only so many openings at once, and closes a connection past them
+    /// at once, so that a flood of connections cannot exhaust it; the member closed so dials
+    /// again. A call takes one channel: a member that must answer several peers accepts on a
+    /// thread of its own and hands each channel on.
     fn accept(&self, expected: &[&str]) -> Result<Self::Channel, LinkError>;
 
     /// Takes the next channel any member of the pool opens to this one, and reports it as the
@@ -90,8 +98,8 @@ pub trait Link {
     /// after it began is named by nothing it was told, only by its certificate; it then tells a
     /// control channel from a job's by [`ChannelEnd::job`]. A certificate naming no member, or
     /// more than one, is refused and closed, [`Refused::NotOneMember`], and the refusal
-    /// returned; the caller accepts again. One connection at a time, as [`Link::accept`] takes
-    /// them.
+    /// returned; the caller accepts again. Its connections open apart from each other, as
+    /// [`Link::accept`]'s do.
     fn accept_any(&self) -> Result<Self::Channel, LinkError>;
 
     /// The rate measured on every channel to `member` so far, for the placement loop's cost

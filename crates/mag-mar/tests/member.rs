@@ -937,6 +937,22 @@ fn a_member_with_no_offers_is_recorded_nowhere_and_its_leave_is_answered() {
 }
 
 #[test]
+fn a_member_joins_at_once_while_peers_that_say_nothing_hold_connections_to_the_coordinator() {
+    let pool = Pool::new("silent-peers");
+    let (mut coordinating, at) = coordinator(&pool);
+    // Taken one at a time, each would hold the coordinator for the opening's deadline, 10 s.
+    let _silent: Vec<TcpStream> = (0..5).map(|_| TcpStream::connect(&at).unwrap()).collect();
+    let started = Instant::now();
+    let _laptop = joined(&pool, "laptop", &at, description());
+    coordinating.says("`laptop` joined with 1 devices");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn a_member_gone_without_leaving_is_recorded_as_left() {
     let pool = Pool::new("gone");
     let (mut coordinating, at) = coordinator(&pool);

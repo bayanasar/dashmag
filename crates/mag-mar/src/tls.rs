@@ -10,11 +10,14 @@
 //! not resumed, so every channel shows its certificate afresh, and no server name is sent in
 //! the clear.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -36,6 +39,11 @@ use crate::{
 /// How long the opening of a channel may take, dialling, the handshake and the opening words
 /// together, before the channel is given up: the default of [`TlsLink::with_opening`].
 pub const OPENING: Duration = Duration::from_secs(10);
+
+/// How many connections an end that answers holds at once while they open, before a caller of
+/// `accept` takes them: the default of [`TlsLink::with_answering`]. A connection past it is
+/// closed at once.
+pub const ANSWERING: usize = 64;
 
 /// A member's credentials on its links: the pool's authority certificate, the member's own
 /// certificate, signed by it and naming the member, and the member's private key.
@@ -302,7 +310,7 @@ fn timed_out() -> io::Error {
 
 /// The socket under a channel while it opens. Each read and write may take only what is left of
 /// one deadline for the whole opening, dialling included, so a peer that sends a byte now and
-/// then cannot hold the opening, and with it `accept`, for longer than that.
+/// then cannot hold the opening, nor the thread it runs on, for longer than that.
 struct Sock {
     tcp: TcpStream,
     deadline: Instant,
@@ -507,6 +515,29 @@ fn watch(tcp: &TcpStream, keepalive: Option<Keepalive>) -> io::Result<()> {
     sock.set_tcp_keepalive(&params)
 }
 
+/// A failure of an opening that was given `opening` and was to end by `deadline`, at `side`.
+/// While a channel opens, its socket has no timeout but what the deadline leaves, so a read or a
+/// write that waits that out is the opening timing out ([`LinkError::OpeningTimedOut`]): Linux
+/// reports it as `WouldBlock`, other systems as `TimedOut`. So is a `TimedOut` once the deadline
+/// has passed: a dial given up at it, or the deadline found passed before the next read or
+/// write. A `TimedOut` before it is the system's own, such as TCP keepalive finding the peer
+/// gone, and stays as it came, as does every other failure: a peer that refused this end, or
+/// dropped the connection.
+fn ran_out(e: LinkError, opening: Duration, deadline: Instant, side: Side) -> LinkError {
+    match &e {
+        LinkError::Io(io)
+            if io.kind() == io::ErrorKind::WouldBlock
+                || (io.kind() == io::ErrorKind::TimedOut && Instant::now() >= deadline) =>
+        {
+            LinkError::OpeningTimedOut {
+                after: opening,
+                side,
+            }
+        }
+        _ => e,
+    }
+}
+
 /// A socket whose opening must end by `deadline`, watched by `keepalive`.
 fn prepare(
     tcp: TcpStream,
@@ -550,14 +581,24 @@ fn member_named(cert: &CertificateDer<'_>, expected: &[&str]) -> Result<String, 
 
 /// A member's end of its links over TCP with TLS 1.3: it dials other members, and if it was
 /// bound to an address, it answers them.
+///
+/// An end that answers opens each connection it takes on a thread of its own, from the first
+/// `accept` on, so that a peer that stalls its opening holds no other's: `accept` returns the
+/// next channel whose opening has finished, whichever connection came first. It holds at most
+/// [`TlsLink::with_answering`] connections at once while they open, and closes any past that at
+/// once, so that a flood of connections cannot take every thread.
 pub struct TlsLink {
     credentials: Credentials,
     client: Arc<ClientConfig>,
     server: Arc<ServerConfig>,
+    /// The thread that takes connections, once the first `accept` has started it. Dropped
+    /// before the listener, it ends the thread, which holds a listener of its own.
+    answerer: Mutex<Option<Answerer>>,
     listener: Option<TcpListener>,
     opening: Duration,
     keepalive: Option<Keepalive>,
     silence: Option<Duration>,
+    answering: usize,
     rates: Arc<Mutex<BTreeMap<String, Rate>>>,
 }
 
@@ -568,10 +609,12 @@ impl TlsLink {
             client: Arc::new(client_config(&credentials)?),
             server: Arc::new(server_config(&credentials)?),
             credentials,
+            answerer: Mutex::new(None),
             listener: None,
             opening: OPENING,
             keepalive: Some(KEEPALIVE),
             silence: None,
+            answering: ANSWERING,
             rates: Arc::default(),
         })
     }
@@ -581,6 +624,7 @@ impl TlsLink {
     /// [`OPENING`] unless set.
     pub fn with_opening(mut self, opening: Duration) -> TlsLink {
         self.opening = opening;
+        self.restart_answering();
         self
     }
 
@@ -588,6 +632,7 @@ impl TlsLink {
     /// [`KEEPALIVE`] unless set.
     pub fn with_keepalive(mut self, keepalive: Option<Keepalive>) -> TlsLink {
         self.keepalive = keepalive;
+        self.restart_answering();
         self
     }
 
@@ -601,6 +646,24 @@ impl TlsLink {
     pub fn with_silence(mut self, silence: Option<Duration>) -> TlsLink {
         self.silence = silence.filter(|s| !s.is_zero());
         self
+    }
+
+    /// The same end, holding at most `limit` connections at once while they open, before a
+    /// caller of `accept` takes them, at least one. A connection past it is closed at once, so
+    /// that a flood of connections, each held until its opening's deadline, cannot take every
+    /// thread; a member closed so dials again. [`ANSWERING`] unless set.
+    pub fn with_answering(mut self, limit: usize) -> TlsLink {
+        self.answering = limit.max(1);
+        self.restart_answering();
+        self
+    }
+
+    /// Ends the thread that takes connections, if one runs, so that the next `accept` starts one
+    /// with the end's settings as they are now. The connections it held are closed, those still
+    /// opening once their openings end.
+    fn restart_answering(&mut self) {
+        let answerer = self.answerer.get_mut().unwrap_or_else(|p| p.into_inner());
+        drop(answerer.take());
     }
 
     /// An end that dials and answers at `address`, such as `0.0.0.0:7340`.
@@ -621,29 +684,6 @@ impl TlsLink {
     /// This member's credentials.
     pub fn credentials(&self) -> &Credentials {
         &self.credentials
-    }
-
-    /// A failure of an opening that was to end by `deadline`, at `side`. While a channel opens,
-    /// its socket has no timeout but what the deadline leaves, so a read or a write that waits
-    /// that out is the opening timing out ([`LinkError::OpeningTimedOut`]): Linux reports it as
-    /// `WouldBlock`, other systems as `TimedOut`. So is a `TimedOut` once the deadline has
-    /// passed: a dial given up at it, or the deadline found passed before the next read or
-    /// write. A `TimedOut` before it is the system's own, such as TCP keepalive finding the peer
-    /// gone, and stays as it came, as does every other failure: a peer that refused this end, or
-    /// dropped the connection.
-    fn ran_out(&self, e: LinkError, deadline: Instant, side: Side) -> LinkError {
-        match &e {
-            LinkError::Io(io)
-                if io.kind() == io::ErrorKind::WouldBlock
-                    || (io.kind() == io::ErrorKind::TimedOut && Instant::now() >= deadline) =>
-            {
-                LinkError::OpeningTimedOut {
-                    after: self.opening,
-                    side,
-                }
-            }
-            _ => e,
-        }
     }
 
     /// The channel is open: the opening's deadline is dropped, the silence allowed is set, and
@@ -713,7 +753,8 @@ impl Link for TlsLink {
             frame::open_as_dialler(&mut stream, job, mag_by::WIRE_VERSION)?;
             Ok((stream, peer))
         };
-        let (stream, peer) = opening().map_err(|e| self.ran_out(e, deadline, Side::Dialling))?;
+        let (stream, peer) =
+            opening().map_err(|e| ran_out(e, self.opening, deadline, Side::Dialling))?;
         self.opened(stream, peer, job.into())
     }
 
@@ -734,46 +775,258 @@ impl Link for TlsLink {
 }
 
 impl TlsLink {
-    /// Takes the next connection, and opens it as a channel from the member `named` reads from
-    /// the certificate it presents, which the handshake has checked is the pool authority's.
+    /// Takes the next connection whose opening has finished as far as it goes on its own thread,
+    /// and opens it as a channel from the member `named` reads from the certificate it presents,
+    /// which the handshake has checked is the pool authority's.
     fn answer(
         &self,
         named: impl FnOnce(&CertificateDer<'_>) -> Result<String, Refused>,
     ) -> Result<TlsChannel, LinkError> {
+        let Answered {
+            mut stream,
+            open,
+            deadline,
+        } = self.answering()?.next()?;
+        let (peer, job) = taken(&mut stream, open, named)
+            .map_err(|e| ran_out(e, self.opening, deadline, Side::Answering))?;
+        self.opened(stream, peer, job)
+    }
+
+    /// The connections this end holds while they open, the thread that takes them started if
+    /// this is the first `accept`.
+    fn answering(&self) -> Result<Arc<Answering>, LinkError> {
         let listener = self.listener.as_ref().ok_or_else(|| {
             LinkError::Io(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "this end was bound to no address, and only dials",
             ))
         })?;
-        let (tcp, _) = listener.accept()?;
-        let deadline = Instant::now() + self.opening;
-        let opening = || {
-            let sock = prepare(tcp, deadline, self.keepalive)?;
-            let conn = ServerConnection::new(self.server.clone()).map_err(LinkError::Tls)?;
-            let mut stream = Stream::Answered(StreamOwned::new(conn, sock));
-            stream.handshake()?;
-            let cert = stream
-                .peer_certificate()
-                .ok_or(LinkError::Refused(Refused::NoCertificate))?;
-            let member = match named(cert) {
-                Ok(member) => member,
-                Err(refused) => {
-                    let _ = stream.close();
-                    return Err(LinkError::Refused(refused));
-                }
-            };
-            let peer = Identity {
-                member,
-                serial: serial(&stream)?,
-            };
-            let job = frame::open_as_acceptor(&mut stream, mag_by::WIRE_VERSION)?;
-            Ok((stream, peer, job))
+        let mut answerer = self.answerer.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(answerer) = answerer.as_ref() {
+            return Ok(answerer.answering.clone());
+        }
+        let wake = waking(listener.local_addr()?);
+        let taking = listener.try_clone()?;
+        let answering = Arc::new(Answering {
+            held: Mutex::new(Held {
+                count: 0,
+                done: VecDeque::new(),
+            }),
+            finished: Condvar::new(),
+            limit: self.answering,
+            stop: AtomicBool::new(false),
+        });
+        let thread = {
+            let answering = answering.clone();
+            let server = self.server.clone();
+            let (opening, keepalive) = (self.opening, self.keepalive);
+            thread::Builder::new()
+                .name("mag-mar answers".into())
+                .spawn(move || take_connections(taking, &answering, server, opening, keepalive))?
         };
-        let (stream, peer, job) =
-            opening().map_err(|e| self.ran_out(e, deadline, Side::Answering))?;
-        self.opened(stream, peer, job)
+        *answerer = Some(Answerer {
+            answering: answering.clone(),
+            thread: Some(thread),
+            wake,
+        });
+        Ok(answering)
     }
+}
+
+/// A connection an end that answers has taken, opened as far as it goes before a caller of
+/// `accept` checks the member it is from: the handshake done, which checked that its
+/// certificate is the pool authority's, and the opening the other end sent read, or why it was
+/// not.
+struct Answered {
+    stream: Stream,
+    open: Result<mag_by::Open, LinkError>,
+    deadline: Instant,
+}
+
+/// What an end that answers holds of the connections it has taken and not yet handed to a
+/// caller.
+struct Held {
+    /// The connections held: opening on their threads, or in `done`.
+    count: usize,
+    /// The openings finished as far as they go, or failed, in the order they finished.
+    done: VecDeque<Result<Answered, LinkError>>,
+}
+
+/// The connections an end that answers holds while they open, shared by the thread that takes
+/// them, the thread each opens on, and the callers of `accept`.
+struct Answering {
+    held: Mutex<Held>,
+    /// Told each time an opening finishes, or fails.
+    finished: Condvar,
+    /// The most connections held at once.
+    limit: usize,
+    /// Set when the end is dropped: the thread that takes connections ends.
+    stop: AtomicBool,
+}
+
+impl Answering {
+    fn held(&self) -> MutexGuard<'_, Held> {
+        self.held.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Holds one more connection, unless `limit` are held already.
+    fn hold(&self) -> bool {
+        let mut held = self.held();
+        if held.count >= self.limit {
+            return false;
+        }
+        held.count += 1;
+        true
+    }
+
+    /// Hands on a connection held, opened as far as it goes, or why it failed.
+    fn finish(&self, answered: Result<Answered, LinkError>) {
+        self.held().done.push_back(answered);
+        self.finished.notify_one();
+    }
+
+    /// The next opening finished, or failed, waiting for one; it is no longer held.
+    fn next(&self) -> Result<Answered, LinkError> {
+        let mut held = self.held();
+        loop {
+            if let Some(answered) = held.done.pop_front() {
+                held.count -= 1;
+                return answered;
+            }
+            held = self.finished.wait(held).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+/// The thread that takes an answering end's connections, from its first `accept` until it is
+/// dropped.
+struct Answerer {
+    answering: Arc<Answering>,
+    thread: Option<thread::JoinHandle<()>>,
+    /// An address at which a connection reaches the listener, to wake the thread.
+    wake: SocketAddr,
+}
+
+impl Drop for Answerer {
+    /// Ends the thread: a connection of its own wakes it from waiting for the next, and it ends
+    /// on seeing the stop, closing its listener, so that the end's address is free once the end
+    /// is dropped. Openings still running end by their deadline, and are dropped.
+    fn drop(&mut self) {
+        self.answering.stop.store(true, Ordering::SeqCst);
+        if TcpStream::connect_timeout(&self.wake, Duration::from_secs(1)).is_ok()
+            && let Some(thread) = self.thread.take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// An address at which a connection reaches a listener bound at `bound`: the same, or for a
+/// listener bound to every address, loopback.
+fn waking(bound: SocketAddr) -> SocketAddr {
+    let ip = match bound.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, bound.port())
+}
+
+/// Takes connections on `listener` until `answering` is stopped, and opens each on a thread of
+/// its own, so that one whose peer stalls holds no other: given `opening` from when it is taken,
+/// and watched by `keepalive`. One past `answering`'s limit is closed at once. A connection the
+/// system fails to take is handed on as the failure, and the next is taken a little later, so
+/// that a failure that lasts, such as running out of file descriptors, does not spin.
+fn take_connections(
+    listener: TcpListener,
+    answering: &Arc<Answering>,
+    server: Arc<ServerConfig>,
+    opening: Duration,
+    keepalive: Option<Keepalive>,
+) {
+    loop {
+        let taken = listener.accept();
+        if answering.stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let tcp = match taken {
+            Ok((tcp, _)) => tcp,
+            Err(e) => {
+                if answering.hold() {
+                    answering.finish(Err(LinkError::Io(e)));
+                }
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        let deadline = Instant::now() + opening;
+        if !answering.hold() {
+            drop(tcp);
+            continue;
+        }
+        let on_its_own = {
+            let answering = answering.clone();
+            let server = server.clone();
+            move || {
+                let answered = opened_so_far(tcp, server, keepalive, deadline)
+                    .map_err(|e| ran_out(e, opening, deadline, Side::Answering));
+                answering.finish(answered);
+            }
+        };
+        if let Err(e) = thread::Builder::new()
+            .name("mag-mar opens".into())
+            .spawn(on_its_own)
+        {
+            answering.finish(Err(LinkError::Io(e)));
+        }
+    }
+}
+
+/// Opens a connection an end that answers has taken as far as it goes before a caller checks the
+/// member it is from: the handshake, which checks that the other end's certificate is the pool
+/// authority's, and the opening it sends, read.
+fn opened_so_far(
+    tcp: TcpStream,
+    server: Arc<ServerConfig>,
+    keepalive: Option<Keepalive>,
+    deadline: Instant,
+) -> Result<Answered, LinkError> {
+    let sock = prepare(tcp, deadline, keepalive)?;
+    let conn = ServerConnection::new(server).map_err(LinkError::Tls)?;
+    let mut stream = Stream::Answered(StreamOwned::new(conn, sock));
+    stream.handshake()?;
+    let open = frame::read_open(&mut stream);
+    Ok(Answered {
+        stream,
+        open,
+        deadline,
+    })
+}
+
+/// Takes a connection opened so far as a channel from the member `named` reads from its
+/// certificate, and answers its opening: the member, and the job. A member `named` refuses is
+/// told the channel is closed, and the refusal returned before any failure of the opening.
+fn taken(
+    stream: &mut Stream,
+    open: Result<mag_by::Open, LinkError>,
+    named: impl FnOnce(&CertificateDer<'_>) -> Result<String, Refused>,
+) -> Result<(Identity, String), LinkError> {
+    let cert = stream
+        .peer_certificate()
+        .ok_or(LinkError::Refused(Refused::NoCertificate))?;
+    let member = match named(cert) {
+        Ok(member) => member,
+        Err(refused) => {
+            let _ = stream.close();
+            return Err(LinkError::Refused(refused));
+        }
+    };
+    let peer = Identity {
+        member,
+        serial: serial(stream)?,
+    };
+    let job = frame::answer_open(stream, mag_by::WIRE_VERSION, open?)?;
+    Ok((peer, job))
 }
 
 /// What the two halves of an open channel share: its TLS session, locked only while records
@@ -825,7 +1078,6 @@ const RECORDS: usize = 64 << 10;
 /// Bytes read from the socket at a time, before the session takes them.
 const READ: usize = 64 << 10;
 
-/// The channel's way out: the socket written by the sending half alone.
 /// The one member the certificate names, whoever it is: its one DNS name, which must be a member
 /// name. A certificate that names more than one could stand for any of them, and is refused.
 fn member_any(cert: &CertificateDer<'_>) -> Result<String, Refused> {
@@ -838,6 +1090,7 @@ fn member_any(cert: &CertificateDer<'_>) -> Result<String, Refused> {
     }
 }
 
+/// The channel's way out: the socket written by the sending half alone.
 struct Outbound {
     shared: Arc<Shared>,
     tcp: TcpStream,

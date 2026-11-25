@@ -115,7 +115,8 @@ fn send_open<W: Write>(w: &mut W, wire: u64, job: &str) -> Result<(), LinkError>
     Ok(())
 }
 
-fn read_open<R: Read>(r: &mut R) -> Result<Open, LinkError> {
+/// Reads the opening the end that dialled sends: the first half of taking a channel.
+pub(crate) fn read_open<R: Read>(r: &mut R) -> Result<Open, LinkError> {
     let incoming = read(r, 0)?;
     if incoming.body != 0 {
         return Err(LinkError::Opening(format!(
@@ -168,11 +169,11 @@ pub(crate) fn open_as_dialler<S: Read + Write>(
     Ok(())
 }
 
-/// Takes a channel at the end that answered, speaking `wire`, and returns its job. It answers
-/// with its own version even when the two differ, so that the end that dialled sees why.
-pub(crate) fn open_as_acceptor<S: Read + Write>(s: &mut S, wire: u64) -> Result<String, LinkError> {
-    let open = read_open(s)?;
-    send_open(s, wire, &open.job)?;
+/// Takes a channel at the end that answered, speaking `wire`, once its opening `open` is read
+/// ([`read_open`]), and returns its job. It answers with its own version even when the two
+/// differ, so that the end that dialled sees why.
+pub(crate) fn answer_open<W: Write>(w: &mut W, wire: u64, open: Open) -> Result<String, LinkError> {
+    send_open(w, wire, &open.job)?;
     if open.wire != wire {
         return Err(LinkError::Wire {
             ours: wire,
@@ -189,6 +190,12 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    /// Takes a channel at the end that answered: its opening read, then answered.
+    fn open_as_acceptor<S: Read + Write>(s: &mut S, wire: u64) -> Result<String, LinkError> {
+        let open = read_open(s)?;
+        answer_open(s, wire, open)
+    }
 
     fn written(messages: &[(&[u8], &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
