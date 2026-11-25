@@ -182,7 +182,7 @@ pub fn resize_bilinear(src: &Rgb8, width: usize, height: usize) -> Rgb8 {
 pub fn to_nchw(img: &Rgb8, mean: [f32; 3], std: [f32; 3]) -> Vec<f32> {
     let plane = img.width * img.height;
     let mut out = vec![0f32; 3 * plane];
-    for (i, px) in img.data.chunks_exact(3).enumerate() {
+    for (i, px) in img.data.as_chunks::<3>().0.iter().enumerate() {
         for ch in 0..3 {
             out[ch * plane + i] = (f32::from(px[ch]) / 255.0 - mean[ch]) / std[ch];
         }
@@ -306,8 +306,10 @@ mod tests {
             out: (h, w),
             resized: read(format!("{stem}_{h}x{w}.u8")),
             tensor: read(format!("{stem}_{h}x{w}.f32"))
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect(),
         }
     }

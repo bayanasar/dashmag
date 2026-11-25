@@ -94,8 +94,10 @@ fn read_wmma_layout(client: &Client, dtype: DType) -> bool {
         return false;
     };
     let words: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| u32::from_le_bytes(*w))
         .collect();
     (0..32u32).all(|lane| {
         (0..3).all(|ident| {

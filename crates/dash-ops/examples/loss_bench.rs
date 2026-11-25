@@ -240,7 +240,12 @@ mod bench {
             start.elapsed().as_secs_f64() * 1e3 / 10.0
         };
         let shapes: Vec<(usize, usize)> = match sizes.len() >= 2 {
-            true => sizes.chunks_exact(2).map(|p| (p[0], p[1])).collect(),
+            true => sizes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| (p[0], p[1]))
+                .collect(),
             false => vec![
                 (2048, 4096),
                 (3072, 2048),

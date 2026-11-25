@@ -458,8 +458,10 @@ fn run(dir: &Path, t: usize, only: Option<&str>) -> R<()> {
 fn load(dir: &Path, name: &str) -> R<Vec<f32>> {
     let bytes = fs::read(dir.join(format!("{name}.f32")))?;
     Ok(bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect())
 }
 

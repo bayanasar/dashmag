@@ -110,8 +110,10 @@ fn imagenet_weights_give_torchs_answer_on_flex() {
     let raw =
         fs::read(fixtures_dir().join("input_1x3x224x224.f32")).expect("input fixture missing");
     let input: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
 
     let got = burn_logits(&model, &input, &device);

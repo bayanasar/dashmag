@@ -276,8 +276,10 @@ fn run() -> Result<(), String> {
     let floats = match (input, image) {
         (Some(input), _) => {
             let raw = fs::read(&input).map_err(|e| format!("read input {input}: {e}"))?;
-            raw.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         }
         (None, Some(image)) => image_tensor(&image, &shape, mean, std)?,

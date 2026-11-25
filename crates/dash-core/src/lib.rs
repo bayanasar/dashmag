@@ -346,8 +346,8 @@ impl HostTensor {
     /// Build an f32 tensor from a slice.
     pub fn from_f32(shape: Vec<usize>, v: &[f32]) -> Self {
         let mut data = vec![0u8; v.len() * 4];
-        for (dst, x) in data.chunks_exact_mut(4).zip(v) {
-            dst.copy_from_slice(&x.to_le_bytes());
+        for (dst, x) in data.as_chunks_mut::<4>().0.iter_mut().zip(v) {
+            *dst = x.to_le_bytes();
         }
         HostTensor {
             dtype: DType::F32,
@@ -359,8 +359,8 @@ impl HostTensor {
     /// Build an i64 tensor from a slice (detector index outputs).
     pub fn from_i64(shape: Vec<usize>, v: &[i64]) -> Self {
         let mut data = vec![0u8; v.len() * 8];
-        for (dst, x) in data.chunks_exact_mut(8).zip(v) {
-            dst.copy_from_slice(&x.to_le_bytes());
+        for (dst, x) in data.as_chunks_mut::<8>().0.iter_mut().zip(v) {
+            *dst = x.to_le_bytes();
         }
         HostTensor {
             dtype: DType::I64,
@@ -399,8 +399,10 @@ impl HostTensor {
         }
         Ok(self
             .data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect())
     }
 }

@@ -47,8 +47,10 @@ fn iree_cpu_matches_torch_reference() {
     });
     let raw = fs::read(dir.join("input_1x3x224x224.f32")).expect("input fixture missing");
     let floats: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
 
     let art = Artifact {

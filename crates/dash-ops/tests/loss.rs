@@ -182,8 +182,10 @@ fn f32s(bytes: &[u8], key: &str) -> Vec<f32> {
     let view = tensors.tensor(key).unwrap_or_else(|_| panic!("{key}"));
     assert_eq!(view.dtype(), safetensors::Dtype::F32, "{key}");
     view.data()
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 
@@ -199,8 +201,10 @@ fn load(name: &'static str) -> Case {
         let view = st.tensor(&format!("{name}.targets")).unwrap();
         assert_eq!(view.dtype(), safetensors::Dtype::I64);
         view.data()
-            .chunks_exact(8)
-            .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| i64::from_le_bytes(*b))
             .collect()
     };
     let variants = meta["variants"]
