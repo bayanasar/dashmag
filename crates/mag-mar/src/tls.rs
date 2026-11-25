@@ -30,7 +30,7 @@ use rustls::{
 
 use crate::{
     Channel, ChannelEnd, Identity, Incoming, Link, LinkError, Measure, Rate, Receiver, Refused,
-    Sender, check_name, frame,
+    Sender, Side, check_name, frame,
 };
 
 /// How long the opening of a channel may take, dialling, the handshake and the opening words
@@ -576,8 +576,9 @@ impl TlsLink {
         })
     }
 
-    /// The same end, giving each channel `opening` to open, before it is given up: dialling, the
-    /// handshake and the opening words together. [`OPENING`] unless set.
+    /// The same end, giving each channel `opening` to open, before it is given up
+    /// ([`LinkError::OpeningTimedOut`]): dialling, the handshake and the opening words together.
+    /// [`OPENING`] unless set.
     pub fn with_opening(mut self, opening: Duration) -> TlsLink {
         self.opening = opening;
         self
@@ -620,6 +621,29 @@ impl TlsLink {
     /// This member's credentials.
     pub fn credentials(&self) -> &Credentials {
         &self.credentials
+    }
+
+    /// A failure of an opening that was to end by `deadline`, at `side`. While a channel opens,
+    /// its socket has no timeout but what the deadline leaves, so a read or a write that waits
+    /// that out is the opening timing out ([`LinkError::OpeningTimedOut`]): Linux reports it as
+    /// `WouldBlock`, other systems as `TimedOut`. So is a `TimedOut` once the deadline has
+    /// passed: a dial given up at it, or the deadline found passed before the next read or
+    /// write. A `TimedOut` before it is the system's own, such as TCP keepalive finding the peer
+    /// gone, and stays as it came, as does every other failure: a peer that refused this end, or
+    /// dropped the connection.
+    fn ran_out(&self, e: LinkError, deadline: Instant, side: Side) -> LinkError {
+        match &e {
+            LinkError::Io(io)
+                if io.kind() == io::ErrorKind::WouldBlock
+                    || (io.kind() == io::ErrorKind::TimedOut && Instant::now() >= deadline) =>
+            {
+                LinkError::OpeningTimedOut {
+                    after: self.opening,
+                    side,
+                }
+            }
+            _ => e,
+        }
     }
 
     /// The channel is open: the opening's deadline is dropped, the silence allowed is set, and
@@ -674,18 +698,22 @@ impl Link for TlsLink {
         let name =
             ServerName::try_from(member.to_string()).map_err(|_| LinkError::Name(member.into()))?;
         let deadline = Instant::now() + self.opening;
-        let sock = prepare(dial(address, deadline)?, deadline, self.keepalive)?;
-        let conn = ClientConnection::new(self.client.clone(), name).map_err(LinkError::Tls)?;
-        let mut stream = Stream::Dialled(StreamOwned::new(conn, sock));
-        // The other end's certificate is checked here, its name with it. This end's is checked
-        // by the other end after this end's part of the handshake ends, so its answer to the
-        // opening is what says it was taken.
-        stream.handshake()?;
-        let peer = Identity {
-            member: member.into(),
-            serial: serial(&stream)?,
+        let opening = || {
+            let sock = prepare(dial(address, deadline)?, deadline, self.keepalive)?;
+            let conn = ClientConnection::new(self.client.clone(), name).map_err(LinkError::Tls)?;
+            let mut stream = Stream::Dialled(StreamOwned::new(conn, sock));
+            // The other end's certificate is checked here, its name with it. This end's is
+            // checked by the other end after this end's part of the handshake ends, so its answer
+            // to the opening is what says it was taken.
+            stream.handshake()?;
+            let peer = Identity {
+                member: member.into(),
+                serial: serial(&stream)?,
+            };
+            frame::open_as_dialler(&mut stream, job, mag_by::WIRE_VERSION)?;
+            Ok((stream, peer))
         };
-        frame::open_as_dialler(&mut stream, job, mag_by::WIRE_VERSION)?;
+        let (stream, peer) = opening().map_err(|e| self.ran_out(e, deadline, Side::Dialling))?;
         self.opened(stream, peer, job.into())
     }
 
@@ -700,25 +728,31 @@ impl Link for TlsLink {
             ))
         })?;
         let (tcp, _) = listener.accept()?;
-        let sock = prepare(tcp, Instant::now() + self.opening, self.keepalive)?;
-        let conn = ServerConnection::new(self.server.clone()).map_err(LinkError::Tls)?;
-        let mut stream = Stream::Answered(StreamOwned::new(conn, sock));
-        stream.handshake()?;
-        let cert = stream
-            .peer_certificate()
-            .ok_or(LinkError::Refused(Refused::NoCertificate))?;
-        let member = match member_named(cert, expected) {
-            Ok(member) => member,
-            Err(refused) => {
-                let _ = stream.close();
-                return Err(LinkError::Refused(refused));
-            }
+        let deadline = Instant::now() + self.opening;
+        let opening = || {
+            let sock = prepare(tcp, deadline, self.keepalive)?;
+            let conn = ServerConnection::new(self.server.clone()).map_err(LinkError::Tls)?;
+            let mut stream = Stream::Answered(StreamOwned::new(conn, sock));
+            stream.handshake()?;
+            let cert = stream
+                .peer_certificate()
+                .ok_or(LinkError::Refused(Refused::NoCertificate))?;
+            let member = match member_named(cert, expected) {
+                Ok(member) => member,
+                Err(refused) => {
+                    let _ = stream.close();
+                    return Err(LinkError::Refused(refused));
+                }
+            };
+            let peer = Identity {
+                member,
+                serial: serial(&stream)?,
+            };
+            let job = frame::open_as_acceptor(&mut stream, mag_by::WIRE_VERSION)?;
+            Ok((stream, peer, job))
         };
-        let peer = Identity {
-            member,
-            serial: serial(&stream)?,
-        };
-        let job = frame::open_as_acceptor(&mut stream, mag_by::WIRE_VERSION)?;
+        let (stream, peer, job) =
+            opening().map_err(|e| self.ran_out(e, deadline, Side::Answering))?;
         self.opened(stream, peer, job)
     }
 

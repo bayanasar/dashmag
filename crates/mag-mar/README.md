@@ -70,16 +70,17 @@ dials again.
   Every certificate has a new serial, so a certificate issued after a lease ended can be told
   from the one it ended on. Refusing the old one is the coordinator's, and not built yet.
 - **Nothing waits for ever.** Dialling, the handshake and the opening words share one deadline,
-  10 s unless set, and each address a name resolves to is tried in turn while time is left. On
-  an open channel, TCP keepalive (probes after 10 s of quiet, every 5 s, three of them, unless
-  set) finds a peer whose machine went away while the channel was quiet, and a receive waiting
-  on it fails. While this end has sent bytes the peer has not acknowledged, TCP does not probe,
-  and the system's limit on retransmitting decides, on Linux about 15 minutes. A peer whose
-  machine is up but whose program has stopped still answers keepalive. So a link may also be
-  given a limit on silence: nothing received for that long ends the channel both ways, a send
-  waiting on the same peer with it. It is off unless set, since a job may wait, or take long over
-  a step, while its channels are quiet. No bound is set on data left unacknowledged: on Linux
-  that bound also cut a channel whose peer was alive but not reading.
+  10 s unless set, and each address a name resolves to is tried in turn while time is left. An
+  opening that runs out of it says so, with the time it had and whether this end was dialling or
+  answering. On an open channel, TCP keepalive (probes after 10 s of quiet, every 5 s, three of
+  them, unless set) finds a peer whose machine went away while the channel was quiet, and a
+  receive waiting on it fails. While this end has sent bytes the peer has not acknowledged, TCP
+  does not probe, and the system's limit on retransmitting decides, on Linux about 15 minutes. A
+  peer whose machine is up but whose program has stopped still answers keepalive. So a link may
+  also be given a limit on silence: nothing received for that long ends the channel both ways, a
+  send waiting on the same peer with it. It is off unless set, since a job may wait, or take long
+  over a step, while its channels are quiet. No bound is set on data left unacknowledged: on
+  Linux that bound also cut a channel whose peer was alive but not reading.
 - **A member's key is its own.** Read from a start file, a key file that its group or others may
   read, write or run is refused, on Unix.
 

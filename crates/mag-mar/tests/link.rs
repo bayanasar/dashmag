@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use mag_by::{Dtype, Stamp, Start, TakeBack, Tensor};
 use mag_mar::issue::Authority;
 use mag_mar::{
-    Channel, ChannelEnd, Credentials, Link, LinkError, Receiver, Refused, Sender, TlsLink,
+    Channel, ChannelEnd, Credentials, Link, LinkError, Receiver, Refused, Sender, Side, TlsLink,
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -363,13 +363,9 @@ fn a_peer_that_stalls_cannot_hold_the_opening_past_its_deadline() {
     });
     let took = started.elapsed();
     match accepted {
-        Err(LinkError::Io(e)) => assert!(
-            matches!(
-                e.kind(),
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-            ),
-            "{e:?}"
-        ),
+        Err(LinkError::OpeningTimedOut { after, side }) => {
+            assert_eq!((after, side), (Duration::from_millis(300), Side::Answering));
+        }
         other => panic!("{:?}", other.err()),
     }
     // Given up at the deadline, not when the peer stopped: 0.3 s and a read's slack, not 2 s.
@@ -389,14 +385,105 @@ fn a_peer_that_says_nothing_is_given_up_at_the_deadline() {
     let started = Instant::now();
     let accepted = server.accept(&["laptop"]);
     let took = started.elapsed();
+    let err = accepted.err().unwrap();
     assert!(
-        matches!(accepted, Err(LinkError::Io(_))),
-        "{:?}",
-        accepted.err()
+        matches!(
+            err,
+            LinkError::OpeningTimedOut {
+                side: Side::Answering,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "the channel did not open within 0.3 s, while answering"
     );
     // At the deadline, not when the peer leaves three seconds later, nor after the default.
     assert!(took < Duration::from_millis(1200), "{took:?}");
     silent.join().unwrap();
+}
+
+#[test]
+fn a_dialler_whose_peer_says_nothing_is_given_up_at_the_deadline() {
+    use std::time::{Duration, Instant};
+    let pool = Authority::new(1).unwrap();
+    let laptop = TlsLink::new(credentials(&pool, "laptop"))
+        .unwrap()
+        .with_opening(Duration::from_millis(300));
+    // A peer that takes the connection and says nothing: the handshake waits for its answer.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = silent.local_addr().unwrap().to_string();
+    let holding = thread::spawn(move || {
+        let (_sock, _) = silent.accept().unwrap();
+        thread::sleep(Duration::from_secs(3));
+    });
+    let started = Instant::now();
+    let err = laptop.open("server", &at, "j").err().unwrap();
+    let took = started.elapsed();
+    match &err {
+        LinkError::OpeningTimedOut { after, side } => {
+            assert_eq!(
+                (*after, *side),
+                (Duration::from_millis(300), Side::Dialling)
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        err.to_string(),
+        "the channel did not open within 0.3 s, while dialling"
+    );
+    assert!(took >= Duration::from_millis(250), "{took:?}");
+    assert!(took < Duration::from_millis(1200), "{took:?}");
+    holding.join().unwrap();
+}
+
+#[test]
+fn an_opening_dropped_or_refused_is_not_said_to_have_timed_out() {
+    use std::io::ErrorKind;
+    use std::time::Duration;
+    let pool = Authority::new(1).unwrap();
+    let laptop = TlsLink::new(credentials(&pool, "laptop"))
+        .unwrap()
+        .with_opening(Duration::from_secs(5));
+    // Nothing listens: the dial is refused at once.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .to_string();
+    match laptop.open("server", &closed, "j") {
+        Err(LinkError::Io(e)) => assert_eq!(e.kind(), ErrorKind::ConnectionRefused),
+        other => panic!("{:?}", other.err()),
+    }
+    // The answering end takes the connection and drops it before the handshake: the stream
+    // ends, or is reset when the dialler's first words came before the drop and were unread.
+    let dropping = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = dropping.local_addr().unwrap().to_string();
+    let dropped = thread::spawn(move || drop(dropping.accept().unwrap()));
+    match laptop.open("server", &at, "j") {
+        Err(LinkError::Io(e)) => assert!(
+            matches!(
+                e.kind(),
+                ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+            ),
+            "{e:?}"
+        ),
+        other => panic!("{:?}", other.err()),
+    }
+    dropped.join().unwrap();
+    // The dialling end connects and drops the connection before the handshake.
+    let server = bound(&pool, "server").with_opening(Duration::from_secs(5));
+    let at = address(&server);
+    let (accepted, ()) = meet(&server, &["laptop"], move || {
+        drop(TcpStream::connect(&at).unwrap());
+    });
+    match accepted {
+        Err(LinkError::Io(e)) => assert_eq!(e.kind(), ErrorKind::UnexpectedEof),
+        other => panic!("{:?}", other.err()),
+    }
 }
 
 #[test]
@@ -996,7 +1083,8 @@ fn dialling_an_address_that_drops_packets_gives_up_at_the_opening_s_deadline() {
     });
     match dialled {
         // Dropped: given up at the deadline, not at the system's own, minutes later.
-        Err(LinkError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+        Err(LinkError::OpeningTimedOut { after, side }) => {
+            assert_eq!((after, side), (Duration::from_millis(400), Side::Dialling));
             assert!(took >= Duration::from_millis(350), "{took:?}");
         }
         // A machine with no route there is told so at once.

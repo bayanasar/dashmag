@@ -306,6 +306,13 @@ pub enum LinkError {
     Silent {
         after: std::time::Duration,
     },
+    /// The channel did not open in the time each opening is given ([`TlsLink::with_opening`]):
+    /// dialling, the handshake and the opening words together. That time, and whether this end
+    /// was dialling or answering. The channel is given up.
+    OpeningTimedOut {
+        after: std::time::Duration,
+        side: Side,
+    },
     /// A header longer than [`MAX_HEADER`], sent or received.
     HeaderTooLong {
         bytes: u64,
@@ -337,6 +344,22 @@ pub enum LinkError {
     Io(io::Error),
 }
 
+/// Which end of a channel: the one that dialled, or the one that answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Dialling,
+    Answering,
+}
+
+impl fmt::Display for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Side::Dialling => "dialling",
+            Side::Answering => "answering",
+        })
+    }
+}
+
 impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -353,6 +376,11 @@ impl fmt::Display for LinkError {
             LinkError::Silent { after } => write!(
                 f,
                 "nothing came from the other end for {:.1} s; the channel is ended",
+                after.as_secs_f64()
+            ),
+            LinkError::OpeningTimedOut { after, side } => write!(
+                f,
+                "the channel did not open within {:.1} s, while {side}",
                 after.as_secs_f64()
             ),
             LinkError::HeaderTooLong { bytes } => write!(
