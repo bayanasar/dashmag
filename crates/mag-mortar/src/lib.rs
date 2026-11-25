@@ -119,6 +119,8 @@ pub enum ChangeError {
     NoDevices,
     /// The pool already holds a job of this name.
     Duplicate { job: String },
+    /// The pool holds no job of this name, so it has nothing to end.
+    NoJob { job: String },
     /// The time is not finite.
     Time,
 }
@@ -137,6 +139,7 @@ impl fmt::Display for ChangeError {
             ChangeError::Duplicate { job } => {
                 write!(f, "the pool already holds a job named `{job}`")
             }
+            ChangeError::NoJob { job } => write!(f, "the pool holds no job named `{job}`"),
             ChangeError::Time => write!(f, "the time is not finite"),
         }
     }
@@ -360,12 +363,16 @@ impl Pool {
     /// The pool a ledger describes: begun with its time, members and offers, then told each
     /// change at its time, each record compared with the one logged. Its own ledger is then the
     /// same, its header too: which version wrote it and which ledger it follows are as logged.
+    ///
+    /// The end of a job the pool did not hold is replayed as it was logged. [`Pool::apply`]
+    /// refuses it now (`ChangeError::NoJob`), but before it did, it took one as any end, and a
+    /// ledger written then may hold it; its record is still the one the loop makes.
     pub fn replay(ledger: &Ledger) -> Result<Pool, ReplayError> {
         let mut pool = Pool::begin(ledger.members.clone(), ledger.offers.clone(), ledger.at);
         pool.ledger.written_by.clone_from(&ledger.written_by);
         pool.ledger.follows.clone_from(&ledger.follows);
         for (entry, e) in ledger.entries.iter().enumerate() {
-            match pool.apply(e.change.clone(), e.at) {
+            match pool.take(e.change.clone(), e.at) {
                 Ok(record) if record == &e.record => {}
                 Ok(_) => return Err(ReplayError::Differs { entry }),
                 Err(error) => return Err(ReplayError::Refused { entry, error }),
@@ -673,13 +680,24 @@ impl Pool {
 
     /// The one way into the pool: it takes a change at `at` seconds, runs the loop, and adds the
     /// change with the loop's record to its ledger. A change it refuses leaves it as it was and is
-    /// not logged.
+    /// not logged: among them the end of a job it does not hold (`ChangeError::NoJob`).
     ///
     /// A time earlier than the pool's is taken as it is told, and logged as given: the pool's time
     /// does not go back, and no job's wait grows or shrinks for it. Hosts deliver changes in the
     /// order they happened, and a change reported a little late is still a change; refusing it
     /// would lose a job's end or a device's leaving. A replay takes the same path.
     pub fn apply(&mut self, change: Change, at: f64) -> Result<&Record, ChangeError> {
+        if let Change::End { job } = &change
+            && !self.jobs.iter().any(|j| &j.graph.job.name == job)
+        {
+            return Err(ChangeError::NoJob { job: job.clone() });
+        }
+        self.take(change, at)
+    }
+
+    /// [`Pool::apply`], but an end of a job the pool does not hold is taken, as [`Pool::replay`]
+    /// takes one an earlier version logged.
+    fn take(&mut self, change: Change, at: f64) -> Result<&Record, ChangeError> {
         if !at.is_finite() {
             return Err(ChangeError::Time);
         }
@@ -713,7 +731,8 @@ impl Pool {
         self.apply(Change::Submit { graph, stamp }, at)
     }
 
-    /// A job ends at `at` seconds; the jobs waiting are placed again where they now fit.
+    /// A job ends at `at` seconds; the jobs waiting are placed again where they now fit. A job
+    /// the pool does not hold is refused, and nothing is logged.
     pub fn end(&mut self, job: &str, at: f64) -> Result<&Record, ChangeError> {
         self.apply(Change::End { job: job.into() }, at)
     }

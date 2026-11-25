@@ -242,7 +242,7 @@ fn a_job_that_waits_again_after_being_placed_counts_its_wait_from_zero() {
     pool.leave(&device("b", 0), 110.0).unwrap();
     assert_eq!(pool.describe().jobs[1].waited_seconds, 0.0);
     // Its wait now runs from the leave, not from its arrival.
-    pool.end("no such job", 130.0).unwrap();
+    pool.apply(tick("tick"), 130.0).unwrap();
     assert_eq!(pool.describe().jobs[1].waited_seconds, 20.0);
 }
 
@@ -254,7 +254,7 @@ fn a_plan_on_a_pool_whose_time_has_moved_ages_its_waiting_jobs_from_the_pool_s_t
     pool.submit(one_part("second", 1, 1), Stamp::default(), 0.0)
         .unwrap();
     // The pool's time moves to 500 s; the second job has waited all of it.
-    pool.end("no such job", 500.0).unwrap();
+    pool.apply(tick("tick"), 500.0).unwrap();
     assert_eq!(pool.describe().at, 500.0);
     assert_eq!(pool.describe().jobs[1].waited_seconds, 500.0);
     // At 500 s it weighs 1 + 500/60 and still waits; at 600 s, 1 + 600/60, and it is placed.

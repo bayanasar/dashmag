@@ -59,8 +59,9 @@
 //!    file's `idle_seconds`, never the coordinator's own. The host polls the status, and decides;
 //!    the coordinator calls no one. A submission or an end is applied to the pool, and its line
 //!    written to the ledger and synced, before it is answered; one the pool refuses is answered
-//!    with why, and nothing is written. Ending a job the pool does not hold is refused, rather
-//!    than written as an end of nothing.
+//!    with why, and nothing is written. Ending a job the pool does not hold is refused by the
+//!    pool (`mag_mortar::ChangeError::NoJob`), and so at the door, rather than written as an end
+//!    of nothing.
 //! 8. **It takes a device back by need**, for a take-back at the door: a kind of device within a
 //!    deadline. The pool chooses the device ([`mag_mortar::Pool::give_up`]): of those of the kind
 //!    whose members give a device back within the deadline, the one whose loss costs it least,
@@ -796,13 +797,11 @@ impl Keeper {
                     Err(e) => refused(e),
                 }
             }
-            DoorRequest::End { job } if self.pool.arrangement(&job).is_none() => {
-                DoorAnswer::Refused {
-                    refusal: DoorRefusal::NoJob { job },
-                }
-            }
             DoorRequest::End { job } => match self.take(Change::End { job })? {
                 Ok(record) => DoorAnswer::Ended { record },
+                Err(ChangeError::NoJob { job }) => DoorAnswer::Refused {
+                    refusal: DoorRefusal::NoJob { job },
+                },
                 Err(e) => refused(e),
             },
             DoorRequest::Status => DoorAnswer::Status {

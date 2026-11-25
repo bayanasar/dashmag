@@ -1,6 +1,7 @@
 //! The `mag plan` command over the example pool and graph: its kept output, its exit status, and
 //! its reasons for refusing.
 
+mod common;
 #[path = "../examples/mag.rs"]
 mod example;
 
@@ -8,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use mag_by::{Description, Graph, Record, Stamp};
 use mag_mortar::{HoldsJobs, Pool};
+
+use common::tick;
 
 fn by(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -231,7 +234,7 @@ fn a_pool_begun_from_a_description_keeps_its_time_and_replays_from_it() {
     );
     pool.submit(Graph::from_json(&huge).unwrap(), Stamp::default(), 100.0)
         .unwrap();
-    pool.end("nothing", 310.0).unwrap();
+    pool.apply(tick("tick"), 310.0).unwrap();
     assert_eq!(pool.describe().jobs[0].waited_seconds, 60.0);
     let back = Pool::replay(pool.ledger()).unwrap();
     assert_eq!(back.describe(), pool.describe());

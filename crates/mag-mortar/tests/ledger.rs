@@ -399,6 +399,70 @@ fn a_time_that_is_not_finite_is_refused_and_the_pool_is_unchanged() {
 }
 
 #[test]
+fn the_end_of_a_job_the_pool_does_not_hold_is_refused_and_not_logged() {
+    let mut pool = three_cards();
+    pool.apply(submit(wants_everything("a", 1)), 0.0).unwrap();
+    pool.apply(submit(wants_everything("waits", 1)), 0.0)
+        .unwrap();
+    let before = state(&pool);
+    // Never submitted: refused, and the pool's time does not move to it.
+    assert_eq!(
+        pool.end("none", 60.0).unwrap_err(),
+        ChangeError::NoJob { job: "none".into() }
+    );
+    assert_eq!(state(&pool), before);
+    assert_eq!(pool.ledger().entries.len(), 2);
+    assert_eq!(
+        ChangeError::NoJob { job: "none".into() }.to_string(),
+        "the pool holds no job named `none`"
+    );
+    // Ended once, then again: the second end is refused.
+    pool.end("a", 90.0).unwrap();
+    let ended = state(&pool);
+    assert_eq!(
+        pool.apply(end("a"), 100.0).unwrap_err(),
+        ChangeError::NoJob { job: "a".into() }
+    );
+    assert_eq!(state(&pool), ended);
+    assert_eq!(pool.ledger().entries.len(), 3);
+    assert_eq!(state(&Pool::replay(pool.ledger()).unwrap()), ended);
+}
+
+/// Before the pool refused the end of a job it does not hold, it took one as any end: the time
+/// moved and the loop ran. A ledger it wrote then still replays.
+#[test]
+fn an_end_of_a_job_the_pool_did_not_hold_logged_before_it_was_refused_replays() {
+    // The record such an end made: the loop's, over the jobs the pool held. A pool that holds
+    // the job, waiting and taking nothing, makes the same one when it ends.
+    let mut held = three_cards();
+    held.apply(submit(wants_everything("a", 1)), 0.0).unwrap();
+    held.apply(tick("ghost"), 0.0).unwrap();
+    let record = held.end("ghost", 20.0).unwrap().clone();
+    let mut pool = three_cards();
+    pool.apply(submit(wants_everything("a", 1)), 0.0).unwrap();
+    let mut ledger = pool.ledger().clone();
+    ledger.entries.push(Entry {
+        at: 20.0,
+        change: end("ghost"),
+        record,
+    });
+    let back = Pool::replay(&ledger).unwrap();
+    assert_eq!(back.ledger(), &ledger);
+    assert_eq!(back.describe().at, 20.0);
+    assert_eq!(back.describe().jobs, held.describe().jobs);
+    // Through its lines too.
+    let read = Ledger::from_lines(&ledger.to_lines()).unwrap();
+    assert_eq!(Pool::replay(&read.ledger).unwrap().ledger(), &ledger);
+    // Told now, the same end is refused.
+    assert_eq!(
+        back.clone().end("ghost", 30.0).unwrap_err(),
+        ChangeError::NoJob {
+            job: "ghost".into()
+        }
+    );
+}
+
+#[test]
 fn a_time_earlier_than_the_pool_s_is_taken_and_moves_nothing_back() {
     let mut pool = three_cards();
     pool.apply(submit(wants_everything("blocker", 1)), 0.0)
@@ -407,13 +471,13 @@ fn a_time_earlier_than_the_pool_s_is_taken_and_moves_nothing_back() {
         .unwrap();
     // Told at 50 s, after the pool reached 100 s: taken, logged at 50, the pool's time and the
     // waiting job's wait unchanged.
-    pool.apply(end("no such job"), 50.0).unwrap();
+    pool.apply(tick("tick at 50"), 50.0).unwrap();
     let d = pool.describe();
     assert_eq!(d.at, 100.0);
     assert_eq!(d.jobs[1].waited_seconds, 0.0);
     assert_eq!(pool.ledger().entries[2].at, 50.0);
     // Time then runs on from the pool's own: 30 s later the job has waited 30 s.
-    pool.apply(end("no such job"), 130.0).unwrap();
+    pool.apply(tick("tick at 130"), 130.0).unwrap();
     assert_eq!(pool.describe().jobs[1].waited_seconds, 30.0);
     let back = Pool::replay(pool.ledger()).unwrap();
     assert_eq!(state(&back), state(&pool));

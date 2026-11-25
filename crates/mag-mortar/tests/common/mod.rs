@@ -3,8 +3,8 @@
 #![allow(dead_code)]
 
 use mag_by::{
-    Backend, Blob, Chain, Cost, DeviceId, Dtype, Edge, Graph, Input, Job, Mark, Member, Need,
-    Offer, Part, Pin, Step, Tolerance, Unit,
+    Backend, Blob, Chain, Change, Cost, DeviceId, Dtype, Edge, Graph, Input, Job, Mark, Member,
+    Need, Offer, Part, Pin, Step, Tolerance, Unit,
 };
 // The words most tests use, so that each test names a level as it reads.
 #[allow(unused_imports)]
@@ -120,4 +120,23 @@ pub fn local_weights() -> Blob {
 pub fn pinned(mut p: Part, pin: Pin) -> Part {
     p.pin = Some(pin);
     p
+}
+
+/// A change that moves the pool's time and nothing its other jobs see: a job named `name` arrives
+/// that may use only a device no member has, so it waits and takes nothing. The end of a job the
+/// pool does not hold would move the time too, but the pool refuses it.
+pub fn tick(name: &str) -> Change {
+    Change::Submit {
+        graph: job(
+            name,
+            1,
+            vec![],
+            vec![part("p", "u", Mark::Atomic, 1)],
+            vec![],
+        ),
+        stamp: Stamp {
+            devices: Some(vec![device("nobody", 0)]),
+            ..Stamp::default()
+        },
+    }
 }
