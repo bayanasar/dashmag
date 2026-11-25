@@ -17,6 +17,11 @@ const EPS: f64 = 1e-6;
 /// as [`dash_contract::clip`] defines it: the total in f32 over the gradients that have elements,
 /// the coefficient as torch evaluates it, and each gradient multiplied in its own dtype. The total
 /// is read back to the host on every call, where torch returns a tensor.
+///
+/// The total is over the tensors in `grads`, each once per place in the slice. A tied parameter,
+/// one tensor a model uses in two places, has one gradient, the sum of both uses, and the caller
+/// lists it once: listed twice, it counts twice in the total. A parameter without a gradient,
+/// frozen or outside the loss, is left out by the caller.
 pub fn clip_grad_norm(grads: &mut [Tensor], options: &ClipGradNormOptions) -> Result<f32> {
     let mut partials = Vec::with_capacity(grads.len());
     for grad in grads.iter().filter(|g| g.size() > 0) {
@@ -66,14 +71,36 @@ pub fn clip_grad_norm(grads: &mut [Tensor], options: &ClipGradNormOptions) -> Re
 }
 
 /// AdamW as `torch.optim.AdamW` applies it, its state per parameter name.
+///
+/// Each parameter counts its own steps, the updates it has had, and its bias correction raises the
+/// betas to that count, as torch keeps `step` per parameter. A parameter that joins later, such as
+/// a backbone unfrozen mid-run, starts from 1, and one the caller leaves out of a step keeps its
+/// moments and its count, as torch skips a parameter without a gradient. The caller names the
+/// parameters each step: nothing here walks a model.
+///
+/// One rate per [`Self::update`] call and one `betas` for every parameter, set between steps, so
+/// a schedule and parameter groups with their own rates need no more. One weight decay per
+/// optimiser: groups that decay differently, such as none on norms and biases, are two instances,
+/// each over its own parameters' names, since the state is keyed by name.
 #[derive(Clone, Debug)]
 pub struct AdamW {
     pub betas: (f64, f64),
     pub eps: f64,
     pub weight_decay: f64,
-    /// The steps taken.
+    /// The steps the optimiser has taken, counted by [`Self::begin_step`]: what a checkpoint keeps,
+    /// and the count of a parameter whose moments were put back without their own.
     pub step: u64,
-    state: HashMap<String, (Tensor, Tensor)>,
+    state: HashMap<String, Moments>,
+}
+
+/// One parameter's state.
+#[derive(Clone, Debug)]
+struct Moments {
+    m: Tensor,
+    v: Tensor,
+    /// The updates the parameter has had, or `None` for moments put back by [`AdamW::set_state`]
+    /// alone: then it has had every step [`AdamW::step`] counts.
+    steps: Option<u64>,
 }
 
 impl AdamW {
@@ -92,9 +119,30 @@ impl AdamW {
         self.step += 1;
     }
 
+    /// The updates the parameter `name` has had, which its next one adds 1 to, or `None` if it
+    /// holds no state. Between steps, for a checkpoint beside [`Self::named_state`].
+    pub fn steps(&self, name: &str) -> Option<u64> {
+        self.state
+            .get(name)
+            .map(|held| held.steps.unwrap_or(self.step))
+    }
+
+    /// Puts back the count [`Self::steps`] gave, for moments [`Self::set_state`] has put back.
+    pub fn set_steps(&mut self, name: &str, steps: u64) -> Result<()> {
+        match self.state.get_mut(name) {
+            Some(held) => {
+                held.steps = Some(steps);
+                Ok(())
+            }
+            None => refuse(format!(
+                "AdamW: a count of steps for {name}, which has no state"
+            )),
+        }
+    }
+
     /// The parameter `name` after this step, from its value and its gradient, at learning rate `lr`.
     pub fn update(&mut self, name: &str, p: &Tensor, g: &Tensor, lr: f64) -> Result<Tensor> {
-        if let Some((m, _)) = self.state.get(name)
+        if let Some(Moments { m, .. }) = self.state.get(name)
             && (m.shape() != p.shape() || m.dtype() != p.dtype())
         {
             return refuse(format!(
@@ -106,11 +154,12 @@ impl AdamW {
             ));
         }
         let (b1, b2) = self.betas;
-        let t = self.step.max(1) as i32;
-        let (m, v) = match self.state.remove(name) {
-            Some(state) => state,
-            None => (p.zeros_like()?, p.zeros_like()?),
+        let (m, v, steps) = match self.state.remove(name) {
+            Some(Moments { m, v, steps }) => (m, v, steps.unwrap_or(self.step.max(1) - 1)),
+            None => (p.zeros_like()?, p.zeros_like()?, 0),
         };
+        let steps = steps + 1;
+        let t = steps as i32;
         let g = g.as_dtype(p.dtype())?;
         // In torch's order and form: the decay first, then the two moments.
         let p = if self.weight_decay != 0.0 {
@@ -126,26 +175,37 @@ impl AdamW {
             .add_scalar(self.eps)?;
         let step = lr / (1.0 - b1.powi(t));
         let p = p.sub(&m.div(&denominator)?.mul_scalar(step)?)?;
-        self.state.insert(name.to_string(), (m, v));
+        self.state.insert(
+            name.to_string(),
+            Moments {
+                m,
+                v,
+                steps: Some(steps),
+            },
+        );
         Ok(p)
     }
 
     /// Every array this holds, to hand to [`crate::eval`] after a step.
     pub fn state(&self) -> impl Iterator<Item = &Tensor> {
-        self.state.values().flat_map(|(m, v)| [m, v])
+        self.state.values().flat_map(|held| [&held.m, &held.v])
     }
 
     /// Each parameter's name and its two moments, in order of name: what a checkpoint keeps, beside
-    /// [`Self::step`].
+    /// [`Self::step`] and each parameter's [`Self::steps`].
     pub fn named_state(&self) -> impl Iterator<Item = (&str, &Tensor, &Tensor)> {
         let mut held: Vec<_> = self.state.iter().collect();
         held.sort_by_key(|(name, _)| name.as_str());
-        held.into_iter().map(|(name, (m, v))| (name.as_str(), m, v))
+        held.into_iter()
+            .map(|(name, held)| (name.as_str(), &held.m, &held.v))
     }
 
     /// Puts a parameter's moments back, as [`Self::named_state`] gave them, so that a resumed run
     /// continues the one it left; [`Self::step`] goes back beside them. They are of one floating dtype and
     /// shape, and [`Self::update`] holds them to the parameter's.
+    ///
+    /// Until [`Self::set_steps`] gives it its own count, the parameter is taken to have had every
+    /// step [`Self::step`] counts.
     pub fn set_state(&mut self, name: &str, m: Tensor, v: Tensor) -> Result<()> {
         if !m.dtype().is_floating() || m.dtype() != v.dtype() || m.shape() != v.shape() {
             return refuse(format!(
@@ -156,7 +216,8 @@ impl AdamW {
                 v.shape()
             ));
         }
-        self.state.insert(name.to_string(), (m, v));
+        self.state
+            .insert(name.to_string(), Moments { m, v, steps: None });
         Ok(())
     }
 }

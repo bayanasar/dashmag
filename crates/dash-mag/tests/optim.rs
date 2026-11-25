@@ -1,8 +1,9 @@
-//! Clipping and AdamW against their definitions, evaluated in f64, and AdamW's state through a resume.
+//! Clipping and AdamW against their definitions, evaluated in f64, AdamW's count of steps per
+//! parameter, and its state through a resume.
 
 mod common;
 
-use common::{close, tensor};
+use common::{bits, close, tensor};
 use dash_mag::optim::{AdamW, ClipGradNormOptions, NonFinite, NormType, clip_grad_norm};
 use dash_mag::{DType, Tensor};
 
@@ -205,4 +206,114 @@ fn adamw_refuses_moments_that_do_not_fit() {
     assert!(optimiser.update("bf16", &p, &g, 1e-2).is_err());
     assert_eq!(optimiser.named_state().count(), 2);
     assert!(optimiser.update("new", &p, &g, 1e-2).is_ok());
+}
+
+/// A tied parameter has one gradient, listed once. Listed twice, it counts twice in the total: the
+/// caller's to avoid.
+#[test]
+fn a_tensor_listed_twice_counts_twice() {
+    let options = ClipGradNormOptions {
+        max_norm: 100.0,
+        ..Default::default()
+    };
+    let mut once = [t(&[3.0, -4.0], &[2])];
+    assert_eq!(clip_grad_norm(&mut once, &options).unwrap(), 5.0);
+    let mut twice = [t(&[3.0, -4.0], &[2]), t(&[3.0, -4.0], &[2])];
+    let total = clip_grad_norm(&mut twice, &options).unwrap();
+    assert!((total - 50f32.sqrt()).abs() < 1e-6, "{total}");
+}
+
+/// Each parameter counts its own steps, as torch keeps `step` per parameter: one that joins at the
+/// third step takes the bias correction of its own first step, the same bits as in an optimiser
+/// that starts with it, and one left out of a step keeps its count.
+#[test]
+fn adamw_counts_each_parameters_steps() {
+    let grad = |seed: u64| tensor(seed, &[5], DType::F32);
+    let mut optimiser = AdamW::new((0.9, 0.999), 1e-5, 0.01);
+    let mut a = tensor(1, &[5], DType::F32);
+    let mut late = tensor(2, &[5], DType::F32);
+    for s in 0..2 {
+        optimiser.begin_step();
+        a = optimiser.update("a", &a, &grad(10 + s), 1e-2).unwrap();
+    }
+    assert_eq!(optimiser.steps("late"), None);
+
+    let mut fresh = AdamW::new((0.9, 0.999), 1e-5, 0.01);
+    let mut alone = late.clone();
+    for s in 0..3 {
+        optimiser.begin_step();
+        a = optimiser.update("a", &a, &grad(20 + s), 1e-2).unwrap();
+        late = optimiser
+            .update("late", &late, &grad(30 + s), 1e-2)
+            .unwrap();
+        fresh.begin_step();
+        alone = fresh.update("late", &alone, &grad(30 + s), 1e-2).unwrap();
+        assert_eq!(bits(&late), bits(&alone), "step {s} of the late parameter");
+    }
+    assert_eq!(optimiser.step, 5);
+    assert_eq!(optimiser.steps("a"), Some(5));
+    assert_eq!(optimiser.steps("late"), Some(3));
+
+    // A step without "late": its count stays, and its next update is its fourth.
+    optimiser.begin_step();
+    optimiser.update("a", &a, &grad(40), 1e-2).unwrap();
+    assert_eq!(optimiser.steps("a"), Some(6));
+    assert_eq!(optimiser.steps("late"), Some(3));
+    optimiser.begin_step();
+    late = optimiser.update("late", &late, &grad(50), 1e-2).unwrap();
+    fresh.begin_step();
+    alone = fresh.update("late", &alone, &grad(50), 1e-2).unwrap();
+    assert_eq!(bits(&late), bits(&alone));
+    assert_eq!(optimiser.steps("late"), Some(4));
+}
+
+/// A resumed run that puts back each parameter's count continues to the bit, a late parameter
+/// too. Moments put back without their count take the optimiser's, which is right for every
+/// parameter that has taken every step and wrong for a late one.
+#[test]
+fn adamw_resumes_each_parameters_count() {
+    let grad = |seed: u64| tensor(seed, &[4], DType::F32);
+    let mut first = AdamW::new((0.9, 0.999), 1e-5, 0.01);
+    let (mut a, mut late) = (tensor(1, &[4], DType::F32), tensor(2, &[4], DType::F32));
+    for s in 0..4 {
+        first.begin_step();
+        a = first.update("a", &a, &grad(10 + s), 1e-2).unwrap();
+        if s >= 2 {
+            late = first.update("late", &late, &grad(20 + s), 1e-2).unwrap();
+        }
+    }
+    let resume = |with_counts: bool| {
+        let mut second = AdamW::new((0.9, 0.999), 1e-5, 0.01);
+        for (name, m, v) in first.named_state() {
+            second.set_state(name, m.clone(), v.clone()).unwrap();
+            if with_counts {
+                second.set_steps(name, first.steps(name).unwrap()).unwrap();
+            }
+        }
+        second.step = first.step;
+        second
+    };
+    let mut counted = resume(true);
+    let mut uncounted = resume(false);
+    assert_eq!(counted.steps("late"), Some(2));
+    assert_eq!(uncounted.steps("late"), Some(4), "the optimiser's count");
+    assert_eq!(uncounted.steps("a"), Some(4));
+    assert!(uncounted.set_steps("absent", 1).is_err());
+
+    let step = |o: &mut AdamW, a: &Tensor, late: &Tensor| {
+        o.begin_step();
+        (
+            o.update("a", a, &grad(30), 1e-2).unwrap(),
+            o.update("late", late, &grad(31), 1e-2).unwrap(),
+        )
+    };
+    let want = step(&mut first, &a, &late);
+    let got = step(&mut counted, &a, &late);
+    assert_eq!(bits(&want.0), bits(&got.0));
+    assert_eq!(bits(&want.1), bits(&got.1));
+    // Without its count "a" still continues to the bit, and "late" takes the fifth step's
+    // correction where it has had three.
+    let off = step(&mut uncounted, &a, &late);
+    assert_eq!(bits(&want.0), bits(&off.0));
+    assert_ne!(bits(&want.1), bits(&off.1));
 }
