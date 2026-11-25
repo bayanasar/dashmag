@@ -2429,3 +2429,30 @@ fn a_join_is_not_told_joined_until_its_ledger_line_is_written() {
     assert!(!laptop.said("joined the pool"), "{:#?}", laptop.said);
     assert_eq!(read_ledger(&pool).1, text);
 }
+
+#[test]
+fn a_member_that_cannot_reach_the_coordinator_dials_again_less_and_less_often() {
+    let pool = Pool::new("backoff");
+    // An address no one answers at: a port bound, then let go.
+    let address = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .to_string();
+    let start = pool.start("server", None, Some(&address));
+    let mut program = Program::start(Some(&start));
+    program.says_times("is not reached", 3);
+    let (status, _) = program.terminate(limit() * 3);
+    assert_eq!(status.code(), Some(0), "{:#?}", program.said);
+    let waits: Vec<&str> = program
+        .said
+        .iter()
+        .filter_map(|l| l.split("dialling again in ").nth(1))
+        .collect();
+    assert_eq!(
+        waits[..3],
+        ["0.25 s", "0.5 s", "1 s"],
+        "{:#?}",
+        program.said
+    );
+}

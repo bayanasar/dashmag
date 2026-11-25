@@ -369,9 +369,9 @@ fn longer(wait: Duration) -> Duration {
     (wait * 2).min(REDIAL)
 }
 
-/// Dials the coordinator on a thread of its own until a control channel opens, after `wait`,
-/// and after each dial that fails waits [`REDIAL_FIRST`], then twice as long each time, up to
-/// [`REDIAL`].
+/// Dials the coordinator on a thread of its own until a control channel opens, after `wait`.
+/// After each dial that fails it waits twice as long as before, up to [`REDIAL`], or
+/// [`REDIAL_FIRST`] after a first dial made at once.
 fn dial(
     link: Arc<TlsLink>,
     member: String,
@@ -381,25 +381,30 @@ fn dial(
     events: mpsc::Sender<Event>,
 ) {
     thread::spawn(move || {
-        thread::sleep(wait);
-        let mut wait = REDIAL_FIRST;
+        let mut wait = wait;
         loop {
+            thread::sleep(wait);
             match link.open(&coordinator, &address, CONTROL) {
                 Ok(channel) => {
                     let _ = events.send(Event::Dialled(Box::new(channel)));
                     return;
                 }
-                Err(e) => say(
-                    &member,
-                    format_args!(
-                        "the coordinator `{coordinator}` at {address} is not reached ({e}); \
-                         dialling again in {} s",
-                        wait.as_secs_f64()
-                    ),
-                ),
+                Err(e) => {
+                    wait = if wait.is_zero() {
+                        REDIAL_FIRST
+                    } else {
+                        longer(wait)
+                    };
+                    say(
+                        &member,
+                        format_args!(
+                            "the coordinator `{coordinator}` at {address} is not reached ({e}); \
+                             dialling again in {} s",
+                            wait.as_secs_f64()
+                        ),
+                    );
+                }
             }
-            thread::sleep(wait);
-            wait = longer(wait);
         }
     });
 }
