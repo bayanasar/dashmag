@@ -202,9 +202,13 @@ machine, with the coordinator's start file, asks the pool there:
 - **Nothing waits for ever.** Dialling, the handshake and the opening words share one deadline,
   10 s unless set, and each address a name resolves to is tried in turn while time is left. An
   opening that runs out of it says so, with the time it had and whether this end was dialling or
-  answering. On an open channel, TCP keepalive (probes after 10 s of quiet, every 5 s, three of
-  them, unless set) finds a peer whose machine went away while the channel was quiet, and a
-  receive waiting on it fails. While this end has sent bytes the peer has not acknowledged, TCP
+  answering. The end that answers opens each connection on a thread of its own, so that a peer
+  that connects and says nothing holds no other's opening: `accept` returns whichever opening
+  finishes first. It holds at most 64 openings at once, unless set; a connection past them is
+  closed at once, so that a flood cannot take every thread, and a member closed so dials again.
+  On an open channel, TCP keepalive (probes after 10 s of quiet, every 5 s, three of them,
+  unless set) finds a peer whose machine went away while the channel was quiet, and a receive
+  waiting on it fails. While this end has sent bytes the peer has not acknowledged, TCP
   does not probe, and the system's limit on retransmitting decides, on Linux about 15 minutes. A
   peer whose machine is up but whose program has stopped still answers keepalive. So a link may
   also be given a limit on silence: nothing received for that long ends the channel both ways, a
@@ -244,6 +248,10 @@ anything new. `certs help` says the same.
 
 `cargo test -p mag-mar` runs two members over loopback, each refusal, two jobs' channels, a
 tensor of 64 MiB byte for byte, and both ends of one channel sending 64 MiB at the same moment.
+Behind five peers that connect and say nothing, a member's channel opens within a second, by
+`accept_any` and by `accept`, and a member joins the coordinator within five, where taking one
+connection at a time held each for 10 s; past a limit of two openings, a third connection is
+closed at once, and a member's opens once one of the two has gone.
 It runs the member program as a process of its own against a stand-in coordinator: the member
 joins with its offers and leaves on SIGTERM; it exits 0 within its give-back time when the
 coordinator stops answering, and when it is still opening its channel to one that never answers;
