@@ -6,10 +6,11 @@ over ssh, as `mpirun` runs from a hostfile. The target is one job's graph run ac
 unequal machines: one with a CUDA card, one with a ROCm card, and a Mac with MLX.
 
 What runs today is the first step, planning. You write the pool file, and `mag plan` shows where
-the pool would place a graph on it, and why. Nothing is placed on any machine yet: the program
-each machine runs (`mag-mar`) starts, joins the pool at the coordinator, which records the join
-in the pool's ledger, and gives its machine back on SIGTERM, but no job can be submitted yet,
-since the coordinator's door is not built.
+the pool would place a graph on it, and why. The program each machine runs (`mag-mar`) starts,
+joins the pool at the coordinator, which records the join in the pool's ledger, and gives its
+machine back on SIGTERM; and at the coordinator's door you submit a job to the running pool,
+which places it and writes it to the ledger. Nothing runs on any machine yet: running the parts
+placed on a member is not built.
 
 ## The files
 
@@ -117,7 +118,9 @@ a member.
   door, the idle time, and the paths of the member's certificate and key, as `mag-by`'s
   [start file](../../crates/mag-by/starts/example.json) has them. The coordinator needs a
   `listen` address, and every other member's start file gives it as the coordinator's address,
-  since every member dials it.
+  since every member dials it. The door is a path on the coordinator's machine, such as
+  `door.sock`, at most 101 bytes long, since a Unix socket's path is short; a relative one is
+  taken from the directory you start the program in.
 - The member program on each machine, from the repository's root:
 
       MAG_START=server.json cargo run --release -q -p mag-mar
@@ -133,7 +136,37 @@ a member.
   coordinator's start file, issued a certificate later with `certs add`, joins too, and is
   recorded at `outside` whatever its own start file says. The ledger is one JSON object per line,
   as `mag-by`'s [ledger schema](../../crates/mag-by/schemas/mag-ledger.schema.json) has it.
+- The door, on the coordinator's machine. With the three members running, ask the pool with
+  the coordinator's start file, from the repository's root, where you started the coordinator:
+
+      MAG_START=workstation.json cargo run --release -q -p mag-mar -- door status
+      MAG_START=workstation.json cargo run --release -q -p mag-mar -- door submit \
+          crates/mag-by/graphs/example.json
+      MAG_START=workstation.json cargo run --release -q -p mag-mar -- door end label-frames
+
+  This runs today, as far as it goes: the pool places the job and writes it to its ledger, and
+  nothing runs on any machine. Each command prints the coordinator's answer as JSON, and a line
+  for you on standard error. Run by hand on one machine, the three members on loopback, the
+  pool file above in each start file:
+  - `status` says `3 members, 5 devices, 0 jobs`, and prints the pool as one virtual device: the
+    three members at `owner`, and the devices as their start files offer them, in name order:
+    `laptop/0` (MLX), `server/0` (ROCm), `server/1` (CPU), `workstation/0` (CUDA) and
+    `workstation/1` (CPU).
+  - `submit` says `` `label-frames` is placed `` and exits 0, once the job is in the ledger. It
+    prints the loop's record, every candidate with why any was removed, which is long, and the
+    job's arrangement: the parts where [`plan.txt`](plan.txt) puts them, `decode` in copies on
+    `server/1` and `workstation/1`, the model's blocks on `laptop/0`, `head` on `workstation/0`
+    and `count` on `server/1`. A job that waits exits 3. With `--stamp stamp.json` after the
+    graph, the stamp file holds your stamp, such as `{"by": "you", "priority_ceiling": 1}`.
+  - `status` then says `1 jobs`, and shows `label-frames` with that arrangement, at priority 2,
+    having waited 0 s.
+  - `end label-frames` ends it, in the ledger before it answers, and `status` shows no job again.
+    Ending it a second time is refused, with exit 4: the pool holds no job of that name.
+  - With no coordinator running, each command fails at once with exit 5.
+
+  The pool's asks in `status`, the kind of device it most wants and the members it would give
+  back, are to come, and so is taking a device back by need at the door.
 - Three containers on CPU: two jobs submitted to the coordinator's door and placed against each
-  other, and one machine taken back with SIGTERM. This needs the coordinator's door in
-  `mag-mar`.
+  other, and one machine taken back with SIGTERM. This needs the members to run the parts placed
+  on them, in `mag-mar`.
 - The same on three real machines with CUDA, ROCm and MLX.
