@@ -25,10 +25,12 @@ feature is on.
   names the version of `mag-mortar` that wrote it and the ledger it follows.
 - The host's words: the `Stamp` the host puts on a submission (who submitted it, which mag never
   reads; the devices it may use; a ceiling on its priority), which a submission carries into the
-  ledger; a `TakeBack`, by name (a device or a member) or by need (a `DeviceKind`: a backend, a
-  least memory, or both), each with a deadline, which the host asks at the door and the pool
-  learns as devices leaving; what the pool `Asks` of the host, the kind of device it most wants
-  and the members it would give back; and the `Start` file each member's program begins from.
+  ledger; a `TakeBack`, by name (a device or a member) or by need (a `DeviceKind`: what a
+  device must be, any of a backend, a least memory, its member's least trust, the tolerance
+  classes it meets and the dtypes it computes in, and `DeviceKind::admits` saying whether a
+  device is of it), each with a deadline, which the host asks at the door and the pool learns as
+  devices leaving; what the pool `Asks` of the host, the kind of device it most wants and the
+  members it would give back; and the `Start` file each member's program begins from.
 
 The `graph` feature, named for the first of them, now turns on all of the files, each read and
 written as JSON with serde, each refusing a key repeated in one object (JSON would keep its last
@@ -81,7 +83,7 @@ the files kept in [`tests/v1`](tests/v1) show:
   asks the pool: a `DoorRequest`, to submit a graph with its stamp, end a job by its name, or
   ask the pool's status; and the coordinator's `DoorAnswer`: the record of the loop's run and
   where the job's parts are, each on a device or waiting, the record of an end, or the pool's
-  `Description` with a place for what it `Asks` of the host, left out until the pool can say
+  `Description` with what it `Asks` of the host, left out by a coordinator that does not say
   it; or a `DoorRefusal`: a request it does not read, a change the pool refuses, an end of a
   job it does not hold. With the `graph` feature each is one line of JSON on the socket. Taking
   a device back by need is to be asked there too, and is not a word yet.

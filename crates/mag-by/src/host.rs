@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 
 #[cfg(feature = "graph")]
 use crate::graph::present;
-use crate::{Backend, Description, DeviceId};
+use crate::{Backend, Description, DeviceId, Dtype, Offer, Tolerance, Trust};
 
 /// The start file's `format`: a [`Start`].
 pub const START_FORMAT: &str = "mag-start";
@@ -64,7 +64,12 @@ pub struct Stamp {
     pub priority_ceiling: Option<u32>,
 }
 
-/// A kind of device: a backend, a least memory, both, or, with neither, any device.
+/// A kind of device: what a device must be to be of it. Each field left out, or empty, asks
+/// nothing of it, so a kind with none is any device.
+///
+/// It names what the loop's constraints ask of a device: its backend, for a part pinned to one;
+/// its memory; its member's trust, for the guard; the tolerance classes its measured bounds meet;
+/// and the dtypes it computes in. [`DeviceKind::admits`] says whether a device is of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(
     feature = "graph",
@@ -91,6 +96,41 @@ pub struct DeviceKind {
         )
     )]
     pub memory_bytes: Option<u64>,
+    /// The least trust of its member.
+    #[cfg_attr(
+        feature = "graph",
+        serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )
+    )]
+    pub trust: Option<Trust>,
+    /// The tolerance classes its measured bounds meet, each of them.
+    #[cfg_attr(
+        feature = "graph",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub tolerances: Vec<Tolerance>,
+    /// The dtypes it computes in, each of them.
+    #[cfg_attr(
+        feature = "graph",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub dtypes: Vec<Dtype>,
+}
+
+impl DeviceKind {
+    /// Whether a device offering `offer`, of a member trusted at `trust`, is of this kind: its
+    /// backend the one named, its memory at least that named, its member trusted at least as far
+    /// as named, and every tolerance class and dtype named among its own.
+    pub fn admits(&self, offer: &Offer, trust: Trust) -> bool {
+        self.backend.is_none_or(|b| b == offer.backend)
+            && self.memory_bytes.is_none_or(|m| m <= offer.memory_bytes)
+            && self.trust.is_none_or(|t| t <= trust)
+            && self.tolerances.iter().all(|t| offer.tolerances.contains(t))
+            && self.dtypes.iter().all(|d| offer.dtypes.contains(d))
+    }
 }
 
 /// The host taking a device back, at its door: by name, or by need, each within a deadline in

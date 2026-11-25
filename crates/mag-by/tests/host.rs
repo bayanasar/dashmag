@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use mag_by::{
-    Asks, Backend, DeviceId, DeviceKind, Stamp, Start, StartFileError, TakeBack, Trust,
-    start_schema,
+    Asks, Backend, DeviceId, DeviceKind, Dtype, Offer, Stamp, Start, StartFileError, TakeBack,
+    Tolerance, Trust, start_schema,
 };
 use serde_json::{Value, json};
 
@@ -73,6 +73,7 @@ fn taking_back_by_name_and_by_need_each_with_a_deadline() {
         kind: DeviceKind {
             backend: Some(Backend::Cuda),
             memory_bytes: Some(24 << 30),
+            ..DeviceKind::default()
         },
         deadline_seconds: 120.0,
     };
@@ -104,12 +105,92 @@ fn the_pool_asks_for_a_kind_and_offers_members_back() {
         &Asks {
             wants: Some(DeviceKind {
                 backend: Some(Backend::Rocm),
-                memory_bytes: None,
+                ..DeviceKind::default()
             }),
             gives_back: vec!["laptop".into()],
         },
         json!({ "wants": { "backend": "rocm" }, "gives_back": ["laptop"] }),
     );
+    // Every field of a kind: a member's trust, tolerance classes and dtypes as well.
+    round_trip(
+        &Asks {
+            wants: Some(DeviceKind {
+                backend: Some(Backend::Cuda),
+                memory_bytes: Some(8 << 30),
+                trust: Some(Trust::Owner),
+                tolerances: vec![Tolerance::Bf16],
+                dtypes: vec![Dtype::Bf16, Dtype::I32],
+            }),
+            gives_back: vec![],
+        },
+        json!({
+            "wants": {
+                "backend": "cuda",
+                "memory_bytes": 8u64 << 30,
+                "trust": "owner",
+                "tolerances": ["bf16"],
+                "dtypes": ["bf16", "i32"]
+            },
+            "gives_back": []
+        }),
+    );
+    for refused in [
+        json!({ "wants": { "trust": null }, "gives_back": [] }),
+        json!({ "wants": { "colour": "red" }, "gives_back": [] }),
+    ] {
+        assert!(
+            serde_json::from_value::<Asks>(refused.clone()).is_err(),
+            "{refused}"
+        );
+    }
+}
+
+#[test]
+fn a_kind_admits_a_device_that_meets_every_field_it_names() {
+    let offer = Offer {
+        device: DeviceId {
+            member: "a".into(),
+            index: 0,
+        },
+        backend: Backend::Cuda,
+        memory_bytes: 16 << 30,
+        tolerances: vec![Tolerance::F32, Tolerance::Bf16],
+        dtypes: vec![Dtype::F32, Dtype::Bf16],
+        costs: vec![],
+    };
+    let all = DeviceKind {
+        backend: Some(Backend::Cuda),
+        memory_bytes: Some(16 << 30),
+        trust: Some(Trust::Site),
+        tolerances: vec![Tolerance::Bf16, Tolerance::F32],
+        dtypes: vec![Dtype::Bf16],
+    };
+    assert!(DeviceKind::default().admits(&offer, Trust::Outside));
+    assert!(all.admits(&offer, Trust::Site));
+    assert!(all.admits(&offer, Trust::Owner));
+    // Each field, one past what the device is.
+    let fails = [
+        DeviceKind {
+            backend: Some(Backend::Rocm),
+            ..all.clone()
+        },
+        DeviceKind {
+            memory_bytes: Some((16 << 30) + 1),
+            ..all.clone()
+        },
+        DeviceKind {
+            tolerances: vec![Tolerance::Bf16, Tolerance::Exact],
+            ..all.clone()
+        },
+        DeviceKind {
+            dtypes: vec![Dtype::Bf16, Dtype::I8],
+            ..all.clone()
+        },
+    ];
+    for kind in &fails {
+        assert!(!kind.admits(&offer, Trust::Owner), "{kind:?}");
+    }
+    assert!(!all.admits(&offer, Trust::Outside));
 }
 
 fn changed(change: impl FnOnce(&mut Value)) -> String {

@@ -116,7 +116,7 @@ fn an_answer_carries_the_record_and_where_the_job_is_or_the_pool_or_a_typed_refu
         jobs: vec![],
         formats: vec![],
     };
-    // The pool's asks have their place, and are left out until the pool can say them.
+    // The pool's asks have their place, and are left out by a coordinator that does not say them.
     let status = DoorAnswer::Status {
         pool: pool.clone(),
         asks: None,

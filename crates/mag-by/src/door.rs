@@ -66,7 +66,7 @@ pub enum DoorAnswer {
     Status {
         pool: Description,
         /// What the pool asks of its host: the kind of device it most wants, and the members it
-        /// would give back. Left out until the pool can say; it is not built yet.
+        /// would give back. Left out by a coordinator that does not say.
         #[cfg_attr(
             feature = "graph",
             serde(
