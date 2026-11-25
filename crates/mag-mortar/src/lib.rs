@@ -49,6 +49,13 @@
 //!   the coordinator's own. When each member last held a part is kept from the changes the pool
 //!   was told, so a replay keeps it, and the ledger is unchanged.
 //!
+//! When the host takes a device back by need, a kind of device within a deadline, the pool
+//! chooses which device to give up, [`Pool::give_up`]: of the devices of that kind whose members
+//! give a device back within the deadline, the one whose leave, the loop placing its jobs again
+//! or leaving them waiting, costs the pool's score least, the coordinator's own devices last. It
+//! too is a pure function of the pool's state and the time of asking; the leave itself is a
+//! change the pool is then told.
+//!
 //! The pool does no I/O. Every change reaches it through [`Pool::apply`], which adds the change
 //! and the record of the loop's run to its [`Ledger`]. The pool is deterministic, so the ledger
 //! is all its host need keep: [`Pool::replay`] applies the changes again to a pool begun the same
@@ -65,8 +72,7 @@
 //!   squeezing a running job (M-6). Running jobs are not moved here, so moving costs nothing;
 //! - memory over time: a device's parts are summed as if all resident at once;
 //! - a deadline: a job states no length yet;
-//! - which device to give up when the host takes one back by need; and beginning a pool from the
-//!   arrangement its members hold, after its coordinator stops.
+//! - beginning a pool from the arrangement its members hold, after its coordinator stops.
 //!
 //! The same members, offers and events give the same records: devices are taken in the order of
 //! their [`DeviceId`], and the first of equal scores wins.
@@ -134,6 +140,45 @@ impl fmt::Display for ChangeError {
 }
 
 impl std::error::Error for ChangeError {}
+
+/// The device a pool gives up for a need, and every device it weighed: see [`Pool::give_up`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct GiveUp {
+    /// The device given up: the first of `ranked`.
+    pub device: DeviceId,
+    /// The score the pool loses by it, as the loop scores: 0 for a device that holds no part,
+    /// and the more the more its jobs lose, by priority, after the loop places them again.
+    pub loss: f64,
+    /// Every device that meets the need, with its loss, in the order they were ranked: the
+    /// coordinator's own last, then the least loss, the least memory and the device's id.
+    pub ranked: Vec<(DeviceId, f64)>,
+}
+
+/// Why a pool gives up no device for a need: nothing it holds meets it. See [`Pool::give_up`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unmet {
+    /// The devices of the kind asked for, each of a member that takes longer than the deadline
+    /// to give a device back, or that the pool was never told of; empty when no device in the
+    /// pool is of the kind.
+    pub slow: Vec<DeviceId>,
+}
+
+impl fmt::Display for Unmet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.slow.is_empty() {
+            return write!(f, "no device in the pool is of the kind asked for");
+        }
+        let slow: Vec<String> = self.slow.iter().map(ToString::to_string).collect();
+        write!(
+            f,
+            "the devices of the kind asked for ({}) are each of a member that takes longer than \
+             the deadline to give a device back",
+            slow.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for Unmet {}
 
 /// Why a ledger was not replayed. Entries are counted from 0.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -460,6 +505,89 @@ impl Pool {
             }
         }
         best.map(|(kind, _)| kind)
+    }
+
+    /// Which device the pool gives up when its host takes one back by need: of the devices of
+    /// `kind`, the one whose loss costs the pool least, at `at` seconds. The host wants it within
+    /// `deadline_seconds`. The pool is left as it is: the leave is the host's to tell it, as
+    /// [`Pool::leave`], once the device's member has been told.
+    ///
+    /// **The devices weighed.** Each device `kind` admits ([`DeviceKind::admits`]), its member
+    /// trusted as the guard takes it (`outside` for a member the pool was never told of), whose
+    /// member gives a device back within the deadline: its `give_back_seconds` at most
+    /// `deadline_seconds`. A device of a member the pool was never told of has no time to give
+    /// back the pool knows, and meets no deadline. When none is left, nothing the pool holds
+    /// meets the need, and [`Unmet`] lists the devices of the kind whose members are too slow.
+    ///
+    /// **The loss.** Each device is tried as leaving at `at`: the jobs with a part on it wait,
+    /// and the loop runs as on a leave, placing them again where they fit or leaving them
+    /// waiting. The loss is the score of the jobs as they are less the score of the jobs as the
+    /// loop leaves them, both scored as the loop scores, with every job's priority grown by its
+    /// wait until `at`, and every job's rate over its best rate alone on the pool as it is, with
+    /// the device: one scale for every device weighed, so that losing the fastest device is not
+    /// made cheap by the slower best rate the pool would have without it.
+    ///
+    /// **The order, and ties.** The coordinator's own devices come last: of the devices that meet
+    /// the need, one of `coordinator`'s is given up only when no other member's is left. The host
+    /// takes the coordinator's machine back last, and a device of it given up costs the pool
+    /// its placements as any other does, while a need refused would leave the host only SIGTERM
+    /// on the coordinator, which stops the door and every placement until a coordinator starts
+    /// again. Then the least loss; of equal losses the device that offers the least memory, so
+    /// that the pool keeps its larger devices for the jobs to come; then the devices in the order
+    /// of their ids.
+    pub fn give_up(
+        &self,
+        coordinator: &str,
+        kind: &DeviceKind,
+        deadline_seconds: f64,
+        at: f64,
+    ) -> Result<GiveUp, Unmet> {
+        let in_time = |o: &&Offer| {
+            self.member(&o.device)
+                .is_some_and(|m| m.give_back_seconds <= deadline_seconds)
+        };
+        let (meet, slow): (Vec<&Offer>, Vec<&Offer>) = self
+            .offers
+            .iter()
+            .filter(|o| kind.admits(o, self.trust(&o.device)))
+            .partition(in_time);
+        if meet.is_empty() {
+            return Err(Unmet {
+                slow: slow.into_iter().map(|o| o.device.clone()).collect(),
+            });
+        }
+        let mut now = self.without_ledger();
+        now.advance(at);
+        let (before, _) = now.score(&now.jobs);
+        let mut ranked: Vec<(&Offer, f64)> = meet
+            .into_iter()
+            .map(|o| {
+                let mut after = now.without_ledger();
+                after.remove_device(&o.device, at);
+                let mut jobs = now.jobs.clone();
+                for (j, moved) in jobs.iter_mut().zip(after.jobs) {
+                    j.arrangement = moved.arrangement;
+                }
+                (o, before - now.score(&jobs).0)
+            })
+            .collect();
+        let last = |o: &Offer| o.device.member == coordinator;
+        ranked.sort_by(|(a, la), (b, lb)| {
+            last(a)
+                .cmp(&last(b))
+                .then(la.total_cmp(lb))
+                .then(a.memory_bytes.cmp(&b.memory_bytes))
+                .then(a.device.cmp(&b.device))
+        });
+        let ranked: Vec<(DeviceId, f64)> = ranked
+            .into_iter()
+            .map(|(o, loss)| (o.device.clone(), loss))
+            .collect();
+        Ok(GiveUp {
+            device: ranked[0].0.clone(),
+            loss: ranked[0].1,
+            ranked,
+        })
     }
 
     /// The members the pool would give back at `at` seconds: each member with a device in the
@@ -964,6 +1092,25 @@ impl Pool {
         self.members.iter().find(|m| m.name == d.member)
     }
 
+    /// The trust of a device's member, as the guard takes it: `outside` for a member the pool
+    /// does not know.
+    fn trust(&self, d: &DeviceId) -> Trust {
+        self.member(d).map_or(Trust::Outside, |m| m.trust)
+    }
+
+    /// The pool as it is, with an empty ledger: for a trial that is not kept.
+    fn without_ledger(&self) -> Pool {
+        Pool {
+            members: self.members.clone(),
+            offers: self.offers.clone(),
+            jobs: self.jobs.clone(),
+            ledger: Ledger::default(),
+            now: self.now,
+            held: self.held.clone(),
+            unnamed_backend: self.unnamed_backend.clone(),
+        }
+    }
+
     /// A part kind's cost on a device: measured, or else estimated as the slowest any other
     /// device measured, or else one second, marked as an estimate either way.
     fn cost(&self, offer: &Offer, unit: &Unit) -> Cost {
@@ -995,7 +1142,7 @@ impl Pool {
             return Some(Removal::NoDevice { device });
         };
         // A device whose member the pool does not know is trusted at the lowest level.
-        let trust = self.member(d).map_or(Trust::Outside, |m| m.trust);
+        let trust = self.trust(d);
         let keep = j.keeps.parts[i];
         if keep > trust {
             return Some(Removal::Guard {
