@@ -450,3 +450,45 @@ fn against_burns_own_batch_norm() {
     }
     assert!(compared >= 2, "a training and an eval case");
 }
+
+/// The new running statistics are constants to any gradient: a cotangent on them alone, with
+/// none on the output, gives `x`, the weight and the bias gradients of zero. Without that, a
+/// loss that read them would move `x` by `momentum / m` per element through the mean.
+#[test]
+fn the_new_running_statistics_carry_no_gradient() {
+    let case = Case::all()
+        .into_iter()
+        .find(|c| c.training && c.affine)
+        .expect("a training case with a weight and a bias");
+    let running = case.running();
+    let primals = vec![case.x(), case.vector("weight"), case.vector("bias")];
+    let ones = |t: &Tensor| Tensor::ones(&t.shape(), t.dtype()).unwrap();
+    let cotangents = vec![None, Some(ones(&running.mean)), Some(ones(&running.var))];
+    let (outs, grads) = vjp(
+        |p| {
+            let out = batch_norm(
+                &p[0],
+                Some(&p[1]),
+                Some(&p[2]),
+                Some(&running),
+                true,
+                case.options,
+            )?;
+            let running = out.running.expect("the running statistics");
+            Ok(vec![out.out, running.mean, running.var])
+        },
+        &primals,
+        &cotangents,
+    )
+    .unwrap();
+    // The statistics did move: this is a training step, not eval.
+    assert_ne!(outs[1].to_f32().unwrap(), running.mean.to_f32().unwrap());
+    assert_eq!(grads.len(), 3);
+    for (what, g) in ["x", "weight", "bias"].iter().zip(&grads) {
+        let g = g.to_f32().unwrap();
+        assert!(
+            g.iter().all(|v| *v == 0.0),
+            "{what}'s gradient is not zero: {g:?}"
+        );
+    }
+}

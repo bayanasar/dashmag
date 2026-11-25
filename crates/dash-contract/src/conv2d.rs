@@ -29,8 +29,10 @@
 //! `x`, `weight` and `bias` share one float dtype. The output and each gradient come back in it,
 //! each element a sum of products accumulated in f32, IEEE f32 and not TF32, rounded once. Every
 //! implementation takes f32. bf16 and f16 are the conventions' too, but no implementation is held
-//! to them yet, so each refuses them, as a call with an input it does not have: Burn's Flex sums
-//! f16 products in f16 (its native f16 matrix product), which the contract does not allow.
+//! to them yet, so each refuses them, as a call with an input it does not have. For f16, Burn's
+//! Flex sums f16 products in f16 (its native f16 matrix product), which the contract does not
+//! allow; that is read in Burn's source, not measured. For bf16 there is no known reason against
+//! it: no side has been measured in it, and it is refused until one is.
 //!
 //! # Gradients
 //!
