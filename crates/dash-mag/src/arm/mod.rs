@@ -124,6 +124,17 @@ pub(crate) trait Arm {
 
     fn describe() -> String;
     fn clear_cache();
+    /// Chooses the side's device by its index, before its first array; by default the side has one
+    /// device, 0.
+    fn use_device(index: usize) -> Result<()> {
+        if index == 0 {
+            return Ok(());
+        }
+        crate::refuse(format!(
+            "use_device: {} has one device, 0; asked for {index}",
+            Self::describe()
+        ))
+    }
 
     /// An array from little-endian bytes of a floating `dtype`, or from `i32`s, or from booleans.
     fn from_bytes(bytes: &[u8], shape: &[usize], dtype: DType) -> Result<Self::Array>;

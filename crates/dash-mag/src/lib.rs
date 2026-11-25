@@ -97,6 +97,18 @@ pub fn describe() -> String {
     <arm::Selected as arm::Arm>::describe()
 }
 
+/// Chooses the device this process runs on, by its index, before the first [`Tensor`]: on CUDA and
+/// ROCm, among the cards the process sees (`CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`); Flex and
+/// MLX have one device, 0. Without a call it is device 0. Choosing again the device in use is
+/// nothing; choosing another once a tensor is made is refused, as is an index the side has not
+/// (on CUDA and ROCm the first tensor fails instead, as Burn fails it).
+///
+/// One process runs on one device: a machine's other cards are other processes, each choosing its
+/// own.
+pub fn use_device(index: usize) -> Result<()> {
+    <arm::Selected as arm::Arm>::use_device(index)
+}
+
 /// Returns what the device holds in caches to it, where the side has such a cache.
 pub fn clear_cache() {
     <arm::Selected as arm::Arm>::clear_cache();

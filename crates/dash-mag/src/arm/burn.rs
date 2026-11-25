@@ -118,16 +118,22 @@ fn check_device() -> Result<()> {
     Ok(())
 }
 
+/// The index of the device this process runs on: the one [`Arm::use_device`] chose, or 0, fixed
+/// by whichever comes first, that or the first array.
+static INDEX: OnceLock<usize> = OnceLock::new();
+
 fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
+        #[allow(unused_variables)]
+        let index = *INDEX.get_or_init(|| 0);
         #[cfg(feature = "cuda")]
         {
-            Device::cuda(0)
+            Device::cuda(index)
         }
         #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
         {
-            Device::rocm(0)
+            Device::rocm(index)
         }
         #[cfg(all(not(any(feature = "cuda", feature = "rocm")), feature = "flex"))]
         {
@@ -553,6 +559,26 @@ impl Arm for Burn {
 
     fn clear_cache() {
         device().memory_cleanup();
+    }
+
+    /// CUDA's and ROCm's devices by their index among those the process sees
+    /// (`CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`); Flex has one, 0. An index past the cards
+    /// there are fails when the first array is made, as Burn fails it.
+    fn use_device(index: usize) -> Result<()> {
+        if cfg!(not(any(feature = "cuda", feature = "rocm"))) && index != 0 {
+            return refuse(format!(
+                "use_device: {} has one device, 0; asked for {index}",
+                Self::describe()
+            ));
+        }
+        let chosen = *INDEX.get_or_init(|| index);
+        if chosen != index {
+            return refuse(format!(
+                "use_device: device {chosen} is in use already, asked for {index}: choose the \
+                 device before the first tensor"
+            ));
+        }
+        Ok(())
     }
 
     fn from_bytes(bytes: &[u8], shape: &[usize], dtype: DType) -> Result<Array> {

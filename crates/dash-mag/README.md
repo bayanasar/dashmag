@@ -54,6 +54,13 @@ runtime finds the card only with `HSA_ENABLE_DXG_DETECTION=1`. The same TF32 che
 needed. dash-ops' tests pass on a Radeon AI PRO R9700 (gfx1201) with ROCm 7.2.1; its speed there has not
 been measured (`PROGRESS.md`).
 
+## Which device
+
+A build runs on one side and, in one process, on one device: `dash_mag::use_device(index)` chooses
+it before the first tensor, among the cards the process sees on CUDA and ROCm
+(`CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`); without it, device 0. Flex and MLX have one device.
+A machine's other cards are other processes. A GPU build has no CPU fallback.
+
 ## On MLX
 
 `src/arm/mlx.rs` is the side on macOS, over dash-mlx. Building it is dash-mlx's: a prebuilt MLX through
