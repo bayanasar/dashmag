@@ -2212,10 +2212,24 @@ fn a_member_that_joins_again_within_its_grace_keeps_its_devices_and_one_gone_pas
     coordinating.says("`laptop` did not join again within its grace: its 1 devices");
 }
 
+/// The next channel the server opens to `link`, failing the test after 20 s.
+fn accepted(link: &std::sync::Arc<TlsLink>) -> mag_mar::TlsChannel {
+    let (tx, opened) = mpsc::channel();
+    let link = link.clone();
+    thread::spawn(move || {
+        let _ = tx.send(link.accept(&["server"]));
+    });
+    opened
+        .recv_timeout(Duration::from_secs(20))
+        .expect("no channel opened within 20 s")
+        .unwrap()
+}
+
 #[test]
 fn a_member_whose_channel_is_cut_dials_again_and_joins_again() {
     let pool = Pool::new("redial");
-    let link = TlsLink::bind(pool.credentials("workstation"), "127.0.0.1:0").unwrap();
+    let link =
+        std::sync::Arc::new(TlsLink::bind(pool.credentials("workstation"), "127.0.0.1:0").unwrap());
     let address = link.local_addr().unwrap().to_string();
     let start = pool.start("server", None, Some(&address));
     let mut program = Program::start(Some(&start));
@@ -2226,11 +2240,11 @@ fn a_member_whose_channel_is_cut_dials_again_and_joins_again() {
 
     // Cut before `Joined`, as by a coordinator that died before its line was written: it dials
     // again, soon.
-    let mut channel = link.accept(&["server"]).unwrap();
+    let mut channel = accepted(&link);
     let offered = join(&mut channel);
     drop(channel);
     let cut = Instant::now();
-    let mut channel = link.accept(&["server"]).unwrap();
+    let mut channel = accepted(&link);
     assert!(
         cut.elapsed() < Duration::from_secs(2),
         "{:?}",
@@ -2241,7 +2255,7 @@ fn a_member_whose_channel_is_cut_dials_again_and_joins_again() {
     program.says("joined the pool");
     // Cut after `Joined`: the same.
     drop(channel);
-    let mut channel = link.accept(&["server"]).unwrap();
+    let mut channel = accepted(&link);
     assert_eq!(join(&mut channel), offered);
     channel.send_word(&Control::Joined).unwrap();
     program.says_times("joined the pool", 2);
@@ -2309,5 +2323,109 @@ fn a_second_coordinator_on_a_ledger_another_one_writes_is_refused() {
     let (status, _) = refused.exits(Duration::from_secs(10));
     assert_eq!(status.code(), Some(2), "{:#?}", refused.said);
     refused.says("another coordinator holds its lock, and writes it still");
+    assert_eq!(read_ledger(&pool).1, text);
+}
+
+#[test]
+fn a_coordinator_started_again_joins_its_own_devices_as_they_are_and_records_one_not_back_as_left()
+{
+    let pool = Pool::new("not-back");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (mut first, at) = coordinator_from(Program::command(Some(&start)));
+    let mut laptop = joined(&pool, "laptop", &at, description());
+    ledger_of(&pool, 1);
+    kill(&mut first);
+    // The laptop does not come back.
+    laptop.child.kill().unwrap();
+    laptop.child.wait().unwrap();
+
+    // Started again with a device of its own more, and its first offering more memory.
+    let mut own = description();
+    own.offers[0].memory_bytes = 12 << 30;
+    own.offers.push(offer("workstation", 1, 2 << 30));
+    let start = pool.start_in("workstation", Some(&at), None, own);
+    let restarted = Instant::now();
+    let (mut second, _) = coordinator_from(Program::command(Some(&start)));
+    second.says("its own devices differ from the ledger's: 2 changes");
+    second.says("awaits `laptop`");
+    let workstation = || Some(member("workstation", Trust::Owner, 30.0));
+    assert_eq!(
+        changes(&ledger_of(&pool, 3))[1..],
+        [
+            (workstation(), device("workstation", 0), true),
+            (workstation(), device("workstation", 1), true),
+        ]
+    );
+    // The laptop, gone past its grace from the moment the coordinator took up the ledger.
+    let ledger = ledger_of(&pool, 4);
+    assert!(
+        restarted.elapsed() >= Duration::from_millis(4900),
+        "{:?}",
+        restarted.elapsed()
+    );
+    assert_eq!(changes(&ledger)[3], (None, device("laptop", 0), false));
+    second.says("`laptop` did not join again within its grace");
+    // On its notice, the leave of both its own devices.
+    let (status, _) = second.terminate(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "{:#?}", second.said);
+    let (ledger, text) = read_ledger(&pool);
+    assert_eq!(
+        changes(&ledger)[4..],
+        [
+            (None, device("workstation", 0), false),
+            (None, device("workstation", 1), false),
+        ]
+    );
+    assert_eq!(
+        mag_mortar::Pool::replay(&ledger)
+            .unwrap()
+            .ledger()
+            .to_lines(),
+        text
+    );
+}
+
+/// A join whose ledger line cannot be written is never told `Joined`: the coordinator stops with
+/// status 3, and the member, told nothing, dials again. The line is made unwritable as for a
+/// leave, by `prlimit`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_join_is_not_told_joined_until_its_ledger_line_is_written() {
+    use std::os::unix::process::CommandExt;
+
+    let pool = Pool::new("join-unwritten");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let mut command = Program::command(Some(&start));
+    // SAFETY: signal(2) is async-signal-safe, and SIG_IGN is kept across exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let (mut coordinating, at) = coordinator_from(command);
+    let (_, text) = read_ledger(&pool);
+    let limit_to = libc::rlimit {
+        rlim_cur: text.len() as libc::rlim_t,
+        rlim_max: text.len() as libc::rlim_t,
+    };
+    // SAFETY: prlimit(2) on the child this test started, with a limit that lives in this frame.
+    let set = unsafe {
+        libc::prlimit(
+            coordinating.child.id() as libc::pid_t,
+            libc::RLIMIT_FSIZE,
+            &limit_to,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+
+    let start = pool.start_in("laptop", None, Some(&at), description());
+    let mut laptop = Program::start(Some(&start));
+    laptop.says("asks to join the pool");
+    let (status, _) = coordinating.exits(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(3), "{:#?}", coordinating.said);
+    laptop.says("the control channel ended");
+    assert!(!laptop.said("joined the pool"), "{:#?}", laptop.said);
     assert_eq!(read_ledger(&pool).1, text);
 }

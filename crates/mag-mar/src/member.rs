@@ -363,6 +363,12 @@ pub(crate) fn give_back_by(
     });
 }
 
+/// The wait before the next dial, after one of `wait` that failed: twice as long, up to
+/// [`REDIAL`].
+fn longer(wait: Duration) -> Duration {
+    (wait * 2).min(REDIAL)
+}
+
 /// Dials the coordinator on a thread of its own until a control channel opens, after `wait`,
 /// and after each dial that fails waits [`REDIAL_FIRST`], then twice as long each time, up to
 /// [`REDIAL`].
@@ -393,7 +399,7 @@ fn dial(
                 ),
             }
             thread::sleep(wait);
-            wait = (wait * 2).min(REDIAL);
+            wait = longer(wait);
         }
     });
 }
@@ -625,5 +631,26 @@ pub fn run(start: &Start, mut offers: Vec<Offer>, notice: Notice) -> Result<Ende
             }
             Event::Dialled(_) | Event::Heard(_) | Event::Notice => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_member_waits_twice_as_long_after_each_dial_that_fails_up_to_the_longest() {
+        let mut wait = REDIAL_FIRST;
+        let mut waits = vec![wait];
+        for _ in 0..5 {
+            wait = longer(wait);
+            waits.push(wait);
+        }
+        let ms = |m| Duration::from_millis(m);
+        assert_eq!(
+            waits,
+            [ms(250), ms(500), ms(1000), ms(2000), ms(2000), ms(2000)]
+        );
+        assert_eq!(REDIAL, ms(2000));
     }
 }
