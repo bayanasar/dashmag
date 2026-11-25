@@ -476,8 +476,19 @@ pub struct Entry {
 /// refused change is not in it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Ledger {
-    /// The pool's time when it began, in seconds: 0, the time of the pool file it began from, or,
-    /// for a pool a coordinator began, the time it began it, in seconds since 1970.
+    /// The pool's time when it began, in seconds, on the clock its changes are told by. Which time
+    /// that is depends on what began the pool:
+    ///
+    /// - `mag_mortar::Pool::new`: 0.
+    /// - `mag_mortar::Pool::from_description`: the description's `at`, as given, such as a pool
+    ///   file's.
+    /// - `mag_mortar::Pool::follow`: the time it is given, when the new pool begins, and not the
+    ///   `at` of the ledger it follows.
+    /// - `mag_mortar::Pool::replay`: the replayed ledger's own.
+    /// - `mag-mar`'s coordinator, with no ledger at its place: the Unix time when it begins one,
+    ///   through `Pool::from_description`, in seconds since 1970-01-01 UTC with their fraction. A
+    ///   ledger it takes up that its own version wrote is replayed and keeps its `at`; one another
+    ///   version wrote is followed, and the new ledger's `at` is the Unix time when it takes it up.
     pub at: f64,
     /// The version of `mag-mortar` that began it, which `mag-mortar` writes. Absent in a ledger
     /// of version 1, which did not record it.
