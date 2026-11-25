@@ -14,8 +14,9 @@
 //! compile; the gateway itself, its checks, its broadcasting and its dtype rules, is written once.
 //!
 //! Beside them, the modules training uses, each written once: [`loss`], a multi-head classifier's
-//! masked, class-weighted cross-entropy over [`Tensor`]; [`schedule`], `OneCycleLR`; and on the
-//! host, [`metrics`] and [`calibrate`].
+//! masked, class-weighted cross-entropy over [`Tensor`]; [`norm`], batch normalisation in training
+//! and in eval mode, from the tensor's own reductions; [`schedule`], `OneCycleLR`; and on the host,
+//! [`metrics`] and [`calibrate`].
 //!
 //! This crate holds no model, generation loop or training algorithm: those are the application's.
 //!
@@ -59,6 +60,7 @@ pub mod calibrate;
 pub mod lora;
 pub mod loss;
 pub mod metrics;
+pub mod norm;
 pub mod ops;
 pub mod optim;
 pub mod peft;
