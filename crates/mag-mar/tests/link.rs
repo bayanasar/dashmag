@@ -3,12 +3,15 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use mag_by::{Dtype, Stamp, Start, TakeBack, Tensor};
 use mag_mar::issue::Authority;
-use mag_mar::{Channel, Credentials, Link, LinkError, Refused, TlsLink};
+use mag_mar::{
+    Channel, ChannelEnd, Credentials, Link, LinkError, Receiver, Refused, Sender, TlsLink,
+};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
@@ -30,6 +33,47 @@ fn bound(authority: &Authority, member: &str) -> TlsLink {
 
 fn address(link: &TlsLink) -> String {
     link.local_addr().unwrap().to_string()
+}
+
+/// Runs `f` on a thread of its own, and fails if it has not finished within `limit`: a test of a
+/// link that would wait for ever fails, instead of hanging.
+fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done, finished) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = done.send(f());
+    });
+    match finished.recv_timeout(limit) {
+        Ok(t) => t,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("still waiting after {limit:?}"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("the test's thread failed"),
+    }
+}
+
+/// A channel between `server` and `laptop` for job `j`: the server's end and the laptop's.
+fn channel(server: &TlsLink, laptop: TlsLink) -> (mag_mar::TlsChannel, mag_mar::TlsChannel) {
+    let at = address(server);
+    let (accepted, dialled) = meet(server, &["laptop"], move || laptop.open("server", &at, "j"));
+    (accepted.unwrap(), dialled.unwrap())
+}
+
+/// `bytes` bytes, a pattern of its own for each `seed`.
+fn pattern(bytes: usize, seed: usize) -> Vec<u8> {
+    (0..bytes)
+        .map(|i| (i * (31 + 2 * seed) + i / 4093 + seed) as u8)
+        .collect()
+}
+
+/// Writes a key file readable by its owner alone, as `certs` does.
+fn write_key(path: &std::path::Path, key: &str) {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+        .open(path)
+        .unwrap()
+        .write_all(key.as_bytes())
+        .unwrap();
 }
 
 /// `server` accepts what `expected` allows while `dial` runs on another thread; both results.
@@ -700,7 +744,7 @@ fn credentials_come_from_a_start_file_and_must_be_the_authoritys_and_name_the_me
     std::fs::create_dir_all(&dir).unwrap();
     let (cert, key) = (dir.join("server.pem"), dir.join("server.key"));
     std::fs::write(&cert, &issued.certificate).unwrap();
-    std::fs::write(&key, &issued.key).unwrap();
+    write_key(&key, &issued.key);
 
     let mut start = Start::from_json(include_str!("../../mag-by/starts/example.json")).unwrap();
     // The example's authority is another pool's: this member's certificate is not its.
@@ -727,4 +771,349 @@ fn credentials_come_from_a_start_file_and_must_be_the_authoritys_and_name_the_me
         Err(LinkError::Credentials(_))
     ));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn both_ends_send_64_mib_at_once_on_one_channel_and_neither_waits_on_the_other() {
+    const BYTES: usize = 64 << 20;
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server");
+    let laptop = TlsLink::new(credentials(&pool, "laptop")).unwrap();
+    let (on_server, on_laptop) = channel(&server, laptop);
+    let ok = within(Duration::from_secs(120), move || {
+        // Each end splits its channel: the sending half on a thread of its own, the receiving
+        // half here. Both start sending at the same moment, each a body far larger than the
+        // sockets' buffers, before either reads.
+        let start = Arc::new(Barrier::new(2));
+        let ends = [(on_server, 0), (on_laptop, 1)].map(|(channel, seed)| {
+            let start = start.clone();
+            thread::spawn(move || {
+                let (mut sending, mut receiving) = channel.split();
+                let sender = thread::spawn(move || {
+                    let body = pattern(BYTES, seed);
+                    start.wait();
+                    sending.send(b"{}", &body).unwrap();
+                    sending
+                });
+                let incoming = receiving.recv().unwrap();
+                assert_eq!(incoming.body, BYTES as u64);
+                let mut got = vec![0; BYTES];
+                receiving.read_body(&mut got).unwrap();
+                let sending = sender.join().unwrap();
+                (got, sending.rate(), receiving.rate())
+            })
+        });
+        let [server_end, laptop_end] = ends.map(|end| end.join().unwrap());
+        // Each received the other's body byte for byte, and each half measured its own way.
+        assert!(
+            server_end.0 == pattern(BYTES, 1),
+            "the laptop's body differs"
+        );
+        assert!(
+            laptop_end.0 == pattern(BYTES, 0),
+            "the server's body differs"
+        );
+        for (_, sent, received) in [&server_end, &laptop_end] {
+            assert_eq!((sent.sent.bytes, sent.received.bytes), (BYTES as u64, 0));
+            assert_eq!(
+                (received.sent.bytes, received.received.bytes),
+                (0, BYTES as u64)
+            );
+        }
+        true
+    });
+    assert!(ok);
+    let both = server.rate("laptop").unwrap();
+    assert_eq!(
+        (both.sent.bytes, both.received.bytes),
+        (BYTES as u64, BYTES as u64)
+    );
+}
+
+#[test]
+fn a_whole_channel_still_takes_turns_and_its_halves_close_as_it_did() {
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server");
+    let laptop = TlsLink::new(credentials(&pool, "laptop")).unwrap();
+    let (mut on_server, on_laptop) = channel(&server, laptop);
+    let (mut sending, mut receiving) = on_laptop.split();
+    assert_eq!(
+        (sending.peer().member.as_str(), receiving.job()),
+        ("server", "j")
+    );
+    sending.send(b"[1]", b"").unwrap();
+    assert_eq!(on_server.recv().unwrap().header, b"[1]");
+    on_server.send(b"[2]", b"ab").unwrap();
+    let incoming = receiving.recv().unwrap();
+    let mut body = [0; 2];
+    receiving.read_body(&mut body).unwrap();
+    assert_eq!((incoming.header.as_slice(), &body), (&b"[2]"[..], b"ab"));
+
+    // Closing the sending half closes the laptop's way; the server's way stays open until the
+    // server closes it.
+    sending.close().unwrap();
+    assert!(matches!(on_server.recv(), Err(LinkError::Closed)));
+    on_server.send(b"[3]", b"").unwrap();
+    assert_eq!(receiving.recv().unwrap().header, b"[3]");
+    on_server.close().unwrap();
+    assert!(matches!(receiving.recv(), Err(LinkError::Closed)));
+}
+
+#[test]
+fn a_sending_half_dropped_unclosed_is_found_cut_short_while_its_receiving_half_lives() {
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server");
+    let laptop = TlsLink::new(credentials(&pool, "laptop")).unwrap();
+    let (mut on_server, on_laptop) = channel(&server, laptop);
+    let (sending, mut receiving) = on_laptop.split();
+    drop(sending);
+    let found = within(Duration::from_secs(10), move || {
+        let found = on_server.recv();
+        on_server.send(b"[1]", b"").map(|()| found)
+    });
+    assert!(matches!(found, Ok(Err(LinkError::Truncated))), "{found:?}");
+    assert_eq!(receiving.recv().unwrap().header, b"[1]");
+}
+
+#[test]
+fn a_peer_that_goes_silent_is_given_up_and_a_send_waiting_on_it_ends_too() {
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server").with_silence(Some(Duration::from_millis(300)));
+    let laptop = TlsLink::new(credentials(&pool, "laptop")).unwrap();
+    // The laptop holds its end open and does nothing with it: neither reads nor sends.
+    let (on_server, _stopped) = channel(&server, laptop);
+    let (mut sending, mut receiving) = on_server.split();
+    let (received, sent, took) = within(Duration::from_secs(20), move || {
+        // A body far larger than the sockets' buffers, which the laptop never reads, so the send
+        // waits; and a receive, which waits for a word the laptop never sends.
+        let sender = thread::spawn(move || sending.send(b"{}", &vec![7; 64 << 20]));
+        let started = Instant::now();
+        let received = receiving.recv();
+        let took = started.elapsed();
+        (received, sender.join().unwrap(), took)
+    });
+    assert!(
+        matches!(received, Err(LinkError::Silent { after }) if after == Duration::from_millis(300)),
+        "{received:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(250) && took < Duration::from_millis(1500),
+        "{took:?}"
+    );
+    // The channel was ended both ways, so the send that waited on the same peer ended with it.
+    assert!(matches!(sent, Err(LinkError::Silent { .. })), "{sent:?}");
+}
+
+#[test]
+fn silence_is_counted_from_the_last_bytes_received_not_from_the_receive() {
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server").with_silence(Some(Duration::from_millis(400)));
+    let laptop = TlsLink::new(credentials(&pool, "laptop")).unwrap();
+    let (on_server, mut on_laptop) = channel(&server, laptop);
+    let (_sending, mut receiving) = on_server.split();
+    // A message every 100 ms for 1.2 s, three times the silence allowed in all, each part of the
+    // last one's body arriving within it.
+    let speaking = thread::spawn(move || {
+        for i in 0..12u8 {
+            thread::sleep(Duration::from_millis(100));
+            on_laptop.send(b"{}", &[i]).unwrap();
+        }
+        on_laptop
+    });
+    for i in 0..12u8 {
+        let incoming = receiving.recv().unwrap();
+        let mut body = [0; 1];
+        assert_eq!(incoming.body, 1);
+        receiving.read_body(&mut body).unwrap();
+        assert_eq!(body, [i]);
+    }
+    let _on_laptop = speaking.join().unwrap();
+    // Then nothing, and the silence allowed runs out.
+    assert!(matches!(receiving.recv(), Err(LinkError::Silent { .. })));
+}
+
+#[test]
+fn a_peer_that_goes_away_without_closing_ends_a_receive_and_a_send_waiting_on_it() {
+    let pool = Authority::new(1).unwrap();
+    let server = bound(&pool, "server");
+    let laptop = TlsLink::new(credentials(&pool, "laptop")).unwrap();
+    let (on_server, on_laptop) = channel(&server, laptop);
+    let (mut sending, mut receiving) = on_server.split();
+    let (received, sent) = within(Duration::from_secs(20), move || {
+        let sender = thread::spawn(move || sending.send(b"{}", &vec![7; 64 << 20]));
+        let receiver = thread::spawn(move || receiving.recv());
+        // Once the server is waiting both ways, the laptop's end goes, with bytes unread: its
+        // socket is reset, as when a program is killed, and no close is said.
+        thread::sleep(Duration::from_millis(300));
+        drop(on_laptop);
+        (receiver.join().unwrap(), sender.join().unwrap())
+    });
+    assert!(
+        matches!(received, Err(LinkError::Truncated | LinkError::Lost(_))),
+        "{received:?}"
+    );
+    assert!(matches!(sent, Err(LinkError::Lost(_))), "{sent:?}");
+}
+
+#[test]
+fn a_live_peer_that_reads_nothing_for_longer_than_keepalive_s_limit_keeps_its_channel() {
+    const BYTES: usize = 64 << 20;
+    let pool = Authority::new(1).unwrap();
+    let quick = mag_mar::Keepalive {
+        idle: Duration::from_secs(1),
+        interval: Duration::from_secs(1),
+        probes: 1,
+    };
+    let server = bound(&pool, "server").with_keepalive(Some(quick));
+    let laptop = TlsLink::new(credentials(&pool, "laptop"))
+        .unwrap()
+        .with_keepalive(Some(quick));
+    let (mut on_server, mut on_laptop) = channel(&server, laptop);
+    let got = within(Duration::from_secs(60), move || {
+        let sender = thread::spawn(move || on_server.send(b"{}", &pattern(BYTES, 3)));
+        // The laptop is busy for twice keepalive's limit before it reads: the server's send
+        // waits on a full window all that time, and the channel holds.
+        thread::sleep(quick.limit() * 2);
+        let incoming = on_laptop.recv().unwrap();
+        let mut got = vec![0; incoming.body as usize];
+        on_laptop.read_body(&mut got).unwrap();
+        sender.join().unwrap().map(|()| got)
+    });
+    assert!(got.unwrap() == pattern(BYTES, 3), "the body differs");
+}
+
+#[test]
+fn dialling_an_address_that_drops_packets_gives_up_at_the_opening_s_deadline() {
+    let pool = Authority::new(1).unwrap();
+    let laptop = TlsLink::new(credentials(&pool, "laptop"))
+        .unwrap()
+        .with_opening(Duration::from_millis(400));
+    // An address of the documentation range, which no one answers and most networks drop.
+    let (dialled, took) = within(Duration::from_secs(10), move || {
+        let started = Instant::now();
+        let dialled = laptop.open("server", "192.0.2.1:7340", "j");
+        (dialled.map(|_| ()), started.elapsed())
+    });
+    match dialled {
+        // Dropped: given up at the deadline, not at the system's own, minutes later.
+        Err(LinkError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+            assert!(took >= Duration::from_millis(350), "{took:?}");
+        }
+        // A machine with no route there is told so at once.
+        Err(LinkError::Io(_)) => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_key_file_its_group_or_others_can_reach_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let pool = Authority::new(1).unwrap();
+    let issued = pool.issue("server", 1).unwrap();
+    let dir = std::env::temp_dir().join(format!("mag-mar-key-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = (dir.join("server.pem"), dir.join("server.key"));
+    std::fs::write(&cert, &issued.certificate).unwrap();
+    write_key(&key, &issued.key);
+    let mut start = Start::from_json(include_str!("../../mag-by/starts/example.json")).unwrap();
+    start.authority = pool.certificate().into();
+    start.certificate_file = cert.to_str().unwrap().into();
+    start.key_file = key.to_str().unwrap().into();
+
+    // Its owner's alone, as `certs` writes it: taken.
+    for mode in [0o600, 0o400, 0o700] {
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(Credentials::from_start(&start).is_ok(), "{mode:o}");
+    }
+    // Readable, writable or runnable by its group or by others: refused, with its mode.
+    for mode in [0o640, 0o604, 0o644, 0o620, 0o602, 0o610, 0o601, 0o660] {
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+        match Credentials::from_start(&start) {
+            Err(LinkError::KeyExposed { path, mode: found }) => {
+                assert_eq!((path.as_str(), found), (start.key_file.as_str(), mode));
+            }
+            other => panic!("{mode:o}: {other:?}"),
+        }
+    }
+    // The certificate is public: its mode is not checked.
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(Credentials::from_start(&start).is_ok());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A certificate the pool's authority signs for `member`, valid until `until` seconds after
+/// the Unix epoch, and its key, in PEM.
+fn issued_until(pool: &Authority, member: &str, until: u64) -> (String, String) {
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair};
+    let issuer =
+        Issuer::from_ca_cert_pem(pool.certificate(), KeyPair::from_pem(&pool.key()).unwrap())
+            .unwrap();
+    let mut params = CertificateParams::new(vec![member.to_string()]).unwrap();
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    params.use_authority_key_identifier_extension = true;
+    params.not_before = time::OffsetDateTime::from_unix_timestamp(until as i64 - 3600).unwrap();
+    params.not_after = time::OffsetDateTime::from_unix_timestamp(until as i64).unwrap();
+    let key = KeyPair::generate().unwrap();
+    (
+        params.signed_by(&key, &issuer).unwrap().pem(),
+        key.serialize_pem(),
+    )
+}
+
+#[test]
+fn a_certificate_past_its_end_is_refused_and_a_channel_open_when_it_ends_carries_on() {
+    let pool = Authority::new(1).unwrap();
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+
+    // A certificate that has ended is not taken as credentials: the member cannot start on it.
+    let (ended, key) = issued_until(&pool, "laptop", now() - 60);
+    assert!(matches!(
+        Credentials::from_pem("laptop", pool.certificate(), &ended, &key),
+        Err(LinkError::Credentials(why)) if why.contains("Expired")
+    ));
+
+    // One that ends in two seconds opens a channel now.
+    let server = bound(&pool, "server");
+    let until = now() + 2;
+    let (certificate, key) = issued_until(&pool, "laptop", until);
+    let credentials = Credentials::from_pem("laptop", pool.certificate(), &certificate, &key);
+    let laptop = Arc::new(TlsLink::new(credentials.unwrap()).unwrap());
+    let l = laptop.clone();
+    let at = address(&server);
+    let (accepted, dialled) = meet(&server, &["laptop"], move || l.open("server", &at, "j"));
+    let (mut on_server, mut on_laptop) = (accepted.unwrap(), dialled.unwrap());
+
+    // Once it has ended, the open channel carries on: a certificate is checked when a channel
+    // opens.
+    while now() <= until + 1 {
+        thread::sleep(Duration::from_millis(100));
+    }
+    on_laptop.send(b"[1]", b"").unwrap();
+    assert_eq!(on_server.recv().unwrap().header, b"[1]");
+    on_server.send(b"[2]", b"").unwrap();
+    assert_eq!(on_laptop.recv().unwrap().header, b"[2]");
+
+    // A new channel on it is refused, as not the pool's now.
+    let at = address(&server);
+    let (accepted, dialled) = meet(&server, &["laptop"], move || {
+        laptop.open("server", &at, "k")
+    });
+    assert!(
+        matches!(&accepted, Err(LinkError::Refused(Refused::NotThePool(why))) if why.contains("Expired")),
+        "{:?}",
+        accepted.err()
+    );
+    assert!(dialled.is_err());
 }

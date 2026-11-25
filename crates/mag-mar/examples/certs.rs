@@ -1,20 +1,5 @@
 //! `certs`: the pool's certificate authority and its members' certificates, as the host makes
-//! them for a list of machines.
-//!
-//!     certs new DIR MEMBER...   a new authority in DIR, and a certificate for each member
-//!     certs add DIR MEMBER...   a certificate for each member from the authority in DIR: a
-//!                               member that joins, or one whose lease ended and comes back
-//!
-//! `--days N` before DIR sets how long the members' certificates are valid (365 by default);
-//! the authority is valid for ten years. In DIR it writes `authority.pem`, the certificate every
-//! start file holds, and `authority.key`, the authority's key, which stays with the host; and
-//! for each member `MEMBER.pem` and `MEMBER.key`, its certificate and key, which go to that
-//! machine and are named by its start file. Keys are written readable by their owner alone. It
-//! prints each member with its certificate's serial.
-//!
-//! Exit status: 0 when every certificate is written; 2 for a usage error, a member name a
-//! certificate cannot carry, an authority that already exists for `new` or is missing for
-//! `add`, or a file that cannot be written.
+//! them for a list of machines. `certs help` prints this, as [`HELP`] holds it.
 
 use std::fs;
 use std::io::Write;
@@ -25,8 +10,37 @@ use mag_mar::issue::Authority;
 
 const AUTHORITY_DAYS: u32 = 3650;
 
+/// What `certs help` prints.
+const HELP: &str = "\
+certs: the pool's certificate authority and its members' certificates.
+
+    certs new [--days N] DIR MEMBER...   a new authority in DIR, and a certificate for each member
+    certs add [--days N] DIR MEMBER...   a certificate for each member from the authority in DIR:
+                                         a member that joins, one whose lease ended and comes
+                                         back, or one whose certificate is ending
+    certs help                           this
+
+--days N sets how long the members' certificates are valid: 365 days by default. The authority
+is valid for ten years. In DIR it writes authority.pem, the certificate every start file holds,
+and authority.key, the authority's key, which stays with the host; and for each member
+MEMBER.pem and MEMBER.key, its certificate and key, which go to that machine and are named by
+its start file. Keys are written readable by their owner alone, and a member refuses a key file
+its group or others can reach. It prints each member with its certificate's serial.
+
+When a member's certificate ends, the member cannot start on it, and no new channel opens to it
+or from it: the other end refuses the certificate as not the pool's. Channels open when it ended
+carry on, since a certificate is checked when a channel opens. Before it ends, issue the member
+a new one from the same authority with `certs add DIR MEMBER`, put its two files in place of
+the old, and start the member's program again. No other member needs anything new. When the
+authority itself ends, after ten years, make a new pool with `certs new`.
+
+Exit status: 0 when every certificate is written; 2 for a usage error, a member name a
+certificate cannot carry, an authority that already exists for `new` or is missing for `add`,
+or a file that cannot be written.
+";
+
 fn usage() -> ExitCode {
-    eprintln!("usage: certs new|add [--days N] DIR MEMBER...");
+    eprint!("{HELP}");
     ExitCode::from(2)
 }
 
@@ -85,6 +99,10 @@ fn main() -> ExitCode {
     let new = match args.next().as_deref() {
         Some("new") => true,
         Some("add") => false,
+        Some("help" | "--help" | "-h") => {
+            print!("{HELP}");
+            return ExitCode::SUCCESS;
+        }
         _ => return usage(),
     };
     let mut rest: Vec<String> = args.collect();

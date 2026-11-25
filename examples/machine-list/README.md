@@ -91,9 +91,23 @@ a member.
   This runs today. It writes `authority.pem` and `authority.key` into `pool-certs`, and for each
   member `MEMBER.pem` and `MEMBER.key`, and prints each member's certificate serial. Keep
   `authority.key` where you run this, and give it to no member. Copy each member's two files to
-  that machine, readable only by the user the program runs as. For a machine you add later, or
+  that machine, the key readable only by the user the program runs as (`chmod 600`): a member
+  refuses a key file its group or others can read, write or run. For a machine you add later, or
   one that comes back after you took it out, run the same with `add` in place of `new`: the
   same authority signs a new certificate, and the pool needs no other word of it.
+
+  The members' certificates last 365 days, unless you give `--days N` before the directory, and
+  the authority ten years. A pool that outlives a member's certificate loses that member: it
+  cannot start on the certificate, and the other members refuse every new channel to it or from
+  it as not the pool's, though channels open when it ended carry on until they close. Before
+  then, issue that member a new certificate from the same authority,
+
+      cargo run --locked -q -p mag-mar --features issue --example certs -- \
+          add pool-certs server
+
+  copy its two new files over the old on that machine, and start its program again. The other
+  members need nothing new, since they trust the authority and not one certificate. When the
+  authority itself ends, make a new pool with `new`. `certs help` says the same.
 - A start file for each of the three members, named by `MAG_START`: the member, the pool, the
   authority's certificate (the text of `authority.pem`), its peers and their addresses, which
   member coordinates, the ledger, the door, the idle time, and the paths of the member's

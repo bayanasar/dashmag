@@ -8,17 +8,22 @@
 //!   accepts one a peer opens; on it, it sends and receives framed messages, each a header and a
 //!   body that may be gigabytes long; it reads the channel's measured rate, for the placement
 //!   loop's cost model; and it closes it. Each job between two members has its own channel, so
-//!   that one job's words never reach another's.
+//!   that one job's words never reach another's. A channel splits into a [`Sender`] and a
+//!   [`Receiver`], one for each thread, so that both ends can send at once and neither waits on
+//!   the other.
 //! - [`TlsLink`], the first implementation: TCP with TLS 1.3 (rustls), both ends authenticated.
 //!   Each pool has its own certificate authority, held by the host, which issues each member a
 //!   certificate naming it ([`Credentials`]). A channel is taken only when the other end's
 //!   certificate is signed by the pool's authority and names the member expected; anything
 //!   else is a typed [`Refused`]. Either end may dial, so a member behind address translation
 //!   dials out.
-//! - The messages are `mag-by`'s words, as JSON in the header: [`Channel::send_word`],
-//!   [`Channel::recv_word`], and for a tensor, [`Channel::send_tensor`] and
-//!   [`Channel::recv_tensor`], its bytes in the body, streamed from the caller's buffer and into
+//! - The messages are `mag-by`'s words, as JSON in the header: [`Sender::send_word`],
+//!   [`Receiver::recv_word`], and for a tensor, [`Sender::send_tensor`] and
+//!   [`Receiver::recv_tensor`], its bytes in the body, streamed from the caller's buffer and into
 //!   the caller's buffer, never held twice.
+//! - An open channel is watched: TCP keepalive finds a peer whose machine went away
+//!   ([`Keepalive`]), and a receive may be given a limit on silence
+//!   ([`TlsLink::with_silence`]). Dialling and the opening are bounded by one deadline.
 //! - [`Identity`]: who the other end is, by the member its certificate names and the
 //!   certificate's serial, which tells a certificate the host issued after a lease ended from
 //!   the one it ended on.
@@ -41,7 +46,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 pub use frame::MAX_HEADER;
-pub use tls::{Credentials, OPENING, TlsChannel, TlsLink};
+pub use tls::{
+    Credentials, KEEPALIVE, Keepalive, OPENING, TlsChannel, TlsLink, TlsReceiver, TlsSender,
+};
 
 /// One end of the links between members: the replaceable interface. A member holds one, and
 /// opens or accepts a channel for each job it shares with another member.
@@ -69,29 +76,27 @@ pub trait Link {
     fn rate(&self, member: &str) -> Option<Rate>;
 }
 
-/// One job's channel between two members.
-pub trait Channel {
+/// What a channel, or either half of one, says of itself.
+pub trait ChannelEnd {
     /// The other end.
     fn peer(&self) -> &Identity;
 
     /// The job the channel is for.
     fn job(&self) -> &str;
 
+    /// The rate measured so far: both ways on a whole channel, and on a half, its own way only.
+    fn rate(&self) -> Rate;
+}
+
+/// The sending half of a channel, or a whole channel as it sends.
+pub trait Sender: ChannelEnd {
     /// Sends one message: a header of at most [`MAX_HEADER`] bytes, and a body of any length,
     /// read from `body` as it is sent.
     fn send(&mut self, header: &[u8], body: &[u8]) -> Result<(), LinkError>;
 
-    /// Receives the next message's header and the length of its body. The body is then read
-    /// with [`Channel::read_body`], before the next message.
-    fn recv(&mut self) -> Result<Incoming, LinkError>;
-
-    /// Reads the body of the message last received into `into`, which must be its length.
-    fn read_body(&mut self, into: &mut [u8]) -> Result<(), LinkError>;
-
-    /// The rate measured on this channel so far.
-    fn rate(&self) -> Rate;
-
-    /// Closes the channel: the other end's next receive finds it [`LinkError::Closed`].
+    /// Closes the channel: the other end's next receive finds it [`LinkError::Closed`]. Closing
+    /// the sending half closes the channel's one way; the other end may still send until it
+    /// closes its own.
     fn close(self) -> Result<(), LinkError>
     where
         Self: Sized;
@@ -103,21 +108,6 @@ pub trait Channel {
     {
         let header = serde_json::to_vec(word).map_err(LinkError::Word)?;
         self.send(&header, &[])
-    }
-
-    /// Receives one of `mag-by`'s words, sent with no body.
-    fn recv_word<W: DeserializeOwned>(&mut self) -> Result<W, LinkError>
-    where
-        Self: Sized,
-    {
-        let incoming = self.recv()?;
-        if incoming.body != 0 {
-            return Err(LinkError::Body {
-                expected: 0,
-                found: incoming.body,
-            });
-        }
-        serde_json::from_slice(&incoming.header).map_err(LinkError::Word)
     }
 
     /// Sends a tensor: the word, and its bytes as the body, which must be `tensor.bytes` long.
@@ -134,9 +124,34 @@ pub trait Channel {
         let header = serde_json::to_vec(tensor).map_err(LinkError::Word)?;
         self.send(&header, bytes)
     }
+}
+
+/// The receiving half of a channel, or a whole channel as it receives.
+pub trait Receiver: ChannelEnd {
+    /// Receives the next message's header and the length of its body. The body is then read
+    /// with [`Receiver::read_body`], before the next message.
+    fn recv(&mut self) -> Result<Incoming, LinkError>;
+
+    /// Reads the body of the message last received into `into`, which must be its length.
+    fn read_body(&mut self, into: &mut [u8]) -> Result<(), LinkError>;
+
+    /// Receives one of `mag-by`'s words, sent with no body.
+    fn recv_word<W: DeserializeOwned>(&mut self) -> Result<W, LinkError>
+    where
+        Self: Sized,
+    {
+        let incoming = self.recv()?;
+        if incoming.body != 0 {
+            return Err(LinkError::Body {
+                expected: 0,
+                found: incoming.body,
+            });
+        }
+        serde_json::from_slice(&incoming.header).map_err(LinkError::Word)
+    }
 
     /// Receives a tensor's word. Its bytes, `tensor.bytes` of them, are then read with
-    /// [`Channel::read_body`].
+    /// [`Receiver::read_body`].
     fn recv_tensor(&mut self) -> Result<Tensor, LinkError>
     where
         Self: Sized,
@@ -151,6 +166,23 @@ pub trait Channel {
         }
         Ok(tensor)
     }
+}
+
+/// One job's channel between two members: it sends and it receives.
+///
+/// Used by one thread, a channel takes turns: while it sends a body, it does not read, so two
+/// ends that both send bodies larger than the sockets' buffers, each before reading, would wait
+/// on each other. Split, it cannot: each half goes to a thread of its own, and a half that
+/// sends never waits for its own end to read, only for the other end's receiving half. A
+/// member that sends and receives on one job at once, as a chain does with activations forward
+/// and gradients back, splits the channel.
+pub trait Channel: Sender + Receiver {
+    type SendHalf: Sender + Send + 'static;
+    type ReceiveHalf: Receiver + Send + 'static;
+
+    /// The two halves, each to be used on its own thread. Dropping the sending half without
+    /// closing it ends the channel's one way, and the other end finds it [`LinkError::Truncated`].
+    fn split(self) -> (Self::SendHalf, Self::ReceiveHalf);
 }
 
 /// A message's header, and the length of the body that follows it.
@@ -260,6 +292,14 @@ pub enum LinkError {
     Closed,
     /// The channel ended inside a message, or without the other end closing it.
     Truncated,
+    /// The other end went away without closing the channel: it reset the connection, or TCP
+    /// keepalive found it gone. The channel is ended.
+    Lost(io::Error),
+    /// Nothing came from the other end for as long as this end allows ([`TlsLink::with_silence`]).
+    /// The channel is ended both ways, so a send waiting on the same peer ends too.
+    Silent {
+        after: std::time::Duration,
+    },
     /// A header longer than [`MAX_HEADER`], sent or received.
     HeaderTooLong {
         bytes: u64,
@@ -280,6 +320,12 @@ pub enum LinkError {
     Name(String),
     /// This end's certificate, key or authority could not be read, or do not hold together.
     Credentials(String),
+    /// The private key file may be read, written or run by its group or by others (Unix): its
+    /// path, and its mode. It must be its owner's alone, as `certs` writes it.
+    KeyExposed {
+        path: String,
+        mode: u32,
+    },
     /// TLS failed for a reason not listed above.
     Tls(rustls::Error),
     Io(io::Error),
@@ -297,6 +343,12 @@ impl fmt::Display for LinkError {
             LinkError::Opening(why) => write!(f, "the channel did not open: {why}"),
             LinkError::Closed => write!(f, "the other end closed the channel"),
             LinkError::Truncated => write!(f, "the channel ended inside a message, or unclosed"),
+            LinkError::Lost(e) => write!(f, "the other end went away without closing: {e}"),
+            LinkError::Silent { after } => write!(
+                f,
+                "nothing came from the other end for {:.1} s; the channel is ended",
+                after.as_secs_f64()
+            ),
             LinkError::HeaderTooLong { bytes } => write!(
                 f,
                 "a header of {bytes} bytes; at most {MAX_HEADER} are taken"
@@ -315,6 +367,11 @@ impl fmt::Display for LinkError {
                  case"
             ),
             LinkError::Credentials(why) => write!(f, "this end's credentials: {why}"),
+            LinkError::KeyExposed { path, mode } => write!(
+                f,
+                "the key file {path} has mode {mode:03o}: its group and others must have no \
+                 access to it (chmod 600)"
+            ),
             LinkError::Tls(e) => write!(f, "TLS: {e}"),
             LinkError::Io(e) => write!(f, "{e}"),
         }
@@ -337,7 +394,7 @@ impl std::error::Error for LinkError {
         match self {
             LinkError::Word(e) => Some(e),
             LinkError::Tls(e) => Some(e),
-            LinkError::Io(e) => Some(e),
+            LinkError::Io(e) | LinkError::Lost(e) => Some(e),
             _ => None,
         }
     }

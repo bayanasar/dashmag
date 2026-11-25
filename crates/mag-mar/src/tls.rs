@@ -13,7 +13,8 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -27,10 +28,13 @@ use rustls::{
     ServerConfig, ServerConnection, SignatureScheme, StreamOwned,
 };
 
-use crate::{Channel, Identity, Incoming, Link, LinkError, Rate, Refused, check_name, frame};
+use crate::{
+    Channel, ChannelEnd, Identity, Incoming, Link, LinkError, Measure, Rate, Receiver, Refused,
+    Sender, check_name, frame,
+};
 
-/// How long the handshake and the opening of a channel may take, together, before the channel
-/// is given up: the default of [`TlsLink::with_opening`].
+/// How long the opening of a channel may take, dialling, the handshake and the opening words
+/// together, before the channel is given up: the default of [`TlsLink::with_opening`].
 pub const OPENING: Duration = Duration::from_secs(10);
 
 /// A member's credentials on its links: the pool's authority certificate, the member's own
@@ -119,17 +123,41 @@ impl Credentials {
     }
 
     /// Credentials as a start file gives them: its member, the authority it holds, and the
-    /// certificate and key files it names.
+    /// certificate and key files it names. On Unix, a key file its group or others may read,
+    /// write or run is refused, [`LinkError::KeyExposed`], before it is read: a key others can
+    /// read lets them be this member, and one they can write lets them choose its key.
     pub fn from_start(start: &mag_by::Start) -> Result<Credentials, LinkError> {
-        let read = |path: &str| {
-            std::fs::read_to_string(path)
-                .map_err(|e| LinkError::Credentials(format!("reading {path}: {e}")))
+        let failed =
+            |path: &str, e: io::Error| LinkError::Credentials(format!("reading {path}: {e}"));
+        let read = |path: &str, key: bool| -> Result<String, LinkError> {
+            let mut file = std::fs::File::open(path).map_err(|e| failed(path, e))?;
+            #[cfg(unix)]
+            if key {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = file
+                    .metadata()
+                    .map_err(|e| failed(path, e))?
+                    .permissions()
+                    .mode();
+                if mode & 0o077 != 0 {
+                    return Err(LinkError::KeyExposed {
+                        path: path.into(),
+                        mode: mode & 0o7777,
+                    });
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = key;
+            let mut text = String::new();
+            file.read_to_string(&mut text)
+                .map_err(|e| failed(path, e))?;
+            Ok(text)
         };
         Credentials::from_pem(
             &start.member,
             &start.authority,
-            &read(&start.certificate_file)?,
-            &read(&start.key_file)?,
+            &read(&start.certificate_file, false)?,
+            &read(&start.key_file, true)?,
         )
     }
 
@@ -265,26 +293,26 @@ pub(crate) fn from_tls(e: rustls::Error) -> LinkError {
     }
 }
 
-/// The socket under a channel. While the channel opens, each read and write may take only what
-/// is left of one deadline for the whole opening, so a peer that sends a byte now and then
-/// cannot hold the opening, and with it `accept`, for longer than that. Once the channel is
-/// open, nothing is bounded.
+fn timed_out() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the channel did not open in the time allowed",
+    )
+}
+
+/// The socket under a channel while it opens. Each read and write may take only what is left of
+/// one deadline for the whole opening, dialling included, so a peer that sends a byte now and
+/// then cannot hold the opening, and with it `accept`, for longer than that.
 struct Sock {
     tcp: TcpStream,
-    deadline: Option<Instant>,
+    deadline: Instant,
 }
 
 impl Sock {
     fn bound(&self) -> io::Result<()> {
-        let Some(deadline) = self.deadline else {
-            return Ok(());
-        };
-        let left = deadline.saturating_duration_since(Instant::now());
+        let left = self.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "the channel did not open in the time allowed",
-            ));
+            return Err(timed_out());
         }
         self.tcp.set_read_timeout(Some(left))?;
         self.tcp.set_write_timeout(Some(left))
@@ -309,7 +337,8 @@ impl Write for Sock {
     }
 }
 
-/// The stream under a channel, as the end that dialled or the end that answered holds it.
+/// The stream under a channel while it opens, as the end that dialled or the end that answered
+/// holds it.
 enum Stream {
     Dialled(StreamOwned<ClientConnection, Sock>),
     Answered(StreamOwned<ServerConnection, Sock>),
@@ -340,29 +369,27 @@ impl Stream {
         .and_then(|chain| chain.first())
     }
 
-    fn sock(&self) -> &Sock {
-        match self {
-            Stream::Dialled(s) => &s.sock,
-            Stream::Answered(s) => &s.sock,
-        }
-    }
-
-    fn sock_mut(&mut self) -> &mut Sock {
-        match self {
-            Stream::Dialled(s) => &mut s.sock,
-            Stream::Answered(s) => &mut s.sock,
-        }
-    }
-
-    /// Tells the other end the channel is closed, and closes this end's writing half.
+    /// Tells the other end the channel is closed, and closes this end's writing half: a channel
+    /// refused before it opened.
     fn close(&mut self) -> Result<(), LinkError> {
         match self {
             Stream::Dialled(s) => s.conn.send_close_notify(),
             Stream::Answered(s) => s.conn.send_close_notify(),
         }
         self.flush()?;
-        self.sock().tcp.shutdown(Shutdown::Write)?;
+        let tcp = match self {
+            Stream::Dialled(s) => &s.sock.tcp,
+            Stream::Answered(s) => &s.sock.tcp,
+        };
+        tcp.shutdown(Shutdown::Write)?;
         Ok(())
+    }
+
+    fn into_parts(self) -> (rustls::Connection, TcpStream) {
+        match self {
+            Stream::Dialled(s) => (s.conn.into(), s.sock.tcp),
+            Stream::Answered(s) => (s.conn.into(), s.sock.tcp),
+        }
     }
 }
 
@@ -391,22 +418,104 @@ impl Write for Stream {
     }
 }
 
-/// A socket whose opening must end within `opening` from now.
-fn prepare(tcp: TcpStream, opening: Duration) -> Result<Sock, LinkError> {
-    tcp.set_nodelay(true)?;
-    Ok(Sock {
-        tcp,
-        deadline: Some(Instant::now() + opening),
-    })
+/// Connects to `address` by `deadline`: each address it resolves to in turn, each given what is
+/// left of the time, until one answers or the time is up. Resolving a name is the system
+/// resolver's, bounded by its own timeouts; an address given as numbers resolves at once.
+fn dial(address: &str, deadline: Instant) -> io::Result<TcpStream> {
+    connect_any(address, address.to_socket_addrs()?, deadline)
 }
 
-/// The channel is open: from now on nothing is bounded.
-fn opened(stream: &mut Stream) -> Result<(), LinkError> {
-    let sock = stream.sock_mut();
-    sock.deadline = None;
-    sock.tcp.set_read_timeout(None)?;
-    sock.tcp.set_write_timeout(None)?;
-    Ok(())
+/// Connects to the first of `addresses` that answers by `deadline`, `address` as they came.
+fn connect_any(
+    address: &str,
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    deadline: Instant,
+) -> io::Result<TcpStream> {
+    let mut last = None;
+    for at in addresses {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&at, left) {
+            Ok(tcp) => return Ok(tcp),
+            Err(e) => last = Some(e),
+        }
+    }
+    if Instant::now() >= deadline {
+        return Err(timed_out());
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`{address}` resolves to no address"),
+        )
+    }))
+}
+
+/// How TCP watches the other end of a channel while nothing crosses it: after `idle` of quiet, a
+/// probe every `interval`, and the other end taken for gone once `probes` of them go unanswered.
+/// Then a receive waiting on the channel fails, [`LinkError::Lost`].
+///
+/// It finds a peer whose machine went away, switched off, cut from the network, or behind an
+/// address translation that forgot the connection, while the channel is quiet: as when a
+/// member waits for the next word. While this end has sent bytes the other has not acknowledged,
+/// TCP probes nothing, and the system's own limit on retransmitting decides (on Linux about 15
+/// minutes, `tcp_retries2`). A peer whose machine is up answers probes from its kernel, even
+/// while its program is stopped. A limit on silence ([`TlsLink::with_silence`]) bounds both.
+///
+/// It sets no bound on unacknowledged data (Linux's `TCP_USER_TIMEOUT`): that bound also ends a
+/// channel whose peer is alive and busy, not reading, for longer than it, which a member computing
+/// a long step is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Keepalive {
+    pub idle: Duration,
+    pub interval: Duration,
+    pub probes: u32,
+}
+
+impl Keepalive {
+    /// How long after its last sign of life a peer that went away is found gone: `idle`, and
+    /// `interval` for each probe.
+    pub fn limit(&self) -> Duration {
+        self.idle + self.interval * self.probes
+    }
+}
+
+/// The default [`Keepalive`]: probes after 10 s of quiet, every 5 s, three of them, so that a
+/// peer that went away is found within 25 s, inside most members' time to give a device back.
+pub const KEEPALIVE: Keepalive = Keepalive {
+    idle: Duration::from_secs(10),
+    interval: Duration::from_secs(5),
+    probes: 3,
+};
+
+/// Sets `keepalive` on a channel's socket, or turns it off.
+fn watch(tcp: &TcpStream, keepalive: Option<Keepalive>) -> io::Result<()> {
+    let sock = socket2::SockRef::from(tcp);
+    let Some(k) = keepalive else {
+        return sock.set_keepalive(false);
+    };
+    let params = socket2::TcpKeepalive::new().with_time(k.idle);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    ))]
+    let params = params.with_interval(k.interval).with_retries(k.probes);
+    sock.set_tcp_keepalive(&params)
+}
+
+/// A socket whose opening must end by `deadline`, watched by `keepalive`.
+fn prepare(
+    tcp: TcpStream,
+    deadline: Instant,
+    keepalive: Option<Keepalive>,
+) -> Result<Sock, LinkError> {
+    tcp.set_nodelay(true)?;
+    watch(&tcp, keepalive)?;
+    Ok(Sock { tcp, deadline })
 }
 
 /// The serial of the certificate the other end presented, once the handshake has checked it.
@@ -447,6 +556,8 @@ pub struct TlsLink {
     server: Arc<ServerConfig>,
     listener: Option<TcpListener>,
     opening: Duration,
+    keepalive: Option<Keepalive>,
+    silence: Option<Duration>,
     rates: Arc<Mutex<BTreeMap<String, Rate>>>,
 }
 
@@ -459,14 +570,35 @@ impl TlsLink {
             credentials,
             listener: None,
             opening: OPENING,
+            keepalive: Some(KEEPALIVE),
+            silence: None,
             rates: Arc::default(),
         })
     }
 
-    /// The same end, giving each channel `opening` to open, its handshake and its opening words
-    /// together, before it is given up; [`OPENING`] unless set.
+    /// The same end, giving each channel `opening` to open, before it is given up: dialling, the
+    /// handshake and the opening words together. [`OPENING`] unless set.
     pub fn with_opening(mut self, opening: Duration) -> TlsLink {
         self.opening = opening;
+        self
+    }
+
+    /// The same end, watching each channel's socket with `keepalive`, or with none.
+    /// [`KEEPALIVE`] unless set.
+    pub fn with_keepalive(mut self, keepalive: Option<Keepalive>) -> TlsLink {
+        self.keepalive = keepalive;
+        self
+    }
+
+    /// The same end, giving up a channel on which nothing has come for `silence` while this end
+    /// waits to receive: [`LinkError::Silent`], and the channel ended both ways, so that a send
+    /// waiting on the same peer ends too. None unless set, and a limit of zero is none.
+    ///
+    /// None is the default because the link cannot tell a quiet channel from a stopped peer: a
+    /// job may wait, or take long over a step, while its channels carry nothing. A member that
+    /// knows how often a channel's words come sets a limit above that.
+    pub fn with_silence(mut self, silence: Option<Duration>) -> TlsLink {
+        self.silence = silence.filter(|s| !s.is_zero());
         self
     }
 
@@ -490,15 +622,47 @@ impl TlsLink {
         &self.credentials
     }
 
-    fn channel(&self, stream: Stream, peer: Identity, job: String) -> TlsChannel {
-        TlsChannel {
-            stream,
+    /// The channel is open: the opening's deadline is dropped, the silence allowed is set, and
+    /// the stream is divided into the channel's two halves.
+    fn opened(&self, stream: Stream, peer: Identity, job: String) -> Result<TlsChannel, LinkError> {
+        let (tls, tcp) = stream.into_parts();
+        tcp.set_read_timeout(self.silence)?;
+        tcp.set_write_timeout(None)?;
+        let receiving = tcp.try_clone()?;
+        let shared = Arc::new(Shared {
+            tls: Mutex::new(tls),
+            silence: self.silence,
+            silent: AtomicBool::new(false),
+        });
+        let end = End {
             peer,
             job,
-            left: 0,
-            rate: Rate::default(),
             rates: self.rates.clone(),
-        }
+        };
+        Ok(TlsChannel {
+            receiver: TlsReceiver {
+                inbound: Inbound {
+                    shared: shared.clone(),
+                    tcp: receiving,
+                    buf: vec![0; READ].into_boxed_slice(),
+                    start: 0,
+                    end: 0,
+                },
+                end: end.clone(),
+                left: 0,
+                received: Measure::default(),
+            },
+            sender: TlsSender {
+                outbound: Outbound {
+                    shared,
+                    tcp,
+                    records: Vec::new(),
+                    closed: false,
+                },
+                end,
+                sent: Measure::default(),
+            },
+        })
     }
 }
 
@@ -509,7 +673,8 @@ impl Link for TlsLink {
         check_name(member)?;
         let name =
             ServerName::try_from(member.to_string()).map_err(|_| LinkError::Name(member.into()))?;
-        let sock = prepare(TcpStream::connect(address)?, self.opening)?;
+        let deadline = Instant::now() + self.opening;
+        let sock = prepare(dial(address, deadline)?, deadline, self.keepalive)?;
         let conn = ClientConnection::new(self.client.clone(), name).map_err(LinkError::Tls)?;
         let mut stream = Stream::Dialled(StreamOwned::new(conn, sock));
         // The other end's certificate is checked here, its name with it. This end's is checked
@@ -521,8 +686,7 @@ impl Link for TlsLink {
             serial: serial(&stream)?,
         };
         frame::open_as_dialler(&mut stream, job, mag_by::WIRE_VERSION)?;
-        opened(&mut stream)?;
-        Ok(self.channel(stream, peer, job.into()))
+        self.opened(stream, peer, job.into())
     }
 
     fn accept(&self, expected: &[&str]) -> Result<TlsChannel, LinkError> {
@@ -535,8 +699,8 @@ impl Link for TlsLink {
                 "this end was bound to no address, and only dials",
             ))
         })?;
-        let (sock, _) = listener.accept()?;
-        let sock = prepare(sock, self.opening)?;
+        let (tcp, _) = listener.accept()?;
+        let sock = prepare(tcp, Instant::now() + self.opening, self.keepalive)?;
         let conn = ServerConnection::new(self.server.clone()).map_err(LinkError::Tls)?;
         let mut stream = Stream::Answered(StreamOwned::new(conn, sock));
         stream.handshake()?;
@@ -555,8 +719,7 @@ impl Link for TlsLink {
             serial: serial(&stream)?,
         };
         let job = frame::open_as_acceptor(&mut stream, mag_by::WIRE_VERSION)?;
-        opened(&mut stream)?;
-        Ok(self.channel(stream, peer, job))
+        self.opened(stream, peer, job)
     }
 
     fn rate(&self, member: &str) -> Option<Rate> {
@@ -564,67 +727,440 @@ impl Link for TlsLink {
     }
 }
 
-/// One job's channel to another member, over its own TCP connection and TLS session.
+/// What the two halves of an open channel share: its TLS session, locked only while records
+/// are made or read, and never while either half waits on the socket. So the sending half never
+/// waits for its own end to receive, nor the receiving half for it to send.
 ///
-/// Dropped without [`Channel::close`], it ends without telling the other end, which then
-/// finds it [`LinkError::Truncated`].
-pub struct TlsChannel {
-    stream: Stream,
-    peer: Identity,
-    job: String,
-    /// Bytes of the last body received not yet read.
-    left: u64,
-    rate: Rate,
-    rates: Arc<Mutex<BTreeMap<String, Rate>>>,
+/// Only the sending half writes to the socket. What the session must say on the receiving
+/// half's account (TLS 1.3's answer to a key update) waits in it for the next send, as TLS 1.3
+/// allows.
+struct Shared {
+    tls: Mutex<rustls::Connection>,
+    silence: Option<Duration>,
+    /// Set when the receiving half found the other end silent, and ended the channel.
+    silent: AtomicBool,
 }
 
-impl TlsChannel {
-    fn count(&mut self, sent: bool, m: crate::Measure) {
-        let mut all = self.rates.lock().unwrap_or_else(|p| p.into_inner());
-        let link = all.entry(self.peer.member.clone()).or_default();
-        for rate in [&mut self.rate, link] {
-            let measure = if sent {
-                &mut rate.sent
-            } else {
-                &mut rate.received
-            };
-            measure.add(m.bytes, m.seconds);
+impl Shared {
+    fn tls(&self) -> MutexGuard<'_, rustls::Connection> {
+        self.tls.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A failure on the open channel, as either half reports it.
+    fn failed(&self, e: LinkError) -> LinkError {
+        if let Some(after) = self.silence
+            && self.silent.load(Ordering::SeqCst)
+        {
+            return LinkError::Silent { after };
+        }
+        match e {
+            LinkError::Io(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                LinkError::Lost(e)
+            }
+            e => e,
         }
     }
 }
 
-impl Channel for TlsChannel {
-    fn peer(&self) -> &Identity {
-        &self.peer
-    }
+/// Plaintext made into records at a time: rustls's own limit on what it holds to send.
+const RECORDS: usize = 64 << 10;
 
-    fn job(&self) -> &str {
-        &self.job
-    }
+/// Bytes read from the socket at a time, before the session takes them.
+const READ: usize = 64 << 10;
 
-    fn send(&mut self, header: &[u8], body: &[u8]) -> Result<(), LinkError> {
-        let m = frame::write(&mut self.stream, header, body)?;
-        self.count(true, m);
+/// The channel's way out: the socket written by the sending half alone.
+struct Outbound {
+    shared: Arc<Shared>,
+    tcp: TcpStream,
+    /// Records made and not yet written; reused.
+    records: Vec<u8>,
+    closed: bool,
+}
+
+impl Outbound {
+    /// Takes every record the session holds to send.
+    fn take_records(&mut self, tls: &mut rustls::Connection) -> io::Result<()> {
+        self.records.clear();
+        while tls.wants_write() {
+            tls.write_tls(&mut self.records)?;
+        }
         Ok(())
     }
 
+    fn close(&mut self) -> io::Result<()> {
+        self.closed = true;
+        {
+            let shared = self.shared.clone();
+            let mut tls = shared.tls();
+            tls.send_close_notify();
+            self.take_records(&mut tls)?;
+        }
+        self.tcp.write_all(&self.records)?;
+        self.tcp.shutdown(Shutdown::Write)
+    }
+}
+
+impl Write for Outbound {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let taken = {
+            let shared = self.shared.clone();
+            let mut tls = shared.tls();
+            let taken = tls.writer().write(&buf[..buf.len().min(RECORDS)])?;
+            self.take_records(&mut tls)?;
+            taken
+        };
+        // The socket may wait here for the other end to read, with the session unlocked: this
+        // end's receiving half goes on reading meanwhile.
+        self.tcp.write_all(&self.records)?;
+        Ok(taken)
+    }
+
+    /// Each write has written its records already.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for Outbound {
+    /// A sending half dropped unclosed ends its way of the channel without telling the other
+    /// end, which finds it cut short, even while the receiving half lives on.
+    fn drop(&mut self) {
+        if !self.closed {
+            let _ = self.tcp.shutdown(Shutdown::Write);
+        }
+    }
+}
+
+/// The channel's way in: the socket read by the receiving half alone.
+struct Inbound {
+    shared: Arc<Shared>,
+    tcp: TcpStream,
+    /// Bytes read from the socket, `start..end` of them not yet given to the session.
+    buf: Box<[u8]>,
+    start: usize,
+    end: usize,
+}
+
+impl Inbound {
+    /// Whether a failed read is the silence allowed running out.
+    fn silence(&self, e: &io::Error, waited: Instant) -> bool {
+        let Some(limit) = self.shared.silence else {
+            return false;
+        };
+        match e.kind() {
+            io::ErrorKind::WouldBlock => true,
+            // Some systems report the socket's timeout so; keepalive reports a peer gone so too.
+            io::ErrorKind::TimedOut => waited.elapsed() >= limit,
+            _ => false,
+        }
+    }
+}
+
+impl Read for Inbound {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            {
+                let mut tls = self.shared.tls();
+                match tls.reader().read(out) {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    done => return done,
+                }
+                if self.start < self.end {
+                    let taken = tls.read_tls(&mut &self.buf[self.start..self.end])?;
+                    if taken == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "the TLS session took no more bytes",
+                        ));
+                    }
+                    self.start += taken;
+                    tls.process_new_packets()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    continue;
+                }
+            }
+            // Nothing is left to decrypt: wait on the socket with the session unlocked, so that
+            // this end's sending half goes on sending meanwhile.
+            let waited = Instant::now();
+            match self.tcp.read(&mut self.buf) {
+                Ok(read) => {
+                    (self.start, self.end) = (0, read);
+                    if read == 0 {
+                        // The socket ended. The session is told, and the reader then says
+                        // whether the other end closed the channel first.
+                        self.shared.tls().read_tls(&mut io::empty())?;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if self.silence(&e, waited) => {
+                    self.shared.silent.store(true, Ordering::SeqCst);
+                    let _ = self.tcp.shutdown(Shutdown::Both);
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// Who a half's channel is with and what it is for, and the link's rates by member.
+#[derive(Clone)]
+struct End {
+    peer: Identity,
+    job: String,
+    rates: Arc<Mutex<BTreeMap<String, Rate>>>,
+}
+
+impl End {
+    fn count(&self, sent: bool, m: Measure) {
+        let mut all = self.rates.lock().unwrap_or_else(|p| p.into_inner());
+        let rate = all.entry(self.peer.member.clone()).or_default();
+        let measure = if sent {
+            &mut rate.sent
+        } else {
+            &mut rate.received
+        };
+        measure.add(m.bytes, m.seconds);
+    }
+}
+
+/// One job's channel to another member, over its own TCP connection and TLS session: its
+/// sending half and its receiving half, used together by one thread, or split for two.
+///
+/// Dropped without [`Sender::close`], it ends without telling the other end, which then finds
+/// it [`LinkError::Truncated`].
+pub struct TlsChannel {
+    sender: TlsSender,
+    receiver: TlsReceiver,
+}
+
+/// The sending half of a [`TlsChannel`].
+pub struct TlsSender {
+    outbound: Outbound,
+    end: End,
+    sent: Measure,
+}
+
+/// The receiving half of a [`TlsChannel`].
+pub struct TlsReceiver {
+    inbound: Inbound,
+    end: End,
+    /// Bytes of the last body received not yet read.
+    left: u64,
+    received: Measure,
+}
+
+impl ChannelEnd for TlsSender {
+    fn peer(&self) -> &Identity {
+        &self.end.peer
+    }
+
+    fn job(&self) -> &str {
+        &self.end.job
+    }
+
+    fn rate(&self) -> Rate {
+        Rate {
+            sent: self.sent,
+            received: Measure::default(),
+        }
+    }
+}
+
+impl Sender for TlsSender {
+    fn send(&mut self, header: &[u8], body: &[u8]) -> Result<(), LinkError> {
+        let m = frame::write(&mut self.outbound, header, body)
+            .map_err(|e| self.outbound.shared.failed(e))?;
+        self.sent.add(m.bytes, m.seconds);
+        self.end.count(true, m);
+        Ok(())
+    }
+
+    fn close(mut self) -> Result<(), LinkError> {
+        self.outbound
+            .close()
+            .map_err(|e| self.outbound.shared.failed(e.into()))
+    }
+}
+
+impl ChannelEnd for TlsReceiver {
+    fn peer(&self) -> &Identity {
+        &self.end.peer
+    }
+
+    fn job(&self) -> &str {
+        &self.end.job
+    }
+
+    fn rate(&self) -> Rate {
+        Rate {
+            sent: Measure::default(),
+            received: self.received,
+        }
+    }
+}
+
+impl Receiver for TlsReceiver {
     fn recv(&mut self) -> Result<Incoming, LinkError> {
-        let incoming = frame::read(&mut self.stream, self.left)?;
+        let incoming =
+            frame::read(&mut self.inbound, self.left).map_err(|e| self.inbound.shared.failed(e))?;
         self.left = incoming.body;
         Ok(incoming)
     }
 
     fn read_body(&mut self, into: &mut [u8]) -> Result<(), LinkError> {
-        let m = frame::read_body(&mut self.stream, &mut self.left, into)?;
-        self.count(false, m);
+        let m = frame::read_body(&mut self.inbound, &mut self.left, into)
+            .map_err(|e| self.inbound.shared.failed(e))?;
+        self.received.add(m.bytes, m.seconds);
+        self.end.count(false, m);
         Ok(())
+    }
+}
+
+impl ChannelEnd for TlsChannel {
+    fn peer(&self) -> &Identity {
+        self.sender.peer()
+    }
+
+    fn job(&self) -> &str {
+        self.sender.job()
     }
 
     fn rate(&self) -> Rate {
-        self.rate
+        Rate {
+            sent: self.sender.sent,
+            received: self.receiver.received,
+        }
+    }
+}
+
+impl Sender for TlsChannel {
+    fn send(&mut self, header: &[u8], body: &[u8]) -> Result<(), LinkError> {
+        self.sender.send(header, body)
     }
 
-    fn close(mut self) -> Result<(), LinkError> {
-        self.stream.close()
+    fn close(self) -> Result<(), LinkError> {
+        self.sender.close()
+    }
+}
+
+impl Receiver for TlsChannel {
+    fn recv(&mut self) -> Result<Incoming, LinkError> {
+        self.receiver.recv()
+    }
+
+    fn read_body(&mut self, into: &mut [u8]) -> Result<(), LinkError> {
+        self.receiver.read_body(into)
+    }
+}
+
+impl Channel for TlsChannel {
+    type SendHalf = TlsSender;
+    type ReceiveHalf = TlsReceiver;
+
+    fn split(self) -> (TlsSender, TlsReceiver) {
+        (self.sender, self.receiver)
+    }
+}
+
+#[cfg(all(test, feature = "issue"))]
+mod tests {
+    use std::net::TcpListener;
+    use std::thread;
+
+    use super::*;
+    use crate::issue::Authority;
+
+    fn credentials(pool: &Authority, member: &str) -> Credentials {
+        let issued = pool.issue(member, 1).unwrap();
+        Credentials::from_pem(member, pool.certificate(), &issued.certificate, &issued.key).unwrap()
+    }
+
+    /// A channel's two ends, the server's and the laptop's, each link given `setting`.
+    fn ends(
+        setting: impl Fn(TlsLink) -> TlsLink + Clone + Send + 'static,
+    ) -> (TlsChannel, TlsChannel) {
+        let pool = Authority::new(1).unwrap();
+        let server = setting(TlsLink::bind(credentials(&pool, "server"), "127.0.0.1:0").unwrap());
+        let laptop = setting(TlsLink::new(credentials(&pool, "laptop")).unwrap());
+        let at = server.local_addr().unwrap().to_string();
+        let dialling = thread::spawn(move || laptop.open("server", &at, "j").unwrap());
+        let accepted = server.accept(&["laptop"]).unwrap();
+        (accepted, dialling.join().unwrap())
+    }
+
+    /// The keepalive each of a channel's two sockets is watched by.
+    fn watched(channel: &TlsChannel) -> [Option<Keepalive>; 2] {
+        [&channel.sender.outbound.tcp, &channel.receiver.inbound.tcp].map(|tcp| {
+            let sock = socket2::SockRef::from(tcp);
+            sock.keepalive().unwrap().then(|| Keepalive {
+                idle: sock.tcp_keepalive_time().unwrap(),
+                interval: sock.tcp_keepalive_interval().unwrap(),
+                probes: sock.tcp_keepalive_retries().unwrap(),
+            })
+        })
+    }
+
+    #[test]
+    fn both_ends_of_a_channel_are_watched_by_keepalive_as_set() {
+        let (answered, dialled) = ends(|link| link);
+        assert_eq!(watched(&answered), [Some(KEEPALIVE); 2]);
+        assert_eq!(watched(&dialled), [Some(KEEPALIVE); 2]);
+        assert_eq!(KEEPALIVE.limit(), Duration::from_secs(25));
+
+        let other = Keepalive {
+            idle: Duration::from_secs(7),
+            interval: Duration::from_secs(3),
+            probes: 4,
+        };
+        let (answered, dialled) = ends(move |link| link.with_keepalive(Some(other)));
+        assert_eq!(watched(&answered), [Some(other); 2]);
+        assert_eq!(watched(&dialled), [Some(other); 2]);
+
+        let (answered, dialled) = ends(|link| link.with_keepalive(None));
+        assert_eq!(watched(&answered), [None; 2]);
+        assert_eq!(watched(&dialled), [None; 2]);
+    }
+
+    #[test]
+    fn dialling_tries_each_address_in_turn_while_time_is_left() {
+        let listening = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = listening.local_addr().unwrap();
+        // A port nothing listens on: refused at once.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let soon = || Instant::now() + Duration::from_secs(5);
+        let tcp = connect_any("both", [closed, at], soon()).unwrap();
+        assert_eq!(tcp.peer_addr().unwrap(), at);
+        // The last refusal is what is reported when none answers, and no address at all is
+        // said so.
+        let refused = connect_any("closed", [closed], soon()).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+        let none = connect_any("nowhere", [], soon()).unwrap_err();
+        assert_eq!(none.kind(), io::ErrorKind::InvalidInput);
+        // With no time left, nothing is tried.
+        let late = connect_any("both", [at], Instant::now()).unwrap_err();
+        assert_eq!(late.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn addresses_that_drop_packets_share_one_deadline_between_them() {
+        // Two addresses of the documentation range, which most networks drop: the second is
+        // given what the first left, not a deadline of its own.
+        let dropped = ["192.0.2.1:7340", "192.0.2.2:7340"].map(|a| a.parse().unwrap());
+        let started = Instant::now();
+        let failed = connect_any("two", dropped, started + Duration::from_millis(300)).unwrap_err();
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(500), "{took:?}: {failed}");
     }
 }

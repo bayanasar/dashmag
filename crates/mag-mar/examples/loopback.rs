@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use mag_by::{Dtype, Tensor};
 use mag_mar::issue::Authority;
-use mag_mar::{Channel, Credentials, Link, TlsLink};
+use mag_mar::{ChannelEnd, Credentials, Link, Receiver, Sender, TlsLink};
 
 /// A value of `/proc/self/status`, in kibibytes.
 fn status_kib(field: &str) -> Option<u64> {
