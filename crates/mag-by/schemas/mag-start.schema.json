@@ -397,7 +397,7 @@
       "type": "string"
     },
     "coordinator": {
-      "description": "The member that coordinates: this one, or one of the peers.",
+      "description": "The member that coordinates: this one, with a `listen` address, or one of the peers,\nwith an address to dial it at.",
       "type": "string"
     },
     "door": {
@@ -418,6 +418,10 @@
     },
     "ledger": {
       "description": "Where the coordinator writes the ledger: a path.",
+      "type": "string"
+    },
+    "listen": {
+      "description": "Where this member answers other members, as `host:port`, such as `0.0.0.0:7340`: the\naddress it binds, which the others' start files give as its peer's address. Left out, it\nonly dials, as a machine behind address translation does; a coordinator needs one, since\nevery member dials it.",
       "type": "string"
     },
     "member": {

@@ -2,6 +2,7 @@
   "format": "mag-start",
   "version": 1,
   "member": "server",
+  "listen": "0.0.0.0:7340",
   "pool": {
     "at": 0.0,
     "members": [

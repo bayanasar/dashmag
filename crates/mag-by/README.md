@@ -56,20 +56,27 @@ the files kept in [`tests/v1`](tests/v1) show:
   acknowledged, and is dropped and reported; a line cut short before it is refused. Every float
   reads back to its bits. A ledger of version 1 is written again whole before it is appended to.
 - `Start::from_json` and `Start::to_json`: the start file (`"mag-start"`, version 1), which the
-  environment variable `MAG_START` names: this member's name, the pool's description, the pool's
-  authority certificate, the peers with an address where they have one, the coordinator, where
+  environment variable `MAG_START` names: this member's name, where it answers other members
+  (left out for a member that only dials), the pool's description, the pool's authority
+  certificate, the peers with an address where they have one, the coordinator, where
   the ledger goes, the door's local address, the idle time after which the pool offers a member
   back, and the paths of this member's certificate and private key files. The key itself is
   never in it. Each pool has its own certificate authority, held by the host, which signs every
   member's certificate and names the member in it; a link is taken only from a certificate the
   authority signed that names the member expected, so a member that joins later proves itself
-  by its certificate. [`starts/example.json`](starts/example.json) is one; `mag-mar`'s `certs`
-  command makes an authority and its members' certificates.
+  by its certificate. A coordinator that is a peer must have an address, and one that is this
+  member a `listen` address, since every member dials it.
+  [`starts/example.json`](starts/example.json) is one; `mag-mar`'s `certs` command makes an
+  authority and its members' certificates.
 - `is_member_name`: a member's name is a DNS name in lower case, the last label not all digits,
   since its certificate carries it as one. The pool file and the start file refuse any other.
 - The words of a link between two members, at `WIRE_VERSION` 1: `Open`, which each end says
   once on a channel for one job, and `Tensor`, the value of one edge at one step, whose bytes
-  follow it on the channel. With the `graph` feature they are JSON, as the files' words are.
+  follow it on the channel. A member's control channel to the coordinator is opened for no job,
+  `CONTROL`, the empty name, which no job may have; on it the member says `Control::Join`, with
+  itself as its start file describes it and its devices' offers, when its lease begins, and
+  `Control::Leave` when it ends. With the `graph` feature they are JSON, as the files' words
+  are.
 
 To print a graph file's DOT, or why the file is refused:
 

@@ -186,6 +186,11 @@ pub enum StartFileError {
     Peer { name: String },
     /// The coordinator is another member, but no peer: this member could not reach it.
     CoordinatorNotPeer { name: String },
+    /// The coordinator is a peer with no address: this member could not dial it, and the
+    /// coordinator, which is told nothing of a member until it joins, would not dial this one.
+    CoordinatorNoAddress { name: String },
+    /// This member coordinates but has no `listen` address: no member could join it.
+    CoordinatorDialsOnly,
     /// `idle_seconds` is not finite, or is below 0.
     IdleSeconds,
 }
@@ -226,6 +231,14 @@ impl fmt::Display for StartFileError {
                 f,
                 "the coordinator `{name}` is another member but not a peer, so it cannot be \
                  reached"
+            ),
+            StartFileError::CoordinatorNoAddress { name } => write!(
+                f,
+                "the coordinator `{name}` is a peer with no address, so it cannot be dialled"
+            ),
+            StartFileError::CoordinatorDialsOnly => write!(
+                f,
+                "this member coordinates but has no `listen` address, so no member could join it"
             ),
             StartFileError::IdleSeconds => {
                 write!(f, "`idle_seconds` must be finite and not below 0")
@@ -380,8 +393,10 @@ impl Start {
     /// Reads a start file. Besides what every file's reader refuses, it refuses a pool that lists
     /// a member twice, offers a device twice or names a member as a certificate could not; a
     /// `member`, `coordinator` or peer that names no member of the pool; a peer that is this
-    /// member or is listed twice; a coordinator that is another member but no peer, since this
-    /// member could not reach it; and an `idle_seconds` that is not finite or is below 0.
+    /// member or is listed twice; a coordinator that is another member but no peer, or a peer
+    /// with no address, since this member could not reach it; this member coordinating with no
+    /// `listen` address, since no member could join it; and an `idle_seconds` that is not finite
+    /// or is below 0.
     pub fn from_json(text: &str) -> Result<Start, StartFileError> {
         let (value, _) = read(text, START_FORMAT, START_VERSION).map_err(|bad| match bad {
             Bad::Json(e) => StartFileError::Json(e),
@@ -411,10 +426,24 @@ impl Start {
                 });
             }
         }
-        if s.coordinator != s.member && !s.peers.iter().any(|p| p.member == s.coordinator) {
-            return Err(StartFileError::CoordinatorNotPeer {
-                name: s.coordinator.clone(),
-            });
+        if s.coordinator == s.member {
+            if s.listen.is_none() {
+                return Err(StartFileError::CoordinatorDialsOnly);
+            }
+        } else {
+            match s.peers.iter().find(|p| p.member == s.coordinator) {
+                None => {
+                    return Err(StartFileError::CoordinatorNotPeer {
+                        name: s.coordinator.clone(),
+                    });
+                }
+                Some(p) if p.address.is_none() => {
+                    return Err(StartFileError::CoordinatorNoAddress {
+                        name: s.coordinator.clone(),
+                    });
+                }
+                Some(_) => {}
+            }
         }
         if !(s.idle_seconds.is_finite() && s.idle_seconds >= 0.0) {
             return Err(StartFileError::IdleSeconds);

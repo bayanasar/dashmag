@@ -190,6 +190,19 @@ pub struct Asks {
 pub struct Start {
     /// This process's member, by its name in the pool.
     pub member: String,
+    /// Where this member answers other members, as `host:port`, such as `0.0.0.0:7340`: the
+    /// address it binds, which the others' start files give as its peer's address. Left out, it
+    /// only dials, as a machine behind address translation does; a coordinator needs one, since
+    /// every member dials it.
+    #[cfg_attr(
+        feature = "graph",
+        serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )
+    )]
+    pub listen: Option<String>,
     /// The pool as the host describes it, as a pool file does: its members, each with its trust
     /// and its time to give a device back, and any offers the host knows.
     pub pool: Description,
@@ -198,7 +211,8 @@ pub struct Start {
     pub authority: String,
     /// The other members this one knows, each with an address where it has one.
     pub peers: Vec<Peer>,
-    /// The member that coordinates: this one, or one of the peers.
+    /// The member that coordinates: this one, with a `listen` address, or one of the peers,
+    /// with an address to dial it at.
     pub coordinator: String,
     /// Where the coordinator writes the ledger: a path.
     pub ledger: String,

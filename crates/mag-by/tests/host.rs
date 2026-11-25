@@ -122,6 +122,7 @@ fn changed(change: impl FnOnce(&mut Value)) -> String {
 fn the_example_start_file_reads_and_writes_back_byte_for_byte() {
     let s = Start::from_json(EXAMPLE).unwrap();
     assert_eq!(s.member, "server");
+    assert_eq!(s.listen.as_deref(), Some("0.0.0.0:7340"));
     assert_eq!(s.coordinator, "workstation");
     assert_eq!(s.pool.members.len(), 4);
     assert_eq!(s.pool.members[3].trust, Trust::Outside);
@@ -133,6 +134,17 @@ fn the_example_start_file_reads_and_writes_back_byte_for_byte() {
     assert_eq!(s.certificate_file, "/etc/mag/server.pem");
     assert_eq!(s.key_file, "/etc/mag/server.key");
     assert_eq!(s.to_json(), EXAMPLE);
+}
+
+#[test]
+fn a_start_file_without_a_listen_address_only_dials_and_writes_none_back() {
+    let dials = changed(|v| {
+        v.as_object_mut().unwrap().remove("listen");
+    });
+    let s = Start::from_json(&dials).unwrap();
+    assert_eq!(s.listen, None);
+    assert!(!s.to_json().contains("listen"));
+    assert_eq!(Start::from_json(&s.to_json()).unwrap(), s);
 }
 
 #[test]
@@ -151,6 +163,8 @@ fn a_start_file_is_refused_for_its_form_as_every_file_is() {
     for bad in [
         changed(|v| v["private_key"] = "secret".into()),
         changed(|v| v["peers"][0]["address"] = Value::Null),
+        changed(|v| v["listen"] = Value::Null),
+        changed(|v| v["listen"] = 7340.into()),
         changed(|v| {
             v.as_object_mut().unwrap().remove("key_file");
         }),
@@ -180,7 +194,7 @@ fn a_start_file_is_refused_for_its_form_as_every_file_is() {
 
 #[test]
 fn a_start_file_that_does_not_hold_together_is_refused() {
-    let cases: [(String, &str); 9] = [
+    let cases: [(String, &str); 11] = [
         (
             changed(|v| v["member"] = "nobody".into()),
             "`member` names `nobody`, which is no member of the pool",
@@ -209,6 +223,19 @@ fn a_start_file_that_does_not_hold_together_is_refused() {
              reached",
         ),
         (
+            changed(|v| {
+                v["peers"][0].as_object_mut().unwrap().remove("address");
+            }),
+            "the coordinator `workstation` is a peer with no address, so it cannot be dialled",
+        ),
+        (
+            changed(|v| {
+                v["coordinator"] = "server".into();
+                v.as_object_mut().unwrap().remove("listen");
+            }),
+            "this member coordinates but has no `listen` address, so no member could join it",
+        ),
+        (
             changed(|v| v["idle_seconds"] = (-1.0).into()),
             "`idle_seconds` must be finite and not below 0",
         ),
@@ -229,7 +256,9 @@ fn a_start_file_that_does_not_hold_together_is_refused() {
         let err = Start::from_json(&text).unwrap_err();
         assert_eq!(err.to_string(), reason);
     }
-    // The coordinator may be this member, with no peer for it; and an idle time of 0 is taken.
+    // The coordinator may be this member, with a `listen` address and no peer for it; another
+    // member with no address is a peer still, which dials this one; and an idle time of 0 is
+    // taken.
     let own = changed(|v| {
         v["coordinator"] = "server".into();
         v["peers"].as_array_mut().unwrap().remove(0);
@@ -265,8 +294,9 @@ fn the_schema_takes_the_example_and_refuses_what_the_reader_refuses_for_its_form
     let schema: Value = serde_json::from_str(&start_schema()).unwrap();
     let v = jsonschema::draft202012::new(&schema).expect("a valid draft 2020-12 schema");
     assert!(v.is_valid(&serde_json::from_str(EXAMPLE).unwrap()));
-    let changes: [(&str, Edit); 8] = [
+    let changes: [(&str, Edit); 9] = [
         ("another format", |v| v["format"] = "mag-pool".into()),
+        ("a null listen address", |v| v["listen"] = Value::Null),
         ("a newer version", |v| v["version"] = 2.into()),
         ("a private key", |v| v["private_key"] = "secret".into()),
         ("a null address", |v| v["peers"][0]["address"] = Value::Null),
