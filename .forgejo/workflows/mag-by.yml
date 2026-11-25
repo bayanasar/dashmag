@@ -68,6 +68,11 @@ jobs:
       - name: The link between members, and the member program
         run: cargo test --locked -p mag-mar
 
+      # Alone, outside its tests: a feature a dev-dependency turns on does not reach a build of
+      # mag-mar for a member, or for a crate that depends on it.
+      - name: mag-mar builds outside its tests
+        run: cargo build --locked -p mag-mar
+
       - name: The plan command, as the README gives it, prints the kept plan
         run: |
           cargo run --locked -q -p mag-mortar --features files --example mag -- plan \
