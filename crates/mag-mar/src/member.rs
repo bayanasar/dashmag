@@ -27,8 +27,7 @@
 //! cannot promise this, since TCP does not probe while data is unacknowledged.
 //!
 //! Not built yet: running the parts placed on it, channels to other members for their jobs,
-//! giving back with the parts' state, the coordinator's door, and joining again after the
-//! coordinator returns.
+//! giving back with the parts' state, and joining again after the coordinator returns.
 
 use std::fmt;
 use std::io;
@@ -98,6 +97,12 @@ pub enum MemberError {
     /// The coordinator could not write a line of its ledger, and stopped: the path, and why.
     /// Nothing after the last line written was acknowledged.
     LedgerUnwritten { path: String, error: io::Error },
+    /// The coordinator could not serve its door at the start file's `door`: the path, and why.
+    /// Another coordinator serving it is one reason.
+    Door {
+        path: String,
+        error: crate::door::DoorError,
+    },
 }
 
 impl fmt::Display for MemberError {
@@ -127,6 +132,9 @@ impl fmt::Display for MemberError {
                 "a line of the ledger {path} was not written ({error}): the coordinator stops, \
                  and nothing after its last line was acknowledged"
             ),
+            MemberError::Door { path, error } => {
+                write!(f, "the door {path} cannot be served: {error}")
+            }
         }
     }
 }
@@ -140,6 +148,7 @@ impl std::error::Error for MemberError {
             MemberError::Ledger { error, .. } | MemberError::LedgerUnwritten { error, .. } => {
                 Some(error)
             }
+            MemberError::Door { error, .. } => Some(error),
             _ => None,
         }
     }

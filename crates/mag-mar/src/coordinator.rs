@@ -25,15 +25,31 @@
 //!    its way of the channel. That close is the acknowledgement the member waits for, within its
 //!    `give_back_seconds`. A control channel that ends without `Leave`, the member gone, is
 //!    recorded the same way, and nothing is acknowledged.
-//! 6. **On its own notice** it records its own devices' leave the same way, and returns. Its
+//! 6. **It serves the door** ([`crate::door`]), at the start file's `door`, opened before the
+//!    ledger is begun, so that a coordinator refused its door leaves no ledger behind. A command
+//!    there submits a job with its stamp (`mag_by::Change::Submit`), ends one
+//!    (`mag_by::Change::End`), or asks the pool's status (`mag_mortar::Pool::describe`). A
+//!    submission or an end is applied to the pool, and its line written to the ledger and
+//!    synced, before it is answered; one the pool refuses is answered with why, and nothing is
+//!    written. Ending a job the pool does not hold is refused, rather than written as an end of
+//!    nothing.
+//! 7. **On its own notice** it records its own devices' leave the same way, and returns. Its
 //!    members' channels end without a close: their leave is not recorded by this coordinator.
 //!
-//! A ledger line that cannot be written stops the coordinator at once, with nothing after the
-//! last line written acknowledged.
+//! **One thread keeps the pool.** The members' channels and the door's connections are each heard
+//! on a thread of their own, and each hands what it hears to the one thread that holds the pool
+//! and the ledger, as an event, and the door's waits for its answer. So the pool takes one change
+//! at a time, in the order the events come, and the ledger's lines are written in that order,
+//! each synced before the next change is taken: a submission while members join is one more
+//! event between theirs.
 //!
-//! Not built yet: the door; taking a job's channel; announcing a member to its peers; sending
-//! placements; refusing a member's old certificate by its serial; and a coordinator that takes up
-//! the ledger of one that stopped, with its members joining again.
+//! A ledger line that cannot be written stops the coordinator at once, with nothing after the
+//! last line written acknowledged or answered.
+//!
+//! Not built yet: the pool's asks in the door's status; taking a device back by need; taking a
+//! job's channel; announcing a member to its peers; sending placements; refusing a member's old
+//! certificate by its serial; and a coordinator that takes up the ledger of one that stopped,
+//! with its members joining again.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -43,8 +59,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mag_by::{CONTROL, Change, Control, Description, DeviceId, Ledger, Member, Offer, Trust};
-use mag_mortar::Pool;
+use mag_by::{
+    CONTROL, Change, Control, Description, DeviceId, DoorAnswer, DoorRefusal, DoorRequest, Ledger,
+    Member, Offer, Record, Trust,
+};
+use mag_mortar::{ChangeError, Pool};
 
 use crate::member::{Ended, MemberError, Notice, give_back_by, say};
 use crate::{Channel, TlsSender};
@@ -220,6 +239,11 @@ enum Event {
         id: u64,
         error: LinkError,
     },
+    /// A request at the door, and where its answer goes.
+    Door {
+        request: DoorRequest,
+        reply: mpsc::Sender<DoorAnswer>,
+    },
 }
 
 /// A member's control channel, as the coordinator holds it.
@@ -310,6 +334,82 @@ impl Keeper {
                 error,
             })
     }
+
+    /// Applies one change to the pool, and if the pool takes it, writes and syncs its line: the
+    /// record of the loop's run on it, or why the pool refused it, which writes nothing. Only once
+    /// this returns may it be answered.
+    fn take(&mut self, change: Change) -> Result<Result<Record, ChangeError>, MemberError> {
+        let record = match self.pool.apply(change, now()) {
+            Ok(record) => record.clone(),
+            Err(e) => return Ok(Err(e)),
+        };
+        self.ledger
+            .write(self.pool.ledger())
+            .map_err(|error| MemberError::LedgerUnwritten {
+                path: self.ledger.path().into(),
+                error,
+            })?;
+        Ok(Ok(record))
+    }
+
+    /// The answer to a request at the door, once what it changes is in the ledger.
+    fn door(&mut self, request: DoorRequest) -> Result<DoorAnswer, MemberError> {
+        let refused = |e: ChangeError| DoorAnswer::Refused {
+            refusal: DoorRefusal::Pool {
+                reason: e.to_string(),
+            },
+        };
+        Ok(match request {
+            DoorRequest::Submit { graph, stamp } => {
+                let job = graph.job.name.clone();
+                match self.take(Change::Submit { graph, stamp })? {
+                    Ok(record) => DoorAnswer::Submitted {
+                        record,
+                        arrangement: self
+                            .pool
+                            .arrangement(&job)
+                            .expect("the pool holds a job it took")
+                            .clone(),
+                    },
+                    Err(e) => refused(e),
+                }
+            }
+            DoorRequest::End { job } if self.pool.arrangement(&job).is_none() => {
+                DoorAnswer::Refused {
+                    refusal: DoorRefusal::NoJob { job },
+                }
+            }
+            DoorRequest::End { job } => match self.take(Change::End { job })? {
+                Ok(record) => DoorAnswer::Ended { record },
+                Err(e) => refused(e),
+            },
+            DoorRequest::Status => DoorAnswer::Status {
+                pool: self.pool.describe(),
+                asks: None,
+            },
+        })
+    }
+}
+
+/// What a door's answer says, for the coordinator's own lines.
+fn told(answer: &DoorAnswer) -> String {
+    match answer {
+        DoorAnswer::Submitted { arrangement, .. } => format!(
+            "`{}` submitted, written, and {}",
+            arrangement.job,
+            if answer.placed() == Some(true) {
+                "placed"
+            } else {
+                "waits"
+            }
+        ),
+        DoorAnswer::Ended { record } => match &record.event {
+            mag_by::Event::End { job } => format!("`{job}` ended, written"),
+            other => format!("{other:?} written"),
+        },
+        DoorAnswer::Status { .. } => "status given".into(),
+        DoorAnswer::Refused { refusal } => format!("refused: {refusal}"),
+    }
 }
 
 fn describe(change: &Change) -> String {
@@ -343,6 +443,12 @@ pub(crate) fn run(
 ) -> Result<Ended, MemberError> {
     let name = me.name.clone();
     let mine: Vec<DeviceId> = offers.iter().map(|o| o.device.clone()).collect();
+    // The door first: a coordinator refused its door begins no ledger.
+    #[cfg(unix)]
+    let door = crate::door::Door::open(&start.door).map_err(|error| MemberError::Door {
+        path: start.door.clone(),
+        error,
+    })?;
     let pool = Pool::from_description(&Description {
         at: now(),
         members: vec![me],
@@ -376,6 +482,20 @@ pub(crate) fn run(
         give_back_by(notice, give_back, name.clone(), move || {
             let _ = events.send(Event::Notice);
         });
+    }
+    #[cfg(unix)]
+    {
+        let events = events_tx.clone();
+        crate::door::serve(&door, name.clone(), move |request| {
+            let (reply, answer) = mpsc::channel();
+            events.send(Event::Door { request, reply }).ok()?;
+            answer.recv().ok()
+        })
+        .map_err(|error| MemberError::Door {
+            path: start.door.clone(),
+            error: crate::door::DoorError::Io(error),
+        })?;
+        say(&name, format_args!("serves the door at {}", start.door));
     }
     take(link, name.clone(), events_tx);
 
@@ -491,6 +611,12 @@ pub(crate) fn run(
                     ),
                     None => {}
                 }
+            }
+            Event::Door { request, reply } => {
+                // Written and synced first: the answer is sent only once `door` returns.
+                let answer = keeper.door(request)?;
+                say(&name, format_args!("the door: {}", told(&answer)));
+                let _ = reply.send(answer);
             }
             Event::Ended { id, error } => {
                 let Some(m) = members.remove(&id) else {

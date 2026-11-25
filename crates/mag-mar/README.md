@@ -3,8 +3,9 @@
 The program every member of a mag pool is to run. So far it is the link between members, and
 the program's skeleton: it reads `MAG_START`, joins the pool at the coordinator, and gives its
 devices back on SIGTERM within its time. On the member that coordinates, it takes the members'
-joins and leaves into the pool and writes the pool's ledger. Running the parts placed on a
-member, and the coordinator's door, are not built yet.
+joins and leaves into the pool and writes the pool's ledger, and serves the door, where a command
+run on its machine submits a job, ends one or asks the pool's status. Running the parts placed on
+a member is not built yet.
 
 ## The member program
 
@@ -34,8 +35,9 @@ start file (`mag-by`'s `Start`):
   does not probe while data is unacknowledged.
 - **What it does goes to standard error**, a line at a time. It exits 2 when it cannot start:
   `MAG_START` unset, a start file that cannot be read or is refused, credentials refused, an
-  address it cannot bind, or, as coordinator, a ledger it cannot begin. It exits 3 when, as
-  coordinator, it could not write a line of its ledger.
+  address it cannot bind, an argument it does not take, or, as coordinator, a door another
+  coordinator serves or a ledger it cannot begin. It exits 3 when, as coordinator, it could not
+  write a line of its ledger.
 
 The library entry is `mag_mar::member::run`; the binary takes SIGTERM as its notice
 (`member::Notice::sigterm`, on Unix), reads the start file and calls it.
@@ -73,9 +75,19 @@ program (`mag_mar::coordinator`):
   `give_back_seconds`.
 - **A member gone without leaving is recorded as left.** Its control channel ended without
   `Leave`: the member died, or its machine went away, and the coordinator can place nothing there.
-- **On its own notice**, SIGTERM, it records its own devices' leave the same way and exits 0.
+- **It serves the door** (below), opened before the ledger is begun, so that a coordinator
+  refused its door leaves no ledger behind.
+- **On its own notice**, SIGTERM, it records its own devices' leave the same way, closes its
+  door and exits 0.
 - **A ledger line that cannot be written stops it**, with exit status 3. Nothing after the last
-  line written was acknowledged, and the members find their channels cut short.
+  line written was acknowledged or answered, and the members find their channels cut short.
+- **One thread keeps the pool.** Each member's channel and each connection at the door is heard
+  on a thread of its own, and hands what it hears to the one thread that holds the `Pool` and
+  the ledger, as an event; the door's connection waits for its answer. So the pool takes one
+  change at a time, in the order the events come, and each line is written and synced before
+  the next change is taken: a submission while members join is one more event between their
+  joins. The coordinator already took its members' words this way, and a lock around the pool
+  would add nothing but a lock held through every sync of the ledger.
 
 **Not settled: the trust of a member that joins later.** A member the coordinator's start file
 does not list is known only by its own join, and a machine holding a certificate the host meant
@@ -83,6 +95,57 @@ for `outside` could say `owner`. Either the host writes the trust into the certi
 and the coordinator believes nothing the member says, or such a member is trusted at `outside`.
 Until that is settled, the coordinator takes the second, which cannot place data where it should
 not go. `coordinator::recorded_member` is the one place either answer changes.
+
+## The door
+
+The coordinator serves the door, a Unix socket at its start file's `door`. A command run on its
+machine, with the coordinator's start file, asks the pool there:
+
+    MAG_START=workstation.json mag-mar door status
+    MAG_START=workstation.json mag-mar door submit GRAPH.json [--stamp STAMP.json]
+    MAG_START=workstation.json mag-mar door end JOB
+
+- **Only the coordinator's user can reach it.** The socket has mode 0600. It is bound in a new
+  directory of mode 0700 beside the door's path (the path and `.new`), made 0600 there, and only
+  then renamed to the door's path, so no one else can reach it at any moment. On its notice, the
+  coordinator removes it.
+- **One coordinator at a door.** While it serves the door, a coordinator holds a lock on the
+  door's path and `.lock`, a file beside it that is never removed. A second coordinator is
+  refused, with exit status 2 and before it begins a ledger, when that lock is held or a socket
+  at the path answers. A socket there that no one answers, as a coordinator killed leaves it, is
+  replaced. Anything else at the path is refused and left as it is: it is not a door.
+- **The words are `mag-by`'s.** The command writes one `DoorRequest` as a line of JSON, and the
+  coordinator answers with one `DoorAnswer` as a line of JSON, and closes.
+  - **`submit`** sends the graph file's graph, with the stamp in the stamp file, a `Stamp` as
+    JSON such as `{"by": "ops", "priority_ceiling": 2}`. With no stamp file, the stamp bounds
+    nothing. The coordinator applies `Change::Submit` to the pool, writes its line to the ledger
+    and syncs it, and only then answers, with the loop's record and where each part is, on a
+    device or waiting.
+  - **`end`** ends a job by its name: `Change::End`, written and synced before it is answered,
+    with the loop's record. A job the pool does not hold is refused, rather than written as the
+    end of nothing.
+  - **`status`** answers `Pool::describe`: the pool as one virtual device, its members, each
+    device's offer, and its jobs, where each is, its priority as held to its stamp's ceiling and
+    how long each waiting one has waited. The pool's asks, the kind of device it most wants and
+    the members it would give back, have their place in the answer (`asks`), and are left out:
+    they are not built.
+  - A change the pool refuses, such as a graph that fails its check, a stamp with a ceiling of
+    0, or a second job of one name, is answered with why, and nothing is written.
+- **The command prints the answer** as JSON on standard output, and a line for a person on
+  standard error. Its exit status: 0 answered (the job placed, the job ended, the status given);
+  2 it could not ask (its arguments, `MAG_START`, the start file, a graph or stamp file refused);
+  3 the job is submitted, in the ledger, and waits; 4 the door refused the request, and nothing
+  was written; 5 no coordinator answered.
+- **With no coordinator at the door, the command fails at once**: nothing at the path, or a
+  socket no one answers. A coordinator that stops before it answers, as on a ledger line it
+  cannot write, closes the connection unanswered, and the command says to ask the status
+  whether the request was taken. It waits at most 60 s for an answer.
+- **A door's path is short.** A Unix socket's path holds at most 107 bytes on Linux and 103 on
+  macOS, and the socket is first bound at the door's path with `.new/s` added: so at most 101
+  bytes on Linux. A relative path is taken from the directory the program runs in, the
+  coordinator's and the command's alike.
+- **Taking a device back by need is not asked at the door yet.** It is not a word in `mag-by`, and
+  a coordinator answers a request it does not read as `unreadable`.
 
 ## The link
 
@@ -169,8 +232,23 @@ SIGTERM in the ledger as the member exits, within its time, and the ledger repla
 on a job's channel, as the coordinator, and for a member already joined; an unlisted member at
 `outside`; a member with no offers recorded nowhere; a member killed recorded as left; a ledger
 already there left as it is; and, on Linux, a leave whose ledger line cannot be written never
-acknowledged. `loopback` sends one tensor of any size and reports the
-rate and the memory the link took beyond the two buffers:
+acknowledged. And it runs the door, the command as a process of its own against the coordinator
+with members joined: the status before, a job submitted with its stamp, placed, and in the ledger
+as the command has its answer, the status showing it, its end in the ledger as it is answered, and
+the ledger replayed to the status the door gave last; a socket of mode 0600 only; a job that waits,
+with exit 3; a second job of one name, a stamp of ceiling 0 and the end of a job the pool does not
+hold refused, with exit 4, and nothing written; a line that is no request, and one longer than
+the door reads, answered as unreadable;
+six submissions at once while two members join, every line whole and the ledger replayed to the
+same lines; the command with no coordinator failing at once, with exit 5, at a path with nothing
+and at a socket no one answers; an argument other than `door` refused, with exit 2; a second
+coordinator at the door refused, by its lock with the socket moved away, and by the socket
+answering with the lock removed, its ledger not begun; a door a killed coordinator left
+replaced; something other than a socket at the path refused and left; and, on Linux, a submission
+whose ledger line cannot be written never answered.
+
+`loopback` sends one tensor of any size and reports the rate and the memory the link took beyond
+the two buffers:
 
     cargo run --release -p mag-mar --features issue --example loopback -- 4
 
@@ -180,7 +258,8 @@ sending (2026-11-25, three runs).
 
 ## Not built yet
 
-- The door: submitting a job, ending one, taking back by need, and the pool's status.
+- At the door: taking a device back by need, and the pool's asks in its status, the kind of
+  device it most wants and the members it would give back.
 - The coordinator's words to members: announcing a member to its peers, and sending placements.
 - Taking up the ledger of a coordinator that stopped, and members joining again when one starts.
 - Running the parts placed on a member, channels to other members for their jobs, and giving

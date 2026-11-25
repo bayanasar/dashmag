@@ -38,10 +38,13 @@
 //! On SIGTERM it says it leaves and exits 0 within its `give_back_seconds`, whatever any peer
 //! does. On the member that coordinates, it runs [`coordinator`]: it takes any member's control
 //! channel ([`Link::accept_any`]), and records each join and leave in a `mag_mortar::Pool` and in
-//! the pool's ledger, written before a leave is acknowledged. Running the parts placed on a
-//! member, and the coordinator's door, are not built yet.
+//! the pool's ledger, written before a leave is acknowledged. It serves the door, a local socket
+//! where a command run on its machine ([`door::command`], `mag-mar door`) submits a job, ends one
+//! or asks the pool's status, each change written to the ledger before it is answered. Running
+//! the parts placed on a member is not built yet.
 
 pub mod coordinator;
+pub mod door;
 mod frame;
 #[cfg(feature = "issue")]
 pub mod issue;

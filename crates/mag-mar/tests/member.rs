@@ -1,7 +1,8 @@
 //! The member program, run as the host runs it: a process of its own with `MAG_START` naming its
 //! start file, ended by SIGTERM. A member is run first against a stand-in coordinator, which takes
 //! its control channel and records what it says, or fails to answer as a test needs; then against
-//! the program itself as coordinator, whose ledger the tests read and replay.
+//! the program itself as coordinator, whose ledger the tests read and replay; and last, the
+//! coordinator's door, asked by `mag-mar door` as a process of its own.
 
 #![cfg(unix)]
 
@@ -14,8 +15,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mag_by::{
-    Backend, CONTROL, Change, Control, Description, DeviceId, Dtype, Ledger, Member, Offer, Peer,
-    Start, Tolerance, Trust,
+    Backend, CONTROL, Change, Control, Description, DeviceId, DoorAnswer, DoorRefusal, Dtype,
+    Ledger, Member, Offer, Peer, Place, Start, Tolerance, Trust,
 };
 use mag_mar::issue::Authority;
 use mag_mar::{ChannelEnd, Credentials, Link, LinkError, Receiver, Sender, TlsLink};
@@ -1014,5 +1015,466 @@ fn a_leave_is_not_acknowledged_until_its_ledger_line_is_written() {
         "{:#?}",
         coordinating.said
     );
+    assert_eq!(read_ledger(&pool).1, text);
+}
+
+// The door: a command run on the coordinator's machine, `mag-mar door`, asking the coordinator.
+
+/// A graph of one part, `sum`, that any of the test pool's devices can run; `pinned` pins it to
+/// CUDA, which no device of the test pool offers, so that it waits.
+fn graph_file(pool: &Pool, job: &str, pinned: bool) -> PathBuf {
+    let mut graph = serde_json::json!({
+        "format": "mag-graph",
+        "version": 2,
+        "job": { "name": job, "priority": 1 },
+        "inputs": [{ "name": "numbers", "bytes": 4096, "keep": "owner" }],
+        "parts": [{
+            "name": "sum",
+            "unit": { "name": "sum", "version": 1 },
+            "mark": "atomic",
+            "step": "item",
+            "memory_bytes": 1 << 20,
+            "weights": [],
+            "tolerance": "exact"
+        }],
+        "chains": [],
+        "edges": [
+            { "from": "numbers", "to": "sum", "dtype": "f32", "bytes": 4096 },
+            { "from": "sum", "dtype": "f32", "bytes": 4 }
+        ]
+    });
+    if pinned {
+        graph["parts"][0]["pin"] = serde_json::json!({ "backend": "cuda" });
+    }
+    let path = pool.dir.join(format!("{job}.json"));
+    let text = serde_json::to_string_pretty(&graph).unwrap();
+    // What the command reads is what the graph file's reader takes.
+    mag_by::Graph::from_json(&text).unwrap();
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// What `mag-mar door ARGS` did, run with `MAG_START` naming `start`.
+struct Asked {
+    code: Option<i32>,
+    answer: Option<DoorAnswer>,
+    said: String,
+    took: Duration,
+}
+
+fn door(start: &Path, args: &[&str]) -> Asked {
+    let began = Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_mag-mar"))
+        .arg("door")
+        .args(args)
+        .env("MAG_START", start)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8(out.stderr).unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    Asked {
+        code: out.status.code(),
+        answer: (!stdout.is_empty())
+            .then(|| serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"))),
+        said,
+        took: began.elapsed(),
+    }
+}
+
+fn status_at(start: &Path) -> Description {
+    match door(start, &["status"]) {
+        Asked {
+            code: Some(0),
+            answer: Some(DoorAnswer::Status { pool, asks: None }),
+            ..
+        } => pool,
+        Asked { code, said, .. } => panic!("{code:?}: {said}"),
+    }
+}
+
+fn path(p: &Path) -> &str {
+    p.to_str().unwrap()
+}
+
+#[test]
+fn a_job_submitted_at_the_door_is_written_before_it_is_answered_ended_and_replayed() {
+    let pool = Pool::new("door");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (mut coordinating, at) = coordinator_from(Program::command(Some(&start)));
+    coordinating.says("serves the door at");
+    let _server = joined(&pool, "server", &at, description());
+    let _laptop = joined(&pool, "laptop", &at, description());
+    ledger_of(&pool, 3);
+
+    // The door is a socket only the coordinator's user can reach.
+    let door_path = pool.dir.join("door.sock");
+    let meta = std::fs::symlink_metadata(&door_path).unwrap();
+    assert!(std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()));
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777,
+        0o600
+    );
+    assert!(!pool.dir.join("door.sock.new").exists());
+
+    // Status before: the pool as one virtual device, its three members' four devices, no job.
+    let before = status_at(&start);
+    let devices =
+        |d: &Description| -> Vec<DeviceId> { d.offers.iter().map(|o| o.device.clone()).collect() };
+    assert_eq!(
+        devices(&before),
+        [
+            device("laptop", 0),
+            device("server", 0),
+            device("server", 1),
+            device("workstation", 0)
+        ]
+    );
+    assert_eq!(before.members.len(), 3);
+    assert!(before.jobs.is_empty());
+
+    // Submitted with its stamp: placed, and in the ledger, synced, as the command has its answer.
+    let graph = graph_file(&pool, "tally", false);
+    let stamp = pool.dir.join("stamp.json");
+    std::fs::write(&stamp, r#"{ "by": "ops", "priority_ceiling": 1 }"#).unwrap();
+    let asked = door(&start, &["submit", path(&graph), "--stamp", path(&stamp)]);
+    assert_eq!(asked.code, Some(0), "{}", asked.said);
+    assert!(asked.said.contains("`tally` is placed"), "{}", asked.said);
+    let Some(DoorAnswer::Submitted {
+        record,
+        arrangement,
+    }) = asked.answer
+    else {
+        panic!("{:?}", asked.answer)
+    };
+    assert_eq!(arrangement.job, "tally");
+    assert!(matches!(arrangement.places[..], [Place::On(_)]));
+    assert!(record.chosen.is_some());
+    let (ledger, _) = read_ledger(&pool);
+    assert_eq!(ledger.entries.len(), 4);
+    let submitted = &ledger.entries[3];
+    match &submitted.change {
+        Change::Submit { graph: g, stamp: s } => {
+            assert_eq!(g.job.name, "tally");
+            assert_eq!(s.by.as_deref(), Some("ops"));
+            assert_eq!(s.priority_ceiling, Some(1));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(submitted.record, record);
+    coordinating.says("the door: `tally` submitted, written, and placed");
+
+    // Status after: the job, where the answer said.
+    let during = status_at(&start);
+    assert_eq!(during.jobs.len(), 1);
+    assert_eq!(during.jobs[0].arrangement, arrangement);
+    assert_eq!(during.jobs[0].priority, 1);
+
+    // Ended: in the ledger as it is answered, and gone from the status.
+    let asked = door(&start, &["end", "tally"]);
+    assert_eq!(asked.code, Some(0), "{}", asked.said);
+    let Some(DoorAnswer::Ended { record }) = asked.answer else {
+        panic!("{:?}", asked.answer)
+    };
+    let (ledger, text) = read_ledger(&pool);
+    assert_eq!(ledger.entries.len(), 5);
+    assert_eq!(
+        ledger.entries[4].change,
+        Change::End {
+            job: "tally".into()
+        }
+    );
+    assert_eq!(ledger.entries[4].record, record);
+    let after = status_at(&start);
+    assert!(after.jobs.is_empty());
+    assert_eq!(devices(&after), devices(&before));
+
+    // The ledger replays to the same pool: the same lines, and the status the door gave.
+    let replayed = mag_mortar::Pool::replay(&ledger).unwrap();
+    assert_eq!(replayed.ledger().to_lines(), text);
+    assert_eq!(replayed.describe(), after);
+    let mut upto = ledger.clone();
+    upto.entries.truncate(4);
+    assert_eq!(mag_mortar::Pool::replay(&upto).unwrap().describe(), during);
+
+    // On its notice the coordinator closes its door: the command then finds no one.
+    let (status, _) = coordinating.terminate(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "{:#?}", coordinating.said);
+    assert!(!door_path.exists());
+    assert_eq!(door(&start, &["status"]).code, Some(5));
+}
+
+#[test]
+fn the_door_refuses_what_the_pool_refuses_writes_nothing_for_it_and_says_when_a_job_waits() {
+    let pool = Pool::new("door-refuses");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (_coordinating, _) = coordinator_from(Program::command(Some(&start)));
+
+    // A job no device can take: in the ledger, and waiting.
+    let waits = graph_file(&pool, "on-cuda", true);
+    let asked = door(&start, &["submit", path(&waits)]);
+    assert_eq!(asked.code, Some(3), "{}", asked.said);
+    assert!(asked.said.contains("`on-cuda` waits"), "{}", asked.said);
+    assert_eq!(asked.answer.as_ref().unwrap().placed(), Some(false));
+    assert_eq!(read_ledger(&pool).0.entries.len(), 1);
+
+    let refused = |asked: Asked| match asked {
+        Asked {
+            code: Some(4),
+            answer: Some(DoorAnswer::Refused { refusal }),
+            ..
+        } => refusal,
+        Asked { code, said, .. } => panic!("{code:?}: {said}"),
+    };
+    // A second job of one name.
+    assert!(matches!(
+        refused(door(&start, &["submit", path(&waits)])),
+        DoorRefusal::Pool { reason } if reason.contains("already holds a job named `on-cuda`")
+    ));
+    // A stamp the pool cannot take.
+    let tally = graph_file(&pool, "tally", false);
+    let stamp = pool.dir.join("stamp.json");
+    std::fs::write(&stamp, r#"{ "priority_ceiling": 0 }"#).unwrap();
+    assert!(matches!(
+        refused(door(&start, &["submit", path(&tally), "--stamp", path(&stamp)])),
+        DoorRefusal::Pool { reason } if reason.contains("ceiling is 0")
+    ));
+    // The end of a job the pool does not hold.
+    assert_eq!(
+        refused(door(&start, &["end", "tally"])),
+        DoorRefusal::NoJob {
+            job: "tally".into()
+        }
+    );
+    // None of them written.
+    assert_eq!(read_ledger(&pool).0.entries.len(), 1);
+
+    // A line that is no request, sent to the socket by hand.
+    let mut stream = std::os::unix::net::UnixStream::connect(pool.dir.join("door.sock")).unwrap();
+    stream.write_all(b"{\"stop\": {}}\n").unwrap();
+    let mut answer = String::new();
+    std::io::Read::read_to_string(&mut stream, &mut answer).unwrap();
+    assert!(matches!(
+        serde_json::from_str::<DoorAnswer>(&answer).unwrap(),
+        DoorAnswer::Refused {
+            refusal: DoorRefusal::Unreadable { .. }
+        }
+    ));
+    // A line longer than the door reads, refused once it has read that much.
+    let mut stream = std::os::unix::net::UnixStream::connect(pool.dir.join("door.sock")).unwrap();
+    let long = vec![b' '; mag_mar::door::REQUEST_LIMIT as usize + 2];
+    let writing = {
+        let mut stream = stream.try_clone().unwrap();
+        thread::spawn(move || {
+            let _ = stream.write_all(&long);
+        })
+    };
+    let mut answer = String::new();
+    std::io::Read::read_to_string(&mut stream, &mut answer).unwrap();
+    writing.join().unwrap();
+    match serde_json::from_str::<DoorAnswer>(&answer).unwrap() {
+        DoorAnswer::Refused {
+            refusal: DoorRefusal::Unreadable { error },
+        } => assert!(error.contains("longer than"), "{error}"),
+        other => panic!("{other:?}"),
+    }
+
+    // The command's own refusals, before it asks: a graph file it cannot read, and its usage.
+    let asked = door(&start, &["submit", path(&pool.dir.join("none.json"))]);
+    assert_eq!(asked.code, Some(2));
+    let asked = door(&start, &["stop"]);
+    assert_eq!(asked.code, Some(2));
+    assert!(asked.said.contains("usage"), "{}", asked.said);
+    assert_eq!(read_ledger(&pool).0.entries.len(), 1);
+}
+
+#[test]
+fn submissions_while_members_join_are_written_in_the_order_the_pool_took_them() {
+    let pool = Pool::new("door-busy");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (_coordinating, at) = coordinator_from(Program::command(Some(&start)));
+    let graphs: Vec<PathBuf> = (0..6)
+        .map(|i| graph_file(&pool, &format!("job-{i}"), false))
+        .collect();
+    // Six commands at once, while two members join.
+    let asking: Vec<_> = graphs
+        .into_iter()
+        .map(|g| {
+            let start = start.clone();
+            thread::spawn(move || door(&start, &["submit", path(&g)]))
+        })
+        .collect();
+    let _server = joined(&pool, "server", &at, description());
+    let _laptop = joined(&pool, "laptop", &at, description());
+    // Each in the pool, placed or waiting as the loop chose, which is not this test's to say.
+    for a in asking {
+        let asked = a.join().unwrap();
+        assert!(matches!(asked.code, Some(0 | 3)), "{}", asked.said);
+    }
+    // Six submissions and three joins, the joins written once the coordinator hears them.
+    ledger_of(&pool, 9);
+    let (ledger, text) = read_ledger(&pool);
+    let submitted = ledger
+        .entries
+        .iter()
+        .filter(|e| matches!(e.change, Change::Submit { .. }))
+        .count();
+    assert_eq!(submitted, 6);
+    // Each line whole, and the whole replaying to the same records and lines.
+    let replayed = mag_mortar::Pool::replay(&ledger).unwrap();
+    assert_eq!(replayed.ledger().to_lines(), text);
+    assert_eq!(replayed.describe().jobs.len(), 6);
+}
+
+#[test]
+fn the_door_command_fails_at_once_when_no_coordinator_answers() {
+    let pool = Pool::new("no-door");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    // Nothing at the door's path.
+    let asked = door(&start, &["status"]);
+    assert_eq!(asked.code, Some(5), "{}", asked.said);
+    assert!(asked.said.contains("no coordinator answers at the door"));
+    assert!(asked.took < Duration::from_secs(2), "{:?}", asked.took);
+    assert!(asked.answer.is_none());
+    // A socket there that no one answers, as a coordinator killed leaves it.
+    let left = std::os::unix::net::UnixListener::bind(pool.dir.join("door.sock")).unwrap();
+    drop(left);
+    let graph = graph_file(&pool, "tally", false);
+    let asked = door(&start, &["submit", path(&graph)]);
+    assert_eq!(asked.code, Some(5), "{}", asked.said);
+    assert!(asked.said.contains("no coordinator answers at the door"));
+    assert!(asked.took < Duration::from_secs(2), "{:?}", asked.took);
+    // No `MAG_START`.
+    let out = Command::new(env!("CARGO_BIN_EXE_mag-mar"))
+        .args(["door", "status"])
+        .env_remove("MAG_START")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    // The program takes no other argument than `door`: it does not start as a member, here the
+    // coordinator, which would run until its notice.
+    let mut command = Program::command(Some(&start));
+    command.arg("doors");
+    let mut program = Program::spawn(command);
+    let (status, _) = program.exits(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(2), "{:#?}", program.said);
+    program.says("usage");
+}
+
+/// Writes the start file at `start` again with its ledger at `ledger`, in the pool's directory.
+fn with_ledger(start: &Path, ledger: &str, pool: &Pool) {
+    let mut s = Start::from_json(&std::fs::read_to_string(start).unwrap()).unwrap();
+    s.ledger = pool.dir.join(ledger).to_str().unwrap().into();
+    std::fs::write(start, s.to_json()).unwrap();
+}
+
+#[test]
+fn a_second_coordinator_at_a_door_is_refused_and_a_door_left_behind_is_replaced() {
+    let pool = Pool::new("door-held");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let (mut first, _) = coordinator_from(Program::command(Some(&start)));
+
+    // A second coordinator at the same door, with a ledger of its own: refused, its ledger not
+    // begun, and the first's door still answering.
+    let second = pool.dir.join("second.json");
+    std::fs::copy(&start, &second).unwrap();
+    with_ledger(&second, "second.jsonl", &pool);
+    let mut refused = Program::start(Some(&second));
+    let (status, _) = refused.exits(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(2), "{:#?}", refused.said);
+    refused.says("another coordinator serves this door");
+    assert!(!pool.dir.join("second.jsonl").exists());
+    assert_eq!(status_at(&start).members.len(), 1);
+    // Its socket moved away, the first's door is still its own: it holds the lock.
+    let door_path = pool.dir.join("door.sock");
+    let away = pool.dir.join("away.sock");
+    std::fs::rename(&door_path, &away).unwrap();
+    let mut refused = Program::start(Some(&second));
+    let (status, _) = refused.exits(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(2), "{:#?}", refused.said);
+    refused.says("another coordinator serves this door");
+    assert!(!door_path.exists());
+    std::fs::rename(&away, &door_path).unwrap();
+    // Its lock removed, the first's door is still its own: the socket answers.
+    std::fs::remove_file(pool.dir.join("door.sock.lock")).unwrap();
+    let mut refused = Program::start(Some(&second));
+    let (status, _) = refused.exits(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(2), "{:#?}", refused.said);
+    refused.says("another coordinator serves this door");
+    assert!(!pool.dir.join("second.jsonl").exists());
+    assert_eq!(status_at(&start).members.len(), 1);
+
+    // The first killed, its door left behind, a socket no one answers: the next coordinator
+    // replaces it.
+    first.child.kill().unwrap();
+    first.child.wait().unwrap();
+    assert!(pool.dir.join("door.sock").exists());
+    assert_eq!(door(&start, &["status"]).code, Some(5));
+    let (mut third, _) = coordinator_from(Program::command(Some(&second)));
+    third.says("serves the door");
+    assert!(pool.dir.join("second.jsonl").exists());
+    assert_eq!(status_at(&start).members.len(), 1);
+    drop(third);
+
+    // Anything at the door's path that is not a socket is not a door: refused, and left.
+    let _ = std::fs::remove_file(&door_path);
+    std::fs::write(&door_path, "kept\n").unwrap();
+    with_ledger(&second, "fourth.jsonl", &pool);
+    let mut fourth = Program::start(Some(&second));
+    let (status, _) = fourth.exits(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(2), "{:#?}", fourth.said);
+    fourth.says("something other than a socket");
+    assert_eq!(std::fs::read_to_string(&door_path).unwrap(), "kept\n");
+    assert!(!pool.dir.join("fourth.jsonl").exists());
+}
+
+/// A submission whose ledger line cannot be written is never answered: the coordinator stops
+/// with status 3, and the command finds the door closed without an answer. The line is made
+/// unwritable as for a leave, by `prlimit`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_submission_is_not_answered_until_its_ledger_line_is_written() {
+    use std::os::unix::process::CommandExt;
+
+    let pool = Pool::new("door-unwritten");
+    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let mut command = Program::command(Some(&start));
+    // SAFETY: signal(2) is async-signal-safe, and SIG_IGN is kept across exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let (mut coordinating, at) = coordinator_from(command);
+    let _laptop = joined(&pool, "laptop", &at, description());
+    ledger_of(&pool, 1);
+    let (_, text) = read_ledger(&pool);
+    let limit_to = libc::rlimit {
+        rlim_cur: text.len() as libc::rlim_t,
+        rlim_max: text.len() as libc::rlim_t,
+    };
+    // SAFETY: prlimit(2) on the child this test started, with a limit that lives in this frame.
+    let set = unsafe {
+        libc::prlimit(
+            coordinating.child.id() as libc::pid_t,
+            libc::RLIMIT_FSIZE,
+            &limit_to,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+
+    let graph = graph_file(&pool, "tally", false);
+    let asked = door(&start, &["submit", path(&graph)]);
+    assert_eq!(asked.code, Some(5), "{}", asked.said);
+    assert!(asked.answer.is_none());
+    assert!(
+        asked.said.contains("closed the door without answering"),
+        "{}",
+        asked.said
+    );
+    let (status, _) = coordinating.exits(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(3), "{:#?}", coordinating.said);
     assert_eq!(read_ledger(&pool).1, text);
 }

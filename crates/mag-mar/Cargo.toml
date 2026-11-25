@@ -1,6 +1,6 @@
 [package]
 name = "mag-mar"
-description = "The program every member of a mag pool runs. So far its link, one channel per job to another member over TCP with TLS 1.3, both ends holding certificates from the pool's own authority, carrying mag-by's words and tensors of any size; and the program's skeleton, which joins the pool and gives its devices back on SIGTERM within its time, and as coordinator records the members' joins and leaves in the pool's ledger."
+description = "The program every member of a mag pool runs. So far its link, one channel per job to another member over TCP with TLS 1.3, both ends holding certificates from the pool's own authority, carrying mag-by's words and tensors of any size; and the program's skeleton, which joins the pool and gives its devices back on SIGTERM within its time, and as coordinator records the members' joins and leaves in the pool's ledger and serves the door, where a command submits a job, ends one or asks the pool's status."
 readme = "README.md"
 keywords = ["scheduling", "distributed", "machine-learning", "tls"]
 categories = ["network-programming"]
