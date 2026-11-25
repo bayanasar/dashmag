@@ -77,6 +77,14 @@ the files kept in [`tests/v1`](tests/v1) show:
   itself as its start file describes it and its devices' offers, when its lease begins, and
   `Control::Leave` when it ends. With the `graph` feature they are JSON, as the files' words
   are.
+- The words of the door, the coordinator's local socket, where a command run on its machine
+  asks the pool: a `DoorRequest`, to submit a graph with its stamp, end a job by its name, or
+  ask the pool's status; and the coordinator's `DoorAnswer`: the record of the loop's run and
+  where the job's parts are, each on a device or waiting, the record of an end, or the pool's
+  `Description` with a place for what it `Asks` of the host, left out until the pool can say
+  it; or a `DoorRefusal`: a request it does not read, a change the pool refuses, an end of a
+  job it does not hold. With the `graph` feature each is one line of JSON on the socket. Taking
+  a device back by need is to be asked there too, and is not a word yet.
 
 To print a graph file's DOT, or why the file is refused:
 

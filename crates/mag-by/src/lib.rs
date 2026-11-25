@@ -28,6 +28,9 @@
 //!   once on a channel for a job, and a [`Tensor`] whose bytes follow it; and on a member's
 //!   control channel to the coordinator, opened for no job ([`CONTROL`]), the [`Control`] words
 //!   it joins and leaves with.
+//! - The words of the door, the coordinator's local socket: a [`DoorRequest`], to submit a job
+//!   with its stamp, end one or ask the pool's status, and the coordinator's [`DoorAnswer`], or
+//!   its [`DoorRefusal`].
 //! - With the `graph` feature, `Graph::from_json` and `Graph::to_json`: the graph file, a
 //!   graph in JSON, as an agent writes, reads back and edits it (`format` `"mag-graph"`,
 //!   `version` 2); `graph_schema`, its JSON Schema; `Graph::to_dot`, the graph as Graphviz DOT
@@ -46,6 +49,7 @@
 
 extern crate alloc;
 
+mod door;
 #[cfg(feature = "graph")]
 mod dot;
 mod graph;
@@ -60,6 +64,7 @@ mod pool;
 #[cfg(feature = "graph")]
 mod v1;
 
+pub use door::{DoorAnswer, DoorRefusal, DoorRequest};
 pub use graph::{
     Backend, Blob, Chain, Dtype, Edge, GRAPH_FORMAT, GRAPH_VERSION, Graph, Input, Job, Mark, Need,
     Part, Pin, Refusal, Step, Tolerance, Unit,
