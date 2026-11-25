@@ -88,7 +88,7 @@ fn the_control_channel_is_for_no_job_a_name_no_job_may_have() {
 }
 
 #[test]
-fn a_member_joins_leaves_and_gives_a_device_back_when_the_coordinator_says() {
+fn a_member_joins_is_told_it_joined_leaves_and_gives_a_device_back_when_the_coordinator_says() {
     let join = Control::Join {
         member: Member {
             name: "laptop".into(),
@@ -121,6 +121,7 @@ fn a_member_joins_leaves_and_gives_a_device_back_when_the_coordinator_says() {
             }]
         } }),
     );
+    round_trip(&Control::Joined, json!("joined"));
     round_trip(&Control::Leave, json!("leave"));
     // The coordinator's word to give a device back, and the member's that it has.
     let device = DeviceId {
@@ -153,6 +154,8 @@ fn a_member_joins_leaves_and_gives_a_device_back_when_the_coordinator_says() {
         } }),
         json!("join"),
         json!({ "leave": {} }),
+        json!({ "joined": {} }),
+        json!({ "joined": { "devices": [] } }),
         json!("stay"),
     ] {
         assert!(

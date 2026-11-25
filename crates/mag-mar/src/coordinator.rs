@@ -844,13 +844,13 @@ pub(crate) fn run(
             }
             Event::Said {
                 id,
-                word: Control::GiveBack { device, .. },
+                word: word @ (Control::GiveBack { .. } | Control::Joined),
             } => {
                 let who = members.get(&id).map(|m| m.peer.member.clone());
                 say(
                     &name,
                     format_args!(
-                        "`{}` says to give {device} back, a coordinator's word: not taken",
+                        "`{}` says {word:?}, a coordinator's word: not taken",
                         who.unwrap_or_default()
                     ),
                 );

@@ -476,7 +476,8 @@ pub struct Entry {
 /// refused change is not in it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Ledger {
-    /// The pool's time when it began, in seconds: 0, or the time of the pool file it began from.
+    /// The pool's time when it began, in seconds: 0, the time of the pool file it began from, or,
+    /// for a pool a coordinator began, the time it began it, in seconds since 1970.
     pub at: f64,
     /// The version of `mag-mortar` that began it, which `mag-mortar` writes. Absent in a ledger
     /// of version 1, which did not record it.

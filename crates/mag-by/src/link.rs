@@ -68,14 +68,17 @@ pub struct Tensor {
 
 /// The words on a member's control channel to the coordinator ([`CONTROL`]): the member's,
 /// [`Control::Join`], [`Control::Leave`] and [`Control::GaveBack`], and the coordinator's,
-/// [`Control::GiveBack`]. Each end takes only the other's.
+/// [`Control::Joined`] and [`Control::GiveBack`]. Each end takes only the other's.
 ///
 /// When its lease begins, a member dials the coordinator and joins; the host tells the
-/// coordinator nothing. When the host ends the lease (SIGTERM), the member says it leaves, closes
-/// its way of the channel, and waits for the coordinator to close the other way, the sign that
-/// the leaving is recorded, until its `give_back_seconds` are up. When the host takes a device
-/// back by need at the door, and the pool chooses one of this member's, the coordinator tells it
-/// to give that device back, and the member says when it has.
+/// coordinator nothing. The coordinator says [`Control::Joined`] once the join is in its ledger;
+/// a join it refuses it answers by closing its way of the channel without it, and the member
+/// does not join again. A channel that ends any other way, the member not leaving, is dialled
+/// again and joined again. When the host ends the lease (SIGTERM), the member says it leaves,
+/// closes its way of the channel, and waits for the coordinator to close the other way, the sign
+/// that the leaving is recorded, until its `give_back_seconds` are up. When the host takes a
+/// device back by need at the door, and the pool chooses one of this member's, the coordinator
+/// tells it to give that device back, and the member says when it has.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(
     feature = "graph",
@@ -90,6 +93,9 @@ pub enum Control {
     /// time to give a device back, as the host wrote them), and what each of its devices offers.
     /// Its name is the one its certificate carries, which the coordinator checks.
     Join { member: Member, offers: Vec<Offer> },
+    /// The coordinator's word: the join is in the ledger, or was already, and the member is in
+    /// the pool with the devices it offered.
+    Joined,
     /// The member leaves: its lease is ending, and its devices are given back.
     Leave,
     /// The coordinator's word: give this device back within `deadline_seconds`, as the host
