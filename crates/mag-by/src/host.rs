@@ -173,8 +173,14 @@ pub struct Asks {
 /// A start file: what a member's program begins from, the same convention for every host. The
 /// environment variable `MAG_START` names it.
 ///
-/// It names no private key: it gives the path of this member's key file, which the host places
-/// and keeps readable by the program alone.
+/// Each pool has its own certificate authority, which the host holds. The host issues every
+/// member a certificate signed by it and naming the member, and a link between two members is
+/// taken only when the other end's certificate is signed by the pool's authority and names the
+/// member expected. So a member that joins a running pool proves itself by its certificate, and
+/// the host tells the coordinator nothing.
+///
+/// It holds no private key: it gives the paths of this member's certificate and key files,
+/// which the host places and keeps readable by the program alone.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(
     feature = "graph",
@@ -187,7 +193,10 @@ pub struct Start {
     /// The pool as the host describes it, as a pool file does: its members, each with its trust
     /// and its time to give a device back, and any offers the host knows.
     pub pool: Description,
-    /// The other members this one links to, each with its public key.
+    /// The pool's authority certificate, in PEM: what every member's certificate is signed by.
+    /// Public; its private key stays with the host.
+    pub authority: String,
+    /// The other members this one knows, each with an address where it has one.
     pub peers: Vec<Peer>,
     /// The member that coordinates: this one, or one of the peers.
     pub coordinator: String,
@@ -197,11 +206,16 @@ pub struct Start {
     pub door: String,
     /// Seconds a member stays idle before the pool offers it back. Finite, and not below 0.
     pub idle_seconds: f64,
-    /// The path of this member's private key file. The key itself is never in a start file.
+    /// The path of this member's certificate file, in PEM: the host's authority's signature on
+    /// this member's name and public key.
+    pub certificate_file: String,
+    /// The path of this member's private key file, in PEM. The key itself is never in a start
+    /// file.
     pub key_file: String,
 }
 
-/// Another member, as this one reaches it and knows it.
+/// Another member, as this one reaches it. It is known by the certificate it presents, signed by
+/// the pool's authority and naming it, not by anything listed here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
     feature = "graph",
@@ -210,8 +224,6 @@ pub struct Start {
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Peer {
     pub member: String,
-    /// Its public key, as the transport reads it: both ends of a link are authenticated by these.
-    pub public_key: String,
     /// Where it is dialled, as `host:port`, if it can be: a machine behind address translation
     /// has none, and dials out instead.
     #[cfg_attr(

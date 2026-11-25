@@ -268,7 +268,7 @@
     },
     "Peer": {
       "additionalProperties": false,
-      "description": "Another member, as this one reaches it and knows it.",
+      "description": "Another member, as this one reaches it. It is known by the certificate it presents, signed by\nthe pool's authority and naming it, not by anything listed here.",
       "properties": {
         "address": {
           "description": "Where it is dialled, as `host:port`, if it can be: a machine behind address translation\nhas none, and dials out instead.",
@@ -276,15 +276,10 @@
         },
         "member": {
           "type": "string"
-        },
-        "public_key": {
-          "description": "Its public key, as the transport reads it: both ends of a link are authenticated by these.",
-          "type": "string"
         }
       },
       "required": [
-        "member",
-        "public_key"
+        "member"
       ],
       "type": "object"
     },
@@ -387,8 +382,16 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "A start file: what a member's program begins from, the same convention for every host. The\nenvironment variable `MAG_START` names it.\n\nIt names no private key: it gives the path of this member's key file, which the host places\nand keeps readable by the program alone.",
+  "description": "A start file: what a member's program begins from, the same convention for every host. The\nenvironment variable `MAG_START` names it.\n\nEach pool has its own certificate authority, which the host holds. The host issues every\nmember a certificate signed by it and naming the member, and a link between two members is\ntaken only when the other end's certificate is signed by the pool's authority and names the\nmember expected. So a member that joins a running pool proves itself by its certificate, and\nthe host tells the coordinator nothing.\n\nIt holds no private key: it gives the paths of this member's certificate and key files,\nwhich the host places and keeps readable by the program alone.",
   "properties": {
+    "authority": {
+      "description": "The pool's authority certificate, in PEM: what every member's certificate is signed by.\nPublic; its private key stays with the host.",
+      "type": "string"
+    },
+    "certificate_file": {
+      "description": "The path of this member's certificate file, in PEM: the host's authority's signature on\nthis member's name and public key.",
+      "type": "string"
+    },
     "coordinator": {
       "description": "The member that coordinates: this one, or one of the peers.",
       "type": "string"
@@ -406,7 +409,7 @@
       "type": "number"
     },
     "key_file": {
-      "description": "The path of this member's private key file. The key itself is never in a start file.",
+      "description": "The path of this member's private key file, in PEM. The key itself is never in a start\nfile.",
       "type": "string"
     },
     "ledger": {
@@ -418,7 +421,7 @@
       "type": "string"
     },
     "peers": {
-      "description": "The other members this one links to, each with its public key.",
+      "description": "The other members this one knows, each with an address where it has one.",
       "items": {
         "$ref": "#/$defs/Peer"
       },
@@ -437,11 +440,13 @@
     "version",
     "member",
     "pool",
+    "authority",
     "peers",
     "coordinator",
     "ledger",
     "door",
     "idle_seconds",
+    "certificate_file",
     "key_file"
   ],
   "title": "mag-start, version 1",

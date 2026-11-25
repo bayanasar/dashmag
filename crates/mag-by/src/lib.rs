@@ -23,7 +23,9 @@
 //!   record the loop made of it, from which the pool is restored by replaying it.
 //! - The host's words: the [`Stamp`] the host puts on a submission, a [`TakeBack`] by name or by
 //!   need, what the pool [`Asks`] of the host, and the [`Start`] file a member's program begins
-//!   from, with its [`Peer`]s.
+//!   from, with the pool's authority certificate and its [`Peer`]s.
+//! - The words of a link between two members, at [`WIRE_VERSION`]: the [`Open`] each end says
+//!   once on a channel for a job, and a [`Tensor`] whose bytes follow it.
 //! - With the `graph` feature, `Graph::from_json` and `Graph::to_json`: the graph file, a
 //!   graph in JSON, as an agent writes, reads back and edits it (`format` `"mag-graph"`,
 //!   `version` 2); `graph_schema`, its JSON Schema; `Graph::to_dot`, the graph as Graphviz DOT
@@ -51,6 +53,7 @@ mod json;
 mod keep;
 #[cfg(feature = "graph")]
 mod ledger;
+mod link;
 mod pool;
 #[cfg(feature = "graph")]
 mod v1;
@@ -65,6 +68,7 @@ pub use json::{PoolFileError, ReadError, StartFileError, graph_schema, pool_sche
 pub use keep::{Keeps, Trust};
 #[cfg(feature = "graph")]
 pub use ledger::{LedgerError, ReadLedger, ledger_schema};
+pub use link::{Open, Tensor, WIRE_VERSION};
 pub use pool::{
     Arrangement, Candidate, Change, Cost, Description, DeviceId, Entry, Event, Format, Held,
     LEDGER_FORMAT, LEDGER_VERSION, Ledger, Member, Move, Offer, POOL_FORMAT, POOL_VERSION, Place,

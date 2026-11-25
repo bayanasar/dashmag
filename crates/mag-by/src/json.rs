@@ -168,7 +168,7 @@ pub enum StartFileError {
     Format { found: Option<String> },
     /// `version` is not 1. The JSON found, if any.
     Version { found: Option<String> },
-    /// A key appears twice in one object. Where, as a path such as `peers[0].public_key`.
+    /// A key appears twice in one object. Where, as a path such as `peers[0].address`.
     RepeatedKey { at: String },
     /// The pool lists a member twice, or offers a device twice, as a pool file may not.
     Pool(PoolFileError),

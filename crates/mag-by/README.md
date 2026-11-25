@@ -56,11 +56,18 @@ the files kept in [`tests/v1`](tests/v1) show:
   acknowledged, and is dropped and reported; a line cut short before it is refused. Every float
   reads back to its bits. A ledger of version 1 is written again whole before it is appended to.
 - `Start::from_json` and `Start::to_json`: the start file (`"mag-start"`, version 1), which the
-  environment variable `MAG_START` names: this member's name, the pool's description, the peers
-  with their public keys and an address where they have one, the coordinator, where the ledger
-  goes, the door's local address, the idle time after which the pool offers a member back, and
-  the path of this member's private key file. The key itself is never in it.
-  [`starts/example.json`](starts/example.json) is one.
+  environment variable `MAG_START` names: this member's name, the pool's description, the pool's
+  authority certificate, the peers with an address where they have one, the coordinator, where
+  the ledger goes, the door's local address, the idle time after which the pool offers a member
+  back, and the paths of this member's certificate and private key files. The key itself is
+  never in it. Each pool has its own certificate authority, held by the host, which signs every
+  member's certificate and names the member in it; a link is taken only from a certificate the
+  authority signed that names the member expected, so a member that joins later proves itself
+  by its certificate. [`starts/example.json`](starts/example.json) is one; `mag-mar`'s `certs`
+  command makes an authority and its members' certificates.
+- The words of a link between two members, at `WIRE_VERSION` 1: `Open`, which each end says
+  once on a channel for one job, and `Tensor`, the value of one edge at one step, whose bytes
+  follow it on the channel. With the `graph` feature they are JSON, as the files' words are.
 
 To print a graph file's DOT, or why the file is refused:
 

@@ -30,19 +30,17 @@
     "jobs": [],
     "formats": []
   },
+  "authority": "-----BEGIN CERTIFICATE-----\nMIIBfjCCASOgAwIBAgIQdtk/du4KWT2/yff3sZ3PTzAKBggqhkjOPQQDAjAdMRsw\nGQYDVQQDDBJtYWcgcG9vbCBhdXRob3JpdHkwHhcNMjYxMTI1MDY0MzMzWhcNMzYx\nMTIyMDY0ODMzWjAdMRswGQYDVQQDDBJtYWcgcG9vbCBhdXRob3JpdHkwWTATBgcq\nhkjOPQIBBggqhkjOPQMBBwNCAARUWGUcuKjgjhdMBdPvohrNnNDeT0Hk+Kb6p2qg\nsREEuvqDR46EcsaiEPShb26aM/NWo9yz+DMPeZr+J+C8pgA7o0UwQzAOBgNVHQ8B\nAf8EBAMCAQYwHQYDVR0OBBYEFFU7KTqcmdIQ3ZDl9BVNs/s+QSC7MBIGA1UdEwEB\n/wQIMAYBAf8CAQAwCgYIKoZIzj0EAwIDSQAwRgIhAKwqnGrO/Cv9BM9nM/20suzC\nD+VtSJdvSwmSVzPepaCxAiEAqZZPX3Y6NTGomB7wMQ2JnKIZSwDTFmF8duEK2Ri1\nKlE=\n-----END CERTIFICATE-----\n",
   "peers": [
     {
       "member": "workstation",
-      "public_key": "ed25519:VzlMTdytRxJy+oNYVQ+m6SfB17lPjroBfrgO5eyESnA=",
       "address": "192.0.2.10:7340"
     },
     {
-      "member": "laptop",
-      "public_key": "ed25519:La5om7juQ2GnGcobyPldtmKyW+XuYq/Y0ZN+1E1iit4="
+      "member": "laptop"
     },
     {
       "member": "rented",
-      "public_key": "ed25519:mJUVkPhV+ZgmFlUxHVDJtsI2EzFl8rbahYjvpAzvTDU=",
       "address": "198.51.100.7:7340"
     }
   ],
@@ -50,5 +48,6 @@
   "ledger": "/var/lib/mag/ledger.jsonl",
   "door": "/run/mag/door.sock",
   "idle_seconds": 900.0,
+  "certificate_file": "/etc/mag/server.pem",
   "key_file": "/etc/mag/server.key"
 }

@@ -127,6 +127,10 @@ fn the_example_start_file_reads_and_writes_back_byte_for_byte() {
     assert_eq!(s.pool.members[3].trust, Trust::Outside);
     // The laptop is behind address translation: it has no address, and dials out.
     assert_eq!(s.peers[1].address, None);
+    // The pool's authority, held once; this member's certificate and key, by their paths.
+    assert!(s.authority.starts_with("-----BEGIN CERTIFICATE-----\n"));
+    assert!(s.authority.ends_with("-----END CERTIFICATE-----\n"));
+    assert_eq!(s.certificate_file, "/etc/mag/server.pem");
     assert_eq!(s.key_file, "/etc/mag/server.key");
     assert_eq!(s.to_json(), EXAMPLE);
 }
@@ -150,6 +154,14 @@ fn a_start_file_is_refused_for_its_form_as_every_file_is() {
         changed(|v| {
             v.as_object_mut().unwrap().remove("key_file");
         }),
+        changed(|v| {
+            v.as_object_mut().unwrap().remove("certificate_file");
+        }),
+        changed(|v| {
+            v.as_object_mut().unwrap().remove("authority");
+        }),
+        // A peer is known by its certificate, not by a key listed for it.
+        changed(|v| v["peers"][0]["public_key"] = "ed25519:AAAA".into()),
         changed(|v| v["pool"]["members"][0]["remote"] = false.into()),
     ] {
         let err = Start::from_json(&bad).unwrap_err();
@@ -248,13 +260,19 @@ fn the_schema_takes_the_example_and_refuses_what_the_reader_refuses_for_its_form
     let schema: Value = serde_json::from_str(&start_schema()).unwrap();
     let v = jsonschema::draft202012::new(&schema).expect("a valid draft 2020-12 schema");
     assert!(v.is_valid(&serde_json::from_str(EXAMPLE).unwrap()));
-    let changes: [(&str, Edit); 6] = [
+    let changes: [(&str, Edit); 8] = [
         ("another format", |v| v["format"] = "mag-pool".into()),
         ("a newer version", |v| v["version"] = 2.into()),
         ("a private key", |v| v["private_key"] = "secret".into()),
         ("a null address", |v| v["peers"][0]["address"] = Value::Null),
-        ("a peer without a key", |v| {
-            v["peers"][0].as_object_mut().unwrap().remove("public_key");
+        ("a peer with a key", |v| {
+            v["peers"][0]["public_key"] = "ed25519:AAAA".into()
+        }),
+        ("no authority", |v| {
+            v.as_object_mut().unwrap().remove("authority");
+        }),
+        ("no certificate file", |v| {
+            v.as_object_mut().unwrap().remove("certificate_file");
         }),
         ("an unknown level", |v| {
             v["pool"]["members"][0]["trust"] = "anyone".into()
