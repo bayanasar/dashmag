@@ -16,6 +16,10 @@
 //!    way of the control channel, and waits for the coordinator to close the other way, the sign
 //!    that the leaving is recorded. Then it returns, and the program exits 0.
 //!
+//! The member the start file names as coordinator dials no one: it runs the coordinator
+//! ([`crate::coordinator`]), which takes the other members' joins and leaves into the pool and its
+//! ledger, until its own notice.
+//!
 //! The member's `give_back_seconds` bound step 4 whatever any peer does. The notice sets a
 //! deadline on a thread of its own, at a tenth of them before their end and never more than 1 s
 //! before it ([`deadline`]), and at that deadline the process exits 0, wherever [`run`] is
@@ -23,9 +27,8 @@
 //! cannot promise this, since TCP does not probe while data is unacknowledged.
 //!
 //! Not built yet: running the parts placed on it, channels to other members for their jobs,
-//! giving back with the parts' state, and what the coordinator's member does as coordinator.
-//! The coordinator's member binds and waits for its notice; joining again after the
-//! coordinator returns is the coordinator's step too.
+//! giving back with the parts' state, the coordinator's door, and joining again after the
+//! coordinator returns.
 
 use std::fmt;
 use std::io;
@@ -64,7 +67,8 @@ pub enum Ended {
     /// The notice came while it had no control channel: before it joined, or after the channel
     /// ended. There was no one to tell.
     Alone,
-    /// It is the coordinator, whose part is not built yet: it bound its address and waited.
+    /// It is the coordinator: it took the members' joins and leaves into the pool and its ledger
+    /// until its notice, and then recorded its own devices' leave.
     Coordinator,
 }
 
@@ -88,6 +92,12 @@ pub enum MemberError {
     NoCoordinatorAddress(String),
     /// The member's credentials, or binding its `listen` address.
     Link(LinkError),
+    /// The coordinator could not begin its ledger at the start file's `ledger`: the path, and
+    /// why. A file already there is refused, not overwritten.
+    Ledger { path: String, error: io::Error },
+    /// The coordinator could not write a line of its ledger, and stopped: the path, and why.
+    /// Nothing after the last line written was acknowledged.
+    LedgerUnwritten { path: String, error: io::Error },
 }
 
 impl fmt::Display for MemberError {
@@ -107,6 +117,16 @@ impl fmt::Display for MemberError {
                 write!(f, "the coordinator `{name}` has no address to dial")
             }
             MemberError::Link(e) => write!(f, "{e}"),
+            MemberError::Ledger { path, error } => write!(
+                f,
+                "the ledger {path} cannot be begun ({error}); a coordinator begins a new one, \
+                 and taking up an old one is not built yet"
+            ),
+            MemberError::LedgerUnwritten { path, error } => write!(
+                f,
+                "a line of the ledger {path} was not written ({error}): the coordinator stops, \
+                 and nothing after its last line was acknowledged"
+            ),
         }
     }
 }
@@ -117,6 +137,9 @@ impl std::error::Error for MemberError {
             MemberError::Read { error, .. } => Some(error),
             MemberError::Start { error, .. } => Some(error),
             MemberError::Link(e) => Some(e),
+            MemberError::Ledger { error, .. } | MemberError::LedgerUnwritten { error, .. } => {
+                Some(error)
+            }
             _ => None,
         }
     }
@@ -164,7 +187,7 @@ impl Notice {
 
     /// Waits for the notice, and returns when it was seen. A notice that came before is seen at
     /// once.
-    fn wait(self) -> Instant {
+    pub(crate) fn wait(self) -> Instant {
         #[cfg(unix)]
         {
             use std::io::Read;
@@ -272,8 +295,34 @@ enum Event {
     Ended(LinkError),
 }
 
-fn say(member: &str, what: impl fmt::Display) {
+pub(crate) fn say(member: &str, what: impl fmt::Display) {
     eprintln!("mag-mar {member}: {what}");
+}
+
+/// Waits for the notice on a thread of its own, calls `tell` when it comes, and at the
+/// [`deadline`] it sets ends the process with status 0, whatever any other thread waits on: so
+/// the process ends by `give_back`.
+pub(crate) fn give_back_by(
+    notice: Notice,
+    give_back: Duration,
+    name: String,
+    tell: impl FnOnce() + Send + 'static,
+) {
+    thread::spawn(move || {
+        let at = notice.wait();
+        tell();
+        let end = at + deadline(give_back);
+        thread::sleep(end.saturating_duration_since(Instant::now()));
+        say(
+            &name,
+            format_args!(
+                "gives its devices back at its deadline, {:.2} s after the notice, without \
+                 waiting longer for any peer",
+                at.elapsed().as_secs_f64()
+            ),
+        );
+        std::process::exit(0);
+    });
 }
 
 /// Dials the coordinator on a thread of its own until a control channel opens, after `wait`.
@@ -364,35 +413,22 @@ pub fn run(start: &Start, offers: Vec<Offer>, notice: Notice) -> Result<Ended, M
         None => say(&name, "dials only"),
     }
 
+    let Some(address) = coordinator else {
+        let offers = offers
+            .into_iter()
+            .filter(|o| o.device.member == name)
+            .collect();
+        return crate::coordinator::run(start, me, offers, link, notice, give_back);
+    };
+
     let (events_tx, events) = mpsc::channel();
     {
-        // The notice, and the deadline it sets, on a thread of its own: whatever this thread
-        // waits on, the process ends by `give_back`.
         let events = events_tx.clone();
-        let name = name.clone();
-        thread::spawn(move || {
-            let at = notice.wait();
+        give_back_by(notice, give_back, name.clone(), move || {
             let _ = events.send(Event::Notice);
-            let end = at + deadline(give_back);
-            thread::sleep(end.saturating_duration_since(Instant::now()));
-            say(
-                &name,
-                format_args!(
-                    "gives its devices back at its deadline, {:.2} s after the notice, without \
-                     waiting longer for any peer",
-                    at.elapsed().as_secs_f64()
-                ),
-            );
-            std::process::exit(0);
         });
     }
     let next = || events.recv().expect("this thread holds a sender");
-
-    let Some(address) = coordinator else {
-        say(&name, "coordinates: waiting for its notice");
-        while !matches!(next(), Event::Notice) {}
-        return Ok(Ended::Coordinator);
-    };
     let link = Arc::new(link);
     let redial = |wait| {
         dial(

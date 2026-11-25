@@ -3,7 +3,9 @@
 //! `give_back_seconds`. What it says goes to standard error, a line at a time.
 //!
 //! Exit status: 0 once its lease has ended; 2 when it cannot start: `MAG_START` unset, a start
-//! file that cannot be read or is refused, credentials refused, or an address it cannot bind.
+//! file that cannot be read or is refused, credentials refused, an address it cannot bind, or, on
+//! the coordinator, a ledger it cannot begin; 3 when the coordinator stopped because a line of
+//! its ledger could not be written.
 
 use std::process::ExitCode;
 
@@ -20,7 +22,10 @@ fn main() -> ExitCode {
     };
     let failed = |e: member::MemberError| {
         eprintln!("mag-mar: {e}");
-        ExitCode::from(2)
+        match e {
+            member::MemberError::LedgerUnwritten { .. } => ExitCode::from(3),
+            _ => ExitCode::from(2),
+        }
     };
     let start = match member::read_start() {
         Ok(start) => start,

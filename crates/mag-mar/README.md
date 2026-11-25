@@ -2,8 +2,9 @@
 
 The program every member of a mag pool is to run. So far it is the link between members, and
 the program's skeleton: it reads `MAG_START`, joins the pool at the coordinator, and gives its
-devices back on SIGTERM within its time. Running the parts placed on its member, and serving the
-pool on the member that coordinates, are not built yet.
+devices back on SIGTERM within its time. On the member that coordinates, it takes the members'
+joins and leaves into the pool and writes the pool's ledger. Running the parts placed on a
+member, and the coordinator's door, are not built yet.
 
 ## The member program
 
@@ -32,15 +33,56 @@ start file (`mag-by`'s `Start`):
   answering, or on a dial that has not opened. A link's keepalive cannot promise this, since TCP
   does not probe while data is unacknowledged.
 - **What it does goes to standard error**, a line at a time. It exits 2 when it cannot start:
-  `MAG_START` unset, a start file that cannot be read or is refused, credentials refused, or an
-  address it cannot bind.
+  `MAG_START` unset, a start file that cannot be read or is refused, credentials refused, an
+  address it cannot bind, or, as coordinator, a ledger it cannot begin. It exits 3 when, as
+  coordinator, it could not write a line of its ledger.
 
 The library entry is `mag_mar::member::run`; the binary takes SIGTERM as its notice
 (`member::Notice::sigterm`, on Unix), reads the start file and calls it.
 
-The coordinator's own program is not built: a member that coordinates binds its address and waits
-for its notice, and a member that dials it waits in its opening until the opening gives up, and
-dials again.
+## The coordinator
+
+The member a start file names as `coordinator` dials no one. It runs the coordinator, in the same
+program (`mag_mar::coordinator`):
+
+- **It begins a new ledger** at the start file's `ledger`. The pool (`mag_mortar::Pool`) begins
+  with the coordinator's own member and devices, at the time it starts, in seconds since 1970.
+  The ledger's header is written and synced before any member is taken. A file already at that
+  place is refused, and the program exits 2: taking up the ledger of a coordinator that stopped
+  is not built yet.
+- **It takes a control channel from any member of the pool.** `Link::accept_any` takes whoever
+  holds a certificate the pool's authority signed naming exactly one member, and reports that
+  member. A member that joins later than the coordinator began is named by nothing the
+  coordinator was told, only by its certificate. A channel for a job is refused, since no job is
+  placed yet.
+- **It checks a join.** The member a `Join` names, and the member of every device it offers, must
+  be the member the certificate names. That member may hold no other live control channel, and
+  may not be the coordinator itself. A join that fails is refused, and the channel ended without
+  a close, so the member never reads it as an acknowledgement.
+- **It records a join.** One `Change::Join` per offer is applied to the pool, and the new lines are
+  written to the ledger and synced. The member is recorded as the coordinator's start file lists
+  it, at the lower of the two trusts and the shorter of the two times to give a device back. A
+  member the coordinator's start file does not list is recorded at `outside`, whatever its join
+  says (below).
+- **A member with no offers is recorded nowhere.** The pool is told of devices, not of members,
+  and `Change::Join` carries one offer. Such a member holds its control channel, and its leave is
+  answered at once.
+- **It records a leave, then acknowledges it.** On `Leave`, one `Change::Leave` per device the
+  member joined with is applied, the lines are written and synced, and only then does the
+  coordinator close its way of the channel. That close is what the member waits for, within its
+  `give_back_seconds`.
+- **A member gone without leaving is recorded as left.** Its control channel ended without
+  `Leave`: the member died, or its machine went away, and the coordinator can place nothing there.
+- **On its own notice**, SIGTERM, it records its own devices' leave the same way and exits 0.
+- **A ledger line that cannot be written stops it**, with exit status 3. Nothing after the last
+  line written was acknowledged, and the members find their channels cut short.
+
+**Not settled: the trust of a member that joins later.** A member the coordinator's start file
+does not list is known only by its own join, and a machine holding a certificate the host meant
+for `outside` could say `owner`. Either the host writes the trust into the certificate it signs,
+and the coordinator believes nothing the member says, or such a member is trusted at `outside`.
+Until that is settled, the coordinator takes the second, which cannot place data where it should
+not go. `coordinator::recorded_member` is the one place either answer changes.
 
 ## The link
 
@@ -69,6 +111,9 @@ dials again.
 - **Who the other end is**: the member its certificate names, and that certificate's serial.
   Every certificate has a new serial, so a certificate issued after a lease ended can be told
   from the one it ended on. Refusing the old one is the coordinator's, and not built yet.
+- **Any member of the pool**: `accept` takes only the members a caller expects; `accept_any`
+  takes any member the pool's authority signed a certificate for, and refuses a certificate that
+  names more than one member, which could stand for either.
 - **Nothing waits for ever.** Dialling, the handshake and the opening words share one deadline,
   10 s unless set, and each address a name resolves to is tried in turn while time is left. An
   opening that runs out of it says so, with the time it had and whether this end was dialling or
@@ -117,7 +162,14 @@ tensor of 64 MiB byte for byte, and both ends of one channel sending 64 MiB at t
 It runs the member program as a process of its own against a stand-in coordinator: the member
 joins with its offers and leaves on SIGTERM; it exits 0 within its give-back time when the
 coordinator stops answering, and when it is still opening its channel to one that never answers;
-a start file without `listen` dials only. `loopback` sends one tensor of any size and reports the
+a start file without `listen` dials only. And it runs the program as coordinator, with members
+as processes of their own: two members' joins in its ledger, one entry per device; a leave on
+SIGTERM in the ledger as the member exits, within its time, and the ledger replayed by
+`mag_mortar::Pool::replay` to the same lines; joins refused for another member's name or device,
+on a job's channel, as the coordinator, and for a member already joined; an unlisted member at
+`outside`; a member with no offers recorded nowhere; a member killed recorded as left; a ledger
+already there left as it is; and, on Linux, a leave whose ledger line cannot be written never
+acknowledged. `loopback` sends one tensor of any size and reports the
 rate and the memory the link took beyond the two buffers:
 
     cargo run --release -p mag-mar --features issue --example loopback -- 4
@@ -128,7 +180,9 @@ sending (2026-11-25, three runs).
 
 ## Not built yet
 
-- The coordinator and the door; joining again after the coordinator comes back.
+- The door: submitting a job, ending one, taking back by need, and the pool's status.
+- The coordinator's words to members: announcing a member to its peers, and sending placements.
+- Taking up the ledger of a coordinator that stopped, and members joining again when one starts.
 - Running the parts placed on a member, channels to other members for their jobs, and giving
   back with the parts' state at a step.
 - Refusing a member whose lease ended until it has a new certificate.

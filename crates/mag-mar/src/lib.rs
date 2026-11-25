@@ -36,8 +36,12 @@
 //! start file `MAG_START` names, binds the member's own address if it has one, dials the
 //! coordinator unless it is the coordinator, and joins over a control channel with its offers.
 //! On SIGTERM it says it leaves and exits 0 within its `give_back_seconds`, whatever any peer
-//! does. Running the parts placed on it, and serving the pool as coordinator, are not built yet.
+//! does. On the member that coordinates, it runs [`coordinator`]: it takes any member's control
+//! channel ([`Link::accept_any`]), and records each join and leave in a `mag_mortar::Pool` and in
+//! the pool's ledger, written before a leave is acknowledged. Running the parts placed on a
+//! member, and the coordinator's door, are not built yet.
 
+pub mod coordinator;
 mod frame;
 #[cfg(feature = "issue")]
 pub mod issue;

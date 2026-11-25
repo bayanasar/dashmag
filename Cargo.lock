@@ -4260,6 +4260,7 @@ dependencies = [
  "libc",
  "mag-by",
  "mag-mar",
+ "mag-mortar",
  "rcgen",
  "ring",
  "rustls",

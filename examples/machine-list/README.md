@@ -7,8 +7,9 @@ unequal machines: one with a CUDA card, one with a ROCm card, and a Mac with MLX
 
 What runs today is the first step, planning. You write the pool file, and `mag plan` shows where
 the pool would place a graph on it, and why. Nothing is placed on any machine yet: the program
-each machine runs (`mag-mar`) starts, dials the coordinator and gives its machine back on
-SIGTERM, but the coordinator's side of it is not built, so no member joins a pool yet.
+each machine runs (`mag-mar`) starts, joins the pool at the coordinator, which records the join
+in the pool's ledger, and gives its machine back on SIGTERM, but no job can be submitted yet,
+since the coordinator's door is not built.
 
 ## The files
 
@@ -121,11 +122,18 @@ a member.
 
       MAG_START=server.json cargo run --release -q -p mag-mar
 
-  This runs today, as far as it goes. The member reads its start file, binds its `listen`
-  address and dials the coordinator; the coordinator's member binds its address and waits. Since
-  the coordinator's side is not built, a member's dial is not answered: it gives up after 10 s
-  and dials again, saying so on standard error. `kill -TERM` ends it with status 0 within its
-  `give_back_seconds`.
+  This runs today, as far as it goes. Start the coordinator first. It begins the ledger at the
+  start file's `ledger`, which must not exist yet: a coordinator does not take up an old ledger,
+  so move the last one away before you start it again. Each other member reads its start file,
+  binds its `listen` address, dials the coordinator and joins. The coordinator records one entry
+  in the ledger for each device the member offers, from the offers its start file's pool gives
+  for it, so write an offer for each device there: a member with none is recorded nowhere.
+  `kill -TERM` on a member ends it with status 0 within its `give_back_seconds`, once the
+  coordinator has written its leave to the ledger. A machine you did not list in the
+  coordinator's start file, issued a certificate later with `certs add`, joins too, and is
+  recorded at `outside` whatever its own start file says. The ledger is one JSON object per line,
+  as `mag-by`'s [ledger schema](../../crates/mag-by/schemas/mag-ledger.schema.json) has it.
 - Three containers on CPU: two jobs submitted to the coordinator's door and placed against each
-  other, and one machine taken back with SIGTERM. This needs the coordinator in `mag-mar`.
+  other, and one machine taken back with SIGTERM. This needs the coordinator's door in
+  `mag-mar`.
 - The same on three real machines with CUDA, ROCm and MLX.
