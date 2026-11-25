@@ -79,6 +79,10 @@ fn what_neither_side_takes_is_refused_alike() {
             "{why:?} does not start with {want:?}"
         );
     }
+    // Wait for the work this thread queued: on ROCm under WSL2, a process that exits while
+    // CubeCL's device thread is still creating this thread's stream crashes in the HIP runtime's
+    // teardown.
+    x.to_f32().unwrap();
 }
 
 #[test]
@@ -93,4 +97,6 @@ fn an_output_has_the_contracts_shape() {
     let y = conv2d(&x, &w, Some(&b), options).unwrap();
     assert_eq!(y.shape(), [2, 8, 5, 5]);
     assert_eq!(y.dtype(), DType::F32);
+    // Read it, so that the process does not exit with the convolution queued (as above).
+    assert!(y.to_f32().unwrap().iter().all(|v| *v == 0.0));
 }
