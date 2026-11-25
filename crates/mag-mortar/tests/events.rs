@@ -1,4 +1,4 @@
-//! The pool's events beyond an arrival: a second job of one name, a member's mark, a device
+//! The pool's events beyond an arrival: a second job of one name, a member's trust, a device
 //! leaving, and a job too large to list every placement of.
 
 mod common;
@@ -12,7 +12,7 @@ use mag_mortar::{ChangeError, Pool};
 #[test]
 fn a_second_job_of_one_name_is_refused_and_the_first_is_kept() {
     let mut pool = Pool::new(
-        vec![member("a", false)],
+        vec![member("a", Owner)],
         vec![offer(device("a", 0), Backend::Cuda, 16, &[("u", 0.01)])],
     );
     let g = || {
@@ -24,9 +24,9 @@ fn a_second_job_of_one_name_is_refused_and_the_first_is_kept() {
             vec![],
         )
     };
-    pool.submit(g(), 0.0).unwrap();
+    pool.submit(g(), Stamp::default(), 0.0).unwrap();
     assert_eq!(
-        pool.submit(g(), 1.0).unwrap_err(),
+        pool.submit(g(), Stamp::default(), 1.0).unwrap_err(),
         ChangeError::Duplicate { job: "same".into() }
     );
     assert_eq!(pool.records().len(), 1);
@@ -35,36 +35,47 @@ fn a_second_job_of_one_name_is_refused_and_the_first_is_kept() {
 }
 
 #[test]
-fn a_later_report_of_a_member_as_remote_stands_over_an_earlier_local_one() {
+fn a_later_report_of_a_lower_trust_stands_over_an_earlier_higher_one() {
     let mut pool = Pool::new(
-        vec![member("m", false)],
+        vec![member("m", Owner)],
         vec![offer(device("m", 0), Backend::Cuda, 16, &[("u", 0.05)])],
     );
     let r = pool
         .join(
-            Some(member("m", true)),
+            Some(member("m", Site)),
             offer(device("m", 1), Backend::Cuda, 16, &[("u", 0.01)]),
             0.0,
         )
         .unwrap();
-    assert_eq!(r.marked_remote, ["m"]);
-    // The opposite report does not undo it.
+    assert_eq!(r.lowered, ["m"]);
+    // A higher report does not undo it.
     let r = pool
         .join(
-            Some(member("m", false)),
+            Some(member("m", Owner)),
             offer(device("m", 2), Backend::Cuda, 16, &[("u", 0.01)]),
             1.0,
         )
         .unwrap();
-    assert!(r.marked_remote.is_empty());
+    assert!(r.lowered.is_empty());
+    assert_eq!(pool.describe().members, [member("m", Site)]);
+    // A lower one lowers it again.
+    let r = pool
+        .join(
+            Some(member("m", Outside)),
+            offer(device("m", 3), Backend::Cuda, 16, &[("u", 0.01)]),
+            1.5,
+        )
+        .unwrap();
+    assert_eq!(r.lowered, ["m"]);
+    assert_eq!(pool.describe().members, [member("m", Outside)]);
     let g = job(
         "label",
         1,
-        vec![input("frames", true)],
+        vec![input("frames", Owner)],
         vec![part("detect", "u", Mark::Atomic, 4)],
         vec![edge("frames", Some("detect"))],
     );
-    let r = pool.submit(g, 2.0).unwrap();
+    let r = pool.submit(g, Stamp::default(), 2.0).unwrap();
     assert_eq!(r.chosen, None);
     assert!(
         r.candidates[1..]
@@ -76,7 +87,7 @@ fn a_later_report_of_a_member_as_remote_stands_over_an_earlier_local_one() {
 #[test]
 fn a_device_that_leaves_takes_nothing_with_it() {
     let mut pool = Pool::new(
-        vec![member("a", false), member("b", false)],
+        vec![member("a", Owner), member("b", Owner)],
         vec![
             offer(device("a", 0), Backend::Cuda, 16, &[("u", 0.01)]),
             offer(device("b", 0), Backend::Rocm, 16, &[("u", 0.02)]),
@@ -90,6 +101,7 @@ fn a_device_that_leaves_takes_nothing_with_it() {
             vec![part("p", "u", Mark::Atomic, 4)],
             vec![],
         ),
+        Stamp::default(),
         0.0,
     )
     .unwrap();
@@ -117,7 +129,7 @@ fn a_device_that_leaves_takes_nothing_with_it() {
 fn past_the_bound_the_loop_places_greedily_and_quickly() {
     // Twelve atomic parts on four cards are 4^12 placements; listing them would take minutes.
     let mut pool = Pool::new(
-        (0..4).map(|i| member(&format!("m{i}"), false)).collect(),
+        (0..4).map(|i| member(&format!("m{i}"), Owner)).collect(),
         (0..4)
             .map(|i| {
                 offer(
@@ -134,7 +146,7 @@ fn past_the_bound_the_loop_places_greedily_and_quickly() {
         .collect();
     let start = Instant::now();
     let r = pool
-        .submit(job("wide", 1, vec![], parts, vec![]), 0.0)
+        .submit(job("wide", 1, vec![], parts, vec![]), Stamp::default(), 0.0)
         .unwrap();
     assert!(r.greedy);
     assert!(start.elapsed().as_secs_f64() < 1.0, "{:?}", start.elapsed());

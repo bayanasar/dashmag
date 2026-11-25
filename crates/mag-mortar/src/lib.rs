@@ -17,14 +17,16 @@
 //!    priority first, each group of a job on the device that adds least to the busiest device's
 //!    time, and the record says so.
 //! 2. **Remove** a candidate that breaks a constraint, with a typed reason: first any part's
-//!    eligibility over every part (no such device, the guard, a pin, its tolerance class, its
-//!    edges' dtypes), then the memory each device offers, then a job's need, a rate it must
-//!    sustain, for every placed job. The guard keeps a part carrying local-only data off a
-//!    device of a member marked remote, and off a device of a member the pool does not know.
+//!    eligibility over every part (no such device, the guard, the job's stamp, a pin, its
+//!    tolerance class, its edges' dtypes), then the memory each device offers, then a job's
+//!    need, a rate it must sustain, for every placed job. The guard compares levels: a part kept
+//!    at a level goes only on a device of a member trusted at least as far, and a member the
+//!    pool does not know is trusted at `outside`. The stamp keeps a job to the devices it names.
 //! 3. **Predict** each remaining candidate's score: the sum over jobs of their priority times
 //!    their rate, each rate divided by the job's best rate alone on the pool as it now is. A
-//!    waiting job's priority is its own times `1 + waited / AGING_SECONDS`: 2 at 60 s, 3 at
-//!    120 s. Once placed, its waiting time starts again from 0.
+//!    job's priority is its graph's, held to its stamp's ceiling. A waiting job's priority is
+//!    that times `1 + waited / AGING_SECONDS`: 2 at 60 s, 3 at 120 s, so that no job starves,
+//!    whatever its ceiling. Once placed, its waiting time starts again from 0.
 //! 4. **Commit** the best candidate if it scores above leaving things as they are, and **record**
 //!    the run.
 //!
@@ -52,7 +54,10 @@
 //! - dividing a chain across devices, choosing to share a device with a running job, and
 //!   squeezing a running job (M-6). Running jobs are not moved here, so moving costs nothing;
 //! - memory over time: a device's parts are summed as if all resident at once;
-//! - a deadline: a job states no length yet.
+//! - a deadline: a job states no length yet;
+//! - which device to give up when the host takes one back by need, and which kind of device the
+//!   pool most wants and which members it would give back (`mag_by::Asks`); and beginning a pool
+//!   from the arrangement its members hold, after its coordinator stops.
 //!
 //! The same members, offers and events give the same records: devices are taken in the order of
 //! their [`DeviceId`], and the first of equal scores wins.
@@ -62,10 +67,13 @@ use std::fmt;
 
 use mag_by::{
     Arrangement, Candidate, Change, Cost, Description, DeviceId, Dtype, Entry, Event, Format,
-    GRAPH_FORMAT, GRAPH_VERSION, Graph, Held, LEDGER_FORMAT, LEDGER_VERSION, Ledger, LocalOnly,
-    Mark, Member, Move, Offer, POOL_FORMAT, POOL_VERSION, Pin, Place, Record, Refusal, Removal,
-    Unit,
+    GRAPH_FORMAT, GRAPH_VERSION, Graph, Held, Keeps, LEDGER_FORMAT, LEDGER_VERSION, Ledger, Mark,
+    Member, Move, Offer, POOL_FORMAT, POOL_VERSION, Pin, Place, Record, Refusal, Removal, Stamp,
+    Trust, Unit,
 };
+
+/// This crate's version, which a ledger it begins records as `written_by`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The most candidates listed one by one before generation turns greedy (proposed).
 pub const EXHAUSTIVE: usize = 500;
@@ -82,6 +90,10 @@ pub const ESTIMATE_BAND: f64 = 1.0;
 pub enum ChangeError {
     /// The graph fails [`Graph::check`].
     Graph(Refusal),
+    /// The stamp's priority ceiling is 0, which no job's priority may be.
+    ZeroCeiling,
+    /// The stamp names no device, so the job could never run.
+    NoDevices,
     /// The pool already holds a job of this name.
     Duplicate { job: String },
     /// The time is not finite.
@@ -92,6 +104,13 @@ impl fmt::Display for ChangeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ChangeError::Graph(r) => write!(f, "the graph is refused: {r}"),
+            ChangeError::ZeroCeiling => {
+                write!(
+                    f,
+                    "the stamp's priority ceiling is 0; it must be at least 1"
+                )
+            }
+            ChangeError::NoDevices => write!(f, "the stamp names no device the job may use"),
             ChangeError::Duplicate { job } => {
                 write!(f, "the pool already holds a job named `{job}`")
             }
@@ -148,17 +167,27 @@ impl fmt::Display for HoldsJobs {
 
 impl std::error::Error for HoldsJobs {}
 
-/// A job the pool holds: its graph, its marks, where its parts are, and how long it has waited.
+/// A job the pool holds: its graph and stamp, the level each part is kept at, where its parts
+/// are, and how long it has waited.
 #[derive(Clone, Debug)]
 struct Live {
     graph: Graph,
-    marks: LocalOnly,
+    stamp: Stamp,
+    keeps: Keeps,
     arrangement: Arrangement,
     waited: f64,
     best_alone: f64,
 }
 
 impl Live {
+    /// Its priority: its graph's, held to its stamp's ceiling.
+    fn priority(&self) -> u32 {
+        match self.stamp.priority_ceiling {
+            Some(ceiling) => self.graph.job.priority.min(ceiling),
+            None => self.graph.job.priority,
+        }
+    }
+
     fn waiting(&self) -> bool {
         self.arrangement
             .places
@@ -209,8 +238,8 @@ struct Built {
 
 impl Pool {
     /// A pool of these members and their devices' offers, holding no job, at time 0. Of two
-    /// reports of one member the stricter mark stands, and of two offers for one device the later,
-    /// as when they join.
+    /// reports of one member the lower trust stands, and of two offers for one device the later,
+    /// as when they join. Its ledger is a first one, written by this crate's [`VERSION`].
     pub fn new(members: Vec<Member>, offers: Vec<Offer>) -> Self {
         Pool::begin(members, offers, 0.0)
     }
@@ -240,6 +269,8 @@ impl Pool {
             jobs: Vec::new(),
             ledger: Ledger {
                 at,
+                written_by: Some(VERSION.into()),
+                follows: None,
                 members: members.clone(),
                 offers,
                 entries: Vec::new(),
@@ -254,9 +285,11 @@ impl Pool {
 
     /// The pool a ledger describes: begun with its time, members and offers, then told each
     /// change at its time, each record compared with the one logged. Its own ledger is then the
-    /// same.
+    /// same, its header too: which version wrote it and which ledger it follows are as logged.
     pub fn replay(ledger: &Ledger) -> Result<Pool, ReplayError> {
         let mut pool = Pool::begin(ledger.members.clone(), ledger.offers.clone(), ledger.at);
+        pool.ledger.written_by.clone_from(&ledger.written_by);
+        pool.ledger.follows.clone_from(&ledger.follows);
         for (entry, e) in ledger.entries.iter().enumerate() {
             match pool.apply(e.change.clone(), e.at) {
                 Ok(record) if record == &e.record => {}
@@ -299,30 +332,30 @@ impl Pool {
                 .iter()
                 .map(|j| Held {
                     arrangement: j.arrangement.clone(),
-                    priority: j.graph.job.priority,
+                    priority: j.priority(),
                     waited_seconds: j.waited,
                 })
                 .collect(),
-            formats: vec![
-                Format {
-                    name: GRAPH_FORMAT.into(),
-                    version: GRAPH_VERSION,
-                },
-                Format {
-                    name: LEDGER_FORMAT.into(),
-                    version: LEDGER_VERSION,
-                },
-                Format {
-                    name: POOL_FORMAT.into(),
-                    version: POOL_VERSION,
-                },
-            ],
+            formats: [
+                (GRAPH_FORMAT, GRAPH_VERSION),
+                (LEDGER_FORMAT, LEDGER_VERSION),
+                (POOL_FORMAT, POOL_VERSION),
+            ]
+            .into_iter()
+            .flat_map(|(name, newest)| {
+                (1..=newest).map(move |version| Format {
+                    name: name.into(),
+                    version,
+                })
+            })
+            .collect(),
         }
     }
 
-    /// The record [`Pool::submit`] would make of this graph at `at` seconds, or its refusal. The
-    /// pool is left as it is: it holds no new job, keeps no record and does not move its time.
-    pub fn plan(&self, graph: &Graph, at: f64) -> Result<Record, ChangeError> {
+    /// The record [`Pool::submit`] would make of this graph and stamp at `at` seconds, or its
+    /// refusal. The pool is left as it is: it holds no new job, keeps no record and does not move
+    /// its time.
+    pub fn plan(&self, graph: &Graph, stamp: &Stamp, at: f64) -> Result<Record, ChangeError> {
         let mut trial = Pool {
             members: self.members.clone(),
             offers: self.offers.clone(),
@@ -330,7 +363,7 @@ impl Pool {
             ledger: Ledger::default(),
             now: self.now,
         };
-        trial.submit(graph.clone(), at).cloned()
+        trial.submit(graph.clone(), stamp.clone(), at).cloned()
     }
 
     /// The one way into the pool: it takes a change at `at` seconds, runs the loop, and adds the
@@ -346,7 +379,7 @@ impl Pool {
             return Err(ChangeError::Time);
         }
         let record = match &change {
-            Change::Submit { graph } => self.arrive(graph.clone(), at)?,
+            Change::Submit { graph, stamp } => self.arrive(graph.clone(), stamp.clone(), at)?,
             Change::End { job } => self.finish(job, at),
             Change::Join { member, offer } => self.add_device(member.clone(), offer.clone(), at),
             Change::Leave { device } => self.remove_device(device, at),
@@ -355,10 +388,12 @@ impl Pool {
         Ok(&self.ledger.entries.last().expect("just pushed").record)
     }
 
-    /// A job arrives at `at` seconds. A graph that fails [`Graph::check`], or a second job of a
-    /// name the pool holds, is refused and the pool is unchanged.
-    pub fn submit(&mut self, graph: Graph, at: f64) -> Result<&Record, ChangeError> {
-        self.apply(Change::Submit { graph }, at)
+    /// A job arrives at `at` seconds, with the host's stamp: it is placed only on the devices the
+    /// stamp names, if it names any, and its priority is held to the stamp's ceiling, if it has
+    /// one. A graph that fails [`Graph::check`], a stamp with a ceiling of 0 or an empty list of
+    /// devices, or a second job of a name the pool holds, is refused and the pool is unchanged.
+    pub fn submit(&mut self, graph: Graph, stamp: Stamp, at: f64) -> Result<&Record, ChangeError> {
+        self.apply(Change::Submit { graph, stamp }, at)
     }
 
     /// A job ends at `at` seconds; the jobs waiting are placed again where they now fit.
@@ -367,7 +402,7 @@ impl Pool {
     }
 
     /// A device joins at `at` seconds, with its member's report. Of two reports for one member
-    /// the stricter mark stands: remote over local, the shorter time to give a device back.
+    /// the stricter stands: the lower trust, the shorter time to give a device back.
     pub fn join(
         &mut self,
         member: Option<Member>,
@@ -388,8 +423,14 @@ impl Pool {
         )
     }
 
-    fn arrive(&mut self, graph: Graph, at: f64) -> Result<Record, ChangeError> {
-        let marks = graph.local_only().map_err(ChangeError::Graph)?;
+    fn arrive(&mut self, graph: Graph, stamp: Stamp, at: f64) -> Result<Record, ChangeError> {
+        let keeps = graph.keeps().map_err(ChangeError::Graph)?;
+        if stamp.priority_ceiling == Some(0) {
+            return Err(ChangeError::ZeroCeiling);
+        }
+        if stamp.devices.as_ref().is_some_and(Vec::is_empty) {
+            return Err(ChangeError::NoDevices);
+        }
         let name = graph.job.name.clone();
         if self.jobs.iter().any(|j| j.graph.job.name == name) {
             return Err(ChangeError::Duplicate { job: name });
@@ -397,7 +438,8 @@ impl Pool {
         let parts = graph.parts.len();
         let mut live = Live {
             graph,
-            marks,
+            stamp,
+            keeps,
             arrangement: Arrangement {
                 job: name.clone(),
                 places: vec![Place::Waiting; parts],
@@ -419,13 +461,13 @@ impl Pool {
 
     fn add_device(&mut self, member: Option<Member>, offer: Offer, at: f64) -> Record {
         self.advance(at);
-        let marked_remote = member.map(|m| self.add_member(m)).unwrap_or_default();
+        let lowered = member.map(|m| self.add_member(m)).unwrap_or_default();
         let device = offer.device.clone();
         self.offers.retain(|o| o.device != device);
         self.offers.push(offer);
         self.offers.sort_by(|a, b| a.device.cmp(&b.device));
         self.rebase();
-        self.run(Event::Join { device }, marked_remote)
+        self.run(Event::Join { device }, lowered)
     }
 
     fn remove_device(&mut self, device: &DeviceId, at: f64) -> Record {
@@ -453,18 +495,15 @@ impl Pool {
         )
     }
 
-    /// Records a member's report; returns its name if it marks remote a member known as local.
+    /// Records a member's report; returns its name if it lowers the trust the member was known
+    /// at.
     fn add_member(&mut self, m: Member) -> Vec<String> {
         match self.members.iter_mut().find(|x| x.name == m.name) {
             Some(known) => {
-                let newly_remote = m.remote && !known.remote;
-                known.remote |= m.remote;
+                let lowered = m.trust < known.trust;
+                known.trust = known.trust.min(m.trust);
                 known.give_back_seconds = known.give_back_seconds.min(m.give_back_seconds);
-                if newly_remote {
-                    vec![m.name]
-                } else {
-                    Vec::new()
-                }
+                if lowered { vec![m.name] } else { Vec::new() }
             }
             None => {
                 self.members.push(m);
@@ -493,7 +532,7 @@ impl Pool {
     }
 
     /// One run of the loop over the waiting jobs, which every event here touches.
-    fn run(&mut self, event: Event, marked_remote: Vec<String>) -> Record {
+    fn run(&mut self, event: Event, lowered: Vec<String>) -> Record {
         let touched: Vec<usize> = (0..self.jobs.len())
             .filter(|&i| self.jobs[i].waiting())
             .collect();
@@ -555,7 +594,7 @@ impl Pool {
             candidates,
             chosen,
             greedy,
-            marked_remote,
+            lowered,
         }
     }
 
@@ -760,8 +799,8 @@ impl Pool {
         }
     }
 
-    /// Why a part of a job may not go on a device, if it may not: no such device, the guard, a
-    /// pin, its tolerance class, or a dtype its edges carry.
+    /// Why a part of a job may not go on a device, if it may not: no such device, the guard, the
+    /// job's stamp, a pin, its tolerance class, or a dtype its edges carry.
     fn eligibility(&self, j: &Live, i: usize, d: &DeviceId) -> Option<Removal> {
         let g = &j.graph;
         let part = &g.parts[i];
@@ -769,9 +808,24 @@ impl Pool {
         let Some(offer) = self.offer(d) else {
             return Some(Removal::NoDevice { device });
         };
-        // A device whose member the pool does not know is taken as remote.
-        if j.marks.parts[i] && self.member(d).is_none_or(|m| m.remote) {
-            return Some(Removal::Guard { part: name, device });
+        // A device whose member the pool does not know is trusted at the lowest level.
+        let trust = self.member(d).map_or(Trust::Outside, |m| m.trust);
+        let keep = j.keeps.parts[i];
+        if keep > trust {
+            return Some(Removal::Guard {
+                part: name,
+                device,
+                keep,
+                trust,
+            });
+        }
+        if let Some(allowed) = &j.stamp.devices
+            && !allowed.contains(d)
+        {
+            return Some(Removal::Stamp {
+                job: g.job.name.clone(),
+                device,
+            });
         }
         let pinned_elsewhere = match &part.pin {
             Some(Pin::Member(m)) => &d.member != m,
@@ -885,7 +939,7 @@ impl Pool {
     }
 
     fn priority(&self, j: &Live) -> f64 {
-        j.graph.job.priority as f64 * (1.0 + j.waited / AGING_SECONDS)
+        j.priority() as f64 * (1.0 + j.waited / AGING_SECONDS)
     }
 
     /// The candidate's score and its band: the sum over jobs of priority times rate, each rate

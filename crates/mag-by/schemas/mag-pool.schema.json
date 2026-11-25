@@ -149,24 +149,24 @@
     },
     "Member": {
       "additionalProperties": false,
-      "description": "A machine in the pool, running `mag-mar`.",
+      "description": "A machine in the pool, running `mag-mar`: one lease of the host's.",
       "properties": {
         "give_back_seconds": {
-          "description": "Seconds within which the member gives a device back when its owner wants it.",
+          "description": "Seconds within which the member gives a device back when the host takes it back.",
           "format": "double",
           "type": "number"
         },
         "name": {
           "type": "string"
         },
-        "remote": {
-          "description": "Outside the owner's own machines, as a rented GPU is. Nothing local-only is placed on a\nremote member's devices.",
-          "type": "boolean"
+        "trust": {
+          "$ref": "#/$defs/Trust",
+          "description": "How far the host trusts it. Nothing kept at a higher level is placed on its devices."
         }
       },
       "required": [
         "name",
-        "remote",
+        "trust",
         "give_back_seconds"
       ],
       "type": "object"
@@ -276,6 +276,26 @@
         }
       ]
     },
+    "Trust": {
+      "description": "How far a machine is trusted, and how far data must be kept, in order: `outside < site <\nowner`. A member is trusted at a level; an input or a blob is kept at a level, and is placed\nonly on a member trusted at least as far.\n\nThe host gives each member its level, and mag judges no one: what a level means is the\nhost's. As a rule of thumb, `owner` is the owner's own machines, `site` a machine inside the\nowner's site that is not the owner's, and `outside` anything else, a rented machine among\nthem.",
+      "oneOf": [
+        {
+          "const": "outside",
+          "description": "Trusted with what anyone may hold.",
+          "type": "string"
+        },
+        {
+          "const": "site",
+          "description": "Inside the owner's site, but not the owner's.",
+          "type": "string"
+        },
+        {
+          "const": "owner",
+          "description": "The owner's own.",
+          "type": "string"
+        }
+      ]
+    },
     "Unit": {
       "additionalProperties": false,
       "description": "A named, versioned function.",
@@ -323,7 +343,7 @@
       "type": "array"
     },
     "members": {
-      "description": "Its members, each with the stricter of the marks it was reported with.",
+      "description": "Its members, each with the lowest trust and the shortest time to give a device back it was\nreported with.",
       "items": {
         "$ref": "#/$defs/Member"
       },
@@ -337,7 +357,7 @@
       "type": "array"
     },
     "version": {
-      "const": 1
+      "const": 2
     }
   },
   "required": [
@@ -349,6 +369,6 @@
     "jobs",
     "formats"
   ],
-  "title": "mag-pool, version 1",
+  "title": "mag-pool, version 2",
   "type": "object"
 }

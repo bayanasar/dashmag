@@ -5,7 +5,8 @@ use std::path::Path;
 
 use mag_by::{
     Arrangement, Backend, Candidate, Change, Cost, DeviceId, Dtype, Entry, Event, Graph, Ledger,
-    LedgerError, Member, Move, Offer, Place, Record, Removal, Tolerance, Unit, ledger_schema,
+    LedgerError, Member, Move, Offer, Place, Record, Removal, Stamp, Tolerance, Trust, Unit,
+    ledger_schema,
 };
 use serde_json::Value;
 
@@ -18,10 +19,10 @@ fn device(member: &str, index: u32) -> DeviceId {
     }
 }
 
-fn member(name: &str, remote: bool) -> Member {
+fn member(name: &str, trust: Trust) -> Member {
     Member {
         name: name.into(),
-        remote,
+        trust,
         give_back_seconds: 5.0,
     }
 }
@@ -51,7 +52,7 @@ fn record(event: Event, candidates: Vec<Candidate>, chosen: Option<usize>) -> Re
         candidates,
         chosen,
         greedy: false,
-        marked_remote: vec![],
+        lowered: vec![],
     }
 }
 
@@ -69,12 +70,21 @@ fn sample() -> Ledger {
     };
     Ledger {
         at: 0.0,
-        members: vec![member("a", false), member("b", false)],
+        written_by: Some("0.0.1".into()),
+        follows: Some("the ledger before".into()),
+        members: vec![member("a", Trust::Owner), member("b", Trust::Site)],
         offers: vec![offer(device("a", 0))],
         entries: vec![
             Entry {
                 at: 0.0,
-                change: Change::Submit { graph },
+                change: Change::Submit {
+                    graph,
+                    stamp: Stamp {
+                        by: Some("someone".into()),
+                        devices: Some(vec![device("a", 0), device("b", 0)]),
+                        priority_ceiling: Some(1),
+                    },
+                },
                 record: record(
                     Event::Arrival { job: job.clone() },
                     vec![
@@ -84,6 +94,8 @@ fn sample() -> Ledger {
                             removed: Some(Removal::Guard {
                                 part: "decode".into(),
                                 device: device("b", 0),
+                                keep: Trust::Owner,
+                                trust: Trust::Site,
                             }),
                             left_out: vec![],
                             score: None,
@@ -93,12 +105,21 @@ fn sample() -> Ledger {
                             arrangements: vec![placed],
                             moves: vec![Move::Wait],
                             removed: None,
-                            left_out: vec![(
-                                "b0".into(),
-                                Removal::Memory {
-                                    device: device("b", 0),
-                                },
-                            )],
+                            left_out: vec![
+                                (
+                                    "b0".into(),
+                                    Removal::Memory {
+                                        device: device("b", 0),
+                                    },
+                                ),
+                                (
+                                    "decode".into(),
+                                    Removal::Stamp {
+                                        job: job.clone(),
+                                        device: device("c", 0),
+                                    },
+                                ),
+                            ],
                             score: Some(1.0 / 3.0),
                             band: Some(0.05),
                         },
@@ -109,12 +130,12 @@ fn sample() -> Ledger {
             Entry {
                 at: 1.5,
                 change: Change::Join {
-                    member: Some(member("b", true)),
+                    member: Some(member("b", Trust::Outside)),
                     offer: offer(device("b", 1)),
                 },
                 record: Record {
                     greedy: true,
-                    marked_remote: vec!["b".into()],
+                    lowered: vec!["b".into()],
                     ..record(
                         Event::Join {
                             device: device("b", 1),
@@ -175,7 +196,10 @@ fn a_ledger_written_as_lines_reads_back_and_writes_back_byte_for_byte() {
     let ledger = sample();
     let text = ledger.to_lines();
     assert_eq!(text.lines().count(), 1 + ledger.entries.len());
-    assert!(text.starts_with(r#"{"format":"mag-ledger","version":1,"at":0.0,"members":"#));
+    assert!(text.starts_with(
+        r#"{"format":"mag-ledger","version":2,"at":0.0,"written_by":"0.0.1","follows":"the ledger before","members":"#
+    ));
+    assert!(text.contains(r#""stamp":{"by":"someone","devices":"#));
     let read = Ledger::from_lines(&text).unwrap();
     assert_eq!(read.dropped, None);
     assert_eq!(read.ledger, ledger);
@@ -192,6 +216,25 @@ fn a_ledger_written_as_lines_reads_back_and_writes_back_byte_for_byte() {
         Ledger::from_lines(&empty.header_line()).unwrap().ledger,
         empty
     );
+    // A header that knows neither its writer nor a ledger it follows leaves both out, and an
+    // empty stamp is written as `{}`.
+    let first = Ledger {
+        written_by: None,
+        follows: None,
+        ..empty
+    };
+    let header = first.header_line();
+    assert!(!header.contains("written_by") && !header.contains("follows"));
+    assert_eq!(Ledger::from_lines(&header).unwrap().ledger, first);
+    let mut unstamped = sample();
+    unstamped.entries[0].change = Change::Submit {
+        graph: Graph::from_json(EXAMPLE).unwrap(),
+        stamp: Stamp::default(),
+    };
+    let line = Ledger::line(&unstamped.entries[0]);
+    assert!(line.contains(r#""stamp":{}"#), "{line}");
+    let read = Ledger::from_lines(&unstamped.to_lines()).unwrap();
+    assert_eq!((read.ledger, read.version), (unstamped, 2));
 }
 
 #[test]
@@ -202,14 +245,14 @@ fn the_header_s_format_and_version_are_checked_first() {
         Err(LedgerError::Format { found: Some(f) }) if f == "\"mag-graph\""
     ));
     let newer = changed(1, |v| {
-        v["version"] = 2.into();
+        v["version"] = 3.into();
         v["checkpoints"] = Value::Array(vec![]);
     });
     let err = Ledger::from_lines(&newer).unwrap_err();
-    assert!(matches!(&err, LedgerError::Version { found: Some(f) } if f == "2"));
+    assert!(matches!(&err, LedgerError::Version { found: Some(f) } if f == "3"));
     assert_eq!(
         err.to_string(),
-        "the version is 2; this reader reads version 1"
+        "the version is 3; this reader reads versions 1 to 2"
     );
     assert!(matches!(
         Ledger::from_lines(""),
@@ -251,6 +294,11 @@ fn unknown_fields_repeated_keys_and_null_are_refused_with_their_line() {
             changed(4, |v| v["change"]["join"]["member"] = Value::Null),
             4,
         ),
+        (changed(1, |v| v["follows"] = Value::Null), 1),
+        (
+            changed(2, |v| v["change"]["submit"]["stamp"]["by"] = Value::Null),
+            2,
+        ),
     ];
     for (text, line) in nulls {
         let err = Ledger::from_lines(&text).unwrap_err();
@@ -261,10 +309,14 @@ fn unknown_fields_repeated_keys_and_null_are_refused_with_their_line() {
     }
 
     let text = sample().to_lines();
-    let repeated = text.replacen(r#""remote":false,"#, r#""remote":false,"remote":true,"#, 1);
+    let repeated = text.replacen(
+        r#""trust":"owner","#,
+        r#""trust":"owner","trust":"outside","#,
+        1,
+    );
     assert!(matches!(
         Ledger::from_lines(&repeated),
-        Err(LedgerError::RepeatedKey { line: 1, at }) if at == "members[0].remote"
+        Err(LedgerError::RepeatedKey { line: 1, at }) if at == "members[0].trust"
     ));
     let repeated = text.replacen(r#""chosen":1,"#, r#""chosen":1,"chosen":0,"#, 1);
     assert!(matches!(
@@ -336,9 +388,21 @@ fn every_line_the_reader_takes_is_valid() {
 #[test]
 fn lines_the_reader_refuses_for_their_form_are_invalid() {
     let v = validator();
-    let changes: [(&str, usize, Edit); 8] = [
+    let changes: [(&str, usize, Edit); 10] = [
         ("another format", 1, |v| v["format"] = "mag-graph".into()),
-        ("a newer version", 1, |v| v["version"] = 2.into()),
+        ("a newer version", 1, |v| v["version"] = 3.into()),
+        ("a submission without its stamp", 2, |v| {
+            v["change"]["submit"]
+                .as_object_mut()
+                .unwrap()
+                .remove("stamp");
+        }),
+        ("a guard without its levels", 2, |v| {
+            v["record"]["candidates"][0]["removed"]["guard"]
+                .as_object_mut()
+                .unwrap()
+                .remove("trust");
+        }),
         ("an unknown field in the header", 1, |v| {
             v["owner"] = "x".into()
         }),

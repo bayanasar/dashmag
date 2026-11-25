@@ -1,0 +1,449 @@
+{
+  "$defs": {
+    "Arrangement": {
+      "additionalProperties": false,
+      "description": "Where each part of one job is, in the graph's order of parts.",
+      "properties": {
+        "job": {
+          "type": "string"
+        },
+        "places": {
+          "items": {
+            "$ref": "#/$defs/Place"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "job",
+        "places"
+      ],
+      "type": "object"
+    },
+    "Backend": {
+      "description": "A backend a device runs.",
+      "oneOf": [
+        {
+          "enum": [
+            "cuda",
+            "rocm",
+            "mlx"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "flex",
+          "description": "The CPU.",
+          "type": "string"
+        }
+      ]
+    },
+    "Cost": {
+      "additionalProperties": false,
+      "description": "A part kind's time on a device, per step, at the batch the device's memory allows.",
+      "properties": {
+        "band": {
+          "description": "How far a measurement may be from the prediction, relative: taken from past differences\nbetween the two.",
+          "format": "double",
+          "type": "number"
+        },
+        "estimate": {
+          "description": "Not measured on this device: estimated from the part's shapes, and so to be probed, not\ntrusted.",
+          "type": "boolean"
+        },
+        "seconds_per_step": {
+          "format": "double",
+          "type": "number"
+        },
+        "unit": {
+          "$ref": "#/$defs/Unit"
+        }
+      },
+      "required": [
+        "unit",
+        "seconds_per_step",
+        "band",
+        "estimate"
+      ],
+      "type": "object"
+    },
+    "Description": {
+      "additionalProperties": false,
+      "description": "The pool as an author sees it, as one virtual device: its members and what each device\noffers, where each job it holds is and how long each waiting one has waited, and the file\nformats it reads. An author reads it before writing a graph.",
+      "properties": {
+        "at": {
+          "description": "The pool's time, in seconds: the latest it has been told of.",
+          "format": "double",
+          "type": "number"
+        },
+        "formats": {
+          "description": "The file formats it reads.",
+          "items": {
+            "$ref": "#/$defs/Format"
+          },
+          "type": "array"
+        },
+        "jobs": {
+          "description": "The jobs it holds, in the order they arrived.",
+          "items": {
+            "$ref": "#/$defs/Held"
+          },
+          "type": "array"
+        },
+        "members": {
+          "description": "Its members, each with the lowest trust and the shortest time to give a device back it was\nreported with.",
+          "items": {
+            "$ref": "#/$defs/Member"
+          },
+          "type": "array"
+        },
+        "offers": {
+          "description": "What each device offers, with the costs measured or estimated on it, in the order of the\ndevices' ids.",
+          "items": {
+            "$ref": "#/$defs/Offer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "at",
+        "members",
+        "offers",
+        "jobs",
+        "formats"
+      ],
+      "type": "object"
+    },
+    "DeviceId": {
+      "additionalProperties": false,
+      "description": "A device: its member, and its index on that member.",
+      "properties": {
+        "index": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "member": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "member",
+        "index"
+      ],
+      "type": "object"
+    },
+    "Dtype": {
+      "description": "What an edge carries: a tensor's element type, or opaque bytes (an encoded image, a record).",
+      "enum": [
+        "f64",
+        "f32",
+        "bf16",
+        "f16",
+        "i64",
+        "i32",
+        "i8",
+        "u8",
+        "bool",
+        "bytes"
+      ],
+      "type": "string"
+    },
+    "Format": {
+      "additionalProperties": false,
+      "description": "A file format a pool reads, at the version it reads.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "type": "object"
+    },
+    "Held": {
+      "additionalProperties": false,
+      "description": "A job a pool holds, as the pool's description shows it.",
+      "properties": {
+        "arrangement": {
+          "$ref": "#/$defs/Arrangement",
+          "description": "Where its parts are. The job's name is the arrangement's."
+        },
+        "priority": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "waited_seconds": {
+          "description": "Seconds it has waited since it arrived or last lost its place: 0 while it is placed.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "arrangement",
+        "priority",
+        "waited_seconds"
+      ],
+      "type": "object"
+    },
+    "Member": {
+      "additionalProperties": false,
+      "description": "A machine in the pool, running `mag-mar`: one lease of the host's.",
+      "properties": {
+        "give_back_seconds": {
+          "description": "Seconds within which the member gives a device back when the host takes it back.",
+          "format": "double",
+          "type": "number"
+        },
+        "name": {
+          "type": "string"
+        },
+        "trust": {
+          "$ref": "#/$defs/Trust",
+          "description": "How far the host trusts it. Nothing kept at a higher level is placed on its devices."
+        }
+      },
+      "required": [
+        "name",
+        "trust",
+        "give_back_seconds"
+      ],
+      "type": "object"
+    },
+    "Offer": {
+      "additionalProperties": false,
+      "description": "What a device gives the pool now.",
+      "properties": {
+        "backend": {
+          "$ref": "#/$defs/Backend"
+        },
+        "costs": {
+          "description": "Its time per step for each part kind it has run or estimated.",
+          "items": {
+            "$ref": "#/$defs/Cost"
+          },
+          "type": "array"
+        },
+        "device": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "dtypes": {
+          "description": "The dtypes it computes in.",
+          "items": {
+            "$ref": "#/$defs/Dtype"
+          },
+          "type": "array"
+        },
+        "memory_bytes": {
+          "description": "The memory it can give: what is free of anything else holding it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tolerances": {
+          "description": "The tolerance classes its measured bounds meet.",
+          "items": {
+            "$ref": "#/$defs/Tolerance"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "device",
+        "backend",
+        "memory_bytes",
+        "tolerances",
+        "dtypes",
+        "costs"
+      ],
+      "type": "object"
+    },
+    "Peer": {
+      "additionalProperties": false,
+      "description": "Another member, as this one reaches it and knows it.",
+      "properties": {
+        "address": {
+          "description": "Where it is dialled, as `host:port`, if it can be: a machine behind address translation\nhas none, and dials out instead.",
+          "type": "string"
+        },
+        "member": {
+          "type": "string"
+        },
+        "public_key": {
+          "description": "Its public key, as the transport reads it: both ends of a link are authenticated by these.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "member",
+        "public_key"
+      ],
+      "type": "object"
+    },
+    "Place": {
+      "description": "Where a part is.",
+      "oneOf": [
+        {
+          "const": "waiting",
+          "description": "Not placed: its job waits.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "On one device.",
+          "properties": {
+            "on": {
+              "$ref": "#/$defs/DeviceId"
+            }
+          },
+          "required": [
+            "on"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A replicable part's copies, one on each device, each pulling items from one queue.",
+          "properties": {
+            "copies": {
+              "items": {
+                "$ref": "#/$defs/DeviceId"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "copies"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Tolerance": {
+      "description": "The numerics a part accepts. A device takes the part only if its measured bounds for the\npart's operations meet it.",
+      "oneOf": [
+        {
+          "enum": [
+            "f32",
+            "bf16",
+            "int8"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "exact",
+          "description": "The reference's bits.",
+          "type": "string"
+        }
+      ]
+    },
+    "Trust": {
+      "description": "How far a machine is trusted, and how far data must be kept, in order: `outside < site <\nowner`. A member is trusted at a level; an input or a blob is kept at a level, and is placed\nonly on a member trusted at least as far.\n\nThe host gives each member its level, and mag judges no one: what a level means is the\nhost's. As a rule of thumb, `owner` is the owner's own machines, `site` a machine inside the\nowner's site that is not the owner's, and `outside` anything else, a rented machine among\nthem.",
+      "oneOf": [
+        {
+          "const": "outside",
+          "description": "Trusted with what anyone may hold.",
+          "type": "string"
+        },
+        {
+          "const": "site",
+          "description": "Inside the owner's site, but not the owner's.",
+          "type": "string"
+        },
+        {
+          "const": "owner",
+          "description": "The owner's own.",
+          "type": "string"
+        }
+      ]
+    },
+    "Unit": {
+      "additionalProperties": false,
+      "description": "A named, versioned function.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A start file: what a member's program begins from, the same convention for every host. The\nenvironment variable `MAG_START` names it.\n\nIt names no private key: it gives the path of this member's key file, which the host places\nand keeps readable by the program alone.",
+  "properties": {
+    "coordinator": {
+      "description": "The member that coordinates: this one, or one of the peers.",
+      "type": "string"
+    },
+    "door": {
+      "description": "The door's local address on the coordinator's machine: the path of a local socket.",
+      "type": "string"
+    },
+    "format": {
+      "const": "mag-start"
+    },
+    "idle_seconds": {
+      "description": "Seconds a member stays idle before the pool offers it back. Finite, and not below 0.",
+      "format": "double",
+      "type": "number"
+    },
+    "key_file": {
+      "description": "The path of this member's private key file. The key itself is never in a start file.",
+      "type": "string"
+    },
+    "ledger": {
+      "description": "Where the coordinator writes the ledger: a path.",
+      "type": "string"
+    },
+    "member": {
+      "description": "This process's member, by its name in the pool.",
+      "type": "string"
+    },
+    "peers": {
+      "description": "The other members this one links to, each with its public key.",
+      "items": {
+        "$ref": "#/$defs/Peer"
+      },
+      "type": "array"
+    },
+    "pool": {
+      "$ref": "#/$defs/Description",
+      "description": "The pool as the host describes it, as a pool file does: its members, each with its trust\nand its time to give a device back, and any offers the host knows."
+    },
+    "version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "format",
+    "version",
+    "member",
+    "pool",
+    "peers",
+    "coordinator",
+    "ledger",
+    "door",
+    "idle_seconds",
+    "key_file"
+  ],
+  "title": "mag-start, version 1",
+  "type": "object"
+}

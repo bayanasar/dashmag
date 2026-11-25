@@ -10,7 +10,7 @@ use mag_mortar::Pool;
 /// A fast CUDA card, a slower ROCm card and a slower Apple GPU, all on members of the house.
 fn three_cards() -> Pool {
     Pool::new(
-        vec![member("a", false), member("b", false), member("c", false)],
+        vec![member("a", Owner), member("b", Owner), member("c", Owner)],
         vec![
             offer(
                 device("a", 0),
@@ -44,7 +44,7 @@ fn j1_an_atomic_job_lands_on_the_fastest_device_that_holds_it() {
         vec![part("p", "u", Mark::Atomic, 8)],
         vec![],
     );
-    pool.submit(g, 0.0).unwrap();
+    pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(
         pool.arrangement("small").unwrap().places,
         [Place::On(device("a", 0))]
@@ -57,7 +57,7 @@ fn j1_an_atomic_job_lands_on_the_fastest_device_that_holds_it() {
         vec![part("p", "u", Mark::Atomic, 20)],
         vec![],
     );
-    pool.submit(g, 1.0).unwrap();
+    pool.submit(g, Stamp::default(), 1.0).unwrap();
     assert_eq!(
         pool.arrangement("large").unwrap().places,
         [Place::On(device("b", 0))]
@@ -70,11 +70,11 @@ fn j1_a_replicable_job_runs_a_copy_on_every_device_that_holds_it() {
     let g = job(
         "map",
         1,
-        vec![input("items", false)],
+        vec![input("items", Outside)],
         vec![part("r", "r", Mark::Replicable, 12)],
         vec![edge("items", Some("r"))],
     );
-    pool.submit(g, 0.0).unwrap();
+    pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(
         pool.arrangement("map").unwrap().places,
         [Place::Copies(vec![
@@ -88,11 +88,11 @@ fn j1_a_replicable_job_runs_a_copy_on_every_device_that_holds_it() {
     let g = job(
         "map",
         1,
-        vec![input("items", false)],
+        vec![input("items", Outside)],
         vec![part("r", "r", Mark::Replicable, 20)],
         vec![edge("items", Some("r"))],
     );
-    pool.submit(g, 0.0).unwrap();
+    pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(
         pool.arrangement("map").unwrap().places,
         [Place::Copies(vec![device("b", 0), device("c", 0)])]
@@ -111,15 +111,15 @@ fn j1_copies_go_where_they_fit_beside_what_runs_and_the_rest_is_recorded() {
         vec![part("p", "u", Mark::Atomic, 12)],
         vec![],
     );
-    pool.submit(g, 0.0).unwrap();
+    pool.submit(g, Stamp::default(), 0.0).unwrap();
     let g = job(
         "map",
         1,
-        vec![input("items", false)],
+        vec![input("items", Outside)],
         vec![part("r", "r", Mark::Replicable, 12)],
         vec![edge("items", Some("r"))],
     );
-    let r = pool.submit(g, 1.0).unwrap();
+    let r = pool.submit(g, Stamp::default(), 1.0).unwrap();
     let chosen = &r.candidates[r.chosen.unwrap()];
     assert!(chosen.left_out.contains(&(
         "r".into(),
@@ -136,7 +136,7 @@ fn j1_copies_go_where_they_fit_beside_what_runs_and_the_rest_is_recorded() {
 #[test]
 fn j1_a_copy_and_an_atomic_part_share_two_cards_between_them() {
     let mut pool = Pool::new(
-        vec![member("a", false), member("b", false)],
+        vec![member("a", Owner), member("b", Owner)],
         vec![
             offer(
                 device("a", 0),
@@ -155,14 +155,14 @@ fn j1_a_copy_and_an_atomic_part_share_two_cards_between_them() {
     let g = job(
         "mixed",
         1,
-        vec![input("items", false)],
+        vec![input("items", Outside)],
         vec![
             part("r", "r", Mark::Replicable, 10),
             part("p", "u", Mark::Atomic, 10),
         ],
         vec![edge("items", Some("r")), edge("r", Some("p"))],
     );
-    pool.submit(g, 0.0).unwrap();
+    pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(
         pool.arrangement("mixed").unwrap().places,
         [
@@ -175,7 +175,7 @@ fn j1_a_copy_and_an_atomic_part_share_two_cards_between_them() {
 #[test]
 fn j13_a_job_pinned_to_a_backend_no_device_offers_waits_until_one_joins() {
     let mut pool = Pool::new(
-        vec![member("a", false)],
+        vec![member("a", Owner)],
         vec![offer(device("a", 0), Backend::Cuda, 16, &[("u", 0.01)])],
     );
     let g = job(
@@ -188,7 +188,7 @@ fn j13_a_job_pinned_to_a_backend_no_device_offers_waits_until_one_joins() {
         )],
         vec![],
     );
-    let r = pool.submit(g, 0.0).unwrap();
+    let r = pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(r.chosen, None);
     assert_eq!(
         r.candidates[1].removed,
@@ -200,7 +200,7 @@ fn j13_a_job_pinned_to_a_backend_no_device_offers_waits_until_one_joins() {
     assert_eq!(pool.arrangement("pinned").unwrap().places, [Place::Waiting]);
     let r = pool
         .join(
-            Some(member("c", false)),
+            Some(member("c", Owner)),
             offer(device("c", 0), Backend::Mlx, 24, &[("u", 0.03)]),
             5.0,
         )
@@ -218,7 +218,7 @@ fn wants_everything(name: &str, priority: u32) -> mag_by::Graph {
     job(
         name,
         priority,
-        vec![input("items", false)],
+        vec![input("items", Outside)],
         vec![part("r", "r", Mark::Replicable, 17)],
         vec![edge("items", Some("r"))],
     )
@@ -227,9 +227,12 @@ fn wants_everything(name: &str, priority: u32) -> mag_by::Graph {
 #[test]
 fn j14_of_two_jobs_that_each_want_every_device_the_higher_priority_runs_first() {
     let mut pool = three_cards();
-    pool.submit(wants_everything("blocker", 1), 0.0).unwrap();
-    pool.submit(wants_everything("low", 1), 1.0).unwrap();
-    pool.submit(wants_everything("high", 2), 2.0).unwrap();
+    pool.submit(wants_everything("blocker", 1), Stamp::default(), 0.0)
+        .unwrap();
+    pool.submit(wants_everything("low", 1), Stamp::default(), 1.0)
+        .unwrap();
+    pool.submit(wants_everything("high", 2), Stamp::default(), 2.0)
+        .unwrap();
     assert!(matches!(
         pool.arrangement("low").unwrap().places[0],
         Place::Waiting
@@ -260,10 +263,13 @@ fn j14_of_two_jobs_that_each_want_every_device_the_higher_priority_runs_first() 
 #[test]
 fn j14_a_waiting_job_s_priority_grows_until_it_passes_a_newer_higher_one() {
     let mut pool = three_cards();
-    pool.submit(wants_everything("blocker", 1), 0.0).unwrap();
-    pool.submit(wants_everything("old", 1), 0.0).unwrap();
+    pool.submit(wants_everything("blocker", 1), Stamp::default(), 0.0)
+        .unwrap();
+    pool.submit(wants_everything("old", 1), Stamp::default(), 0.0)
+        .unwrap();
     // Priority 2 but newly arrived, against priority 1 that has waited 300 s: 1 x (1 + 300/60).
-    pool.submit(wants_everything("new", 2), 300.0).unwrap();
+    pool.submit(wants_everything("new", 2), Stamp::default(), 300.0)
+        .unwrap();
     pool.end("blocker", 300.0).unwrap();
     assert!(matches!(
         pool.arrangement("old").unwrap().places[0],
@@ -275,10 +281,10 @@ fn j14_a_waiting_job_s_priority_grows_until_it_passes_a_newer_higher_one() {
     ));
 }
 
-/// A local card, slower, and a rented one, faster, on a member marked remote.
+/// A card of the owner's, slower, and a rented one, faster, on a member trusted only at outside.
 fn house_and_rented() -> Pool {
     Pool::new(
-        vec![member("house", false), member("rented", true)],
+        vec![member("house", Owner), member("rented", Outside)],
         vec![
             offer(
                 device("house", 0),
@@ -297,12 +303,12 @@ fn house_and_rented() -> Pool {
 }
 
 #[test]
-fn the_guard_keeps_local_only_data_off_a_remote_member_however_fast() {
+fn the_guard_keeps_data_kept_at_owner_off_an_outside_member_however_fast() {
     let mut pool = house_and_rented();
     let g = job(
         "label",
         1,
-        vec![input("frames", true)],
+        vec![input("frames", Owner)],
         vec![
             part("detect", "u", Mark::Atomic, 4),
             part("count", "c", Mark::Atomic, 1),
@@ -313,12 +319,18 @@ fn the_guard_keeps_local_only_data_off_a_remote_member_however_fast() {
             edge("count", None),
         ],
     );
-    let guarded = pool.submit(g, 0.0).unwrap().candidates.iter().any(|c| {
-        matches!(
-            &c.removed,
-            Some(Removal::Guard { part, device: d }) if part == "detect" && d == &device("rented", 0)
-        )
-    });
+    let guarded = pool
+        .submit(g, Stamp::default(), 0.0)
+        .unwrap()
+        .candidates
+        .iter()
+        .any(|c| {
+            matches!(
+                &c.removed,
+                Some(Removal::Guard { part, device: d, keep: Owner, trust: Outside })
+                    if part == "detect" && d == &device("rented", 0)
+            )
+        });
     assert!(guarded);
     let a = pool.arrangement("label").unwrap();
     assert_eq!(
@@ -328,18 +340,18 @@ fn the_guard_keeps_local_only_data_off_a_remote_member_however_fast() {
 }
 
 #[test]
-fn the_guard_holds_for_a_part_whose_weights_are_local_only() {
+fn the_guard_holds_for_a_part_whose_weights_are_kept_at_owner() {
     let mut pool = house_and_rented();
     let mut adapter = part("adapter", "u", Mark::Atomic, 4);
     adapter.weights.push(local_weights());
     let g = job(
         "serve",
         1,
-        vec![input("prompts", false)],
+        vec![input("prompts", Outside)],
         vec![adapter],
         vec![edge("prompts", Some("adapter"))],
     );
-    pool.submit(g, 0.0).unwrap();
+    pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(
         pool.arrangement("serve").unwrap().places,
         [Place::On(device("house", 0))]
@@ -347,22 +359,24 @@ fn the_guard_holds_for_a_part_whose_weights_are_local_only() {
 }
 
 #[test]
-fn the_guard_keeps_a_replicable_part_s_copies_off_a_remote_member_and_says_so() {
+fn the_guard_keeps_a_replicable_part_s_copies_off_an_outside_member_and_says_so() {
     let mut pool = house_and_rented();
     let g = job(
         "map",
         1,
-        vec![input("frames", true)],
+        vec![input("frames", Owner)],
         vec![part("r", "u", Mark::Replicable, 4)],
         vec![edge("frames", Some("r"))],
     );
-    let r = pool.submit(g, 0.0).unwrap();
+    let r = pool.submit(g, Stamp::default(), 0.0).unwrap();
     let chosen = &r.candidates[r.chosen.unwrap()];
     assert!(chosen.left_out.contains(&(
         "r".into(),
         Removal::Guard {
             part: "r".into(),
-            device: device("rented", 0)
+            device: device("rented", 0),
+            keep: Owner,
+            trust: Outside,
         }
     )));
     assert_eq!(
@@ -372,7 +386,7 @@ fn the_guard_keeps_a_replicable_part_s_copies_off_a_remote_member_and_says_so() 
 }
 
 #[test]
-fn the_guard_takes_a_member_the_pool_was_never_told_of_as_remote() {
+fn the_guard_trusts_a_member_the_pool_was_never_told_of_at_outside() {
     let mut pool = Pool::new(vec![], vec![]);
     // A device joins with no report of its member.
     pool.join(
@@ -384,30 +398,32 @@ fn the_guard_takes_a_member_the_pool_was_never_told_of_as_remote() {
     let g = job(
         "label",
         1,
-        vec![input("frames", true)],
+        vec![input("frames", Owner)],
         vec![part("detect", "u", Mark::Atomic, 4)],
         vec![edge("frames", Some("detect"))],
     );
-    let r = pool.submit(g, 1.0).unwrap();
+    let r = pool.submit(g, Stamp::default(), 1.0).unwrap();
     assert_eq!(r.chosen, None);
     assert_eq!(
         r.candidates[1].removed,
         Some(Removal::Guard {
             part: "detect".into(),
-            device: device("stranger", 0)
+            device: device("stranger", 0),
+            keep: Owner,
+            trust: Outside,
         })
     );
 }
 
 #[test]
-fn a_released_output_s_consumer_may_go_to_the_remote_member() {
+fn an_output_released_to_outside_lets_its_consumer_go_to_the_outside_member() {
     let mut pool = house_and_rented();
     let mut released = edge("detect", Some("count"));
-    released.release = true;
+    released.release = Some(Outside);
     let g = job(
         "label",
         1,
-        vec![input("frames", true)],
+        vec![input("frames", Owner)],
         vec![
             part("detect", "u", Mark::Atomic, 4),
             part("count", "c", Mark::Atomic, 1),
@@ -418,7 +434,7 @@ fn a_released_output_s_consumer_may_go_to_the_remote_member() {
             edge("count", None),
         ],
     );
-    pool.submit(g, 0.0).unwrap();
+    pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(
         pool.arrangement("label").unwrap().places,
         [
@@ -434,7 +450,7 @@ fn work_others_wait_on_lands_on_the_fastest_device() {
     // time it is on the slow one. Edges are not timed in this step, so the hub lands there for
     // its own time: a leaf as slow would land the same way.
     let mut pool = Pool::new(
-        vec![member("a", false), member("b", false)],
+        vec![member("a", Owner), member("b", Owner)],
         vec![
             offer(
                 device("a", 0),
@@ -461,7 +477,7 @@ fn work_others_wait_on_lands_on_the_fastest_device() {
         ],
         vec![edge("hub", Some("x")), edge("hub", Some("y"))],
     );
-    pool.submit(g, 0.0).unwrap();
+    pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(
         pool.arrangement("fan").unwrap().places[0],
         Place::On(device("a", 0))
@@ -473,7 +489,7 @@ fn a_model_that_takes_memory_lands_where_its_measured_rate_is_highest() {
     // Measured at the batch each card's memory allows: the larger card runs the large model
     // faster, though the smaller card is faster at everything else.
     let mut pool = Pool::new(
-        vec![member("a", false), member("b", false)],
+        vec![member("a", Owner), member("b", Owner)],
         vec![
             offer(
                 device("a", 0),
@@ -496,7 +512,7 @@ fn a_model_that_takes_memory_lands_where_its_measured_rate_is_highest() {
         vec![part("m", "model", Mark::Atomic, 14)],
         vec![],
     );
-    pool.submit(g, 0.0).unwrap();
+    pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(
         pool.arrangement("big").unwrap().places,
         [Place::On(device("b", 0))]
@@ -509,12 +525,12 @@ fn every_removed_candidate_has_a_reason_that_names_what_broke() {
     let g = job(
         "label",
         1,
-        vec![input("frames", true)],
+        vec![input("frames", Owner)],
         vec![part("detect", "u", Mark::Atomic, 40)],
         vec![edge("frames", Some("detect"))],
     );
-    let r = pool.submit(g, 0.0).unwrap();
-    // Waiting, the house's card (too small), the rented card (remote).
+    let r = pool.submit(g, Stamp::default(), 0.0).unwrap();
+    // Waiting, the house's card (too small), the rented card (trusted only at outside).
     assert_eq!(r.candidates.len(), 3);
     assert_eq!(r.candidates[0].removed, None);
     assert_eq!(
@@ -527,7 +543,9 @@ fn every_removed_candidate_has_a_reason_that_names_what_broke() {
         r.candidates[2].removed,
         Some(Removal::Guard {
             part: "detect".into(),
-            device: device("rented", 0)
+            device: device("rented", 0),
+            keep: Owner,
+            trust: Outside,
         })
     );
     assert_eq!(r.chosen, None);

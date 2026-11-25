@@ -1,0 +1,54 @@
+{
+  "format": "mag-start",
+  "version": 1,
+  "member": "server",
+  "pool": {
+    "at": 0.0,
+    "members": [
+      {
+        "name": "workstation",
+        "trust": "owner",
+        "give_back_seconds": 5.0
+      },
+      {
+        "name": "server",
+        "trust": "owner",
+        "give_back_seconds": 30.0
+      },
+      {
+        "name": "laptop",
+        "trust": "owner",
+        "give_back_seconds": 2.0
+      },
+      {
+        "name": "rented",
+        "trust": "outside",
+        "give_back_seconds": 60.0
+      }
+    ],
+    "offers": [],
+    "jobs": [],
+    "formats": []
+  },
+  "peers": [
+    {
+      "member": "workstation",
+      "public_key": "ed25519:VzlMTdytRxJy+oNYVQ+m6SfB17lPjroBfrgO5eyESnA=",
+      "address": "192.0.2.10:7340"
+    },
+    {
+      "member": "laptop",
+      "public_key": "ed25519:La5om7juQ2GnGcobyPldtmKyW+XuYq/Y0ZN+1E1iit4="
+    },
+    {
+      "member": "rented",
+      "public_key": "ed25519:mJUVkPhV+ZgmFlUxHVDJtsI2EzFl8rbahYjvpAzvTDU=",
+      "address": "198.51.100.7:7340"
+    }
+  ],
+  "coordinator": "workstation",
+  "ledger": "/var/lib/mag/ledger.jsonl",
+  "door": "/run/mag/door.sock",
+  "idle_seconds": 900.0,
+  "key_file": "/etc/mag/server.key"
+}

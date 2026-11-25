@@ -2,7 +2,7 @@
 
 use mag_by::{
     Arrangement, Backend, Candidate, Cost, DeviceId, Dtype, Event, Member, Move, Offer, Place,
-    Record, Removal, Tolerance, Unit,
+    Record, Removal, Tolerance, Trust, Unit,
 };
 
 fn device(member: &str, index: u32) -> DeviceId {
@@ -16,7 +16,7 @@ fn device(member: &str, index: u32) -> DeviceId {
 fn a_member_and_its_offer() {
     let m = Member {
         name: "member-a".into(),
-        remote: false,
+        trust: Trust::Site,
         give_back_seconds: 5.0,
     };
     let offer = Offer {
@@ -58,6 +58,8 @@ fn a_record_of_one_run() {
             Removal::Guard {
                 part: "r".into(),
                 device: device("rented", 0),
+                keep: Trust::Site,
+                trust: Trust::Outside,
             },
         )],
         score: Some(1.0),
@@ -69,6 +71,8 @@ fn a_record_of_one_run() {
         removed: Some(Removal::Guard {
             part: "decode".into(),
             device: device("rented", 0),
+            keep: Trust::Owner,
+            trust: Trust::Site,
         }),
         left_out: vec![],
         score: None,
@@ -79,7 +83,7 @@ fn a_record_of_one_run() {
         candidates: vec![kept, removed],
         chosen: Some(0),
         greedy: false,
-        marked_remote: vec!["member-b".into()],
+        lowered: vec!["member-b".into()],
     };
     assert_eq!(r.candidates.len(), 2);
     for e in [
@@ -124,7 +128,11 @@ fn a_record_of_one_run() {
             part: "p".into(),
             device: device("a", 0),
         },
+        Removal::Stamp {
+            job: "j".into(),
+            device: device("a", 0),
+        },
         Removal::Need { job: "j".into() },
     ];
-    assert_eq!(removals.len(), 6);
+    assert_eq!(removals.len(), 7);
 }

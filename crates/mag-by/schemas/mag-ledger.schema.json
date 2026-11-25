@@ -50,15 +50,15 @@
         "hash": {
           "type": "string"
         },
-        "local_only": {
-          "description": "Computed from local-only data, as weights trained on it in an earlier job are: never\nplaced on a member marked remote, nor is the part that holds it, nor what that part\ncomputes unless it releases it. The graph file must say it either way: left out, it is\nrefused, as an input's mark is.",
-          "type": "boolean"
+        "keep": {
+          "$ref": "#/$defs/Trust",
+          "description": "The least trust a member must have to hold it, as for weights trained in an earlier job on\ndata kept at that level. The part that holds it is kept at least as far, and so is what\nthat part computes unless it releases it. The graph file must say it: left out, it is\nrefused, as an input's level is."
         }
       },
       "required": [
         "hash",
         "bytes",
-        "local_only"
+        "keep"
       ],
       "type": "object"
     },
@@ -143,17 +143,21 @@
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "A job arrives.",
+          "description": "A job arrives, with the host's stamp on it.",
           "properties": {
             "submit": {
               "additionalProperties": false,
               "properties": {
                 "graph": {
                   "$ref": "#/$defs/Graph"
+                },
+                "stamp": {
+                  "$ref": "#/$defs/Stamp"
                 }
               },
               "required": [
-                "graph"
+                "graph",
+                "stamp"
               ],
               "type": "object"
             }
@@ -212,7 +216,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "A device leaves, or its owner takes it back.",
+          "description": "A device leaves, or the host takes it back.",
           "properties": {
             "leave": {
               "additionalProperties": false,
@@ -321,9 +325,8 @@
           "type": "string"
         },
         "release": {
-          "default": false,
-          "description": "Whether the producing part releases this output, so that it may go where its local-only\ninputs may not. Only a part releases; an input is never released.",
-          "type": "boolean"
+          "$ref": "#/$defs/Trust",
+          "description": "The level the producing part releases this output to, if it releases it: the output is\nthen kept at that level where what the part read is kept higher. A release never keeps\ndata higher than it is. Only a part releases; an input is never released."
         },
         "to": {
           "description": "A part, or `None` for a result of the job.",
@@ -431,7 +434,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "A device leaves, or its owner takes it back.",
+          "description": "A device leaves, or the host takes it back.",
           "properties": {
             "leave": {
               "additionalProperties": false,
@@ -582,6 +585,11 @@
           "format": "double",
           "type": "number"
         },
+        "follows": {
+          "default": null,
+          "description": "The name of the ledger this one follows; left out for a first ledger.",
+          "type": "string"
+        },
         "format": {
           "const": "mag-ledger"
         },
@@ -600,7 +608,12 @@
           "type": "array"
         },
         "version": {
-          "const": 1
+          "const": 2
+        },
+        "written_by": {
+          "default": null,
+          "description": "The version of `mag-mortar` that began the ledger.",
+          "type": "string"
         }
       },
       "required": [
@@ -614,16 +627,16 @@
     },
     "Input": {
       "additionalProperties": false,
-      "description": "Data a job reads from outside its parts. Version 1 of the graph file names an input and its\nmark; which data it is gets bound at submission, where the pool can check the data's own mark\nagainst its record of it. The mark here is only as good as that binding.",
+      "description": "Data a job reads from outside its parts. The graph file names an input and its level; which\ndata it is gets bound at submission, where the pool can check the data's own level against its\nrecord of it. The level here is only as good as that binding.",
       "properties": {
         "bytes": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
-        "local_only": {
-          "description": "Never placed on a member marked remote, nor is anything computed from it unless a stage\nreleases it. The graph file must say it either way: left out, it is refused, so that\nforgetting it never lets an input move.",
-          "type": "boolean"
+        "keep": {
+          "$ref": "#/$defs/Trust",
+          "description": "The least trust a member must have to hold it, or anything computed from it unless a part\nreleases that. The graph file must say it, `outside` included: left out, it is refused, so\nthat forgetting it never lets an input move."
         },
         "name": {
           "type": "string"
@@ -632,7 +645,7 @@
       "required": [
         "name",
         "bytes",
-        "local_only"
+        "keep"
       ],
       "type": "object"
     },
@@ -681,24 +694,24 @@
     },
     "Member": {
       "additionalProperties": false,
-      "description": "A machine in the pool, running `mag-mar`.",
+      "description": "A machine in the pool, running `mag-mar`: one lease of the host's.",
       "properties": {
         "give_back_seconds": {
-          "description": "Seconds within which the member gives a device back when its owner wants it.",
+          "description": "Seconds within which the member gives a device back when the host takes it back.",
           "format": "double",
           "type": "number"
         },
         "name": {
           "type": "string"
         },
-        "remote": {
-          "description": "Outside the owner's own machines, as a rented GPU is. Nothing local-only is placed on a\nremote member's devices.",
-          "type": "boolean"
+        "trust": {
+          "$ref": "#/$defs/Trust",
+          "description": "How far the host trusts it. Nothing kept at a higher level is placed on its devices."
         }
       },
       "required": [
         "name",
-        "remote",
+        "trust",
         "give_back_seconds"
       ],
       "type": "object"
@@ -946,8 +959,8 @@
           "description": "Whether the candidates were too many to list and were generated greedily instead.",
           "type": "boolean"
         },
-        "marked_remote": {
-          "description": "Members this event marked remote where an earlier report had them local: of two marks for\none member, the stricter stands.",
+        "lowered": {
+          "description": "Members whose trust this event lowered below an earlier report's: of two reports for one\nmember, the lower trust stands.",
           "items": {
             "type": "string"
           },
@@ -958,7 +971,7 @@
         "event",
         "candidates",
         "greedy",
-        "marked_remote"
+        "lowered"
       ],
       "type": "object"
     },
@@ -1089,7 +1102,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "The part carries local-only data and the device's member is remote.",
+          "description": "The part carries data kept at a level above the trust of the device's member: `keep` is\nthe part's level, `trust` the member's (`outside` for a member the pool does not know).",
           "properties": {
             "guard": {
               "additionalProperties": false,
@@ -1097,19 +1110,53 @@
                 "device": {
                   "$ref": "#/$defs/DeviceId"
                 },
+                "keep": {
+                  "$ref": "#/$defs/Trust"
+                },
                 "part": {
                   "type": "string"
+                },
+                "trust": {
+                  "$ref": "#/$defs/Trust"
                 }
               },
               "required": [
                 "part",
-                "device"
+                "device",
+                "keep",
+                "trust"
               ],
               "type": "object"
             }
           },
           "required": [
             "guard"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The device is not among those the job's stamp allows.",
+          "properties": {
+            "stamp": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "$ref": "#/$defs/DeviceId"
+                },
+                "job": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "job",
+                "device"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "stamp"
           ],
           "type": "object"
         },
@@ -1136,6 +1183,30 @@
           "type": "object"
         }
       ]
+    },
+    "Stamp": {
+      "additionalProperties": false,
+      "description": "The host's stamp on a submission: its one handle on a job, since priority between jobs is\ndecided inside the pool. Each field may be left out, and a stamp with none puts no bound on\nthe job: as a program that submits its own job to a pool of its own stamps it.",
+      "properties": {
+        "by": {
+          "description": "Who submitted the job, in the host's words. mag never reads it; the ledger keeps it.",
+          "type": "string"
+        },
+        "devices": {
+          "description": "The devices the job may use. Left out, every device in the pool, as it is and as devices\njoin. Given, at least one.",
+          "items": {
+            "$ref": "#/$defs/DeviceId"
+          },
+          "type": "array"
+        },
+        "priority_ceiling": {
+          "description": "The highest priority the job may have: a graph that asks for more is given this. At\nleast 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     },
     "Step": {
       "description": "The point where a part can stop with its state written out.",
@@ -1180,6 +1251,26 @@
         }
       ]
     },
+    "Trust": {
+      "description": "How far a machine is trusted, and how far data must be kept, in order: `outside < site <\nowner`. A member is trusted at a level; an input or a blob is kept at a level, and is placed\nonly on a member trusted at least as far.\n\nThe host gives each member its level, and mag judges no one: what a level means is the\nhost's. As a rule of thumb, `owner` is the owner's own machines, `site` a machine inside the\nowner's site that is not the owner's, and `outside` anything else, a rented machine among\nthem.",
+      "oneOf": [
+        {
+          "const": "outside",
+          "description": "Trusted with what anyone may hold.",
+          "type": "string"
+        },
+        {
+          "const": "site",
+          "description": "Inside the owner's site, but not the owner's.",
+          "type": "string"
+        },
+        {
+          "const": "owner",
+          "description": "The owner's own.",
+          "type": "string"
+        }
+      ]
+    },
     "Unit": {
       "additionalProperties": false,
       "description": "A named, versioned function.",
@@ -1210,5 +1301,5 @@
     }
   ],
   "description": "One line of a ledger, for its schema.",
-  "title": "mag-ledger, version 1: one line"
+  "title": "mag-ledger, version 2: one line"
 }

@@ -46,7 +46,7 @@ fn files_the_reader_takes_are_valid() {
     // Fields with defaults left out.
     let minimal = json!({
         "format": "mag-graph",
-        "version": 1,
+        "version": 2,
         "job": { "name": "j", "priority": 1 },
         "parts": [{
             "name": "p",
@@ -65,9 +65,16 @@ fn files_the_reader_takes_are_valid() {
 #[test]
 fn files_the_reader_refuses_for_their_form_are_invalid() {
     let v = validator();
-    let changes: [(&str, Change); 9] = [
+    let changes: [(&str, Change); 12] = [
+        ("an unknown level", |f| {
+            f["inputs"][0]["keep"] = "anyone".into()
+        }),
+        ("an input without its level", |f| {
+            f["inputs"][0].as_object_mut().unwrap().remove("keep");
+        }),
+        ("a null release", |f| f["edges"][7]["release"] = Value::Null),
         ("another format", |f| f["format"] = "other".into()),
-        ("a newer version", |f| f["version"] = 2.into()),
+        ("a newer version", |f| f["version"] = 3.into()),
         ("no format", |f| {
             f.as_object_mut().unwrap().remove("format");
         }),

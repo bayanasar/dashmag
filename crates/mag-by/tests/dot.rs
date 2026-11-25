@@ -34,11 +34,9 @@ fn every_input_part_and_edge_is_drawn() {
     }
     assert_eq!(dot.matches(" -> ").count(), g.edges.len());
     // The released count is dashed and not red; the frames' edge is red; sizes in binary units.
-    assert!(
-        dot.contains(
-            "\"count\" -> \"job's results\" [label=\"i64 64 B\\nreleased\", style=dashed];"
-        )
-    );
+    assert!(dot.contains(
+        "\"count\" -> \"job's results\" [label=\"i64 64 B\\nreleased to outside\", style=dashed];"
+    ));
     assert!(dot.contains("\"frames\" -> \"decode\" [label=\"bytes 1.12 GiB\", color=red];"));
     for size in [
         "4 KiB", "156 KiB", "18.4 MiB", "287 MiB", "1.12 GiB", "64 B",
@@ -46,6 +44,27 @@ fn every_input_part_and_edge_is_drawn() {
         assert!(dot.contains(size), "{size}");
     }
     assert!(dot.contains("rankdir=TB;"));
+}
+
+#[test]
+fn each_level_is_drawn_in_its_colour_with_its_name() {
+    let mut g = Graph::from_json(EXAMPLE).unwrap();
+    let dot = g.to_dot();
+    assert!(dot.contains(
+        "\"frames\" [shape=ellipse, label=\"frames\\n1.12 GiB\\nkept at owner\", color=red];"
+    ));
+    assert!(dot.contains("\"classes\" [shape=ellipse, label=\"classes\\n4 KiB\"];"));
+    g.inputs[1].keep = mag_by::Trust::Site;
+    g.edges[7].release = Some(mag_by::Trust::Site);
+    let dot = g.to_dot();
+    assert!(dot.contains(
+        "\"classes\" [shape=ellipse, label=\"classes\\n4 KiB\\nkept at site\", color=orange];"
+    ));
+    assert!(dot.contains("\"classes\" -> \"head\" [label=\"i32 4 KiB\", color=orange];"));
+    assert!(dot.contains(
+        "\"count\" -> \"job's results\" [label=\"i64 64 B\\nreleased to site\", style=dashed, \
+         color=orange];"
+    ));
 }
 
 #[test]

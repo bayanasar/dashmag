@@ -10,7 +10,7 @@ use mag_mortar::{ChangeError, Pool};
 /// One device of 64 GiB on which every part takes a second a step.
 fn one_device() -> Pool {
     Pool::new(
-        vec![member("a", false)],
+        vec![member("a", Owner)],
         vec![offer(device("a", 0), Backend::Cuda, 64, &[("u", 1.0)])],
     )
 }
@@ -29,13 +29,14 @@ fn one_part(name: &str, priority: u32, gib: u64) -> mag_by::Graph {
 #[test]
 fn a_plan_and_a_submit_of_one_graph_at_one_time_make_the_same_record() {
     let mut pool = Pool::new(
-        vec![member("a", false), member("b", false)],
+        vec![member("a", Owner), member("b", Owner)],
         vec![
             offer(device("a", 0), Backend::Cuda, 16, &[("u", 0.01)]),
             offer(device("b", 0), Backend::Rocm, 16, &[("u", 0.02)]),
         ],
     );
-    pool.submit(one_part("first", 1, 12), 0.0).unwrap();
+    pool.submit(one_part("first", 1, 12), Stamp::default(), 0.0)
+        .unwrap();
     let g = job(
         "second",
         2,
@@ -46,8 +47,8 @@ fn a_plan_and_a_submit_of_one_graph_at_one_time_make_the_same_record() {
         ],
         vec![edge("p", Some("copies"))],
     );
-    let planned = pool.plan(&g, 7.0).unwrap();
-    let submitted = pool.submit(g, 7.0).unwrap();
+    let planned = pool.plan(&g, &Stamp::default(), 7.0).unwrap();
+    let submitted = pool.submit(g, Stamp::default(), 7.0).unwrap();
     assert_eq!(&planned, submitted);
     assert!(planned.chosen.is_some());
 }
@@ -56,30 +57,38 @@ fn a_plan_and_a_submit_of_one_graph_at_one_time_make_the_same_record() {
 fn a_plan_leaves_the_description_and_the_records_as_they_were() {
     // A second, small device, which only a small job fits.
     let mut pool = Pool::new(
-        vec![member("a", false), member("b", false)],
+        vec![member("a", Owner), member("b", Owner)],
         vec![
             offer(device("a", 0), Backend::Cuda, 16, &[("u", 0.01)]),
             offer(device("b", 0), Backend::Cuda, 4, &[("u", 0.01)]),
         ],
     );
-    pool.submit(one_part("running", 1, 12), 0.0).unwrap();
-    pool.submit(one_part("waiting", 1, 12), 1.0).unwrap();
+    pool.submit(one_part("running", 1, 12), Stamp::default(), 0.0)
+        .unwrap();
+    pool.submit(one_part("waiting", 1, 12), Stamp::default(), 1.0)
+        .unwrap();
     let before = (pool.describe(), pool.records().cloned().collect::<Vec<_>>());
 
     // A job that would be placed, one that would wait, and two that would be refused, each
     // planned later than the pool's time, so that a plan run on the pool would move it.
-    let placed = pool.plan(&one_part("small", 1, 2), 30.0).unwrap();
+    let placed = pool
+        .plan(&one_part("small", 1, 2), &Stamp::default(), 30.0)
+        .unwrap();
     assert!(placed.chosen.is_some());
-    let waits = pool.plan(&one_part("large", 1, 40), 30.0).unwrap();
+    let waits = pool
+        .plan(&one_part("large", 1, 40), &Stamp::default(), 30.0)
+        .unwrap();
     assert_eq!(waits.chosen, None);
     assert_eq!(
-        pool.plan(&one_part("running", 1, 2), 30.0).unwrap_err(),
+        pool.plan(&one_part("running", 1, 2), &Stamp::default(), 30.0)
+            .unwrap_err(),
         ChangeError::Duplicate {
             job: "running".into()
         }
     );
     assert_eq!(
-        pool.plan(&one_part("empty", 1, 0), 30.0).unwrap_err(),
+        pool.plan(&one_part("empty", 1, 0), &Stamp::default(), 30.0)
+            .unwrap_err(),
         ChangeError::Graph(Refusal::ZeroMemory { part: "p".into() })
     );
 
@@ -96,16 +105,19 @@ fn a_plan_at_a_later_time_weighs_the_waiting_jobs_as_they_would_be_then() {
     let mut pool = one_device();
     // A job of priority 10 holds the device. Sharing it with a job of priority 1 would halve the
     // first job's rate for half of the second's: 5 + 0.5 is less than 10, so the second waits.
-    pool.submit(one_part("first", 10, 1), 0.0).unwrap();
-    let r = pool.submit(one_part("second", 1, 1), 0.0).unwrap();
+    pool.submit(one_part("first", 10, 1), Stamp::default(), 0.0)
+        .unwrap();
+    let r = pool
+        .submit(one_part("second", 1, 1), Stamp::default(), 0.0)
+        .unwrap();
     assert_eq!(r.chosen, None);
 
     // Planned now, a third job changes nothing. Planned 1000 s later, the second job has waited
     // 1000 s and weighs 1 + 1000/60: sharing now scores 5 + 8.8, and it is placed, not the third.
     let third = one_part("third", 1, 1);
-    let now = pool.plan(&third, 0.0).unwrap();
+    let now = pool.plan(&third, &Stamp::default(), 0.0).unwrap();
     assert_eq!(now.chosen, None);
-    let later = pool.plan(&third, 1000.0).unwrap();
+    let later = pool.plan(&third, &Stamp::default(), 1000.0).unwrap();
     let chosen = &later.candidates[later.chosen.expect("the second job is placed")];
     let places: Vec<_> = chosen
         .arrangements
@@ -125,44 +137,49 @@ fn a_plan_at_a_later_time_weighs_the_waiting_jobs_as_they_would_be_then() {
     assert_eq!(d.at, 0.0);
     assert_eq!(d.jobs[1].waited_seconds, 0.0);
     // Submitted at that time, the third job's arrival makes the record the plan showed.
-    assert_eq!(pool.submit(third, 1000.0).unwrap(), &later);
+    assert_eq!(
+        pool.submit(third, Stamp::default(), 1000.0).unwrap(),
+        &later
+    );
 }
 
 #[test]
-fn a_description_shows_where_each_job_is_how_long_each_waited_and_the_stricter_mark() {
+fn a_description_shows_where_each_job_is_how_long_each_waited_and_the_lower_trust() {
     let mut pool = Pool::new(
-        vec![member("a", false), member("b", false)],
+        vec![member("a", Owner), member("b", Owner)],
         vec![
             offer(device("a", 0), Backend::Cuda, 16, &[("u", 0.01)]),
             offer(device("b", 0), Backend::Rocm, 16, &[("u", 0.02)]),
         ],
     );
-    pool.submit(one_part("one", 1, 12), 0.0).unwrap();
-    pool.submit(one_part("two", 1, 12), 5.0).unwrap();
+    pool.submit(one_part("one", 1, 12), Stamp::default(), 0.0)
+        .unwrap();
+    pool.submit(one_part("two", 1, 12), Stamp::default(), 5.0)
+        .unwrap();
     let local = job(
         "local",
         1,
-        vec![input("frames", true)],
+        vec![input("frames", Owner)],
         vec![part("p", "u", Mark::Atomic, 12)],
         vec![edge("frames", Some("p"))],
     );
-    pool.submit(local, 10.0).unwrap();
+    pool.submit(local, Stamp::default(), 10.0).unwrap();
     // `two` loses its device and waits.
     pool.leave(&device("b", 0), 20.0).unwrap();
-    // b comes back with another device, now reported as remote: `two` takes it, and `local`,
-    // which reads local-only frames, may not.
+    // b comes back with another device, now reported as trusted only at outside: `two` takes it,
+    // and `local`, which reads frames kept at owner, may not.
     let r = pool
         .join(
-            Some(member("b", true)),
+            Some(member("b", Outside)),
             offer(device("b", 1), Backend::Rocm, 16, &[("u", 0.02)]),
             30.0,
         )
         .unwrap();
-    assert_eq!(r.marked_remote, ["b"]);
+    assert_eq!(r.lowered, ["b"]);
 
     let d = pool.describe();
     assert_eq!(d.at, 30.0);
-    assert_eq!(d.members, [member("a", false), member("b", true)]);
+    assert_eq!(d.members, [member("a", Owner), member("b", Outside)]);
     let devices: Vec<_> = d.offers.iter().map(|o| o.device.clone()).collect();
     assert_eq!(devices, [device("a", 0), device("b", 1)]);
     let jobs: Vec<_> = d
@@ -190,20 +207,30 @@ fn a_description_shows_where_each_job_is_how_long_each_waited_and_the_stricter_m
         .iter()
         .map(|f| (f.name.as_str(), f.version))
         .collect();
+    // Each format at every version the pool reads.
     assert_eq!(
         formats,
-        [("mag-graph", 1), ("mag-ledger", 1), ("mag-pool", 1)]
+        [
+            ("mag-graph", 1),
+            ("mag-graph", 2),
+            ("mag-ledger", 1),
+            ("mag-ledger", 2),
+            ("mag-pool", 1),
+            ("mag-pool", 2)
+        ]
     );
 }
 
 #[test]
 fn a_job_that_waits_again_after_being_placed_counts_its_wait_from_zero() {
     let mut pool = Pool::new(
-        vec![member("a", false), member("b", false)],
+        vec![member("a", Owner), member("b", Owner)],
         vec![offer(device("a", 0), Backend::Cuda, 16, &[("u", 0.01)])],
     );
-    pool.submit(one_part("resident", 1, 12), 0.0).unwrap();
-    pool.submit(one_part("late", 1, 12), 0.0).unwrap();
+    pool.submit(one_part("resident", 1, 12), Stamp::default(), 0.0)
+        .unwrap();
+    pool.submit(one_part("late", 1, 12), Stamp::default(), 0.0)
+        .unwrap();
     // It waits 100 s, is placed when a device joins, and loses that device 10 s later.
     pool.join(
         None,
@@ -222,8 +249,10 @@ fn a_job_that_waits_again_after_being_placed_counts_its_wait_from_zero() {
 #[test]
 fn a_plan_on_a_pool_whose_time_has_moved_ages_its_waiting_jobs_from_the_pool_s_time() {
     let mut pool = one_device();
-    pool.submit(one_part("first", 10, 1), 0.0).unwrap();
-    pool.submit(one_part("second", 1, 1), 0.0).unwrap();
+    pool.submit(one_part("first", 10, 1), Stamp::default(), 0.0)
+        .unwrap();
+    pool.submit(one_part("second", 1, 1), Stamp::default(), 0.0)
+        .unwrap();
     // The pool's time moves to 500 s; the second job has waited all of it.
     pool.end("no such job", 500.0).unwrap();
     assert_eq!(pool.describe().at, 500.0);
@@ -232,9 +261,13 @@ fn a_plan_on_a_pool_whose_time_has_moved_ages_its_waiting_jobs_from_the_pool_s_t
     // Each plan is the record a submit at that time makes, on a copy of the pool.
     let third = one_part("third", 1, 1);
     for (at, placed) in [(500.0, false), (600.0, true)] {
-        let planned = pool.plan(&third, at).unwrap();
+        let planned = pool.plan(&third, &Stamp::default(), at).unwrap();
         let mut copy = pool.clone();
-        assert_eq!(&planned, copy.submit(third.clone(), at).unwrap(), "at {at}");
+        assert_eq!(
+            &planned,
+            copy.submit(third.clone(), Stamp::default(), at).unwrap(),
+            "at {at}"
+        );
         assert_eq!(planned.chosen.is_some(), placed, "at {at}");
     }
     assert_eq!(pool.describe().at, 500.0);
@@ -243,7 +276,7 @@ fn a_plan_on_a_pool_whose_time_has_moved_ages_its_waiting_jobs_from_the_pool_s_t
 #[test]
 fn of_two_offers_for_one_device_given_to_a_new_pool_the_later_stands() {
     let pool = Pool::new(
-        vec![member("a", false)],
+        vec![member("a", Owner)],
         vec![
             offer(device("a", 0), Backend::Cuda, 16, &[("u", 0.01)]),
             offer(device("a", 1), Backend::Cuda, 8, &[("u", 0.01)]),

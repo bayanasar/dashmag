@@ -9,10 +9,10 @@ The best scores 2.000, band ±5%.
 
 Kept off a device, and why:
   laptop/0's measured bounds do not meet decode's tolerance class
-  the guard: decode carries local-only data, and rented/0's member is remote
-  the guard: b0 carries local-only data, and rented/0's member is remote
+  the guard: decode carries data kept at owner, and rented/0's member is trusted only at outside
+  the guard: b0 carries data kept at owner, and rented/0's member is trusted only at outside
   head is pinned to a member or backend that laptop/0 is not
-  the guard: head carries local-only data, and rented/0's member is remote
+  the guard: head carries data kept at owner, and rented/0's member is trusted only at outside
   head is pinned to a member or backend that server/0 is not
   laptop/0's measured bounds do not meet count's tolerance class
-  the guard: count carries local-only data, and rented/0's member is remote
+  the guard: count carries data kept at owner, and rented/0's member is trusted only at outside

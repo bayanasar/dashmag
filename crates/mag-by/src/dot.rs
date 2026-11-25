@@ -3,14 +3,24 @@
 //! Inputs are ellipses, parts boxes (a replicable part a stack of them), a chain's parts sit in
 //! a cluster, and the job's results meet in one node. Each edge is labelled with its dtype and
 //! size, the size in binary units (`1.12 GiB`). It is laid out top to bottom, so that a graph
-//! shown in a column of text keeps its labels readable. An edge carrying data computed from a
-//! local-only input is red, and a released one dashed, so that what may leave the house can be told
-//! apart at a glance.
+//! shown in a column of text keeps its labels readable. An input, a part or an edge kept at
+//! `owner` is red and one kept at `site` orange, an input labelled with its level, and a released
+//! edge is dashed and labelled with the level it is released to, so that what may leave which
+//! machines can be told apart at a glance.
 
 use std::fmt::Write;
 use std::string::String;
 
-use crate::{Graph, Mark};
+use crate::{Graph, Mark, Trust};
+
+/// The colour of what is kept at a level, as a DOT attribute: none for `outside`.
+fn level_colour(keep: Trust) -> &'static str {
+    match keep {
+        Trust::Outside => "",
+        Trust::Site => ", color=orange",
+        Trust::Owner => ", color=red",
+    }
+}
 
 /// `s` as a quoted DOT identifier.
 fn quoted(s: &str) -> String {
@@ -88,9 +98,9 @@ const RESULTS: &str = "job's results";
 impl Graph {
     /// The graph as Graphviz DOT, for a person to look at (`dot -Tsvg`). Never read back. A
     /// graph that [`Graph::check`] refuses is drawn too, so that its author can see what is wrong;
-    /// its marks fail closed, and an edge from a name nothing defines is drawn local-only.
+    /// its levels fail closed, and an edge from a name nothing defines is drawn kept at `owner`.
     pub fn to_dot(&self) -> String {
-        let local = self.marks();
+        let keeps = self.levels();
         let mut d = String::new();
         let w = &mut d;
         let _ = writeln!(w, "digraph {} {{", quoted(&self.job.name));
@@ -99,10 +109,10 @@ impl Graph {
         let _ = writeln!(w, "  edge [fontname=\"monospace\"];");
         for input in &self.inputs {
             let mut label = std::format!("{}\n{}", input.name, size(input.bytes));
-            if input.local_only {
-                label.push_str("\nlocal-only");
+            if input.keep > Trust::Outside {
+                let _ = write!(label, "\nkept at {}", input.keep);
             }
-            let colour = if input.local_only { ", color=red" } else { "" };
+            let colour = level_colour(input.keep);
             let _ = writeln!(
                 w,
                 "  {} [shape=ellipse, label={}{colour}];",
@@ -132,7 +142,7 @@ impl Graph {
                 p.unit.version,
                 step(p.step)
             );
-            let colour = if local.parts[i] { ", color=red" } else { "" };
+            let colour = level_colour(keeps.parts[i]);
             std::format!(
                 "{indent}{} [shape={shape}, label={}{colour}];",
                 quoted(&p.name),
@@ -172,13 +182,11 @@ impl Graph {
         for (i, e) in self.edges.iter().enumerate() {
             let mut label = std::format!("{} {}", dtype(e.dtype), size(e.bytes));
             let mut style = String::new();
-            if e.release {
-                label.push_str("\nreleased");
+            if let Some(to) = e.release {
+                let _ = write!(label, "\nreleased to {to}");
                 style.push_str(", style=dashed");
             }
-            if local.edges[i] {
-                style.push_str(", color=red");
-            }
+            style.push_str(level_colour(keeps.edges[i]));
             let _ = writeln!(
                 w,
                 "  {} -> {} [label={}{style}];",

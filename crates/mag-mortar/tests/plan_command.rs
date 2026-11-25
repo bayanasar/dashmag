@@ -6,7 +6,7 @@ mod example;
 
 use std::path::{Path, PathBuf};
 
-use mag_by::{Description, Graph, Record};
+use mag_by::{Description, Graph, Record, Stamp};
 use mag_mortar::{HoldsJobs, Pool};
 
 fn by(path: &str) -> PathBuf {
@@ -49,14 +49,17 @@ fn the_example_s_plan_is_the_kept_one() {
 }
 
 #[test]
-fn the_plan_keeps_the_frames_off_the_remote_card_head_on_cuda_and_the_chain_together() {
+fn the_plan_keeps_the_frames_off_the_outside_card_head_on_cuda_and_the_chain_together() {
     let out = plan(&pool_file(), &graph_file(), &[]).stdout;
-    // Every part reads the local-only frames: the rented card, the fastest, gets none of them,
+    // Every part reads the frames kept at owner: the rented card, the fastest, gets none of them,
     // and the guard is named for each.
     let (placed, kept_off) = out.split_once("Kept off").unwrap();
     assert!(!placed.contains("rented"));
     for part in ["decode", "b0", "head", "count"] {
-        let line = format!("the guard: {part} carries local-only data, and rented/0's member");
+        let line = format!(
+            "the guard: {part} carries data kept at owner, and rented/0's member is trusted only \
+             at outside"
+        );
         assert!(kept_off.contains(&line), "no guard named for {part}");
     }
     // head is pinned to CUDA: on the workstation's card, kept off the others by its pin.
@@ -74,7 +77,10 @@ fn the_json_is_the_record_the_pool_plans() {
     let printed: Record = serde_json::from_str(&out.stdout).unwrap();
     let d = Description::from_json(&std::fs::read_to_string(pool_file()).unwrap()).unwrap();
     let g = Graph::from_json(&std::fs::read_to_string(graph_file()).unwrap()).unwrap();
-    let planned = Pool::from_description(&d).unwrap().plan(&g, d.at).unwrap();
+    let planned = Pool::from_description(&d)
+        .unwrap()
+        .plan(&g, &Stamp::default(), d.at)
+        .unwrap();
     assert_eq!(printed, planned);
 }
 
@@ -152,7 +158,7 @@ fn a_description_of_a_pool_that_holds_jobs_does_not_begin_a_pool() {
     let d = Description::from_json(&text).unwrap();
     let mut pool = Pool::from_description(&d).unwrap();
     let g = Graph::from_json(&std::fs::read_to_string(graph_file()).unwrap()).unwrap();
-    pool.submit(g, 0.0).unwrap();
+    pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(
         Pool::from_description(&pool.describe()).unwrap_err(),
         HoldsJobs {
@@ -175,7 +181,7 @@ fn a_pool_begun_from_a_description_keeps_its_time_and_replays_from_it() {
         "\"memory_bytes\": 2147483648",
         "\"memory_bytes\": 2199023255552",
     );
-    pool.submit(Graph::from_json(&huge).unwrap(), 100.0)
+    pool.submit(Graph::from_json(&huge).unwrap(), Stamp::default(), 100.0)
         .unwrap();
     pool.end("nothing", 310.0).unwrap();
     assert_eq!(pool.describe().jobs[0].waited_seconds, 60.0);

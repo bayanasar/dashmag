@@ -6,12 +6,18 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::Trust;
+
 /// The graph file's `format`.
 pub const GRAPH_FORMAT: &str = "mag-graph";
 
-/// The graph file's `version` this crate reads and writes. It is the file's own, apart from the
-/// wire form's and from the crate's.
-pub const GRAPH_VERSION: u64 = 1;
+/// The graph file's `version` this crate writes. It reads every version from 1 to this one, an
+/// earlier one to the same meaning. It is the file's own, apart from the wire form's and from the
+/// crate's.
+///
+/// Version 2 states trust as a level: an input's and a blob's `keep`, and the level an edge's
+/// `release` releases to, where version 1 had `local_only` and a `release` of true or false.
+pub const GRAPH_VERSION: u64 = 2;
 
 /// One submitted job.
 ///
@@ -109,9 +115,9 @@ pub struct Need {
     pub deadline_seconds: Option<f64>,
 }
 
-/// Data a job reads from outside its parts. Version 1 of the graph file names an input and its
-/// mark; which data it is gets bound at submission, where the pool can check the data's own mark
-/// against its record of it. The mark here is only as good as that binding.
+/// Data a job reads from outside its parts. The graph file names an input and its level; which
+/// data it is gets bound at submission, where the pool can check the data's own level against its
+/// record of it. The level here is only as good as that binding.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(
     feature = "graph",
@@ -121,10 +127,10 @@ pub struct Need {
 pub struct Input {
     pub name: String,
     pub bytes: u64,
-    /// Never placed on a member marked remote, nor is anything computed from it unless a stage
-    /// releases it. The graph file must say it either way: left out, it is refused, so that
-    /// forgetting it never lets an input move.
-    pub local_only: bool,
+    /// The least trust a member must have to hold it, or anything computed from it unless a part
+    /// releases that. The graph file must say it, `outside` included: left out, it is refused, so
+    /// that forgetting it never lets an input move.
+    pub keep: Trust,
 }
 
 /// The smallest piece mag places: a unit with the weights it holds, the memory it needs, and
@@ -195,11 +201,11 @@ pub struct Unit {
 pub struct Blob {
     pub hash: String,
     pub bytes: u64,
-    /// Computed from local-only data, as weights trained on it in an earlier job are: never
-    /// placed on a member marked remote, nor is the part that holds it, nor what that part
-    /// computes unless it releases it. The graph file must say it either way: left out, it is
-    /// refused, as an input's mark is.
-    pub local_only: bool,
+    /// The least trust a member must have to hold it, as for weights trained in an earlier job on
+    /// data kept at that level. The part that holds it is kept at least as far, and so is what
+    /// that part computes unless it releases it. The graph file must say it: left out, it is
+    /// refused, as an input's level is.
+    pub keep: Trust,
 }
 
 /// How a part may be spread over devices.
@@ -342,10 +348,18 @@ pub struct Edge {
     pub dtype: Dtype,
     /// Its size. 0 is taken: an edge may carry nothing but the order between two parts.
     pub bytes: u64,
-    /// Whether the producing part releases this output, so that it may go where its local-only
-    /// inputs may not. Only a part releases; an input is never released.
-    #[cfg_attr(feature = "graph", serde(default))]
-    pub release: bool,
+    /// The level the producing part releases this output to, if it releases it: the output is
+    /// then kept at that level where what the part read is kept higher. A release never keeps
+    /// data higher than it is. Only a part releases; an input is never released.
+    #[cfg_attr(
+        feature = "graph",
+        serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )
+    )]
+    pub release: Option<Trust>,
     /// Free text: the author's reasons. mag never reads it.
     #[cfg_attr(
         feature = "graph",
@@ -511,7 +525,7 @@ impl Graph {
         }
         for (i, edge) in self.edges.iter().enumerate() {
             match names.get(edge.from.as_str()) {
-                Some(Named::Input) if edge.release => {
+                Some(Named::Input) if edge.release.is_some() => {
                     return Err(Refusal::ReleaseFromInput {
                         edge: i,
                         name: edge.from.clone(),

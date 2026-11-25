@@ -1,26 +1,26 @@
 {
   "format": "mag-pool",
-  "version": 1,
+  "version": 2,
   "at": 0.0,
   "members": [
     {
       "name": "workstation",
-      "remote": false,
+      "trust": "owner",
       "give_back_seconds": 5.0
     },
     {
       "name": "server",
-      "remote": false,
+      "trust": "owner",
       "give_back_seconds": 30.0
     },
     {
       "name": "laptop",
-      "remote": false,
+      "trust": "owner",
       "give_back_seconds": 2.0
     },
     {
       "name": "rented",
-      "remote": true,
+      "trust": "outside",
       "give_back_seconds": 60.0
     }
   ],
@@ -260,12 +260,24 @@
       "version": 1
     },
     {
+      "name": "mag-graph",
+      "version": 2
+    },
+    {
       "name": "mag-ledger",
       "version": 1
     },
     {
+      "name": "mag-ledger",
+      "version": 2
+    },
+    {
       "name": "mag-pool",
       "version": 1
+    },
+    {
+      "name": "mag-pool",
+      "version": 2
     }
   ]
 }

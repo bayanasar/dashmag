@@ -2,7 +2,7 @@ digraph "label-frames" {
   rankdir=TB;
   node [fontname="monospace"];
   edge [fontname="monospace"];
-  "frames" [shape=ellipse, label="frames\n1.12 GiB\nlocal-only", color=red];
+  "frames" [shape=ellipse, label="frames\n1.12 GiB\nkept at owner", color=red];
   "classes" [shape=ellipse, label="classes\n4 KiB"];
   "decode" [shape=box3d, label="decode\ndecode-resize v1\nreplicable, stops each item", color=red];
   "head" [shape=box, label="head\nclassify v1\natomic, stops each item", color=red];
@@ -20,5 +20,5 @@ digraph "label-frames" {
   "classes" -> "head" [label="i32 4 KiB"];
   "head" -> "count" [label="f32 156 KiB", color=red];
   "head" -> "job's results" [label="f32 156 KiB", color=red];
-  "count" -> "job's results" [label="i64 64 B\nreleased", style=dashed];
+  "count" -> "job's results" [label="i64 64 B\nreleased to outside", style=dashed];
 }

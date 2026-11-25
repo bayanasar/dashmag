@@ -6,11 +6,16 @@ use mag_by::{
     Backend, Blob, Chain, Cost, DeviceId, Dtype, Edge, Graph, Input, Job, Mark, Member, Need,
     Offer, Part, Pin, Step, Tolerance, Unit,
 };
+// The words most tests use, so that each test names a level as it reads.
+#[allow(unused_imports)]
+pub use mag_by::Stamp;
+#[allow(unused_imports)]
+pub use mag_by::Trust::{self, Outside, Owner, Site};
 
-pub fn member(name: &str, remote: bool) -> Member {
+pub fn member(name: &str, trust: Trust) -> Member {
     Member {
         name: name.into(),
-        remote,
+        trust,
         give_back_seconds: 5.0,
     }
 }
@@ -69,7 +74,7 @@ pub fn edge(from: &str, to: Option<&str>) -> Edge {
         to: to.map(Into::into),
         dtype: Dtype::Bf16,
         bytes: 1 << 20,
-        release: false,
+        release: None,
         note: None,
     }
 }
@@ -96,11 +101,11 @@ pub fn job(
     }
 }
 
-pub fn input(name: &str, local_only: bool) -> Input {
+pub fn input(name: &str, keep: Trust) -> Input {
     Input {
         name: name.into(),
         bytes: 1 << 20,
-        local_only,
+        keep,
     }
 }
 
@@ -108,7 +113,7 @@ pub fn local_weights() -> Blob {
     Blob {
         hash: "trained-on-local-data".into(),
         bytes: 1 << 20,
-        local_only: true,
+        keep: Owner,
     }
 }
 

@@ -9,7 +9,7 @@ use mag_mortar::Pool;
 
 fn two_cards() -> Pool {
     Pool::new(
-        vec![member("a", false), member("b", false)],
+        vec![member("a", Owner), member("b", Owner)],
         vec![
             offer(
                 device("a", 0),
@@ -33,7 +33,11 @@ fn a_tolerance_no_device_meets_keeps_the_job_waiting_with_its_reason() {
     let mut p = part("p", "u", Mark::Atomic, 1);
     p.tolerance = Tolerance::Int8;
     let r = pool
-        .submit(job("int8", 1, vec![], vec![p], vec![]), 0.0)
+        .submit(
+            job("int8", 1, vec![], vec![p], vec![]),
+            Stamp::default(),
+            0.0,
+        )
         .unwrap();
     assert_eq!(r.chosen, None);
     assert_eq!(
@@ -59,6 +63,7 @@ fn a_dtype_a_device_does_not_compute_in_removes_it() {
                 vec![part("p", "u", Mark::Atomic, 1)],
                 vec![e],
             ),
+            Stamp::default(),
             0.0,
         )
         .unwrap();
@@ -87,7 +92,7 @@ fn a_rate_the_pool_cannot_sustain_keeps_the_job_waiting() {
         rate_per_second: Some(150.0),
         deadline_seconds: None,
     };
-    let r = pool.submit(g, 0.0).unwrap();
+    let r = pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(r.chosen, None);
     assert_eq!(
         r.candidates[1].removed,
@@ -110,7 +115,7 @@ fn an_arrival_that_would_slow_a_running_job_below_its_need_goes_elsewhere() {
         rate_per_second: Some(80.0),
         deadline_seconds: None,
     };
-    pool.submit(service, 0.0).unwrap();
+    pool.submit(service, Stamp::default(), 0.0).unwrap();
     assert_eq!(
         pool.arrangement("service").unwrap().places,
         [Place::On(device("a", 0))]
@@ -124,6 +129,7 @@ fn an_arrival_that_would_slow_a_running_job_below_its_need_goes_elsewhere() {
                 vec![part("q", "v", Mark::Atomic, 1)],
                 vec![],
             ),
+            Stamp::default(),
             1.0,
         )
         .unwrap();
@@ -153,7 +159,7 @@ fn a_pin_to_a_member_holds_however_slow_that_member_is() {
         )],
         vec![],
     );
-    let r = pool.submit(g, 0.0).unwrap();
+    let r = pool.submit(g, Stamp::default(), 0.0).unwrap();
     assert_eq!(
         r.candidates[1].removed,
         Some(Removal::Pin {
@@ -172,7 +178,7 @@ fn a_chain_s_parts_stay_on_one_device_where_dividing_them_would_score_higher() {
     // Divided, each card would take 0.01 s a step; together one takes 0.02. The chain stays
     // together: dividing it across devices is a later step's.
     let mut pool = Pool::new(
-        vec![member("a", false), member("b", false)],
+        vec![member("a", Owner), member("b", Owner)],
         vec![
             offer(device("a", 0), Backend::Cuda, 16, &[("block", 0.01)]),
             offer(device("b", 0), Backend::Cuda, 16, &[("block", 0.01)]),
@@ -192,7 +198,7 @@ fn a_chain_s_parts_stay_on_one_device_where_dividing_them_would_score_higher() {
         name: "blocks".into(),
         parts: vec!["b0".into(), "b1".into()],
     });
-    let r = pool.submit(g, 0.0).unwrap();
+    let r = pool.submit(g, Stamp::default(), 0.0).unwrap();
     // Waiting, then the chain on a, then on b: no candidate divides it.
     assert_eq!(r.candidates.len(), 3);
     let places = &pool.arrangement("model").unwrap().places;
@@ -204,7 +210,7 @@ fn a_cost_never_measured_is_estimated_as_the_slowest_measured_and_flagged() {
     // `c` measured the part kind at 0.05 and `a` at 0.02; `b` never ran it. Its estimate is the
     // slowest, 0.05, with the wide band: the job goes to `a`.
     let mut pool = Pool::new(
-        vec![member("a", false), member("b", false), member("c", false)],
+        vec![member("a", Owner), member("b", Owner), member("c", Owner)],
         vec![
             offer(device("a", 0), Backend::Cuda, 16, &[("u", 0.02)]),
             offer(device("b", 0), Backend::Cuda, 16, &[]),
@@ -220,6 +226,7 @@ fn a_cost_never_measured_is_estimated_as_the_slowest_measured_and_flagged() {
                 vec![part("p", "u", Mark::Atomic, 1)],
                 vec![],
             ),
+            Stamp::default(),
             0.0,
         )
         .unwrap();

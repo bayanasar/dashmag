@@ -1,10 +1,12 @@
 //! The ledger's lines: a [`Ledger`] in JSON Lines, as the host of a pool appends it and reads it
 //! back.
 //!
-//! The first line is the header: `format` `"mag-ledger"`, `version` 1, and the time, members
-//! and offers the pool began with. Each line after it is one [`Entry`], written when the pool
-//! takes its change. A line is one JSON object and ends with its newline; JSON escapes a newline
-//! inside a string, so none can break a line. The words are written as the graph file's are.
+//! The first line is the header: `format` `"mag-ledger"`, `version` 2, the time the pool began
+//! at, the version of `mag-mortar` that wrote it and the ledger it follows, if those are known,
+//! and the members and offers the pool began with. Each line after it is one [`Entry`], written
+//! when the pool takes its change. A line is one JSON object and ends with its newline; JSON
+//! escapes a newline inside a string, so none can break a line. The words are written as the
+//! graph file's are.
 //!
 //! This makes lines and reads them. Opening, appending and syncing a file, or keeping the lines
 //! wherever the host keeps its state, is the host's. A change is acknowledged only once its line
@@ -12,6 +14,10 @@
 //! acknowledged: the reader drops it and says so. A line cut short anywhere else is refused, and
 //! so is what the graph file's reader refuses: another format, a newer version, an unknown field,
 //! a key repeated in one object, a `null`.
+//!
+//! A ledger of version 1 is read to the same meaning, every line of it in version 1's words. Its
+//! lines are not version 2's, so a host that goes on from one writes it again whole, as version
+//! 2, before it appends to it: a version 2 entry under a version 1 header would not be read.
 //!
 //! Every `f64` is written in the shortest form that reads back to the same bits, and is read back
 //! to them, so that a replayed record can be compared with the one logged.
@@ -25,8 +31,9 @@ use std::vec::Vec;
 
 use serde_json::Value;
 
+use crate::graph::present;
 use crate::json::{NoRepeats, strip_null};
-use crate::{Entry, LEDGER_FORMAT, LEDGER_VERSION, Ledger, Member, Offer};
+use crate::{Entry, LEDGER_FORMAT, LEDGER_VERSION, Ledger, Member, Offer, v1};
 
 /// Why a ledger's lines were not read. Lines are counted from 1, the header's.
 #[derive(Debug)]
@@ -34,7 +41,7 @@ pub enum LedgerError {
     /// The first line's `format` is not `"mag-ledger"`, it is not an object, or there is no first
     /// line. The JSON found, if any.
     Format { found: Option<String> },
-    /// The header's `version` is not 1. The JSON found, if any.
+    /// The header's `version` is not 1 or 2. The JSON found, if any.
     Version { found: Option<String> },
     /// A line is not JSON, or not a header or an entry: a field missing, unknown, `null` or of
     /// the wrong type.
@@ -60,7 +67,7 @@ impl fmt::Display for LedgerError {
             }
             LedgerError::Version { found: Some(found) } => write!(
                 f,
-                "the version is {found}; this reader reads version {LEDGER_VERSION}"
+                "the version is {found}; this reader reads versions 1 to {LEDGER_VERSION}"
             ),
             LedgerError::Version { found: None } => write!(f, "the ledger has no version"),
             LedgerError::Json { line, error } => write!(f, "line {line}: {error}"),
@@ -91,6 +98,8 @@ pub struct ReadLedger {
     pub ledger: Ledger,
     /// The number of a last line that was cut short and dropped, if there was one.
     pub dropped: Option<usize>,
+    /// The ledger's version: 1 for a ledger to be written again whole before it is appended to.
+    pub version: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -98,6 +107,10 @@ struct HeaderOut<'a> {
     format: &'static str,
     version: u64,
     at: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    written_by: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    follows: Option<&'a str>,
     members: &'a [Member],
     offers: &'a [Offer],
 }
@@ -108,6 +121,12 @@ struct HeaderOut<'a> {
 struct Header {
     /// The pool's time when it began, in seconds.
     at: f64,
+    /// The version of `mag-mortar` that began the ledger.
+    #[serde(default, deserialize_with = "present")]
+    written_by: Option<String>,
+    /// The name of the ledger this one follows; left out for a first ledger.
+    #[serde(default, deserialize_with = "present")]
+    follows: Option<String>,
     /// The members the pool began with, as they were given to it.
     members: Vec<Member>,
     /// The offers the pool began with, in the order of the devices' ids.
@@ -124,13 +143,16 @@ enum Line {
 }
 
 impl Ledger {
-    /// The first line: the format and version, and the time, members and offers the pool began
-    /// with, with its newline.
+    /// The first line: the format and version, the time the pool began at, the version of
+    /// `mag-mortar` that wrote it and the ledger it follows where those are known, and the members
+    /// and offers the pool began with, with its newline.
     pub fn header_line(&self) -> String {
         let header = HeaderOut {
             format: LEDGER_FORMAT,
             version: LEDGER_VERSION,
             at: self.at,
+            written_by: self.written_by.as_deref(),
+            follows: self.follows.as_deref(),
             members: &self.members,
             offers: &self.offers,
         };
@@ -155,7 +177,7 @@ impl Ledger {
         text
     }
 
-    /// Reads a ledger from its lines, dropping a last line cut short.
+    /// Reads a ledger from its lines, of version 2 or 1, dropping a last line cut short.
     pub fn from_lines(text: &str) -> Result<ReadLedger, LedgerError> {
         let mut lines: Vec<&str> = text.split('\n').collect();
         // What follows the last newline: nothing, when the last line is whole.
@@ -167,24 +189,32 @@ impl Ledger {
                 None => LedgerError::Format { found: None },
             });
         };
-        let Header {
-            at,
-            members,
-            offers,
-        } = header(head)?;
+        let (
+            Header {
+                at,
+                written_by,
+                follows,
+                members,
+                offers,
+            },
+            version,
+        ) = header(head)?;
         let entries = entries
             .iter()
             .enumerate()
-            .map(|(i, l)| entry(l, i + 2))
+            .map(|(i, l)| entry(l, i + 2, version))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(ReadLedger {
             ledger: Ledger {
                 at,
+                written_by,
+                follows,
                 members,
                 offers,
                 entries,
             },
             dropped,
+            version,
         })
     }
 }
@@ -209,8 +239,8 @@ fn no_repeats(text: &str, line: usize) -> Result<(), LedgerError> {
     }
 }
 
-/// The header, its format and version checked first.
-fn header(text: &str) -> Result<Header, LedgerError> {
+/// The header, with the ledger's version, its format and version checked first.
+fn header(text: &str) -> Result<(Header, u64), LedgerError> {
     let mut value = parse(text, 1)?;
     let Value::Object(fields) = &mut value else {
         return Err(LedgerError::Format { found: None });
@@ -223,22 +253,32 @@ fn header(text: &str) -> Result<Header, LedgerError> {
             });
         }
     }
-    match fields.remove("version") {
-        Some(Value::Number(v)) if v.as_u64() == Some(LEDGER_VERSION) => {}
+    let version = match fields.remove("version") {
+        Some(Value::Number(v)) if matches!(v.as_u64(), Some(1..=LEDGER_VERSION)) => {
+            v.as_u64().expect("just checked")
+        }
         other => {
             return Err(LedgerError::Version {
                 found: other.map(|v| v.to_string()),
             });
         }
-    }
+    };
     no_repeats(text, 1)?;
-    serde_json::from_value(value).map_err(|error| LedgerError::Json { line: 1, error })
+    let json = |error| LedgerError::Json { line: 1, error };
+    if version == 1 {
+        v1::header(&mut value).map_err(json)?;
+    }
+    Ok((serde_json::from_value(value).map_err(json)?, version))
 }
 
-fn entry(text: &str, line: usize) -> Result<Entry, LedgerError> {
-    let value = parse(text, line)?;
+fn entry(text: &str, line: usize, version: u64) -> Result<Entry, LedgerError> {
+    let mut value = parse(text, line)?;
     no_repeats(text, line)?;
-    serde_json::from_value(value).map_err(|error| LedgerError::Json { line, error })
+    let json = |error| LedgerError::Json { line, error };
+    if version == 1 {
+        v1::entry(&mut value).map_err(json)?;
+    }
+    serde_json::from_value(value).map_err(json)
 }
 
 /// The JSON Schema (draft 2020-12) of one line of a ledger, header or entry, as text with a

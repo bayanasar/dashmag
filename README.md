@@ -42,8 +42,8 @@ operations, such as attention against a key-value cache and the gated delta rule
 | [`dash-peft`](crates/dash-peft) | PEFT's LoRA adapter files with no tensor library: read and written back byte for byte, and applied to a backend's layers and read out of them through one trait | dash-mag's LoRA layer implements the trait; PEFT's files written back byte for byte |
 | [`dash-mlx`](crates/dash-mlx) | dash-ops' operations on MLX, with their contracts, for Apple silicon: attention, conv1d, the gated delta rule, chosen-token log-probabilities, the fused linear cross-entropy, the low-rank product, recompute and sampling, with Metal kernels where MLX's operations fall short | conv1d, the gated delta rule, the log-probability and attention pass dash-conformance's tests; the others are held to dash-ops' tests by ports of them; not published |
 | [`dash-mag`](crates/dash-mag) | the one crate an application names, the gateway to dash and, as they are built, to the `mag-` crates (it does not reach `mag-by` yet): a tensor, its array operations, a vector-Jacobian product, the operations' entry points, LoRA's layer, rotary embeddings, AdamW and clipping, over `dash-ops` or `dash-mlx`, the side chosen at compile time. | on Burn and on MLX: every entry point the same bits as `dash-ops` or `dash-mlx`, one training step from one source held to one recording; LoRA's layer and AdamW held to PEFT's and torch's recordings |
-| [`mag-by`](crates/mag-by) | the words the `mag-` crates share: the graph of a job's parts, its checks with typed refusals, what its local-only inputs and weights reach, and the pool's words (offers, arrangements, records, a pool's description and its ledger); with the `graph` feature, the files in JSON (the graph, the pool and the ledger's lines) with their JSON Schemas, and DOT for a person to look at; `no_std` with no dependencies unless `graph` is on | its tests hold the checks, the local-only marks, each file's refusals and the kept schemas and DOT to the code; CI builds the default for a `no_std` target with an empty dependency tree |
-| [`mag-mortar`](crates/mag-mortar) | the placement library of a pool: the loop, which on each event lists the ways to place the waiting jobs, removes those that break a constraint (memory, tolerance, dtypes, a pin, a job's need, the guard on local-only data), scores the rest from the devices' measured costs and the jobs' priorities, commits the best and records every candidate; `describe` and `plan` for an author; the pool's state as a ledger its host saves and replays; `mag plan`, a command over files. It does no I/O, and runs on offers given as data | its tests hold each constraint, the guard, priorities and the record, the plan against the submit, the replay of every prefix of a run, and the command's kept output; no member, network or probe yet |
+| [`mag-by`](crates/mag-by) | the words the `mag-` crates share: the graph of a job's parts, its checks with typed refusals, the level of trust each part's data is kept at, and the pool's words (offers, arrangements, records, a pool's description and its ledger, the host's stamp on a job, taking a machine back, and a member's start file); with the `graph` feature, the files in JSON (the graph, the pool, the ledger's lines and the start file; version 1 files still read) with their JSON Schemas, and DOT for a person to look at; `no_std` with no dependencies unless `graph` is on | its tests hold the checks, the levels of trust, each file's refusals and the kept schemas and DOT to the code; CI builds the default for a `no_std` target with an empty dependency tree |
+| [`mag-mortar`](crates/mag-mortar) | the placement library of a pool: the loop, which on each event lists the ways to place the waiting jobs, removes those that break a constraint (memory, tolerance, dtypes, a pin, a job's need, the devices the host's stamp allows, the guard on the levels of trust), scores the rest from the devices' measured costs and the jobs' priorities, commits the best and records every candidate; `describe` and `plan` for an author; the pool's state as a ledger its host saves and replays; `mag plan`, a command over files. It does no I/O, and runs on offers given as data | its tests hold each constraint, the guard, priorities and the record, the plan against the submit, the replay of every prefix of a run, and the command's kept output; no member, network or probe yet |
 | [`dash-image`](crates/dash-image) | image preprocessing: JPEG decode, Pillow-exact bilinear resize, normalisation | byte-exact with Pillow's resize |
 | [`dash-core`](https://crates.io/crates/dash-core) | the inference trait: tensors, capability negotiation, dispatch across runtimes | — |
 | [`dash-burn`](crates/dash-burn) | Burn behind that trait: the model built from code, weights loaded, run on Flex (pure-Rust CPU), CUDA, ROCm or Metal | runs on x86-64 (Flex) and on CUDA |
@@ -121,11 +121,11 @@ planning, not the running. In this table "is to" marks what is not built.
 | each part's function | yours to write, with dash's operations; the graph names it as a `Unit` (a name and a version), and it is to be built into the program each machine runs; how a unit's code reaches a machine is not built, nor decided | the same | the same | the same |
 | the job's graph | yours to write; `mag-by` reads and checks it (`Graph::from_json`, `Graph::check`, [`schemas/mag-graph.schema.json`](crates/mag-by/schemas/mag-graph.schema.json)) | the same | the same | the same |
 | which machines are in the pool | **the host's** | you write the pool file, as [`pools/example.json`](crates/mag-by/pools/example.json) is written | the allocation, one Slurm job per machine; turning it into a pool description is not built | that system's |
-| the pool's description: its members, whether each is `remote`, how soon it gives a device back, and each device's backend, memory, tolerance classes, dtypes and costs | the format is `mag-by`'s (`Description`, the pool file, [`schemas/mag-pool.schema.json`](crates/mag-by/schemas/mag-pool.schema.json)) | yours, by hand | is to come from the allocation; not built | is to come from that system; not built |
+| the pool's description: its members, the level each is trusted at (`outside`, `site` or `owner`), how soon it gives a device back, and each device's backend, memory, tolerance classes, dtypes and costs | the format is `mag-by`'s (`Description`, the pool file, [`schemas/mag-pool.schema.json`](crates/mag-by/schemas/mag-pool.schema.json)) | yours, by hand | is to come from the allocation; not built | is to come from that system; not built |
 | the costs in an offer: seconds per step of each part's unit on each device | the format is `mag-by`'s (`Cost`) | you time one step of each unit on each device yourself, at the batch its memory allows, after warm-up and on an idle device, and write it with a band, how far a later measurement may fall from it; a cost you leave out is taken as the slowest any other device measured for that unit, or 1 s if none did, flagged `estimate` with a band of 100% | is to be measured by `mag-mar`; not built | is to be measured by `mag-mar`; not built |
 | the placement loop: list the arrangements, remove those that break a constraint, score, commit, record | `mag-mortar`'s `Pool`, public; probing candidates, the time of edges, dividing a chain and moving a running job are not built | `mag plan` shows its decision on your two files | the same library | the same library |
 | the queue of jobs and the priority between them | **the pool's**: `mag-mortar`'s, every job submitted to the pool placed against the others | the pool's | the pool's; Slurm queues only the machines' allocations | the pool's |
-| which machines a job may use | the host's, given to mag as data: the pool it is handed, a member's `remote`, an input's or weights' `local_only`, a part's `pin` | the pool file is your policy: list only the machines you allow, and mark a rented one `remote` | Slurm's accounts and partitions decide the allocation | that system's own authorization decides the pool before mag sees it |
+| which machines a job may use | the host's, given to mag as data: the pool it is handed, a member's `trust`, the level an input or weights are kept at (`keep`), the devices and priority ceiling of a job's stamp, a part's `pin` | the pool file is your policy: list only the machines you allow, and trust a rented one at `outside` | Slurm's accounts and partitions decide the allocation | that system's own authorization decides the pool before mag sees it |
 | starting the program on each machine | **the host's**; the program is `mag-mar`'s, not built | you, by hand or over ssh | `sbatch` | that system's |
 | taking a machine back | **the host's**, by sending its program a signal; the pool places again; not built | you | Slurm's preemption, with a grace time | that system's |
 | coordinating: running the loop over time and keeping its ledger | one of the pool's machines, named by the host; `mag-mortar` does no I/O and hands its state over (`Pool::apply`, `Pool::ledger`, `Ledger::line`, `Pool::replay`); the program that does this is `mag-mar`'s, not built | the same | the same | the same |
@@ -140,32 +140,33 @@ It is designed for:
 - a teacher and a student sharing the pool's memory;
 - a long-running service in the pool that yields a card when a more urgent job arrives, and
   spreads back afterwards; and placing again when the host takes a machine back;
-- data that must not leave: what is computed from an input marked local-only, or by a part whose
-  weights are marked local-only, is never to be placed on a remote machine, unless a part of the
-  graph releases it.
+- data that must not leave: data is kept at a level of trust (`outside < site < owner`), and what
+  is computed from it is never to be placed on a machine trusted below that level, unless a part of
+  the graph releases it to a lower one.
 
 **What exists today is the description and the loop that places it, not the pool.**
 [`mag-by`](crates/mag-by) reads a graph file, refuses one that is wrong with a reason that names
-what is wrong, works out what the local-only inputs and weights reach, and writes the graph as
+what is wrong, works out the level of trust each part's data is kept at, and writes the graph as
 Graphviz DOT:
 
-![The example graph: a labelling job whose frames are local-only](crates/mag-by/graphs/example.svg)
+![The example graph: a labelling job, its frames kept at owner](crates/mag-by/graphs/example.svg)
 
-That is [`graphs/example.json`](crates/mag-by/graphs/example.json). Red is the local-only input
-and everything local-only data reaches, here from the frames and from the classifier's weights;
-the dashed edge is where a part releases its output, a count of labels. To draw your own, with
-Graphviz installed:
+That is [`graphs/example.json`](crates/mag-by/graphs/example.json). Red is data kept at `owner` and
+everything it reaches, here from the frames and from the classifier's weights; orange would be
+`site`; the dashed edge is where a part releases its output, a count of labels, to `outside`. To
+draw your own, with Graphviz installed:
 
     cargo run -p mag-by --features graph --example dot -- your-graph.json | dot -Tsvg > graph.svg
 
-[`mag-mortar`](crates/mag-mortar) holds the placement loop, run on what each device offers given
-as data: on every arrival, end, join or leave it lists the ways to place the jobs waiting,
-removes those that break memory, a part's tolerance and dtypes, a pin, a job's need or the guard
-that keeps local-only data off remote machines, scores the rest from the devices' measured costs
-and the jobs' priorities, commits the best, and records every candidate with why any was left
-out. Its tests hold it to the cases it is designed for: a job on the fastest device that holds
-it, copies wherever they fit, a pinned job waiting for its backend, the higher priority of two
-first, and nothing local-only on a remote machine.
+[`mag-mortar`](crates/mag-mortar) holds the placement loop, run on what each device offers given as
+data: on every arrival, end, join or leave it lists the ways to place the jobs waiting, removes
+those that break memory, a part's tolerance and dtypes, a pin, a job's need, the devices the job's
+stamp allows, or the guard that keeps data off machines trusted below its level, scores the rest
+from the devices' measured costs and the jobs' priorities, commits the best, and records every
+candidate with why any was left out. Its tests hold it to the cases it is designed for: a job on the
+fastest device that holds it, copies wherever they fit, a pinned job waiting for its backend, the
+higher priority of two first, a stamped job only on its devices, and no data on a machine trusted
+below its level.
 
 To see it decide, plan the example graph on a pool of four devices described in a file,
 [`pools/example.json`](crates/mag-by/pools/example.json), one of them a fast rented card:
@@ -185,11 +186,11 @@ The best scores 2.000, band ±5%.
 
 Kept off a device, and why:
   laptop/0's measured bounds do not meet decode's tolerance class
-  the guard: decode carries local-only data, and rented/0's member is remote
+  the guard: decode carries data kept at owner, and rented/0's member is trusted only at outside
   ...
 ```
 
-The rented card is the fastest and gets nothing: every part reads the local-only frames. `head`
+The rented card is the fastest and gets nothing: every part reads the frames kept at owner. `head`
 is pinned to CUDA, and the chain's two blocks stay together. The whole output is
 [`plans/example.txt`](crates/mag-mortar/plans/example.txt); `--json` prints the loop's record.
 The command plans and keeps nothing.
@@ -203,8 +204,8 @@ running the parts placed on it, and on the coordinator serving the pool; the rec
 machines and for Slurm; running anything; members on other machines; and trying candidates on the
 job's own steps. Nothing here runs work yet.
 
-The graph file is at version 1 and will change. If your job cannot be said in it, that is what
-we most want to hear: please open an issue.
+The graph file is at version 2 (version 1 files still read) and will change. If your job cannot be
+said in it, that is what we most want to hear: please open an issue.
 
 ## License
 

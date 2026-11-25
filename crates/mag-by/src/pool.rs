@@ -14,21 +14,28 @@ use core::fmt;
 
 #[cfg(feature = "graph")]
 use crate::graph::present;
-use crate::{Backend, Dtype, Graph, Tolerance, Unit};
+use crate::{Backend, Dtype, Graph, Stamp, Tolerance, Trust, Unit};
 
 /// The ledger's `format`.
 pub const LEDGER_FORMAT: &str = "mag-ledger";
 
-/// The ledger's `version` this crate reads and writes.
-pub const LEDGER_VERSION: u64 = 1;
+/// The ledger's `version` this crate writes. It reads version 1 too, to the same meaning.
+///
+/// Version 2 carries the graph file's version 2 in its submissions, each with the host's
+/// [`Stamp`]; a member's `trust` where version 1 had `remote`; the levels in a guard's removal
+/// and the new removal by a stamp; a record's `lowered` where version 1 had `marked_remote`; and
+/// in its header the version of `mag-mortar` that wrote it and the ledger it follows.
+pub const LEDGER_VERSION: u64 = 2;
 
 /// The pool file's `format`: a pool's [`Description`].
 pub const POOL_FORMAT: &str = "mag-pool";
 
-/// The pool file's `version` this crate reads and writes.
-pub const POOL_VERSION: u64 = 1;
+/// The pool file's `version` this crate writes. It reads version 1 too, to the same meaning.
+///
+/// Version 2 gives each member its `trust` where version 1 had `remote`.
+pub const POOL_VERSION: u64 = 2;
 
-/// A machine in the pool, running `mag-mar`.
+/// A machine in the pool, running `mag-mar`: one lease of the host's.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(
     feature = "graph",
@@ -37,10 +44,9 @@ pub const POOL_VERSION: u64 = 1;
 #[cfg_attr(feature = "graph", serde(deny_unknown_fields))]
 pub struct Member {
     pub name: String,
-    /// Outside the owner's own machines, as a rented GPU is. Nothing local-only is placed on a
-    /// remote member's devices.
-    pub remote: bool,
-    /// Seconds within which the member gives a device back when its owner wants it.
+    /// How far the host trusts it. Nothing kept at a higher level is placed on its devices.
+    pub trust: Trust,
+    /// Seconds within which the member gives a device back when the host takes it back.
     pub give_back_seconds: f64,
 }
 
@@ -146,7 +152,7 @@ pub enum Event {
     End { job: String },
     /// A device joins the pool.
     Join { device: DeviceId },
-    /// A device leaves, or its owner takes it back.
+    /// A device leaves, or the host takes it back.
     Leave { device: DeviceId },
     /// A device's offer changes.
     OfferChanged { device: DeviceId },
@@ -199,8 +205,16 @@ pub enum Removal {
     Dtype { part: String, device: DeviceId },
     /// The part is pinned elsewhere.
     Pin { part: String, device: DeviceId },
-    /// The part carries local-only data and the device's member is remote.
-    Guard { part: String, device: DeviceId },
+    /// The part carries data kept at a level above the trust of the device's member: `keep` is
+    /// the part's level, `trust` the member's (`outside` for a member the pool does not know).
+    Guard {
+        part: String,
+        device: DeviceId,
+        keep: Trust,
+        trust: Trust,
+    },
+    /// The device is not among those the job's stamp allows.
+    Stamp { job: String, device: DeviceId },
     /// The job's need is not met: its rate is below the rate it declared.
     Need { job: String },
 }
@@ -228,10 +242,19 @@ impl fmt::Display for Removal {
                     "{part} is pinned to a member or backend that {device} is not"
                 )
             }
-            Removal::Guard { part, device } => write!(
+            Removal::Guard {
+                part,
+                device,
+                keep,
+                trust,
+            } => write!(
                 f,
-                "the guard: {part} carries local-only data, and {device}'s member is remote"
+                "the guard: {part} carries data kept at {keep}, and {device}'s member is trusted \
+                 only at {trust}"
             ),
+            Removal::Stamp { job, device } => {
+                write!(f, "{device} is not among the devices {job}'s stamp allows")
+            }
             Removal::Need { job } => {
                 write!(f, "{job} would run below the rate it needs")
             }
@@ -306,9 +329,9 @@ pub struct Record {
     pub chosen: Option<usize>,
     /// Whether the candidates were too many to list and were generated greedily instead.
     pub greedy: bool,
-    /// Members this event marked remote where an earlier report had them local: of two marks for
-    /// one member, the stricter stands.
-    pub marked_remote: Vec<String>,
+    /// Members whose trust this event lowered below an earlier report's: of two reports for one
+    /// member, the lower trust stands.
+    pub lowered: Vec<String>,
 }
 
 /// A file format a pool reads, at the version it reads.
@@ -350,7 +373,8 @@ pub struct Held {
 pub struct Description {
     /// The pool's time, in seconds: the latest it has been told of.
     pub at: f64,
-    /// Its members, each with the stricter of the marks it was reported with.
+    /// Its members, each with the lowest trust and the shortest time to give a device back it was
+    /// reported with.
     pub members: Vec<Member>,
     /// What each device offers, with the costs measured or estimated on it, in the order of the
     /// devices' ids.
@@ -372,8 +396,8 @@ pub struct Description {
     serde(rename_all = "snake_case", deny_unknown_fields)
 )]
 pub enum Change {
-    /// A job arrives.
-    Submit { graph: Graph },
+    /// A job arrives, with the host's stamp on it.
+    Submit { graph: Graph, stamp: Stamp },
     /// A job finishes, or is withdrawn.
     End { job: String },
     /// A device joins, with its member's report if the member has one to make.
@@ -389,7 +413,7 @@ pub enum Change {
         member: Option<Member>,
         offer: Offer,
     },
-    /// A device leaves, or its owner takes it back.
+    /// A device leaves, or the host takes it back.
     Leave { device: DeviceId },
 }
 
@@ -416,6 +440,13 @@ pub struct Entry {
 pub struct Ledger {
     /// The pool's time when it began, in seconds: 0, or the time of the pool file it began from.
     pub at: f64,
+    /// The version of `mag-mortar` that began it, which `mag-mortar` writes. Absent in a ledger
+    /// of version 1, which did not record it.
+    pub written_by: Option<String>,
+    /// The name of the ledger this one follows, where a new coordinator began it from an earlier
+    /// one; absent for a first ledger. What a name is, is the host's: the ledger's place, as a
+    /// start file gives it.
+    pub follows: Option<String>,
     pub members: Vec<Member>,
     /// In the order of the devices' ids.
     pub offers: Vec<Offer>,

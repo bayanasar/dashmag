@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use mag_by::{Description, DeviceId, PoolFileError, Removal, pool_schema};
+use mag_by::{Description, DeviceId, PoolFileError, Removal, Trust, pool_schema};
 use serde_json::{Value, json};
 
 const EXAMPLE: &str = include_str!("../pools/example.json");
@@ -20,9 +20,14 @@ fn the_example_reads_and_writes_back_byte_for_byte() {
     assert_eq!(d.members.len(), 4);
     assert_eq!(d.offers.len(), 4);
     assert!(d.jobs.is_empty());
-    // One member is remote: the rented card, the fastest and the largest.
-    let remote: Vec<_> = d.members.iter().filter(|m| m.remote).collect();
-    assert_eq!(remote.len(), 1);
+    // One member is trusted only at outside: the rented card, the fastest and the largest.
+    let outside: Vec<_> = d
+        .members
+        .iter()
+        .filter(|m| m.trust == Trust::Outside)
+        .collect();
+    assert_eq!(outside.len(), 1);
+    assert!(d.members.iter().all(|m| m.trust != Trust::Site));
     assert_eq!(d.to_json(), EXAMPLE);
 }
 
@@ -34,30 +39,38 @@ fn a_pool_file_is_refused_as_a_graph_file_is() {
         Err(PoolFileError::Format { found: Some(f) }) if f == "\"mag-graph\""
     ));
     let newer = changed(|v| {
-        v["version"] = 2.into();
+        v["version"] = 3.into();
         v["links"] = json!([]);
     });
-    assert!(matches!(
-        Description::from_json(&newer),
-        Err(PoolFileError::Version { found: Some(f) }) if f == "2"
-    ));
+    let err = Description::from_json(&newer).unwrap_err();
+    assert!(matches!(&err, PoolFileError::Version { found: Some(f) } if f == "3"));
+    assert_eq!(
+        err.to_string(),
+        "the version is 3; this reader reads versions 1 to 2"
+    );
     for bad in [
         changed(|v| v["owner"] = "x".into()),
         changed(|v| v["offers"][0]["speed"] = 1.into()),
-        changed(|v| v["members"][3]["remote"] = Value::Null),
+        changed(|v| v["members"][3]["trust"] = Value::Null),
         changed(|v| {
-            v["members"][3].as_object_mut().unwrap().remove("remote");
+            v["members"][3].as_object_mut().unwrap().remove("trust");
         }),
+        changed(|v| v["members"][3]["trust"] = "rented".into()),
+        changed(|v| v["members"][3]["remote"] = true.into()),
     ] {
         assert!(matches!(
             Description::from_json(&bad),
             Err(PoolFileError::Json(_))
         ));
     }
-    let repeated = EXAMPLE.replacen("\"remote\": true", "\"remote\": true, \"remote\": false", 1);
+    let repeated = EXAMPLE.replacen(
+        "\"trust\": \"outside\"",
+        "\"trust\": \"outside\", \"trust\": \"owner\"",
+        1,
+    );
     let err = Description::from_json(&repeated).unwrap_err();
     assert!(
-        matches!(&err, PoolFileError::RepeatedKey { at } if at == "members[3].remote"),
+        matches!(&err, PoolFileError::RepeatedKey { at } if at == "members[3].trust"),
         "{err}"
     );
 }
@@ -71,11 +84,22 @@ fn a_reason_reads_as_words() {
     assert_eq!(device.to_string(), "rented/0");
     let guard = Removal::Guard {
         part: "decode".into(),
-        device,
+        device: device.clone(),
+        keep: Trust::Owner,
+        trust: Trust::Outside,
     };
     assert_eq!(
         guard.to_string(),
-        "the guard: decode carries local-only data, and rented/0's member is remote"
+        "the guard: decode carries data kept at owner, and rented/0's member is trusted only at \
+         outside"
+    );
+    let stamp = Removal::Stamp {
+        job: "label-frames".into(),
+        device,
+    };
+    assert_eq!(
+        stamp.to_string(),
+        "rented/0 is not among the devices label-frames's stamp allows"
     );
 }
 
@@ -108,9 +132,9 @@ fn the_schema_takes_the_example_and_refuses_what_the_reader_refuses_for_its_form
     assert!(v.is_valid(&serde_json::from_str(EXAMPLE).unwrap()));
     let changes: [(&str, Edit); 5] = [
         ("another format", |v| v["format"] = "mag-graph".into()),
-        ("a newer version", |v| v["version"] = 2.into()),
+        ("a newer version", |v| v["version"] = 3.into()),
         ("an unknown field", |v| v["owner"] = "x".into()),
-        ("a null mark", |v| v["members"][3]["remote"] = Value::Null),
+        ("a null level", |v| v["members"][3]["trust"] = Value::Null),
         ("an unknown backend", |v| {
             v["offers"][0]["backend"] = "tpu".into()
         }),

@@ -14,7 +14,7 @@ fn wants_everything(name: &str, priority: u32) -> Graph {
     job(
         name,
         priority,
-        vec![input("items", false)],
+        vec![input("items", Outside)],
         vec![part("r", "r", Mark::Replicable, 17)],
         vec![edge("items", Some("r"))],
     )
@@ -30,19 +30,22 @@ fn one_part(name: &str, gib: u64) -> Graph {
     )
 }
 
-/// A job reading local-only frames, of one part of `gib` GiB.
+/// A job reading frames kept at owner, of one part of `gib` GiB.
 fn local(name: &str, gib: u64) -> Graph {
     job(
         name,
         1,
-        vec![input("frames", true)],
+        vec![input("frames", Owner)],
         vec![part("p", "u", Mark::Atomic, gib)],
         vec![edge("frames", Some("p"))],
     )
 }
 
 fn submit(graph: Graph) -> Change {
-    Change::Submit { graph }
+    Change::Submit {
+        graph,
+        stamp: Stamp::default(),
+    }
 }
 
 fn end(job: &str) -> Change {
@@ -51,7 +54,7 @@ fn end(job: &str) -> Change {
 
 fn three_cards() -> Pool {
     Pool::new(
-        vec![member("a", false), member("b", false), member("c", false)],
+        vec![member("a", Owner), member("b", Owner), member("c", Owner)],
         vec![
             offer(
                 device("a", 0),
@@ -83,7 +86,7 @@ fn state(pool: &Pool) -> State {
 }
 
 /// A run of 24 changes, two of them refused, and the state after each change taken (the first
-/// before any). Jobs are placed, wait, are refused and end; a member is reported remote; a
+/// before any). Jobs are placed, wait, are refused and end; a member's trust is lowered; a
 /// device leaves and a job waits for it; and a job that waited passes a newer one of higher
 /// priority.
 fn scripted() -> (Pool, Vec<State>) {
@@ -124,11 +127,11 @@ fn scripted() -> (Pool, Vec<State>) {
         Place::Copies(_)
     ));
     assert_eq!(pool.arrangement("new").unwrap().places, [Place::Waiting]);
-    // A member joins remote with a large card: `new` takes it.
+    // A member trusted only at outside joins with a large card: `new` takes it.
     let r = take(
         &mut pool,
         Change::Join {
-            member: Some(member("d", true)),
+            member: Some(member("d", Outside)),
             offer: offer(
                 device("d", 0),
                 Backend::Cuda,
@@ -140,19 +143,19 @@ fn scripted() -> (Pool, Vec<State>) {
     )
     .unwrap();
     assert!(r.chosen.is_some());
-    // c reports itself remote with a second device.
+    // c reports itself trusted only at outside, with a second device.
     let r = take(
         &mut pool,
         Change::Join {
-            member: Some(member("c", true)),
+            member: Some(member("c", Outside)),
             offer: offer(device("c", 1), Backend::Mlx, 24, &[("u", 0.03)]),
         },
         320.0,
     )
     .unwrap();
-    assert_eq!(r.marked_remote, ["c"]);
-    // a's card leaves: `frames` reads local-only data, b's card has no 16 GiB free, and c and d
-    // are remote, so it waits.
+    assert_eq!(r.lowered, ["c"]);
+    // a's card leaves: `frames` reads data kept at owner, b's card has no 16 GiB free, and c and
+    // d are trusted only at outside, so it waits.
     take(
         &mut pool,
         Change::Leave {
@@ -194,10 +197,8 @@ fn scripted() -> (Pool, Vec<State>) {
 /// The ledger with only its first `n` entries.
 fn prefix(ledger: &Ledger, n: usize) -> Ledger {
     Ledger {
-        at: ledger.at,
-        members: ledger.members.clone(),
-        offers: ledger.offers.clone(),
         entries: ledger.entries[..n].to_vec(),
+        ..ledger.clone()
     }
 }
 

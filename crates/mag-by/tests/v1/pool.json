@@ -1,0 +1,271 @@
+{
+  "format": "mag-pool",
+  "version": 1,
+  "at": 0.0,
+  "members": [
+    {
+      "name": "workstation",
+      "remote": false,
+      "give_back_seconds": 5.0
+    },
+    {
+      "name": "server",
+      "remote": false,
+      "give_back_seconds": 30.0
+    },
+    {
+      "name": "laptop",
+      "remote": false,
+      "give_back_seconds": 2.0
+    },
+    {
+      "name": "rented",
+      "remote": true,
+      "give_back_seconds": 60.0
+    }
+  ],
+  "offers": [
+    {
+      "device": {
+        "member": "laptop",
+        "index": 0
+      },
+      "backend": "mlx",
+      "memory_bytes": 25769803776,
+      "tolerances": [
+        "f32",
+        "bf16"
+      ],
+      "dtypes": [
+        "f32",
+        "bf16",
+        "i32",
+        "i64"
+      ],
+      "costs": [
+        {
+          "unit": {
+            "name": "decode-resize",
+            "version": 1
+          },
+          "seconds_per_step": 0.008,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "block",
+            "version": 1
+          },
+          "seconds_per_step": 0.016,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "classify",
+            "version": 1
+          },
+          "seconds_per_step": 0.004,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "count",
+            "version": 1
+          },
+          "seconds_per_step": 0.001,
+          "band": 0.05,
+          "estimate": false
+        }
+      ]
+    },
+    {
+      "device": {
+        "member": "rented",
+        "index": 0
+      },
+      "backend": "cuda",
+      "memory_bytes": 85899345920,
+      "tolerances": [
+        "exact",
+        "f32",
+        "bf16"
+      ],
+      "dtypes": [
+        "f32",
+        "bf16",
+        "i32",
+        "i64"
+      ],
+      "costs": [
+        {
+          "unit": {
+            "name": "decode-resize",
+            "version": 1
+          },
+          "seconds_per_step": 0.002,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "block",
+            "version": 1
+          },
+          "seconds_per_step": 0.003,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "classify",
+            "version": 1
+          },
+          "seconds_per_step": 0.001,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "count",
+            "version": 1
+          },
+          "seconds_per_step": 0.0002,
+          "band": 0.05,
+          "estimate": false
+        }
+      ]
+    },
+    {
+      "device": {
+        "member": "server",
+        "index": 0
+      },
+      "backend": "rocm",
+      "memory_bytes": 34359738368,
+      "tolerances": [
+        "exact",
+        "f32",
+        "bf16"
+      ],
+      "dtypes": [
+        "f32",
+        "bf16",
+        "i32",
+        "i64"
+      ],
+      "costs": [
+        {
+          "unit": {
+            "name": "decode-resize",
+            "version": 1
+          },
+          "seconds_per_step": 0.005,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "block",
+            "version": 1
+          },
+          "seconds_per_step": 0.008,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "classify",
+            "version": 1
+          },
+          "seconds_per_step": 0.002,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "count",
+            "version": 1
+          },
+          "seconds_per_step": 0.0005,
+          "band": 0.05,
+          "estimate": false
+        }
+      ]
+    },
+    {
+      "device": {
+        "member": "workstation",
+        "index": 0
+      },
+      "backend": "cuda",
+      "memory_bytes": 17179869184,
+      "tolerances": [
+        "exact",
+        "f32",
+        "bf16"
+      ],
+      "dtypes": [
+        "f32",
+        "bf16",
+        "i32",
+        "i64"
+      ],
+      "costs": [
+        {
+          "unit": {
+            "name": "decode-resize",
+            "version": 1
+          },
+          "seconds_per_step": 0.004,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "block",
+            "version": 1
+          },
+          "seconds_per_step": 0.01,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "classify",
+            "version": 1
+          },
+          "seconds_per_step": 0.002,
+          "band": 0.05,
+          "estimate": false
+        },
+        {
+          "unit": {
+            "name": "count",
+            "version": 1
+          },
+          "seconds_per_step": 0.0005,
+          "band": 0.05,
+          "estimate": false
+        }
+      ]
+    }
+  ],
+  "jobs": [],
+  "formats": [
+    {
+      "name": "mag-graph",
+      "version": 1
+    },
+    {
+      "name": "mag-ledger",
+      "version": 1
+    },
+    {
+      "name": "mag-pool",
+      "version": 1
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 
 use mag_by::{
     Backend, Blob, Dtype, Edge, Graph, Input, Job, Mark, Need, Part, Pin, ReadError, Refusal, Step,
-    Tolerance, Unit,
+    Tolerance, Trust, Unit,
 };
 
 const EXAMPLE: &str = include_str!("../graphs/example.json");
@@ -22,15 +22,16 @@ fn the_example_reads_and_writes_back_byte_for_byte() {
 }
 
 #[test]
-fn the_examples_counts_are_released_and_its_labels_stay_local() {
+fn the_examples_counts_are_released_and_its_labels_stay_at_owner() {
     let g = Graph::from_json(EXAMPLE).unwrap();
-    let m = g.local_only().unwrap();
+    let k = g.keeps().unwrap();
     let names: Vec<_> = g.parts.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["decode", "b0", "b1", "head", "count"]);
-    // Every part reads local-only data, the count included: it stays local.
-    assert_eq!(m.parts, [true, true, true, true, true]);
-    // The labels reach the count and leave the job unreleased; only the count leaves released.
-    assert_eq!(m.edges[5..], [true, true, false]);
+    // Every part reads data kept at owner, the count included: it stays at owner.
+    assert_eq!(k.parts, [Trust::Owner; 5]);
+    // The labels reach the count and leave the job unreleased; only the count leaves, released
+    // to outside.
+    assert_eq!(k.edges[5..], [Trust::Owner, Trust::Owner, Trust::Outside]);
 }
 
 #[test]
@@ -56,15 +57,20 @@ fn a_wrong_format_is_refused_first() {
 #[test]
 fn a_newer_version_is_refused_as_newer_not_for_its_fields() {
     let newer = changed(|v| {
-        v["version"] = 2.into();
+        v["version"] = 3.into();
         v["objective"] = "makespan".into();
     });
     let err = Graph::from_json(&newer).unwrap_err();
-    assert!(matches!(&err, ReadError::Version { found: Some(f) } if f == "2"));
+    assert!(matches!(&err, ReadError::Version { found: Some(f) } if f == "3"));
     assert_eq!(
         err.to_string(),
-        "the version is 2; this reader reads version 1"
+        "the version is 3; this reader reads versions 1 to 2"
     );
+    let zero = changed(|v| v["version"] = 0.into());
+    assert!(matches!(
+        Graph::from_json(&zero),
+        Err(ReadError::Version { found: Some(f) }) if f == "0"
+    ));
     let missing = changed(|v| {
         v.as_object_mut().unwrap().remove("version");
     });
@@ -89,12 +95,18 @@ fn unknown_fields_are_refused() {
 }
 
 #[test]
-fn local_only_must_be_written() {
+fn an_input_s_level_must_be_written() {
     let missing = changed(|v| {
-        v["inputs"][0].as_object_mut().unwrap().remove("local_only");
+        v["inputs"][0].as_object_mut().unwrap().remove("keep");
     });
     let err = Graph::from_json(&missing).unwrap_err();
-    assert!(err.to_string().contains("local_only"), "{err}");
+    assert!(err.to_string().contains("keep"), "{err}");
+    // A level not among the three is refused.
+    let unknown = changed(|v| v["inputs"][0]["keep"] = "anyone".into());
+    assert!(matches!(
+        Graph::from_json(&unknown),
+        Err(ReadError::Json(_))
+    ));
 }
 
 #[test]
@@ -127,7 +139,7 @@ fn a_graph_that_fails_its_check_is_refused() {
 fn left_out_fields_take_their_defaults() {
     let text = r#"{
         "format": "mag-graph",
-        "version": 1,
+        "version": 2,
         "job": { "name": "j", "priority": 1 },
         "parts": [{
             "name": "p",
@@ -190,7 +202,7 @@ fn everything() -> Graph {
                 .map(|w| Blob {
                     hash: format!("h{w}"),
                     bytes: w as u64,
-                    local_only: w % 2 == 1,
+                    keep: [Trust::Outside, Trust::Site, Trust::Owner][w % 3],
                 })
                 .collect(),
             tolerance: tolerances[i % 4],
@@ -212,12 +224,12 @@ fn everything() -> Graph {
             Input {
                 name: "local".into(),
                 bytes: 0,
-                local_only: true,
+                keep: Trust::Owner,
             },
             Input {
                 name: "public".into(),
                 bytes: 7,
-                local_only: false,
+                keep: Trust::Outside,
             },
         ],
         chains: vec![mag_by::Chain {
@@ -230,7 +242,7 @@ fn everything() -> Graph {
                 to: Some("p0".into()),
                 dtype: Dtype::F64,
                 bytes: 1,
-                release: false,
+                release: None,
                 note: None,
             },
             Edge {
@@ -238,7 +250,7 @@ fn everything() -> Graph {
                 to: Some("p1".into()),
                 dtype: Dtype::F32,
                 bytes: 2,
-                release: true,
+                release: Some(Trust::Site),
                 note: Some("an edge's note".into()),
             },
             Edge {
@@ -246,7 +258,7 @@ fn everything() -> Graph {
                 to: Some("p2".into()),
                 dtype: Dtype::Bf16,
                 bytes: 3,
-                release: false,
+                release: None,
                 note: None,
             },
             Edge {
@@ -254,7 +266,7 @@ fn everything() -> Graph {
                 to: Some("p5".into()),
                 dtype: Dtype::F16,
                 bytes: 4,
-                release: false,
+                release: None,
                 note: None,
             },
             Edge {
@@ -262,7 +274,7 @@ fn everything() -> Graph {
                 to: None,
                 dtype: Dtype::I64,
                 bytes: 5,
-                release: true,
+                release: Some(Trust::Outside),
                 note: None,
             },
         ],
@@ -291,6 +303,8 @@ fn every_field_and_variant_round_trips() {
         "\"dtype\": \"f64\"",
         "\"dtype\": \"i64\"",
         "\"note\": \"a graph-wide note\"",
+        "\"keep\": \"site\"",
+        "\"release\": \"site\"",
     ] {
         assert!(text.contains(word), "{word} not in\n{text}");
     }
@@ -335,18 +349,18 @@ fn with_text(after: &str, insert: &str) -> String {
 fn a_repeated_key_is_refused_wherever_it_stands() {
     let cases = [
         (
-            with_text("\"local_only\": true", ", \"local_only\": false"),
-            "inputs[0].local_only",
+            with_text("\"keep\": \"owner\"", ", \"keep\": \"outside\""),
+            "inputs[0].keep",
         ),
         (
-            with_text("\"local_only\": false", ", \"local_only\": true"),
-            "inputs[1].local_only",
+            with_text("\"keep\": \"outside\"", ", \"keep\": \"owner\""),
+            "inputs[1].keep",
         ),
         (
-            with_text("\"release\": true", ", \"release\": false"),
+            with_text("\"release\": \"outside\"", ", \"release\": \"owner\""),
             "edges[7].release",
         ),
-        (with_text("\"version\": 1", ", \"version\": 1"), "version"),
+        (with_text("\"version\": 2", ", \"version\": 2"), "version"),
     ];
     for (text, at) in cases {
         let err = Graph::from_json(&text).unwrap_err();
@@ -359,8 +373,8 @@ fn a_repeated_key_is_refused_wherever_it_stands() {
 
 #[test]
 fn format_and_version_are_still_checked_before_a_repeated_key() {
-    let text = with_text("\"local_only\": true", ", \"local_only\": false")
-        .replace("\"version\": 1", "\"version\": 2");
+    let text = with_text("\"keep\": \"owner\"", ", \"keep\": \"outside\"")
+        .replace("\"version\": 2", "\"version\": 3");
     assert!(matches!(
         Graph::from_json(&text),
         Err(ReadError::Version { .. })
@@ -368,13 +382,13 @@ fn format_and_version_are_still_checked_before_a_repeated_key() {
 }
 
 #[test]
-fn a_weights_blob_without_its_mark_is_refused() {
+fn a_weights_blob_without_its_level_is_refused() {
     let missing = changed(|v| {
         v["parts"][1]["weights"][0]
             .as_object_mut()
             .unwrap()
-            .remove("local_only");
+            .remove("keep");
     });
     let err = Graph::from_json(&missing).unwrap_err();
-    assert!(err.to_string().contains("local_only"), "{err}");
+    assert!(err.to_string().contains("keep"), "{err}");
 }

@@ -2,7 +2,7 @@
 
 use mag_by::{
     Backend, Blob, Chain, Dtype, Edge, Graph, Input, Job, Mark, Need, Part, Pin, Refusal, Step,
-    Tolerance, Unit,
+    Tolerance, Trust, Unit,
 };
 
 fn part(name: &str, mark: Mark) -> Part {
@@ -18,7 +18,7 @@ fn part(name: &str, mark: Mark) -> Part {
         weights: vec![Blob {
             hash: "h".into(),
             bytes: 4,
-            local_only: false,
+            keep: Trust::Outside,
         }],
         tolerance: Tolerance::F32,
         pin: None,
@@ -32,7 +32,7 @@ fn edge(from: &str, to: Option<&str>) -> Edge {
         to: to.map(Into::into),
         dtype: Dtype::Bf16,
         bytes: 8,
-        release: false,
+        release: None,
         note: None,
     }
 }
@@ -52,7 +52,7 @@ fn valid() -> Graph {
         inputs: vec![Input {
             name: "frames".into(),
             bytes: 1000,
-            local_only: true,
+            keep: Trust::Owner,
         }],
         parts: vec![
             part("decode", Mark::Replicable),
@@ -93,7 +93,7 @@ fn a_loop_and_pins_pass() {
     g.edges.push(edge("b2", Some("b0")));
     g.parts[0].pin = Some(Pin::Backend(Backend::Rocm));
     g.parts[1].pin = Some(Pin::Member("member-a".into()));
-    g.edges[2].release = true;
+    g.edges[2].release = Some(Trust::Site);
     g.check().unwrap();
 }
 
@@ -223,7 +223,7 @@ fn a_replicable_part_needs_a_source_of_items() {
 #[test]
 fn an_input_is_never_released() {
     assert_eq!(
-        refused(|g| g.edges[0].release = true),
+        refused(|g| g.edges[0].release = Some(Trust::Outside)),
         Refusal::ReleaseFromInput {
             edge: 0,
             name: "frames".into()

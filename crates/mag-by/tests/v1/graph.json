@@ -1,0 +1,177 @@
+{
+  "format": "mag-graph",
+  "version": 1,
+  "job": {
+    "name": "label-frames",
+    "priority": 2,
+    "need": {
+      "deadline_seconds": 28800.0
+    },
+    "note": "overnight labelling; done by morning"
+  },
+  "inputs": [
+    {
+      "name": "frames",
+      "bytes": 1200000000,
+      "local_only": true
+    },
+    {
+      "name": "classes",
+      "bytes": 4096,
+      "local_only": false
+    }
+  ],
+  "parts": [
+    {
+      "name": "decode",
+      "unit": {
+        "name": "decode-resize",
+        "version": 1
+      },
+      "mark": "replicable",
+      "step": "item",
+      "memory_bytes": 268435456,
+      "weights": [],
+      "tolerance": "exact",
+      "note": "one copy per device that can take it"
+    },
+    {
+      "name": "b0",
+      "unit": {
+        "name": "block",
+        "version": 1
+      },
+      "mark": "atomic",
+      "step": "item",
+      "memory_bytes": 2147483648,
+      "weights": [
+        {
+          "hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "bytes": 1073741824,
+          "local_only": false
+        }
+      ],
+      "tolerance": "bf16"
+    },
+    {
+      "name": "b1",
+      "unit": {
+        "name": "block",
+        "version": 1
+      },
+      "mark": "atomic",
+      "step": "item",
+      "memory_bytes": 2147483648,
+      "weights": [
+        {
+          "hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "bytes": 1073741824,
+          "local_only": false
+        }
+      ],
+      "tolerance": "bf16"
+    },
+    {
+      "name": "head",
+      "unit": {
+        "name": "classify",
+        "version": 1
+      },
+      "mark": "atomic",
+      "step": "item",
+      "memory_bytes": 67108864,
+      "weights": [
+        {
+          "hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "bytes": 4194304,
+          "local_only": true
+        }
+      ],
+      "tolerance": "f32",
+      "pin": {
+        "backend": "cuda"
+      },
+      "note": "its weights were trained on local-only data in an earlier job"
+    },
+    {
+      "name": "count",
+      "unit": {
+        "name": "count",
+        "version": 1
+      },
+      "mark": "atomic",
+      "step": "item",
+      "memory_bytes": 1048576,
+      "weights": [],
+      "tolerance": "exact",
+      "note": "reads the classifier's local-only output, so it stays local; only its result, a count per class, is released"
+    }
+  ],
+  "chains": [
+    {
+      "name": "model",
+      "parts": [
+        "b0",
+        "b1"
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": "frames",
+      "to": "decode",
+      "dtype": "bytes",
+      "bytes": 1200000000,
+      "release": false
+    },
+    {
+      "from": "decode",
+      "to": "b0",
+      "dtype": "bf16",
+      "bytes": 301056000,
+      "release": false
+    },
+    {
+      "from": "b0",
+      "to": "b1",
+      "dtype": "bf16",
+      "bytes": 19267584,
+      "release": false
+    },
+    {
+      "from": "b1",
+      "to": "head",
+      "dtype": "bf16",
+      "bytes": 19267584,
+      "release": false
+    },
+    {
+      "from": "classes",
+      "to": "head",
+      "dtype": "i32",
+      "bytes": 4096,
+      "release": false
+    },
+    {
+      "from": "head",
+      "to": "count",
+      "dtype": "f32",
+      "bytes": 160000,
+      "release": false
+    },
+    {
+      "from": "head",
+      "dtype": "f32",
+      "bytes": 160000,
+      "release": false
+    },
+    {
+      "from": "count",
+      "dtype": "i64",
+      "bytes": 64,
+      "release": true,
+      "note": "a count per class reveals nothing of any one frame"
+    }
+  ],
+  "note": "a sketch of a labelling job, to show the format"
+}

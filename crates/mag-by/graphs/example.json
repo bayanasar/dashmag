@@ -1,6 +1,6 @@
 {
   "format": "mag-graph",
-  "version": 1,
+  "version": 2,
   "job": {
     "name": "label-frames",
     "priority": 2,
@@ -13,12 +13,12 @@
     {
       "name": "frames",
       "bytes": 1200000000,
-      "local_only": true
+      "keep": "owner"
     },
     {
       "name": "classes",
       "bytes": 4096,
-      "local_only": false
+      "keep": "outside"
     }
   ],
   "parts": [
@@ -48,7 +48,7 @@
         {
           "hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
           "bytes": 1073741824,
-          "local_only": false
+          "keep": "outside"
         }
       ],
       "tolerance": "bf16"
@@ -66,7 +66,7 @@
         {
           "hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
           "bytes": 1073741824,
-          "local_only": false
+          "keep": "outside"
         }
       ],
       "tolerance": "bf16"
@@ -84,7 +84,7 @@
         {
           "hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
           "bytes": 4194304,
-          "local_only": true
+          "keep": "owner"
         }
       ],
       "tolerance": "f32",
@@ -121,55 +121,48 @@
       "from": "frames",
       "to": "decode",
       "dtype": "bytes",
-      "bytes": 1200000000,
-      "release": false
+      "bytes": 1200000000
     },
     {
       "from": "decode",
       "to": "b0",
       "dtype": "bf16",
-      "bytes": 301056000,
-      "release": false
+      "bytes": 301056000
     },
     {
       "from": "b0",
       "to": "b1",
       "dtype": "bf16",
-      "bytes": 19267584,
-      "release": false
+      "bytes": 19267584
     },
     {
       "from": "b1",
       "to": "head",
       "dtype": "bf16",
-      "bytes": 19267584,
-      "release": false
+      "bytes": 19267584
     },
     {
       "from": "classes",
       "to": "head",
       "dtype": "i32",
-      "bytes": 4096,
-      "release": false
+      "bytes": 4096
     },
     {
       "from": "head",
       "to": "count",
       "dtype": "f32",
-      "bytes": 160000,
-      "release": false
+      "bytes": 160000
     },
     {
       "from": "head",
       "dtype": "f32",
-      "bytes": 160000,
-      "release": false
+      "bytes": 160000
     },
     {
       "from": "count",
       "dtype": "i64",
       "bytes": 64,
-      "release": true,
+      "release": "outside",
       "note": "a count per class reveals nothing of any one frame"
     }
   ],

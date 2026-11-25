@@ -17,7 +17,7 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 
-use mag_by::{Description, Graph, Place, Record, Removal};
+use mag_by::{Description, Graph, Place, Record, Removal, Stamp};
 use mag_mortar::Pool;
 
 /// What the command prints, and its exit status.
@@ -57,7 +57,7 @@ pub fn run(args: &[String]) -> Output {
         Ok(g) => g,
         Err(e) => return fail(1, format!("{}: {e}\n", paths[1])),
     };
-    let record = match pool.plan(&graph, description.at) {
+    let record = match pool.plan(&graph, &Stamp::default(), description.at) {
         Ok(r) => r,
         Err(e) => return fail(1, format!("{}: {e}\n", paths[1])),
     };
@@ -168,8 +168,10 @@ fn kept_off(graph: &Graph, record: &Record) -> Vec<Removal> {
             Removal::Tolerance { part, device }
             | Removal::Dtype { part, device }
             | Removal::Pin { part, device }
-            | Removal::Guard { part, device } => (Some(part), Some(device)),
-            Removal::NoDevice { device } | Removal::Memory { device } => (None, Some(device)),
+            | Removal::Guard { part, device, .. } => (Some(part), Some(device)),
+            Removal::NoDevice { device }
+            | Removal::Memory { device }
+            | Removal::Stamp { device, .. } => (None, Some(device)),
             Removal::Need { .. } => (None, None),
         };
         let p = part
