@@ -28,8 +28,9 @@ feature is on.
   ledger; a `TakeBack`, by name (a device or a member) or by need (a `DeviceKind`: what a
   device must be, any of a backend, a least memory, its member's least trust, the tolerance
   classes it meets and the dtypes it computes in, and `DeviceKind::admits` saying whether a
-  device is of it), each with a deadline, which the host asks at the door and the pool learns as
-  devices leaving; what the pool `Asks` of the host, the kind of device it most wants and the
+  device is of it), each with a deadline. The host asks by need at the door, and the pool learns
+  it as a device leaving; by name, the host sends the member's program SIGTERM, and the door
+  refuses it. What the pool `Asks` of the host, the kind of device it most wants and the
   members it would give back; and the `Start` file each member's program begins from.
 
 The `graph` feature, named for the first of them, now turns on all of the files, each read and
@@ -77,16 +78,21 @@ the files kept in [`tests/v1`](tests/v1) show:
   follow it on the channel. A member's control channel to the coordinator is opened for no job,
   `CONTROL`, the empty name, which no job may have; on it the member says `Control::Join`, with
   itself as its start file describes it and its devices' offers, when its lease begins, and
-  `Control::Leave` when it ends. With the `graph` feature they are JSON, as the files' words
-  are.
+  `Control::Leave` when it ends. The coordinator says `Control::GiveBack` on it, with a device
+  and a deadline, when the host takes that device back by need, and the member answers
+  `Control::GaveBack` once it offers the device no longer. With the `graph` feature they are
+  JSON, as the files' words are.
 - The words of the door, the coordinator's local socket, where a command run on its machine
-  asks the pool: a `DoorRequest`, to submit a graph with its stamp, end a job by its name, or
-  ask the pool's status; and the coordinator's `DoorAnswer`: the record of the loop's run and
-  where the job's parts are, each on a device or waiting, the record of an end, or the pool's
-  `Description` with what it `Asks` of the host, left out by a coordinator that does not say
-  it; or a `DoorRefusal`: a request it does not read, a change the pool refuses, an end of a
-  job it does not hold. With the `graph` feature each is one line of JSON on the socket. Taking
-  a device back by need is to be asked there too, and is not a word yet.
+  asks the pool: a `DoorRequest`, to submit a graph with its stamp, end a job by its name, ask
+  the pool's status, or take a device back (a `TakeBack`); and the coordinator's `DoorAnswer`:
+  the record of the loop's run and where the job's parts are, each on a device or waiting, the
+  record of an end, the pool's `Description` with what it `Asks` of the host, left out by a
+  coordinator that does not say it, or the device taken back, with the record of its leave and
+  whether its member said it gave it back before the deadline; or a `DoorRefusal`: a request it
+  does not read, a change the pool refuses, an end of a job it does not hold, a need nothing in
+  the pool meets (`Unmet`, with the devices of the kind whose members take longer than the
+  deadline), or a take-back by name (`ByName`). With the `graph` feature each is one line of
+  JSON on the socket.
 
 To print a graph file's DOT, or why the file is refused:
 

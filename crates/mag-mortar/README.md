@@ -41,8 +41,19 @@ host's idle time, longest idle first, never the coordinator's own. When each mem
 part is kept from the changes the pool is told, so a replayed pool asks the same, and the ledger
 is unchanged.
 
+When the host takes a device back by need, at the coordinator's door, `Pool::give_up` says which
+device the pool gives up: of the devices the `DeviceKind` admits whose members give a device back
+within the deadline, the one whose leave costs the pool least. Each is tried as leaving: the loop
+runs as on a leave, placing its jobs again where they fit or leaving them waiting, and the loss is
+the score before less the score after, both scored as the loop scores, with every job's rate over
+its best rate on the pool as it is, so that losing the fastest device is not made cheap by the
+slower best rate the pool would have without it. The coordinator's own devices come last; of
+equal losses, the device with the least memory, then by id. Nothing meeting the need is `Unmet`,
+with the devices of the kind whose members are too slow. It too is a pure function of the pool's
+state and the time of asking, so a replayed pool chooses the same; the leave itself is a change
+the pool is then told.
+
 This step runs on offers given as data: no member, network or device yet. It does not probe
 candidates, count the time of edges between machines, divide a chain across devices or move a
-running job; those come with the steps that measure them. Nor does it yet choose which device to
-give up when the host takes one back by need, or begin from the arrangement its members hold after
-a coordinator stops.
+running job; those come with the steps that measure them. Nor does it yet begin from the
+arrangement its members hold after a coordinator stops.

@@ -9,8 +9,9 @@ What runs today is the first step, planning. You write the pool file, and `mag p
 the pool would place a graph on it, and why. The program each machine runs (`mag-mar`) starts,
 joins the pool at the coordinator, which records the join in the pool's ledger, and gives its
 machine back on SIGTERM; and at the coordinator's door you submit a job to the running pool,
-which places it and writes it to the ledger. Nothing runs on any machine yet: running the parts
-placed on a member is not built.
+which places it and writes it to the ledger, and take a device back by need, which the pool
+chooses and its member gives back. Nothing runs on any machine yet: running the parts placed on
+a member is not built.
 
 ## The files
 
@@ -143,6 +144,7 @@ a member.
       MAG_START=workstation.json cargo run --release -q -p mag-mar -- door submit \
           crates/mag-by/graphs/example.json
       MAG_START=workstation.json cargo run --release -q -p mag-mar -- door end label-frames
+      MAG_START=workstation.json cargo run --release -q -p mag-mar -- door take-back '{}' 10
 
   This runs today, as far as it goes: the pool places the job and writes it to its ledger, and
   nothing runs on any machine. Each command prints the coordinator's answer as JSON, and a line
@@ -176,7 +178,29 @@ a member.
     server`, equal in time and so in name order.
   - With no coordinator running, each command fails at once with exit 5.
 
-  Taking a device back by need at the door is to come.
+  Taking a device back by need, also run by hand on one machine with the three members on
+  loopback, before any job:
+  - `take-back '{}' 10` asks for any device within 10 s. The laptop gives a device back within
+    2 s, the server within 30 and the coordinator within 5, and the coordinator's own devices
+    come last, so the pool gives up `laptop/0`: it writes its leave to the ledger, tells the
+    laptop, which offers it no longer, and says `laptop/0 is given back`, exit 0. The laptop,
+    its only device gone, says it stays a member until its lease ends; `kill -TERM` still ends
+    it.
+  - `take-back '{}' 1` is refused, with exit 4: `the devices of the kind asked for (server/0,
+    server/1, workstation/0, workstation/1) are each of a member that takes longer than the
+    deadline to give a device back`. A kind no device is, such as
+    `'{"backend":"cuda","memory_bytes":68719476736}'`, is refused as `no device in the pool is
+    of the kind asked for`. Nothing refused is written.
+  - With `label-frames` then submitted and placed (`decode` in copies on `server/1` and
+    `workstation/1`, the blocks on `server/0`, `head` on `workstation/0`, `count` on
+    `server/1`), `take-back '{"backend":"flex"}' 60` asks for a CPU. Of the two, the
+    coordinator's comes last, so the pool gives up `server/1`, and the loop places the job
+    again: `decode`'s one copy and `count` on `workstation/1`. `status` then says `3 members, 3
+    devices, 1 jobs`.
+
+  The door answers once the member says it gave the device back, or at the deadline, when the
+  device is yours whatever the member says. Taking a machine back by name is not the door's:
+  send its program SIGTERM.
 - Three containers on CPU: two jobs submitted to the coordinator's door and placed against each
   other, and one machine taken back with SIGTERM. This needs the members to run the parts placed
   on them, in `mag-mar`.

@@ -4,8 +4,9 @@ The program every member of a mag pool is to run. So far it is the link between 
 the program's skeleton: it reads `MAG_START`, joins the pool at the coordinator, and gives its
 devices back on SIGTERM within its time. On the member that coordinates, it takes the members'
 joins and leaves into the pool and writes the pool's ledger, and serves the door, where a command
-run on its machine submits a job, ends one or asks the pool's status. Running the parts placed on
-a member is not built yet.
+run on its machine submits a job, ends one, asks the pool's status, or takes a device back by
+need, which the member holding it is told to give back. Running the parts placed on a member is
+not built yet.
 
 ## The member program
 
@@ -104,6 +105,7 @@ machine, with the coordinator's start file, asks the pool there:
     MAG_START=workstation.json mag-mar door status
     MAG_START=workstation.json mag-mar door submit GRAPH.json [--stamp STAMP.json]
     MAG_START=workstation.json mag-mar door end JOB
+    MAG_START=workstation.json mag-mar door take-back KIND SECONDS
 
 - **Only the coordinator's user can reach it.** The socket has mode 0600. It is bound in a new
   directory of mode 0700 beside the door's path (the path and `.new`), made 0600 there, and only
@@ -131,23 +133,41 @@ machine, with the coordinator's start file, asks the pool there:
     when it wants none, and `gives_back`, the members that have held no part for the start
     file's `idle_seconds`, never the coordinator's own. The host polls it and decides; the
     coordinator calls no one. The command's line for a person ends with both.
+  - **`take-back`** takes a device back by need: a device of KIND, a `DeviceKind` as JSON such
+    as `{"backend": "cuda", "memory_bytes": 17179869184}`, or `{}` for any device, within
+    SECONDS. The pool chooses it (`Pool::give_up`): of the devices of the kind whose members
+    give a device back within the deadline, the one whose leave costs it least, its jobs placed
+    again or left waiting, and the coordinator's own last. The coordinator applies its
+    `Change::Leave`, writes and syncs its line, so that nothing is placed on it from then on,
+    and tells its member on the control channel (`Control::GiveBack`). The member offers it no
+    longer, at once, since no part runs on it, and says so (`Control::GaveBack`); the door then
+    answers with the device, the record of its leave, and `given_back`. If the deadline passes
+    first, the door answers then, with `given_back` false: the device is the host's at the
+    deadline whatever the member says. A device of the coordinator's own it stops offering
+    itself. A member whose last device is taken stays a member with none, until the host ends
+    its lease; a member that leaves instead gives the device back with the rest. A need nothing
+    meets is refused (`unmet`, with the devices of the kind whose members take longer than the
+    deadline), and nothing is written.
+  - **Taking back by name is not the door's.** The host ends a member's lease with SIGTERM to
+    its program, which gives every device back within its `give_back_seconds`, and works while
+    the coordinator is unreachable; a take-back by name at the door is refused (`by_name`).
   - A change the pool refuses, such as a graph that fails its check, a stamp with a ceiling of
     0, or a second job of one name, is answered with why, and nothing is written.
 - **The command prints the answer** as JSON on standard output, and a line for a person on
-  standard error. Its exit status: 0 answered (the job placed, the job ended, the status given);
+  standard error. Its exit status: 0 answered (the job placed, the job ended, the status given,
+  a device taken back);
   2 it could not ask (its arguments, `MAG_START`, the start file, a graph or stamp file refused);
   3 the job is submitted, in the ledger, and waits; 4 the door refused the request, and nothing
   was written; 5 no coordinator answered.
 - **With no coordinator at the door, the command fails at once**: nothing at the path, or a
   socket no one answers. A coordinator that stops before it answers, as on a ledger line it
   cannot write, closes the connection unanswered, and the command says to ask the status
-  whether the request was taken. It waits at most 60 s for an answer.
+  whether the request was taken. It waits at most 60 s for an answer, beyond a take-back's
+  deadline.
 - **A door's path is short.** A Unix socket's path holds at most 107 bytes on Linux and 103 on
   macOS, and the socket is first bound at the door's path with `.new/s` added: so at most 101
   bytes on Linux. A relative path is taken from the directory the program runs in, the
   coordinator's and the command's alike.
-- **Taking a device back by need is not asked at the door yet.** It is not a word in `mag-by`, and
-  a coordinator answers a request it does not read as `unreadable`.
 
 ## The link
 
@@ -252,7 +272,21 @@ whose ledger line cannot be written never answered; and the status's asks, with 
 pinned to CUDA, which no member offers, asking for a CUDA device of its memory, of a member
 trusted at `owner` as its input is kept, meeting its tolerance class and computing its edges'
 dtype; a job placed taking its member out of those offered back; and the ledger replayed to the
-same asks.
+same asks. And taking a device back by need at the door: any device, with a job placed, the
+laptop's, holding nothing and offering least memory, its leave in the ledger as the record the
+door answers with, the laptop told and saying it gave it back before the deadline, and staying a
+member with no device until SIGTERM, when no second leave is written; a device of 16 GiB, the
+server's first, which holds the job, at no loss, the job placed again on its second; the ledger
+replayed to the devices the door shows; a need of a backend no device has, and one no member
+can meet in 1 s, refused with exit 4 and the devices too slow, and nothing written; a take-back
+by name, of a device or a member, refused; a kind or a time the command cannot read refused with
+exit 2; with no other member, the coordinator's own device given up, and not recorded again on
+its notice; a member told that says nothing, the leave in the ledger as it is told and the door
+answered at the 2 s deadline, not given back, its late word only noted; a member told that
+leaves instead, answered as given back at once, with its other device's leave and not the first
+again; of two devices holding nothing, a member's larger one given up before the coordinator's
+smaller one; and, against a stand-in coordinator, a member told to give back another member's
+device giving back nothing for it, and only its own.
 
 `loopback` sends one tensor of any size and reports the rate and the memory the link took beyond
 the two buffers:
@@ -265,7 +299,10 @@ sending (2026-11-25, three runs).
 
 ## Not built yet
 
-- At the door: taking a device back by need.
+- Taking back by need with parts running: the member stopping them at a step, within the
+  deadline, and writing their state, before it says it gave the device back.
+- The door's own take-back by name of a single device, which SIGTERM cannot say, since it ends
+  the whole lease.
 - The coordinator's words to members: announcing a member to its peers, and sending placements.
 - Taking up the ledger of a coordinator that stopped, and members joining again when one starts.
 - Running the parts placed on a member, channels to other members for their jobs, and giving
