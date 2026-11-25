@@ -1,4 +1,4 @@
-//! PEFT's files with no tensor library: the `peft_*` fixtures in `tests/fixtures/lora`
+//! PEFT's files on the host, with no tensor made: the `peft_*` fixtures in `tests/fixtures/lora`
 //! (written by PEFT 0.20's `save_pretrained`) read and written back byte for byte, and an adapter
 //! applied to layers and read out of them again through [`AdapterLayer`], here a layer that keeps
 //! the host data it is given; per-module scales as PEFT computes them; a new configuration as PEFT
