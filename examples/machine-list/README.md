@@ -122,10 +122,10 @@ a member.
 
       MAG_START=server.json cargo run --release -q -p mag-mar
 
-  This runs today, as far as it goes. Start the coordinator first. It begins the ledger at the
-  start file's `ledger`, which must not exist yet: a coordinator does not take up an old ledger,
-  so move the last one away before you start it again. Each other member reads its start file,
-  binds its `listen` address, dials the coordinator and joins. The coordinator records one entry
+  This runs today, as far as it goes. The coordinator begins the ledger at the start file's
+  `ledger`, which must not exist yet: a coordinator does not take up an old ledger, so move the
+  last one away before you start it again. Each other member reads its start file, binds its
+  `listen` address, dials the coordinator, every second until it answers, and joins. The coordinator records one entry
   in the ledger for each device the member offers, from the offers its start file's pool gives
   for it, so write an offer for each device there: a member with none is recorded nowhere.
   `kill -TERM` on a member ends it with status 0 within its `give_back_seconds`, once the
