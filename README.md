@@ -84,41 +84,53 @@ such in the source rather than presented as finished.
 People who train and run models at home or in a small lab usually have several unequal
 machines: a workstation with one GPU, a second box with another vendor's card, a laptop with its
 own accelerator, now and then a rented cloud GPU for a night. Each is too small for some job, and
-most of them are idle most of the time. mag is to make them one pool.
+most of them are idle most of the time. mag is to make them one pool. A cluster under Slurm is
+the same problem with more machines.
 
-The author of an algorithm, often an AI agent, deals with two things: dash's operations, and a
-graph of the job, which names no device. The graph says what the parts are (a function, the
-weights it holds, the memory it needs, where it can stop), what flows between them and how large
-it is, which parts may run as many copies, where a model may be divided between devices, and what
-the job needs: a rate or a deadline, and how much it weighs against other jobs. mag is to decide
-where each part runs, and to decide again when a machine joins, leaves or is wanted back by its
-owner.
+The work is divided as it is between Slurm and an MPI library:
 
-mag keeps no server of its own. `mag-mortar` is the placement library: in a home system that
-pools its devices, that system's control plane links it and runs the loop; on its own, the
-program that submits the job does. `mag-mar` is to be a library too, in whatever runs on each
-machine.
+- **The author** of an algorithm, often an AI agent, writes each part's function with dash's
+  operations, and a graph of the job, which names no device. The graph says what the parts are (a
+  function, the weights it holds, the memory it needs, where it can stop), what flows between them
+  and how large it is, which parts may run as many copies, where a model may be divided between
+  devices, and what the job needs: a rate or a deadline, and how much it weighs against other
+  jobs.
+- **A host** gives the pool its machines and starts the same program on each: a person with a
+  list of machines, Slurm on a cluster, or a home system. It decides which machines are in the
+  pool, and when one is taken back. It never reads a graph.
+- **The pool**, which is mag, places every job submitted to it against the others: it queues them,
+  weighs their priorities, decides which device each part runs on, which job yields when a more
+  urgent one arrives, and places again when the host takes a machine back. One of the pool's
+  machines coordinates; the host names it and starts it like any other.
+- **dash** runs the operations on each device.
 
-### What mag covers, and what it leaves to you
+mag does not decide which machines it gets, does not wake them, and does not take them back:
+that is the host's, as it is Slurm's and not MPI's. `mag-mortar` is the placement library the
+coordinator runs; `mag-mar` is to be the program on every machine. mag keeps no server of its
+own, and is the same code under every host.
 
-The placement algorithm is not yours to write: it is `mag-mortar`'s. Who may use which machine is
-not mag's: mag places within the pool it is handed, and a home system decides that pool by its own
-rules. What you write on your own is each part's function, with dash's operations, and two files,
-the graph and the pool. What runs today is the planning, not the running. In this table "is to"
-marks what is not built.
+### What mag covers, and what it leaves to the host
 
-| thing | whose | in a home system that pools its devices | on your own |
-|---|---|---|---|
-| each part's function | yours to write, with dash's operations; the graph names it as a `Unit` (a name and a version), and it is to be built into whatever runs on each machine; how a unit's code reaches a machine is not built, nor decided | the same | the same |
-| the job's graph | yours to write; `mag-by` reads and checks it (`Graph::from_json`, `Graph::check`, [`schemas/mag-graph.schema.json`](crates/mag-by/schemas/mag-graph.schema.json)) | the same | the same |
-| the pool: its members, whether each is `remote`, how soon it gives a device back, and each device's backend, memory, tolerance classes, dtypes and costs | the format is `mag-by`'s (`Description`, the pool file, [`schemas/mag-pool.schema.json`](crates/mag-by/schemas/mag-pool.schema.json)) | is to come from that system's registry and each machine's report; not built | you write the pool file from your own machines, as [`pools/example.json`](crates/mag-by/pools/example.json) is written |
-| the costs in an offer: seconds per step of each part's unit on each device | the format is `mag-by`'s (`Cost`); nothing measures them yet | is to be measured by `mag-mar` on each machine; not built | you time one step of each unit on each device yourself, at the batch its memory allows, after warm-up and on an idle device, and write it with a band, how far a later measurement may fall from it; a cost you leave out is taken as the slowest any other device measured for that unit, or 1 s if none did, flagged `estimate` with a band of 100% |
-| the placement loop: list the arrangements, remove those that break a constraint, score, commit, record | `mag-mortar`'s `Pool`, public; probing candidates, the time of edges, dividing a chain and moving a running job are not built | is to be linked by that system's control plane | nothing to program; `mag plan` shows its decision on your two files |
-| which machines a job may use | **not mag's**; mag takes it as given: the pool it is handed, a member's `remote`, an input's or weights' `local_only`, a part's `pin` | that system's own authorization decides the pool before mag sees it | the pool file is your policy: list only the machines you allow, and mark a rented one `remote` |
-| running the loop over time and keeping its ledger | the host's; `mag-mortar` does no I/O and hands its state over (`Pool::apply`, `Pool::ledger`, `Ledger::line`, `Pool::replay`) | is to be that system's control plane | mag's, not built: outside a home system the loop is to run in mag's own fallback; the library exists, and until that program does, nothing runs a pool over time |
-| carrying a placement out on the machines | `mag-mar`'s; not built | is to be linked by whatever runs on each machine | mag's, not built: `mag-mar` is to run on each machine; until it does, nothing carries a placement out |
-| finding machines, waking a sleeping one, keeping it awake for a job | **not mag's** | that system's | your pool file lists them; they must be on |
-| authorization between several people | **not mag's** | that system's | one owner is assumed |
+The placement algorithm is not yours to write: it is `mag-mortar`'s. Which machines are in the
+pool is not mag's: it is the host's. What you write is each part's function, with dash's
+operations, and the graph; on a list of machines, the pool file as well. What runs today is the
+planning, not the running. In this table "is to" marks what is not built.
+
+| thing | whose | on a list of machines | under Slurm | in a home system |
+|---|---|---|---|---|
+| each part's function | yours to write, with dash's operations; the graph names it as a `Unit` (a name and a version), and it is to be built into the program each machine runs; how a unit's code reaches a machine is not built, nor decided | the same | the same | the same |
+| the job's graph | yours to write; `mag-by` reads and checks it (`Graph::from_json`, `Graph::check`, [`schemas/mag-graph.schema.json`](crates/mag-by/schemas/mag-graph.schema.json)) | the same | the same | the same |
+| which machines are in the pool | **the host's** | you write the pool file, as [`pools/example.json`](crates/mag-by/pools/example.json) is written | the allocation, one Slurm job per machine; turning it into a pool description is not built | that system's |
+| the pool's description: its members, whether each is `remote`, how soon it gives a device back, and each device's backend, memory, tolerance classes, dtypes and costs | the format is `mag-by`'s (`Description`, the pool file, [`schemas/mag-pool.schema.json`](crates/mag-by/schemas/mag-pool.schema.json)) | yours, by hand | is to come from the allocation; not built | is to come from that system; not built |
+| the costs in an offer: seconds per step of each part's unit on each device | the format is `mag-by`'s (`Cost`) | you time one step of each unit on each device yourself, at the batch its memory allows, after warm-up and on an idle device, and write it with a band, how far a later measurement may fall from it; a cost you leave out is taken as the slowest any other device measured for that unit, or 1 s if none did, flagged `estimate` with a band of 100% | is to be measured by `mag-mar`; not built | is to be measured by `mag-mar`; not built |
+| the placement loop: list the arrangements, remove those that break a constraint, score, commit, record | `mag-mortar`'s `Pool`, public; probing candidates, the time of edges, dividing a chain and moving a running job are not built | `mag plan` shows its decision on your two files | the same library | the same library |
+| the queue of jobs and the priority between them | **the pool's**: `mag-mortar`'s, every job submitted to the pool placed against the others | the pool's | the pool's; Slurm queues only the machines' allocations | the pool's |
+| which machines a job may use | the host's, given to mag as data: the pool it is handed, a member's `remote`, an input's or weights' `local_only`, a part's `pin` | the pool file is your policy: list only the machines you allow, and mark a rented one `remote` | Slurm's accounts and partitions decide the allocation | that system's own authorization decides the pool before mag sees it |
+| starting the program on each machine | **the host's**; the program is `mag-mar`'s, not built | you, by hand or over ssh | `sbatch` | that system's |
+| taking a machine back | **the host's**, by sending its program a signal; the pool places again; not built | you | Slurm's preemption, with a grace time | that system's |
+| coordinating: running the loop over time and keeping its ledger | one of the pool's machines, named by the host; `mag-mortar` does no I/O and hands its state over (`Pool::apply`, `Pool::ledger`, `Ledger::line`, `Pool::replay`); the program that does this is `mag-mar`'s, not built | the same | the same | the same |
+| carrying a placement out on the machines | `mag-mar`'s; not built | the same | the same | the same |
+| finding machines, waking a sleeping one, keeping it awake | **the host's** | yours: they must be on | the cluster's | that system's |
 
 It is designed for:
 
@@ -126,8 +138,8 @@ It is designed for:
   take it;
 - a model that no single card holds, divided along a chain across two or three;
 - a teacher and a student sharing the pool's memory;
-- a long-running service that gives a card back when something urgent arrives and takes it
-  again afterwards;
+- a long-running service in the pool that yields a card when a more urgent job arrives, and
+  spreads back afterwards; and placing again when the host takes a machine back;
 - data that must not leave: what is computed from an input marked local-only, or by a part whose
   weights are marked local-only, is never to be placed on a remote machine, unless a part of the
   graph releases it.
@@ -182,13 +194,14 @@ is pinned to CUDA, and the chain's two blocks stay together. The whole output is
 [`plans/example.txt`](crates/mag-mortar/plans/example.txt); `--json` prints the loop's record.
 The command plans and keeps nothing.
 
-A pool keeps its state as a ledger of what it was told, with the record made each time. It
-writes nothing itself: its host appends each entry as a line, and a pool comes back by replaying
-them, each record checked against the one logged.
+A pool keeps its state as a ledger of what it was told, with the record made each time. It writes
+nothing itself: the coordinator is to append each entry as a line, and a pool comes back by
+replaying them, each record checked against the one logged.
 
-Not built yet: `mag-mar`, the engine each machine is to run, offering its devices to the pool and
-running the parts placed on it; running anything; members on other machines; and trying
-candidates on the job's own steps. Nothing here runs work yet.
+Not built yet: `mag-mar`, the program each machine is to run, offering its devices to the pool,
+running the parts placed on it, and on the coordinator serving the pool; the recipes for a list of
+machines and for Slurm; running anything; members on other machines; and trying candidates on the
+job's own steps. Nothing here runs work yet.
 
 The graph file is at version 1 and will change. If your job cannot be said in it, that is what
 we most want to hear: please open an issue.

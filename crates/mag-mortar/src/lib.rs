@@ -1,8 +1,9 @@
 //! The placement library of a mag pool: the loop that decides where each part of each job runs.
 //!
-//! A [`Pool`] is run by whatever hosts the pool: a home system's control plane, which links this
-//! crate, or, on its own, the program that submits the job. mag keeps no server of its own, and
-//! this crate does no I/O.
+//! A host gives the pool its machines and takes them back, and never reads a graph. One of the
+//! pool's machines, which the host names, coordinates: it runs a [`Pool`], which places every job
+//! submitted to the pool against the others. mag keeps no server of its own, and this crate does
+//! no I/O.
 //!
 //! On every event (a job arrives or ends, a device joins or leaves) [`Pool`] runs the same steps
 //! over the jobs the event touches, which here are the jobs waiting:
