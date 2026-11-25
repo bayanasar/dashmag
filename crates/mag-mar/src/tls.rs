@@ -721,6 +721,25 @@ impl Link for TlsLink {
         for m in expected {
             check_name(m)?;
         }
+        self.answer(|cert| member_named(cert, expected))
+    }
+
+    fn accept_any(&self) -> Result<TlsChannel, LinkError> {
+        self.answer(member_any)
+    }
+
+    fn rate(&self, member: &str) -> Option<Rate> {
+        self.rates.lock().ok()?.get(member).copied()
+    }
+}
+
+impl TlsLink {
+    /// Takes the next connection, and opens it as a channel from the member `named` reads from
+    /// the certificate it presents, which the handshake has checked is the pool authority's.
+    fn answer(
+        &self,
+        named: impl FnOnce(&CertificateDer<'_>) -> Result<String, Refused>,
+    ) -> Result<TlsChannel, LinkError> {
         let listener = self.listener.as_ref().ok_or_else(|| {
             LinkError::Io(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -737,7 +756,7 @@ impl Link for TlsLink {
             let cert = stream
                 .peer_certificate()
                 .ok_or(LinkError::Refused(Refused::NoCertificate))?;
-            let member = match member_named(cert, expected) {
+            let member = match named(cert) {
                 Ok(member) => member,
                 Err(refused) => {
                     let _ = stream.close();
@@ -754,10 +773,6 @@ impl Link for TlsLink {
         let (stream, peer, job) =
             opening().map_err(|e| self.ran_out(e, deadline, Side::Answering))?;
         self.opened(stream, peer, job)
-    }
-
-    fn rate(&self, member: &str) -> Option<Rate> {
-        self.rates.lock().ok()?.get(member).copied()
     }
 }
 
@@ -811,6 +826,18 @@ const RECORDS: usize = 64 << 10;
 const READ: usize = 64 << 10;
 
 /// The channel's way out: the socket written by the sending half alone.
+/// The one member the certificate names, whoever it is: its one DNS name, which must be a member
+/// name. A certificate that names more than one could stand for any of them, and is refused.
+fn member_any(cert: &CertificateDer<'_>) -> Result<String, Refused> {
+    let ee =
+        webpki::EndEntityCert::try_from(cert).map_err(|e| Refused::NotThePool(e.to_string()))?;
+    let named: Vec<String> = ee.valid_dns_names().map(String::from).collect();
+    match named.as_slice() {
+        [one] if mag_by::is_member_name(one) => Ok(one.clone()),
+        _ => Err(Refused::NotOneMember { named }),
+    }
+}
+
 struct Outbound {
     shared: Arc<Shared>,
     tcp: TcpStream,

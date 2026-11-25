@@ -77,6 +77,16 @@ pub trait Link {
     /// is given up, so a peer that stalls cannot hold it.
     fn accept(&self, expected: &[&str]) -> Result<Self::Channel, LinkError>;
 
+    /// Takes the next channel any member of the pool opens to this one, and reports it as the
+    /// channel's peer: whoever holds a certificate the pool's authority signed naming exactly one
+    /// member. The coordinator takes its members' control channels so, since a member that joins
+    /// after it began is named by nothing it was told, only by its certificate; it then tells a
+    /// control channel from a job's by [`ChannelEnd::job`]. A certificate naming no member, or
+    /// more than one, is refused and closed, [`Refused::NotOneMember`], and the refusal
+    /// returned; the caller accepts again. One connection at a time, as [`Link::accept`] takes
+    /// them.
+    fn accept_any(&self) -> Result<Self::Channel, LinkError>;
+
     /// The rate measured on every channel to `member` so far, for the placement loop's cost
     /// model; `None` before any channel to it has moved a body.
     fn rate(&self, member: &str) -> Option<Rate>;
@@ -260,6 +270,9 @@ pub enum Refused {
     },
     /// It speaks no protocol this end speaks: TLS below 1.3, or nothing in common. Why.
     Protocol(String),
+    /// Its certificate is signed by the pool's authority, but names no member, or more than one,
+    /// to an end that takes any member: the names it carries.
+    NotOneMember { named: Vec<String> },
 }
 
 impl fmt::Display for Refused {
@@ -274,6 +287,9 @@ impl fmt::Display for Refused {
                 "its certificate names {named:?}, not one of the members expected, {expected:?}"
             ),
             Refused::Protocol(why) => write!(f, "it speaks no protocol this end speaks: {why}"),
+            Refused::NotOneMember { named } => {
+                write!(f, "its certificate names {named:?}, not exactly one member")
+            }
         }
     }
 }

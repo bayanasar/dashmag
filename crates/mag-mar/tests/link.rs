@@ -343,6 +343,61 @@ fn a_certificate_naming_two_expected_members_is_refused_and_one_naming_one_is_ta
 }
 
 #[test]
+fn accept_any_takes_any_member_of_the_pool_and_reports_it_but_not_one_naming_two() {
+    let pool = Authority::new(1).unwrap();
+    let coordinator = bound(&pool, "server");
+
+    // A member nothing names in advance, with a certificate of the pool's: taken, and reported
+    // as the member its certificate names, with that certificate's serial.
+    let at = address(&coordinator);
+    let rented = TlsLink::new(credentials(&pool, "rented")).unwrap();
+    let serial = rented.credentials().identity().serial;
+    let dialling = thread::spawn(move || {
+        rented
+            .open("server", &at, mag_by::CONTROL)
+            .map(|c| (c, rented))
+    });
+    let accepted = coordinator.accept_any().unwrap();
+    assert_eq!(accepted.peer().member, "rented");
+    assert_eq!(accepted.peer().serial, serial);
+    assert_eq!(accepted.job(), mag_by::CONTROL);
+    assert!(dialling.join().unwrap().is_ok());
+
+    // A certificate of the pool's naming two members could stand for either: refused.
+    let at = address(&coordinator);
+    let both = TlsLink::new(credentials_naming(&pool, "laptop", &["laptop", "rented"])).unwrap();
+    let dialling = thread::spawn(move || both.open("server", &at, mag_by::CONTROL));
+    match coordinator.accept_any() {
+        Err(LinkError::Refused(Refused::NotOneMember { named })) => {
+            assert_eq!(named, ["laptop", "rented"]);
+        }
+        other => panic!("{:?}", other.err()),
+    }
+    assert!(dialling.join().unwrap().is_err());
+
+    // A member of another pool: refused as not the pool's.
+    let other = Authority::new(1).unwrap();
+    let laptop = other.issue("laptop", 1).unwrap();
+    let config = raw_client(
+        &pool,
+        &rustls::version::TLS13,
+        Some((
+            vec![CertificateDer::from_pem_slice(laptop.certificate.as_bytes()).unwrap()],
+            PrivateKeyDer::from_pem_slice(laptop.key.as_bytes()).unwrap(),
+        )),
+    );
+    let at = address(&coordinator);
+    let dialling = thread::spawn(move || raw_dial(config, &at));
+    let accepted = coordinator.accept_any();
+    assert!(
+        matches!(accepted, Err(LinkError::Refused(Refused::NotThePool(_)))),
+        "{:?}",
+        accepted.err()
+    );
+    assert!(dialling.join().unwrap().is_err());
+}
+
+#[test]
 fn a_peer_that_stalls_cannot_hold_the_opening_past_its_deadline() {
     use std::time::{Duration, Instant};
     let pool = Authority::new(1).unwrap();
