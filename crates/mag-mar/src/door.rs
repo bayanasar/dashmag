@@ -7,6 +7,12 @@
 //!   0700 beside the door's path, made 0600 there, and only then renamed to the door's path, so
 //!   that no one else can reach it at any moment. Beside it, `DOOR.lock` (the door's path and
 //!   `.lock`) is held locked while the coordinator serves the door; it is never removed.
+//! - **A door's path is short** ([`LONGEST_PATH`]): a socket's path holds at most 107 bytes on
+//!   Linux and 103 on macOS, and the socket is bound first at the door's path with `.new/s`
+//!   added, so a door's path is at most 101 bytes on Linux and 97 on macOS. It counts as
+//!   written: a relative path is its own bytes, whatever directory it is taken from, since the
+//!   socket's address holds it as written. A longer one is refused before anything is made
+//!   ([`DoorError::TooLong`]).
 //! - **One coordinator at a door.** A door whose lock another process holds, or at whose path a
 //!   socket answers, is refused ([`DoorError::Held`]). A socket at the path that no one answers
 //!   is a door a coordinator left when it stopped, and is replaced. Anything else at the path is
@@ -62,6 +68,9 @@ pub enum DoorError {
     Held,
     /// Something other than a socket is at the door's path. It is left as it is.
     NotASocket,
+    /// The door's path is `bytes` long, more than the `longest` a socket can be bound at here
+    /// ([`LONGEST_PATH`]). Nothing is made.
+    TooLong { bytes: usize, longest: usize },
     /// The door's socket, its lock or the directory it is bound in could not be made.
     Io(io::Error),
 }
@@ -73,6 +82,13 @@ impl fmt::Display for DoorError {
             DoorError::NotASocket => write!(
                 f,
                 "something other than a socket is at the door's path, and is left as it is"
+            ),
+            DoorError::TooLong { bytes, longest } => write!(
+                f,
+                "the door's path is {bytes} bytes, and may be at most {longest} on this platform: \
+                 a socket's path holds at most {} bytes, and the door's socket is bound first at \
+                 its path with `{STAGED}` added",
+                longest + STAGED.len()
             ),
             DoorError::Io(e) => write!(f, "{e}"),
         }
@@ -131,6 +147,21 @@ impl fmt::Display for AskError {
 
 impl std::error::Error for AskError {}
 
+/// What the door's socket is first bound at, added to the door's path: a socket `s` inside the
+/// new directory `DOOR.new`.
+const STAGED: &str = ".new/s";
+
+/// The longest door path, in bytes as written, that the coordinator serves: the longest path a
+/// socket's address holds on this platform, less [`STAGED`], since the socket is bound there
+/// first. 101 on Linux and 97 on macOS. A relative path counts its own bytes: the address holds it
+/// as written, and the directory it is taken from is not in it.
+#[cfg(unix)]
+pub const LONGEST_PATH: usize = {
+    use std::mem::{offset_of, size_of};
+    // The address's `sun_path`, less the zero that ends it, as the standard library requires.
+    size_of::<libc::sockaddr_un>() - offset_of!(libc::sockaddr_un, sun_path) - 1 - STAGED.len()
+};
+
 #[cfg(unix)]
 pub use unix::{Door, ask};
 
@@ -150,7 +181,7 @@ mod unix {
 
     use mag_by::{DoorAnswer, DoorRefusal, DoorRequest};
 
-    use super::{AskError, DoorError, REQUEST_LIMIT, REQUEST_WAIT};
+    use super::{AskError, DoorError, LONGEST_PATH, REQUEST_LIMIT, REQUEST_WAIT, STAGED};
     use crate::member::say;
 
     /// The door, as the coordinator serves it: its socket, bound and of mode 0600, and its lock,
@@ -174,8 +205,15 @@ mod unix {
         /// Serves the door at `path`: takes its lock, binds its socket where no one else can
         /// reach it, makes it 0600, and puts it at `path` in place of a door left by a
         /// coordinator that stopped. A door another coordinator serves is refused, and so is
-        /// anything at `path` that is not a socket.
+        /// anything at `path` that is not a socket, and before anything is made, a path longer
+        /// than [`LONGEST_PATH`].
         pub fn open(path: &str) -> Result<Door, DoorError> {
+            if path.len() > LONGEST_PATH {
+                return Err(DoorError::TooLong {
+                    bytes: path.len(),
+                    longest: LONGEST_PATH,
+                });
+            }
             let path = PathBuf::from(path);
             let lock = OpenOptions::new()
                 .read(true)
@@ -206,8 +244,11 @@ mod unix {
             // and only then moved to the door's path: no one else can reach it at any moment.
             // The lock is held, so a directory already there was left by a coordinator that
             // stopped while it opened its door.
-            let staging = with_suffix(&path, ".new");
-            let bound = staging.join("s");
+            let bound = with_suffix(&path, STAGED);
+            let staging = bound
+                .parent()
+                .expect("a path with `.new/s` added")
+                .to_owned();
             if fs::symlink_metadata(&staging).is_ok() {
                 match fs::remove_file(&bound) {
                     Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
@@ -484,6 +525,54 @@ mod tests {
 
     fn args(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()
+    }
+
+    /// The longest door path is the platform's, and a path one byte longer is refused before the
+    /// coordinator makes anything, while one of exactly that length is served.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_path_longer_than_its_socket_can_be_bound_at_is_refused_and_nothing_made() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(LONGEST_PATH, 101);
+        }
+        if cfg!(target_os = "macos") {
+            assert_eq!(LONGEST_PATH, 97);
+        }
+        let dir = std::env::temp_dir().join(format!("mag-mar-door-length-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = format!("{}/", dir.to_str().unwrap());
+        let of = |bytes: usize| {
+            let rest = bytes
+                .checked_sub(prefix.len())
+                .filter(|&n| n > 0)
+                .expect("a temporary directory short enough to put a door in");
+            format!("{prefix}{}", "d".repeat(rest))
+        };
+        let long = of(LONGEST_PATH + 1);
+        match Door::open(&long) {
+            Err(e @ DoorError::TooLong { bytes, longest }) => {
+                assert_eq!((bytes, longest), (LONGEST_PATH + 1, LONGEST_PATH));
+                let said = e.to_string();
+                assert!(
+                    said.contains(&format!("is {} bytes", LONGEST_PATH + 1))
+                        && said.contains(&format!("at most {LONGEST_PATH} on this platform"))
+                        && said.contains(&format!("holds at most {} bytes", LONGEST_PATH + 6))
+                        && said.contains("`.new/s`"),
+                    "{said}"
+                );
+            }
+            other => panic!("{:?}", other.map(|d| d.path().to_owned())),
+        }
+        // No lock, no directory to bind in, no socket.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        // Exactly the longest: served, a socket at the path that answers.
+        let longest = of(LONGEST_PATH);
+        let door = Door::open(&longest).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&longest).is_ok());
+        drop(door);
+        assert!(!std::path::Path::new(&longest).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

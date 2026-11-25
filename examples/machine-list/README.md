@@ -121,8 +121,9 @@ a member.
   [start file](../../crates/mag-by/starts/example.json) has them. The coordinator needs a
   `listen` address, and every other member's start file gives it as the coordinator's address,
   since every member dials it. The door is a path on the coordinator's machine, such as
-  `door.sock`, at most 101 bytes long, since a Unix socket's path is short; a relative one is
-  taken from the directory you start the program in.
+  `door.sock`, at most 101 bytes long on Linux and 97 on macOS, since a Unix socket's path is
+  short; a relative one counts its own bytes, and is taken from the directory you start the
+  program in.
 - The member program on each machine, from the repository's root:
 
       MAG_START=server.json cargo run --release -q -p mag-mar

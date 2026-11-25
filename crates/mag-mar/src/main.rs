@@ -4,9 +4,9 @@
 //!
 //! Exit status: 0 once its lease has ended; 2 when it cannot start: `MAG_START` unset, a start
 //! file that cannot be read or is refused, credentials refused, an address it cannot bind, an
-//! argument it does not take, or, on the coordinator, a door another coordinator serves or a
-//! ledger it cannot begin or take up; 3 when the coordinator stopped because a line of its ledger
-//! could not be written.
+//! argument it does not take, or, on the coordinator, a door another coordinator serves or whose
+//! path is too long, or a ledger it cannot begin or take up; 3 when the coordinator stopped because
+//! a line of its ledger could not be written.
 //!
 //! `mag-mar door submit GRAPH.json [--stamp STAMP.json] | end JOB | status | take-back KIND
 //! SECONDS`, run on the coordinator's machine, asks the coordinator at the door of the start file

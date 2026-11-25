@@ -47,8 +47,8 @@ start file (`mag-by`'s `Start`):
 - **What it does goes to standard error**, a line at a time. It exits 2 when it cannot start:
   `MAG_START` unset, a start file that cannot be read or is refused, credentials refused, an
   address it cannot bind, an argument it does not take, or, as coordinator, a door another
-  coordinator serves or a ledger it cannot begin or take up. It exits 3 when, as coordinator, it
-  could not write a line of its ledger.
+  coordinator serves or whose path is too long, or a ledger it cannot begin or take up. It
+  exits 3 when, as coordinator, it could not write a line of its ledger.
 
 The library entry is `mag_mar::member::run`; the binary takes SIGTERM as its notice
 (`member::Notice::sigterm`, on Unix), reads the start file and calls it.
@@ -215,8 +215,10 @@ machine, with the coordinator's start file, asks the pool there:
   deadline.
 - **A door's path is short.** A Unix socket's path holds at most 107 bytes on Linux and 103 on
   macOS, and the socket is first bound at the door's path with `.new/s` added: so at most 101
-  bytes on Linux. A relative path is taken from the directory the program runs in, the
-  coordinator's and the command's alike.
+  bytes on Linux and 97 on macOS (`door::LONGEST_PATH`). It counts as written, a relative path
+  by its own bytes, since the socket's address holds it so. A longer one is refused at start,
+  before anything is made, and the coordinator exits 2. A relative path is taken from the
+  directory the program runs in, the coordinator's and the command's alike.
 
 ## The link
 
@@ -323,7 +325,9 @@ same lines; the command with no coordinator failing at once, with exit 5, at a p
 and at a socket no one answers; an argument other than `door` refused, with exit 2; a second
 coordinator at the door refused, by its lock with the socket moved away, and by the socket
 answering with the lock removed, its ledger not begun; a door a killed coordinator left
-replaced; something other than a socket at the path refused and left; on Linux, a submission
+replaced; something other than a socket at the path refused and left; a path one byte longer
+than a socket can be bound at refused before anything is made, and one of exactly the longest
+served; on Linux, a submission
 whose ledger line cannot be written never answered; and the status's asks, with an idle time of
 0: before any job, no device wanted and both members offered back, never the coordinator; a job
 pinned to CUDA, which no member offers, asking for a CUDA device of its memory, of a member
