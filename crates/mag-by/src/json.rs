@@ -120,6 +120,9 @@ pub enum PoolFileError {
     /// A member's name, or the member a device is offered on, is not a lower-case DNS name
     /// ([`crate::is_member_name`]): a certificate could not carry it.
     MemberName { name: String },
+    /// A member's `give_back_seconds` are below 0, or not finite: no time to give a device back
+    /// in. 0 is taken.
+    GiveBack { member: String, seconds: f64 },
 }
 
 impl fmt::Display for PoolFileError {
@@ -153,6 +156,11 @@ impl fmt::Display for PoolFileError {
                 f,
                 "member name `{name}` is not a DNS name in lower case, as a certificate carries it"
             ),
+            PoolFileError::GiveBack { member, seconds } => write!(
+                f,
+                "member `{member}`'s `give_back_seconds` is {seconds}; it must be finite and not \
+                 below 0"
+            ),
         }
     }
 }
@@ -177,8 +185,8 @@ pub enum StartFileError {
     Version { found: Option<String> },
     /// A key appears twice in one object. Where, as a path such as `peers[0].address`.
     RepeatedKey { at: String },
-    /// The pool lists a member twice, offers a device twice, or names a member as a certificate
-    /// could not, as a pool file may not.
+    /// The pool lists a member twice, offers a device twice, names a member as a certificate
+    /// could not, or gives a member a `give_back_seconds` below 0, as a pool file may not.
     Pool(PoolFileError),
     /// `member`, `coordinator` or a peer names no member of the pool.
     NotInPool { field: &'static str, name: String },
@@ -340,7 +348,9 @@ impl Description {
     /// read to the same meaning. A member listed twice, or a device offered twice, is refused:
     /// `describe` never writes either, and which of two would stand is not the file's to leave
     /// open. So is a member's name that is not a lower-case DNS name ([`crate::is_member_name`]),
-    /// since its certificate could not carry it.
+    /// since its certificate could not carry it, and a member's `give_back_seconds` below 0. JSON
+    /// holds no `NaN` and no infinity, and a number too large for an `f64`, such as `1e400`, is
+    /// refused as JSON, so no time that is not finite is read.
     pub fn from_json(text: &str) -> Result<Description, PoolFileError> {
         let (mut value, version) =
             read(text, POOL_FORMAT, POOL_VERSION).map_err(|bad| match bad {
@@ -357,8 +367,8 @@ impl Description {
         Ok(d)
     }
 
-    /// A member listed twice, a device offered twice, or a member's name that is not a
-    /// lower-case DNS name, refused.
+    /// A member listed twice, a device offered twice, a member's name that is not a lower-case
+    /// DNS name, or a member's `give_back_seconds` not finite or below 0, refused.
     fn each_once(&self) -> Result<(), PoolFileError> {
         let names = self.members.iter().map(|m| &m.name);
         for name in names.chain(self.offers.iter().map(|o| &o.device.member)) {
@@ -367,6 +377,12 @@ impl Description {
             }
         }
         for (i, m) in self.members.iter().enumerate() {
+            if !(m.give_back_seconds.is_finite() && m.give_back_seconds >= 0.0) {
+                return Err(PoolFileError::GiveBack {
+                    member: m.name.clone(),
+                    seconds: m.give_back_seconds,
+                });
+            }
             if self.members[..i].iter().any(|x| x.name == m.name) {
                 return Err(PoolFileError::RepeatedMember {
                     name: m.name.clone(),
@@ -391,12 +407,13 @@ impl Description {
 
 impl Start {
     /// Reads a start file. Besides what every file's reader refuses, it refuses a pool that lists
-    /// a member twice, offers a device twice or names a member as a certificate could not; a
-    /// `member`, `coordinator` or peer that names no member of the pool; a peer that is this
-    /// member or is listed twice; a coordinator that is another member but no peer, or a peer
-    /// with no address, since this member could not reach it; this member coordinating with no
-    /// `listen` address, since no member could join it; and an `idle_seconds` that is not finite
-    /// or is below 0.
+    /// a member twice, offers a device twice, names a member as a certificate could not or gives
+    /// a member a `give_back_seconds` below 0, as the pool file's reader does; a `member`,
+    /// `coordinator` or peer that names no member of the pool; a peer that is this member or is
+    /// listed twice; a coordinator that is another member but no peer, or a peer with no
+    /// address, since this member could not reach it; this member coordinating with no `listen`
+    /// address, since no member could join it; and an `idle_seconds` that is not finite or is
+    /// below 0.
     pub fn from_json(text: &str) -> Result<Start, StartFileError> {
         let (value, _) = read(text, START_FORMAT, START_VERSION).map_err(|bad| match bad {
             Bad::Json(e) => StartFileError::Json(e),

@@ -57,7 +57,10 @@ pub struct Member {
     pub name: String,
     /// How far the host trusts it. Nothing kept at a higher level is placed on its devices.
     pub trust: Trust,
-    /// Seconds within which the member gives a device back when the host takes it back.
+    /// Seconds within which the member gives a device back when the host takes it back. Finite,
+    /// and not below 0: a member given 0 gives its devices back at once, with no time to say it
+    /// leaves, as a host that takes them back without warning allows.
+    #[cfg_attr(feature = "graph", schemars(range(min = 0.0)))]
     pub give_back_seconds: f64,
 }
 

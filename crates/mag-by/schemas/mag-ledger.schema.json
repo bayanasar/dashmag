@@ -697,8 +697,9 @@
       "description": "A machine in the pool, running `mag-mar`: one lease of the host's.",
       "properties": {
         "give_back_seconds": {
-          "description": "Seconds within which the member gives a device back when the host takes it back.",
+          "description": "Seconds within which the member gives a device back when the host takes it back. Finite,\nand not below 0: a member given 0 gives its devices back at once, with no time to say it\nleaves, as a host that takes them back without warning allows.",
           "format": "double",
+          "minimum": 0.0,
           "type": "number"
         },
         "name": {

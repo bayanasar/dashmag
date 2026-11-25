@@ -80,7 +80,8 @@ pub enum MemberError {
     /// The member is not in its start file's pool, which a start file read from its file never
     /// allows.
     NotInPool(String),
-    /// The member's `give_back_seconds` are not finite or are below 0.
+    /// The member's `give_back_seconds` are not a time it can wait: not finite or below 0, which
+    /// a start file read from its file never allows, or 2^64 s or more, which it does.
     GiveBack(f64),
     /// The coordinator is a peer with no address, which a start file read from its file never
     /// allows.
@@ -100,7 +101,7 @@ impl fmt::Display for MemberError {
             }
             MemberError::GiveBack(s) => write!(
                 f,
-                "`give_back_seconds` is {s}; it must be finite and not below 0"
+                "`give_back_seconds` is {s}; it must be finite, not below 0 and below 2^64"
             ),
             MemberError::NoCoordinatorAddress(name) => {
                 write!(f, "the coordinator `{name}` has no address to dial")

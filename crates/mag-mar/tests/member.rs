@@ -223,6 +223,22 @@ impl Program {
 
     /// Sends SIGTERM, and waits for the program to exit, failing it after `limit`: its status,
     /// and the time from the signal to its exit.
+    /// Its exit status, once it ends by itself within `limit`; killed, and the test failed, if
+    /// it has not.
+    fn ends_within(&mut self, limit: Duration) -> ExitStatus {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            if started.elapsed() > limit {
+                let _ = self.child.kill();
+                panic!("still running after {limit:?}; it said {:#?}", self.said);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn terminate(&mut self, limit: Duration) -> (ExitStatus, Duration) {
         // SAFETY: kill(2) on the child this test started and has not waited for.
         assert_eq!(
@@ -477,4 +493,32 @@ fn a_member_does_not_start_without_its_start_file_or_with_a_key_others_can_read(
     let status = program.child.wait().unwrap();
     assert_eq!(status.code(), Some(2));
     program.says("chmod 600");
+}
+
+#[test]
+fn a_member_does_not_start_with_a_give_back_time_it_cannot_wait() {
+    let pool = Pool::new("give-back");
+    let start = pool.start("server", None, Some("127.0.0.1:9"));
+    let text = std::fs::read_to_string(&start).unwrap();
+    // Below 0, the start file's reader refuses it. Longer than a member can wait, the reader
+    // takes it and the member refuses it.
+    for (seconds, says) in [
+        (
+            -1.0,
+            "the pool: member `server`'s `give_back_seconds` is -1",
+        ),
+        (
+            1e20,
+            "`give_back_seconds` is 100000000000000000000; it must be finite, not below 0 and \
+             below 2^64",
+        ),
+    ] {
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["pool"]["members"][1]["give_back_seconds"] = seconds.into();
+        std::fs::write(&start, v.to_string()).unwrap();
+        let mut program = Program::start(Some(&start));
+        let status = program.ends_within(Duration::from_secs(10));
+        assert_eq!(status.code(), Some(2), "{:#?}", program.said);
+        program.says(says);
+    }
 }

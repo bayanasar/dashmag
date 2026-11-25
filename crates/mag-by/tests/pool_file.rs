@@ -130,8 +130,11 @@ fn the_schema_takes_the_example_and_refuses_what_the_reader_refuses_for_its_form
     let schema: Value = serde_json::from_str(&pool_schema()).unwrap();
     let v = jsonschema::draft202012::new(&schema).expect("a valid draft 2020-12 schema");
     assert!(v.is_valid(&serde_json::from_str(EXAMPLE).unwrap()));
-    let changes: [(&str, Edit); 5] = [
+    let changes: [(&str, Edit); 6] = [
         ("another format", |v| v["format"] = "mag-graph".into()),
+        ("a give-back time below 0", |v| {
+            v["members"][2]["give_back_seconds"] = (-1.0).into()
+        }),
         ("a newer version", |v| v["version"] = 3.into()),
         ("an unknown field", |v| v["owner"] = "x".into()),
         ("a null level", |v| v["members"][3]["trust"] = Value::Null),
@@ -240,4 +243,47 @@ fn a_pool_file_naming_a_member_as_a_certificate_could_not_is_refused() {
         matches!(&err, PoolFileError::MemberName { name } if name == "lap_top"),
         "{err}"
     );
+}
+
+#[test]
+fn a_give_back_time_below_0_is_refused_and_0_is_taken() {
+    for (seconds, shown) in [(-1.0, "-1"), (-0.25, "-0.25"), (-1e-9, "-0.000000001")] {
+        let text = changed(|v| v["members"][2]["give_back_seconds"] = seconds.into());
+        let err = Description::from_json(&text).unwrap_err();
+        assert!(
+            matches!(&err, PoolFileError::GiveBack { member, seconds: s }
+                if member == "laptop" && *s == seconds),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "member `laptop`'s `give_back_seconds` is {shown}; it must be finite and not \
+                 below 0"
+            )
+        );
+    }
+    // JSON holds no time that is not finite: a number too large for an f64 is refused as JSON,
+    // and `NaN` and `Infinity` are not JSON at all.
+    for (word, says) in [
+        ("1e400", "number out of range"),
+        ("-1e400", "number out of range"),
+        ("NaN", "expected value"),
+        ("Infinity", "expected value"),
+    ] {
+        let text = EXAMPLE.replacen(
+            "\"give_back_seconds\": 2.0",
+            &format!("\"give_back_seconds\": {word}"),
+            1,
+        );
+        let err = Description::from_json(&text).unwrap_err();
+        assert!(matches!(err, PoolFileError::Json(_)), "{word}: {err}");
+        assert!(err.to_string().contains(says), "{word}: {err}");
+    }
+    // A member that gives its devices back at once, with no time to say it leaves.
+    for zero in [0.0, -0.0] {
+        let text = changed(|v| v["members"][2]["give_back_seconds"] = zero.into());
+        let d = Description::from_json(&text).unwrap();
+        assert_eq!(d.members[2].give_back_seconds, 0.0);
+    }
 }

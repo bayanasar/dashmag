@@ -194,7 +194,7 @@ fn a_start_file_is_refused_for_its_form_as_every_file_is() {
 
 #[test]
 fn a_start_file_that_does_not_hold_together_is_refused() {
-    let cases: [(String, &str); 11] = [
+    let cases: [(String, &str); 12] = [
         (
             changed(|v| v["member"] = "nobody".into()),
             "`member` names `nobody`, which is no member of the pool",
@@ -247,6 +247,11 @@ fn a_start_file_that_does_not_hold_together_is_refused() {
             "the pool: member `workstation` is listed twice",
         ),
         (
+            changed(|v| v["pool"]["members"][2]["give_back_seconds"] = (-2.0).into()),
+            "the pool: member `laptop`'s `give_back_seconds` is -2; it must be finite and not \
+             below 0",
+        ),
+        (
             changed(|v| v["pool"]["members"][1]["name"] = "Server".into()),
             "the pool: member name `Server` is not a DNS name in lower case, as a certificate \
              carries it",
@@ -294,8 +299,11 @@ fn the_schema_takes_the_example_and_refuses_what_the_reader_refuses_for_its_form
     let schema: Value = serde_json::from_str(&start_schema()).unwrap();
     let v = jsonschema::draft202012::new(&schema).expect("a valid draft 2020-12 schema");
     assert!(v.is_valid(&serde_json::from_str(EXAMPLE).unwrap()));
-    let changes: [(&str, Edit); 9] = [
+    let changes: [(&str, Edit); 10] = [
         ("another format", |v| v["format"] = "mag-pool".into()),
+        ("a give-back time below 0", |v| {
+            v["pool"]["members"][2]["give_back_seconds"] = (-1.0).into()
+        }),
         ("a null listen address", |v| v["listen"] = Value::Null),
         ("a newer version", |v| v["version"] = 2.into()),
         ("a private key", |v| v["private_key"] = "secret".into()),
