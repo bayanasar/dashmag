@@ -12,6 +12,8 @@
 //! - [`checkpoint`]: recompute for a stack of layers, one layer's activations alive at a time.
 //! - [`conv1d`]: causal depthwise conv1d with its states, over a batch or packed sequences, and
 //!   its decoding step.
+//! - [`conv2d`]: 2-D convolution of images in torch's NCHW layout, MLX's own convolution and
+//!   backward pass between transposes to and from its channels-last layout.
 //! - [`gated_delta`]: the gated delta rule, chunked for training and recurrent for decoding.
 //! - [`logprob`]: the chosen tokens' log-probabilities and entropies over a large vocabulary,
 //!   without the n x V logits.
@@ -45,6 +47,8 @@ pub mod attention;
 pub mod checkpoint;
 #[cfg(target_os = "macos")]
 pub mod conv1d;
+#[cfg(target_os = "macos")]
+pub mod conv2d;
 #[cfg(target_os = "macos")]
 pub mod gated_delta;
 #[cfg(target_os = "macos")]

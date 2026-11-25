@@ -19,6 +19,9 @@
 //!   smoothing, z-loss, an ignore index and masked ids, training the output weight too.
 //! - [`conv1d`]: causal depthwise 1-D convolution, from a given state and over a batch or packed
 //!   variable-length sequences, with the state a decoder carries.
+//! - [`conv2d`]: 2-D convolution of images, torch's `F.conv2d` with stride, padding, dilation and
+//!   groups: Burn's own convolution and backward pass under dash-contract's checks, the one module
+//!   here that is not a backend extension, since Burn has the operation.
 //! - [`lowrank`]: low-rank products `base + scale · (x Aᵀ) Bᵀ` of small rank, as LoRA and the
 //!   adapters built on it add to a frozen layer, with f32 factors over inputs of any float dtype.
 //! - [`sample`]: sampling the next token on the device, with temperature, top-k, top-p and
@@ -75,6 +78,7 @@ compile_error!(
 pub mod attention;
 pub mod checkpoint;
 pub mod conv1d;
+pub mod conv2d;
 #[cfg(feature = "cubecl")]
 pub(crate) mod cube;
 #[cfg(feature = "cubecl")]

@@ -18,14 +18,15 @@
 use dash_conformance::{
     Adapter, Attention, AttentionDecode, AttentionGrads, AttentionOut, ChosenLogprob,
     ChosenLogprobOut, ChunkGatedDelta, ChunkGatedDeltaGrads, ChunkGatedDeltaOut, Conv1d,
-    Conv1dGrads, Conv1dOut, Conv1dStep, Conv1dStepOut, DType, GatedDeltaStep, GatedDeltaStepGrads,
-    GatedDeltaStepOut, HostTensor, KeyPadding, Unsupported,
+    Conv1dGrads, Conv1dOut, Conv1dStep, Conv1dStepOut, Conv2d, Conv2dGrads, Conv2dOut, DType,
+    GatedDeltaStep, GatedDeltaStepGrads, GatedDeltaStepOut, HostTensor, KeyPadding, Unsupported,
 };
 use dash_contract::attention::AttentionMask;
 use dash_mlx::attention::{
     self, AttentionOptions, attention_decode, attention_with_lse, attention_with_lse_reference,
 };
 use dash_mlx::conv1d::{self, causal_conv1d, causal_conv1d_update};
+use dash_mlx::conv2d::conv2d;
 use dash_mlx::gated_delta::chunk::{self, chunk_gated_delta_rule};
 use dash_mlx::gated_delta::recurrent::{self, gated_delta_step};
 use dash_mlx::logprob::{self, LogprobOptions, chosen_logprob, chosen_logprob_reference};
@@ -248,6 +249,45 @@ fn run_chosen_logprob(
     Ok(out)
 }
 
+/// Runs `call` through MLX's convolution, the gradients of `x`, the weight and the bias through
+/// MLX's own backward pass.
+fn run_conv2d(call: &Conv2d) -> Result<Conv2dOut, Unsupported> {
+    let x = array(&call.x);
+    let weight = array(&call.weight);
+    let bias = call.bias.as_ref().map(array);
+    let f = |p: &[Array]| {
+        let out = conv2d(&p[0], &p[1], p.get(2), call.options)?;
+        Ok((out, None))
+    };
+    let mut primals = vec![x, weight];
+    primals.extend(bias.iter().cloned());
+    let shape = call
+        .options
+        .output_shape(
+            &call.x.shape,
+            &call.weight.shape,
+            call.bias.as_ref().map(|b| b.shape[0]),
+        )
+        .map_err(Unsupported)?
+        .map(|d| d as i32);
+    let cotangents = call.grad.as_ref().map(|d| (Some(d), None));
+    let out = (&shape[..], mlx_dtype(call.x.dtype));
+    let (out, _, grads) = run("conv2d", f, &primals, out, cotangents)?;
+    let grads = grads.map(|grads| {
+        let mut grads = grads.iter().map(host);
+        let mut next = || grads.next().expect("a gradient");
+        Conv2dGrads {
+            x: next(),
+            weight: next(),
+            bias: bias.as_ref().map(|_| next()),
+        }
+    });
+    Ok(Conv2dOut {
+        out: host(&out),
+        grads,
+    })
+}
+
 /// Attention or its reference, as a call runs it.
 type AttentionOp = fn(
     &Array,
@@ -369,6 +409,10 @@ impl Adapter for Mlx {
             final_state: final_state.as_ref().map(host),
             grads,
         })
+    }
+
+    fn conv2d(&self, call: &Conv2d) -> Result<Conv2dOut, Unsupported> {
+        run_conv2d(call)
     }
 
     fn causal_conv1d_update(&self, call: &Conv1dStep) -> Result<Conv1dStepOut, Unsupported> {
@@ -545,6 +589,10 @@ impl Adapter for Reference {
 
     fn causal_conv1d_update(&self, call: &Conv1dStep) -> Result<Conv1dStepOut, Unsupported> {
         Mlx.causal_conv1d_update(call)
+    }
+
+    fn conv2d(&self, call: &Conv2d) -> Result<Conv2dOut, Unsupported> {
+        Mlx.conv2d(call)
     }
 
     fn chunk_gated_delta_rule(

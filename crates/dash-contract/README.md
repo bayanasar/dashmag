@@ -16,6 +16,7 @@ them; an implementation on another framework implements the same contract with t
 | `logprob` | the log-probability of chosen tokens under a large vocabulary, with the entropy |
 | `loss` | cross-entropy fused with the output layer over a large vocabulary, with label smoothing, z-loss, an ignore index and masked ids |
 | `conv1d` | causal depthwise conv1d from given states and over packed sequences, and its decoding step |
+| `conv2d` | 2-D convolution of images, torch's `F.conv2d`, with stride, padding, dilation, groups and an optional bias, in torch's NCHW layout |
 | `lowrank` | low-rank products `base + scale · (x U) V`, as LoRA's term |
 | `lora` | PEFT's default adapter name, and how an adapter read in PEFT's format is given to a model's layers |
 | `sample` | sampling the next token from a decoding step's logits: greedy, or drawn at a temperature with top-k, top-p and masked ids from a counter-based generator, with the token's log-probabilities |

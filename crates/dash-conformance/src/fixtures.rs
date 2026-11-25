@@ -18,14 +18,16 @@ pub(crate) fn path(relative: &str) -> PathBuf {
 enum Values {
     /// f32 or bf16, as f32 values.
     Float(DType, Vec<f32>),
+    /// f64: a reference kept as it was evaluated.
+    Wide(Vec<f64>),
     /// Integers.
     Int(Vec<i64>),
     /// Booleans, stored as u8.
     Bool(Vec<bool>),
 }
 
-/// A safetensors file of recordings, read whole: its tensors (f32, bf16, i64 and booleans as u8)
-/// and its metadata.
+/// A safetensors file of recordings, read whole: its tensors (f32, bf16, f64, i64 and booleans as
+/// u8) and its metadata.
 #[derive(Clone, Debug)]
 pub(crate) struct File {
     name: String,
@@ -38,7 +40,7 @@ impl File {
     ///
     /// # Panics
     ///
-    /// If it cannot be read, or holds a tensor in a dtype other than f32, bf16, i64 and u8.
+    /// If it cannot be read, or holds a tensor in a dtype other than f32, bf16, f64, i64 and u8.
     pub(crate) fn read(relative: &str) -> Self {
         let path = path(relative);
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -66,6 +68,13 @@ impl File {
                             .0
                             .iter()
                             .map(|b| f32::from_bits((u16::from_le_bytes(*b) as u32) << 16))
+                            .collect(),
+                    ),
+                    Dtype::F64 => Values::Wide(
+                        data.as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|b| f64::from_le_bytes(*b))
                             .collect(),
                     ),
                     Dtype::I64 => Values::Int(
@@ -119,9 +128,21 @@ impl File {
             (shape, Values::Float(dtype, values)) => {
                 HostTensor::new(*dtype, shape.clone(), values.clone())
             }
-            (_, Values::Int(_) | Values::Bool(_)) => {
-                panic!("{}: {name} holds no floats", self.name)
+            (_, Values::Int(_) | Values::Bool(_) | Values::Wide(_)) => {
+                panic!("{}: {name} holds no f32 or bf16 floats", self.name)
             }
+        }
+    }
+
+    /// A recorded f64 tensor: its shape and values.
+    ///
+    /// # Panics
+    ///
+    /// If there is none of that name, or it does not hold f64 values.
+    pub(crate) fn wide(&self, name: &str) -> (Vec<usize>, Vec<f64>) {
+        match self.get(name) {
+            (shape, Values::Wide(values)) => (shape.clone(), values.clone()),
+            _ => panic!("{}: {name} holds no f64 values", self.name),
         }
     }
 
@@ -133,7 +154,7 @@ impl File {
     pub(crate) fn ints(&self, name: &str) -> Vec<i64> {
         match self.get(name) {
             (_, Values::Int(values)) => values.clone(),
-            (_, Values::Float(..) | Values::Bool(_)) => {
+            (_, Values::Float(..) | Values::Wide(_) | Values::Bool(_)) => {
                 panic!("{}: {name} holds no integers", self.name)
             }
         }

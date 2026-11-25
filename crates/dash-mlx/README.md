@@ -13,6 +13,7 @@ feature.
 | `attention` | attention with grouped key-value heads, causality, a sliding window, key padding and packed sequences, its log-sum-exp, a backward pass that keeps no more than a tile of scores, and decoding against a key-value cache | one kernel a tile for the forward pass's online softmax and one for the backward pass's probabilities and score gradients, the products MLX's matmuls; a flash-decoding kernel reading the cache in dash-ops' layout |
 | `checkpoint` | recompute for a stack of layers: forward one layer at a time keeping the inputs, backward one layer at a time from them | MLX's operations, evaluated layer by layer |
 | `conv1d` | causal depthwise conv1d of any small width, with an optional bias and SiLU, from initial states or zeros and to final states, over a batch or packed variable-length sequences, with its gradients; the decoding step | widths 2 to 8: forward, backward and step kernels; others the reference |
+| `conv2d` | 2-D convolution of images in torch's NCHW layout, with stride, padding, dilation, groups and an optional bias, and the gradients of the input, the weight and the bias, f32: written, not yet built or run (below) | MLX's own `conv2d` and its backward pass, between transposes to and from its channels-last layout |
 | `gated_delta::chunk` | the gated delta rule, chunked, forward and backward: the l2 normalisation of queries and keys and the query scale as options, from initial states and to final states, over a batch or packed variable-length sequences | the chunks' triangular inverses and the scan from chunk to chunk; the rest MLX's batched operations |
 | `gated_delta::recurrent` | the gated delta rule a token at a time, for decoding: one token of each sequence, or several of each, packed | one kernel a call; its gradient the reference's |
 | `logprob` | the chosen tokens' log-probabilities and entropies over a large vocabulary with a frozen output weight, masked tokens left out, without the n x V logits; the gradient to the hidden states | one kernel a chunk of the vocabulary for the online log-sum-exp and the entropy, one for the backward pass's weights; the logits and the weighted sums MLX's matmuls |
@@ -50,6 +51,12 @@ against one call each (all but the weight and bias gradients' sums, within 1.72e
 
 Each kernel run twice on the same inputs gives the same bits, in f32 and bf16
 (`kernels_repeat_bit_for_bit`).
+
+2-D convolution (`src/conv2d.rs`, `tests/conv2d.rs`, dash-conformance's `conv2d` body through the
+adapter) was written on Linux, where this crate is empty, following `conv1d`'s binding: it has not
+been built or run on a Mac. Its bound is the contract's, a count of roundings per element, which
+MLX's convolution meets if it sums each element's products in f32. MLX's Metal backend has a
+Winograd path for 3 x 3 kernels, which would not meet it; which shapes take it was not checked.
 
 The gated delta rule (`tests/gated_delta_chunk.rs`, `gated_delta_recurrent.rs` and
 `gated_delta_packed.rs`: dash-conformance's tests of the same names through the adapter, which

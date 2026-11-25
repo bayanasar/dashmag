@@ -21,6 +21,10 @@
 //!   states and every gradient; and against itself: a sequence split in two, packed sequences
 //!   against one call each, empty sequences, either output alone in the loss. It calls
 //!   [`Adapter::causal_conv1d`], with gradients and alone.
+//! - [`conv2d`]: 2-D convolution against torch, its output and the gradients of the input, the
+//!   weight and the bias, over strides, paddings, dilations, groups and with and without a bias,
+//!   each element held to a count of roundings: calls of [`Adapter::conv2d`], with gradients and
+//!   alone.
 //! - [`gated_delta_chunk`]: the chunked gated delta rule against transformers, in f32 and from
 //!   bf16 inputs, with initial states and the final state's gradient: calls of
 //!   [`Adapter::chunk_gated_delta_rule`] with gradients.
@@ -106,6 +110,7 @@
 
 use dash_contract::attention::{AttentionMask, AttentionOptions};
 use dash_contract::conv1d::{CausalConv1dOptions, CausalConv1dStepOptions};
+use dash_contract::conv2d::Conv2dOptions;
 use dash_contract::gated_delta::chunk::ChunkGatedDeltaOptions;
 use dash_contract::gated_delta::recurrent::GatedDeltaStepOptions;
 use dash_contract::logprob::LogprobOptions;
@@ -116,6 +121,7 @@ pub use dash_contract::DType;
 pub mod attention;
 pub mod conv1d;
 pub mod conv1d_state;
+pub mod conv2d;
 mod fixtures;
 pub mod gated_delta_chunk;
 pub mod gated_delta_packed;
@@ -188,6 +194,10 @@ pub trait Adapter {
 
     /// `causal_conv1d_update`, one decoding step, without gradients.
     fn causal_conv1d_update(&self, call: &Conv1dStep) -> Result<Conv1dStepOut, Unsupported>;
+
+    /// `conv2d` ([`dash_contract::conv2d`]), with its gradients when [`Conv2d::grad`] asks for
+    /// them.
+    fn conv2d(&self, call: &Conv2d) -> Result<Conv2dOut, Unsupported>;
 
     /// `chunk_gated_delta_rule` ([`dash_contract::gated_delta::chunk`]), with its gradients when
     /// [`ChunkGatedDelta::grad`] asks for them.
@@ -289,6 +299,42 @@ pub struct Conv1dStepOut {
     pub out: HostTensor,
     /// The next state, `[B, W, C]`.
     pub state: HostTensor,
+}
+
+/// One call of `conv2d`.
+#[derive(Clone, Debug)]
+pub struct Conv2d {
+    /// `[N, C, H, W]`, in the case's dtype.
+    pub x: HostTensor,
+    /// `[O, C / G, KH, KW]`, in `x`'s dtype.
+    pub weight: HostTensor,
+    /// `[O]`, in `x`'s dtype, or none.
+    pub bias: Option<HostTensor>,
+    /// The stride, padding, dilation and groups.
+    pub options: Conv2dOptions,
+    /// The output's cotangent, `[N, O, HO, WO]`, if the call asks for gradients: those of
+    /// `sum(out * grad)`, the cotangent rounded to the output's dtype.
+    pub grad: Option<HostTensor>,
+}
+
+/// What a [`Conv2d`] call gave.
+#[derive(Clone, Debug)]
+pub struct Conv2dOut {
+    /// The output, `[N, O, HO, WO]`.
+    pub out: HostTensor,
+    /// The gradients, if asked for.
+    pub grads: Option<Conv2dGrads>,
+}
+
+/// The gradients of a [`Conv2d`] call's inputs.
+#[derive(Clone, Debug)]
+pub struct Conv2dGrads {
+    /// `x`'s.
+    pub x: HostTensor,
+    /// The weight's.
+    pub weight: HostTensor,
+    /// The bias's, if there is a bias.
+    pub bias: Option<HostTensor>,
 }
 
 /// One call of `chunk_gated_delta_rule`.
@@ -634,6 +680,11 @@ impl Adapter for Counted<'_> {
     fn causal_conv1d_update(&self, call: &Conv1dStep) -> Result<Conv1dStepOut, Unsupported> {
         let result = self.adapter.causal_conv1d_update(call);
         self.tally.note("causal_conv1d_update", result)
+    }
+
+    fn conv2d(&self, call: &Conv2d) -> Result<Conv2dOut, Unsupported> {
+        let result = self.adapter.conv2d(call);
+        self.tally.note("conv2d", result)
     }
 
     fn chunk_gated_delta_rule(

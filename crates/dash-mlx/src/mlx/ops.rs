@@ -351,6 +351,35 @@ pub fn conv1d(
     })
 }
 
+/// A 2D convolution of `a` `[.., height, width, channels]` with `weight`
+/// `[out, kernel height, kernel width, channels / groups]`, each pair `(height, width)`: MLX's
+/// channels-last layout.
+pub fn conv2d(
+    a: impl AsRef<Array>,
+    weight: impl AsRef<Array>,
+    stride: [i32; 2],
+    padding: [i32; 2],
+    dilation: [i32; 2],
+    groups: i32,
+) -> Result<Array> {
+    // SAFETY: valid handles, for the length of the call.
+    op(|res, s| unsafe {
+        sys::mlx_conv2d(
+            res,
+            a.as_ref().as_ptr(),
+            weight.as_ref().as_ptr(),
+            stride[0],
+            stride[1],
+            padding[0],
+            padding[1],
+            dilation[0],
+            dilation[1],
+            groups,
+            s,
+        )
+    })
+}
+
 /// The cumulative sum along an axis, inclusive and forward by default.
 pub fn cumsum(
     a: impl AsRef<Array>,

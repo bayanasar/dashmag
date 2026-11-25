@@ -18,6 +18,8 @@
 //!   smoothing, z-loss, an ignore index and masked ids.
 //! - [`conv1d`]: causal depthwise 1-D convolution, from a given state and over a batch or packed
 //!   variable-length sequences, with the state a decoder carries.
+//! - [`conv2d`]: 2-D convolution of images, torch's `F.conv2d`, with stride, padding, dilation,
+//!   groups and an optional bias, in torch's NCHW layout.
 //! - [`lowrank`]: low-rank products `base + scale · (x U) V` of small rank, as LoRA and the
 //!   adapters built on it add to a frozen layer, with f32 factors over inputs of any float dtype.
 //! - [`lora`]: what LoRA adapters in PEFT's format share whatever reads them: the name of the
@@ -48,8 +50,9 @@
 //! decrease (a sequence may be empty), as flash-attn and fla take them. Where the last one falls
 //! is the operation's to say: the gated delta rule's and conv1d's sequences hold every token,
 //! their last offset `T`; attention's may end before `T`, the positions past the last offset
-//! belonging to no sequence. Inputs may have any strides (an implementation may copy one it
-//! cannot read in place); outputs are contiguous in the documented layout.
+//! belonging to no sequence. Images are torch's `[N, C, H, W]`, the layout their checkpoints store
+//! ([`conv2d`]). Inputs may have any strides (an implementation may copy one it cannot read in
+//! place); outputs are contiguous in the documented layout.
 //!
 //! ## Masks
 //!
@@ -93,6 +96,7 @@
 pub mod attention;
 pub mod clip;
 pub mod conv1d;
+pub mod conv2d;
 pub mod gated_delta;
 pub mod logprob;
 pub mod lora;

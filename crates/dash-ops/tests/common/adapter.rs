@@ -16,12 +16,13 @@ use burn::tensor::{Bool, DType, Device, Int, Tensor, TensorData};
 use dash_conformance::{
     Adapter, Attention, AttentionDecode, AttentionGrads, AttentionOut, ChosenLogprob,
     ChosenLogprobOut, ChunkGatedDelta, ChunkGatedDeltaGrads, ChunkGatedDeltaOut, Conv1d,
-    Conv1dGrads, Conv1dOut, Conv1dStep, Conv1dStepOut, GatedDeltaStep, GatedDeltaStepGrads,
-    GatedDeltaStepOut, HostTensor, Unsupported,
+    Conv1dGrads, Conv1dOut, Conv1dStep, Conv1dStepOut, Conv2d, Conv2dGrads, Conv2dOut,
+    GatedDeltaStep, GatedDeltaStepGrads, GatedDeltaStepOut, HostTensor, Unsupported,
 };
 use dash_contract::attention::AttentionMask as HostMask;
 use dash_ops::attention::{self, AttentionMask, attention_decode, attention_with_lse};
 use dash_ops::conv1d::{self, causal_conv1d, causal_conv1d_update};
+use dash_ops::conv2d::conv2d;
 use dash_ops::gated_delta::chunk::{self, chunk_gated_delta_rule};
 use dash_ops::gated_delta::recurrent::gated_delta_step;
 use dash_ops::logprob::{self, LogprobOptions, VocabChunk, chosen_logprob};
@@ -588,6 +589,42 @@ impl Adapter for Burn {
             logprob,
             entropy,
             grad_hidden,
+        })
+    }
+
+    fn conv2d(&self, call: &Conv2d) -> Result<Conv2dOut, Unsupported> {
+        // dash-ops panics outside what it takes: f32 alone, so far.
+        if call.x.dtype != dash_conformance::DType::F32 {
+            return Err(Unsupported(format!(
+                "conv2d: {:?} is not implemented",
+                call.x.dtype
+            )));
+        }
+        let grad = call.grad.is_some();
+        let device = self.device_for(grad);
+        let leaf = |tensor: Tensor<4>| if grad { tensor.require_grad() } else { tensor };
+        let x = leaf(tensor::<4>(&call.x, &device));
+        let weight = leaf(tensor::<4>(&call.weight, &device));
+        let bias = call.bias.as_ref().map(|bias| {
+            let bias = tensor::<1>(bias, &device);
+            if grad { bias.require_grad() } else { bias }
+        });
+        let out = conv2d(x.clone(), weight.clone(), bias.clone(), call.options);
+        let grads = call.grad.as_ref().map(|d_out| {
+            let d_out = tensor::<4>(
+                &d_out.clone().with_dtype(contract_dtype(out.dtype())),
+                &device,
+            );
+            let grads = (out.clone() * d_out).sum().backward();
+            Conv2dGrads {
+                x: host(x.grad(&grads).expect("x's gradient")),
+                weight: host(weight.grad(&grads).expect("the weight's gradient")),
+                bias: bias.map(|bias| host(bias.grad(&grads).expect("the bias's gradient"))),
+            }
+        });
+        Ok(Conv2dOut {
+            out: host(out),
+            grads,
         })
     }
 
