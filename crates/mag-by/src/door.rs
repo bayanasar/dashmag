@@ -12,15 +12,13 @@
 //! a request is one JSON object on one line, and so is its answer.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 #[cfg(feature = "graph")]
 use crate::graph::present;
-use crate::{Arrangement, Asks, Description, Graph, Place, Record, Stamp};
+use crate::{Arrangement, Asks, Description, DeviceId, Graph, Place, Record, Stamp, TakeBack};
 
 /// What a command asks at the door.
-///
-/// Taking a device back by need is to be asked here too, and is not built: a coordinator that
-/// does not read a request answers [`DoorRefusal::Unreadable`].
 // One request is made for each command, so a graph held inline costs nothing worth a box.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +38,11 @@ pub enum DoorRequest {
     End { job: String },
     /// The pool as one virtual device, with its jobs.
     Status,
+    /// The host takes a device back: by need ([`TakeBack::Need`]), a device of a kind within a
+    /// deadline, whichever the pool loses least by. Taking back by name is the host's SIGTERM to
+    /// the member's program, not the door's: a coordinator answers a request by name
+    /// [`DoorRefusal::ByName`].
+    TakeBack(TakeBack),
 }
 
 /// The coordinator's answer to one [`DoorRequest`].
@@ -76,6 +79,17 @@ pub enum DoorAnswer {
             )
         )]
         asks: Option<Asks>,
+    },
+    /// A device is taken back for the host's need: the device the pool chose, the record of the
+    /// loop's run on its leave, which is in the pool's ledger, and whether it is given back.
+    TakenBack {
+        device: DeviceId,
+        record: Record,
+        /// Whether the device's member said it gave the device back before the deadline, or the
+        /// device was the coordinator's own, which it stops offering itself. False when the
+        /// deadline passed first, or the member could not be told; the device is the host's at
+        /// the deadline either way, and the pool places nothing on it from its leave.
+        given_back: bool,
     },
     /// The request is refused, and nothing was written.
     Refused { refusal: DoorRefusal },
@@ -116,6 +130,14 @@ pub enum DoorRefusal {
     Pool { reason: String },
     /// The pool holds no job of this name, so it has nothing to end.
     NoJob { job: String },
+    /// Nothing the pool holds meets the need: no device of the kind, or none whose member gives
+    /// a device back within the deadline. `slow` lists the devices of the kind whose members take
+    /// longer, and is empty when no device is of the kind.
+    Unmet { slow: Vec<DeviceId> },
+    /// A take-back by name, of a device or a member: the host's to do, by SIGTERM to the member's
+    /// program, which gives all its devices back within its time to give back. The door takes
+    /// back by need only.
+    ByName,
 }
 
 impl core::fmt::Display for DoorRefusal {
@@ -126,6 +148,28 @@ impl core::fmt::Display for DoorRefusal {
             }
             DoorRefusal::Pool { reason } => write!(f, "the pool refuses it: {reason}"),
             DoorRefusal::NoJob { job } => write!(f, "the pool holds no job named `{job}`"),
+            DoorRefusal::Unmet { slow } if slow.is_empty() => {
+                write!(f, "no device in the pool is of the kind asked for")
+            }
+            DoorRefusal::Unmet { slow } => {
+                write!(f, "the devices of the kind asked for (")?;
+                for (i, d) in slow.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{d}")?;
+                }
+                write!(
+                    f,
+                    ") are each of a member that takes longer than the deadline to give a \
+                     device back"
+                )
+            }
+            DoorRefusal::ByName => write!(
+                f,
+                "the door takes a device back by need only; by name, send the member's program \
+                 SIGTERM"
+            ),
         }
     }
 }

@@ -27,10 +27,11 @@
 //! - The words of a link between two members, at [`WIRE_VERSION`]: the [`Open`] each end says
 //!   once on a channel for a job, and a [`Tensor`] whose bytes follow it; and on a member's
 //!   control channel to the coordinator, opened for no job ([`CONTROL`]), the [`Control`] words
-//!   it joins and leaves with.
+//!   it joins and leaves with, and with which the coordinator tells it to give a device back and
+//!   it says it has.
 //! - The words of the door, the coordinator's local socket: a [`DoorRequest`], to submit a job
-//!   with its stamp, end one or ask the pool's status, and the coordinator's [`DoorAnswer`], or
-//!   its [`DoorRefusal`].
+//!   with its stamp, end one, ask the pool's status or take a device back by need, and the
+//!   coordinator's [`DoorAnswer`], or its [`DoorRefusal`].
 //! - With the `graph` feature, `Graph::from_json` and `Graph::to_json`: the graph file, a
 //!   graph in JSON, as an agent writes, reads back and edits it (`format` `"mag-graph"`,
 //!   `version` 2); `graph_schema`, its JSON Schema; `Graph::to_dot`, the graph as Graphviz DOT

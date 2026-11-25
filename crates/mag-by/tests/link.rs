@@ -88,7 +88,7 @@ fn the_control_channel_is_for_no_job_a_name_no_job_may_have() {
 }
 
 #[test]
-fn a_member_joins_with_itself_and_its_offers_and_leaves() {
+fn a_member_joins_leaves_and_gives_a_device_back_when_the_coordinator_says() {
     let join = Control::Join {
         member: Member {
             name: "laptop".into(),
@@ -122,7 +122,30 @@ fn a_member_joins_with_itself_and_its_offers_and_leaves() {
         } }),
     );
     round_trip(&Control::Leave, json!("leave"));
+    // The coordinator's word to give a device back, and the member's that it has.
+    let device = DeviceId {
+        member: "laptop".into(),
+        index: 0,
+    };
+    round_trip(
+        &Control::GiveBack {
+            device: device.clone(),
+            deadline_seconds: 30.0,
+        },
+        json!({ "give_back": { "device": { "member": "laptop", "index": 0 },
+                               "deadline_seconds": 30.0 } }),
+    );
+    round_trip(
+        &Control::GaveBack { device },
+        json!({ "gave_back": { "device": { "member": "laptop", "index": 0 } } }),
+    );
     for bad in [
+        json!({ "give_back": { "device": { "member": "laptop", "index": 0 } } }),
+        json!({ "give_back": { "deadline_seconds": 30.0 } }),
+        json!({ "gave_back": { "device": { "member": "laptop", "index": 0 },
+                               "deadline_seconds": 30.0 } }),
+        json!({ "gave_back": {} }),
+        json!("gave_back"),
         json!({ "join": { "offers": [] } }),
         json!({ "join": {
             "member": { "name": "laptop", "trust": "site", "give_back_seconds": 2.0 },

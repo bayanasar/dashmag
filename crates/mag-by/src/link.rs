@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 #[cfg(feature = "graph")]
 use crate::graph::present;
-use crate::{Dtype, Member, Offer};
+use crate::{DeviceId, Dtype, Member, Offer};
 
 /// The version of the words members send each other on a link. Its own, apart from each file's
 /// version and from the crate's.
@@ -66,12 +66,16 @@ pub struct Tensor {
     pub bytes: u64,
 }
 
-/// A member's words to the coordinator, on its control channel ([`CONTROL`]).
+/// The words on a member's control channel to the coordinator ([`CONTROL`]): the member's,
+/// [`Control::Join`], [`Control::Leave`] and [`Control::GaveBack`], and the coordinator's,
+/// [`Control::GiveBack`]. Each end takes only the other's.
 ///
 /// When its lease begins, a member dials the coordinator and joins; the host tells the
 /// coordinator nothing. When the host ends the lease (SIGTERM), the member says it leaves, closes
 /// its way of the channel, and waits for the coordinator to close the other way, the sign that
-/// the leaving is recorded, until its `give_back_seconds` are up.
+/// the leaving is recorded, until its `give_back_seconds` are up. When the host takes a device
+/// back by need at the door, and the pool chooses one of this member's, the coordinator tells it
+/// to give that device back, and the member says when it has.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(
     feature = "graph",
@@ -88,4 +92,14 @@ pub enum Control {
     Join { member: Member, offers: Vec<Offer> },
     /// The member leaves: its lease is ending, and its devices are given back.
     Leave,
+    /// The coordinator's word: give this device back within `deadline_seconds`, as the host
+    /// took a device back by need and the pool chose this one. Its leave is in the ledger before
+    /// the word is said; the member stops offering it, and keeps its other devices and its lease.
+    GiveBack {
+        device: DeviceId,
+        deadline_seconds: f64,
+    },
+    /// The member has given this device back, as the coordinator told it to: it offers it no
+    /// longer.
+    GaveBack { device: DeviceId },
 }

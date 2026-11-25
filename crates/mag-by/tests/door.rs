@@ -1,8 +1,8 @@
 //! The words of the door, written as JSON and read back.
 
 use mag_by::{
-    Arrangement, Asks, Description, DeviceId, DoorAnswer, DoorRefusal, DoorRequest, Event, Graph,
-    Place, Record, Stamp,
+    Arrangement, Asks, Backend, Description, DeviceId, DeviceKind, DoorAnswer, DoorRefusal,
+    DoorRequest, Event, Graph, Place, Record, Stamp, TakeBack,
 };
 use serde_json::{Value, json};
 
@@ -16,6 +16,13 @@ where
 
 fn example() -> Graph {
     Graph::from_json(include_str!("../graphs/example.json")).unwrap()
+}
+
+fn id(member: &str, index: u32) -> DeviceId {
+    DeviceId {
+        member: member.into(),
+        index,
+    }
 }
 
 fn record(job: &str) -> Record {
@@ -60,6 +67,10 @@ fn a_request_submits_a_graph_with_its_stamp_ends_a_job_or_asks_the_status() {
         json!({ "end": {} }),
         json!({ "status": {} }),
         json!({ "take_back": { "need": {}, "deadline_seconds": 1.0 } }),
+        json!({ "take_back": { "need": { "kind": {} } } }),
+        json!({ "take_back": { "need": { "kind": { "cores": 8 }, "deadline_seconds": 1.0 } } }),
+        json!({ "take_back": null }),
+        json!("take_back"),
         json!("stop"),
     ] {
         assert!(
@@ -67,6 +78,40 @@ fn a_request_submits_a_graph_with_its_stamp_ends_a_job_or_asks_the_status() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn a_request_takes_a_device_back_by_need_and_may_name_one_which_the_door_refuses() {
+    let need = DoorRequest::TakeBack(TakeBack::Need {
+        kind: DeviceKind {
+            backend: Some(Backend::Cuda),
+            memory_bytes: Some(1 << 30),
+            ..DeviceKind::default()
+        },
+        deadline_seconds: 30.0,
+    });
+    round_trip(
+        &need,
+        json!({ "take_back": { "need": {
+            "kind": { "backend": "cuda", "memory_bytes": 1073741824u64 },
+            "deadline_seconds": 30.0
+        } } }),
+    );
+    round_trip(
+        &DoorRequest::TakeBack(TakeBack::Need {
+            kind: DeviceKind::default(),
+            deadline_seconds: 0.0,
+        }),
+        json!({ "take_back": { "need": { "kind": {}, "deadline_seconds": 0.0 } } }),
+    );
+    // By name it is a word too, which the coordinator refuses.
+    round_trip(
+        &DoorRequest::TakeBack(TakeBack::Member {
+            member: "laptop".into(),
+            deadline_seconds: 5.0,
+        }),
+        json!({ "take_back": { "member": { "member": "laptop", "deadline_seconds": 5.0 } } }),
+    );
 }
 
 #[test]
@@ -158,6 +203,17 @@ fn an_answer_carries_the_record_and_where_the_job_is_or_the_pool_or_a_typed_refu
             },
             json!({ "no_job": { "job": "tally" } }),
         ),
+        (
+            DoorRefusal::Unmet { slow: vec![] },
+            json!({ "unmet": { "slow": [] } }),
+        ),
+        (
+            DoorRefusal::Unmet {
+                slow: vec![id("laptop", 0)],
+            },
+            json!({ "unmet": { "slow": [{ "member": "laptop", "index": 0 }] } }),
+        ),
+        (DoorRefusal::ByName, json!("by_name")),
     ] {
         round_trip(
             &DoorAnswer::Refused {
@@ -173,12 +229,54 @@ fn an_answer_carries_the_record_and_where_the_job_is_or_the_pool_or_a_typed_refu
         .to_string(),
         "the pool holds no job named `tally`"
     );
+    assert_eq!(
+        DoorRefusal::Unmet { slow: vec![] }.to_string(),
+        "no device in the pool is of the kind asked for"
+    );
+    assert_eq!(
+        DoorRefusal::Unmet {
+            slow: vec![id("laptop", 0), id("server", 1)]
+        }
+        .to_string(),
+        "the devices of the kind asked for (laptop/0, server/1) are each of a member that takes \
+         longer than the deadline to give a device back"
+    );
+    assert!(DoorRefusal::ByName.to_string().contains("SIGTERM"));
+
+    // A device taken back: the one chosen, the record of its leave, and whether its member said
+    // it gave it back in time.
+    let leave = Record {
+        event: Event::Leave {
+            device: id("laptop", 0),
+        },
+        ..record("tally")
+    };
+    for given_back in [true, false] {
+        round_trip(
+            &DoorAnswer::TakenBack {
+                device: id("laptop", 0),
+                record: leave.clone(),
+                given_back,
+            },
+            json!({ "taken_back": {
+                "device": { "member": "laptop", "index": 0 },
+                "record": serde_json::to_value(&leave).unwrap(),
+                "given_back": given_back
+            } }),
+        );
+    }
 
     for bad in [
         json!({ "status": { "pool": serde_json::to_value(&pool).unwrap(), "asks": null } }),
         json!({ "ended": {} }),
         json!({ "refused": { "refusal": { "busy": {} } } }),
         json!({ "submitted": { "record": serde_json::to_value(record("tally")).unwrap() } }),
+        json!({ "refused": { "refusal": { "unmet": {} } } }),
+        json!({ "refused": { "refusal": { "by_name": {} } } }),
+        json!({ "taken_back": {
+            "device": { "member": "laptop", "index": 0 },
+            "record": serde_json::to_value(record("tally")).unwrap()
+        } }),
     ] {
         assert!(
             serde_json::from_value::<DoorAnswer>(bad.clone()).is_err(),

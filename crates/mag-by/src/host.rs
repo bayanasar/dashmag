@@ -133,14 +133,17 @@ impl DeviceKind {
     }
 }
 
-/// The host taking a device back, at its door: by name, or by need, each within a deadline in
-/// seconds.
+/// The host taking a device back: by name, or by need, each within a deadline in seconds.
 ///
 /// A request, not a change the pool is told. What it does to the pool is that devices leave,
-/// once their parts have stopped, and the pool is told that as [`crate::Change::Leave`]. By
-/// name, the member is told to stop and gives its devices back within its `give_back_seconds`,
-/// whatever the pool would rather. By need, the pool chooses which device of the kind costs it
-/// least to lose, and that device's member then stops as for a name.
+/// and the pool is told that as [`crate::Change::Leave`]. By name, the member is told to stop and
+/// gives its devices back within its `give_back_seconds`, whatever the pool would rather. By
+/// need, the pool chooses which device of the kind costs it least to lose, and that device's
+/// member then gives it back as for a name.
+///
+/// The door takes back by need ([`crate::DoorRequest::TakeBack`]). By name, the host sends the
+/// member's program SIGTERM, which ends its lease; the door refuses a take-back by name
+/// ([`crate::DoorRefusal::ByName`]).
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(
     feature = "graph",
