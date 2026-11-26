@@ -612,12 +612,18 @@ pub fn run(start: &Start, mut offers: Vec<Offer>, notice: Notice) -> Result<Ende
         say(&name, "has no control channel: no one to tell it leaves");
         return Ok(Ended::Alone);
     };
-    if let Err(e) = sending
-        .send_word(&Control::Leave)
-        .and_then(|()| sending.close())
-    {
+    if let Err(e) = sending.send_word(&Control::Leave) {
         say(&name, format_args!("its leaving was not sent ({e})"));
         return Ok(Ended::Unheard(e));
+    }
+    // Then its own way closed. The coordinator may have read the leaving, recorded it and closed
+    // both ways already, and the close then fails (not connected): whether the leaving was heard
+    // is the coordinator's close, which the channel's receiving half reports below, either way.
+    if let Err(e) = sending.close() {
+        say(
+            &name,
+            format_args!("its own way of the control channel did not close cleanly ({e})"),
+        );
     }
     // The coordinator closes its way once the leaving is recorded. Until then this waits, and
     // the deadline bounds it.
