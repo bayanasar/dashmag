@@ -349,10 +349,33 @@ mod unix {
         let mut text = serde_json::to_vec(&reply).expect("an answer always serialises");
         text.push(b'\n');
         (&stream).write_all(&text)?;
-        // The answer's end, before the socket is closed: closed with bytes of the request still
-        // unread, as after a request too long, it would end the command's reading as reset, and
-        // the command would lose the answer it had.
-        stream.shutdown(std::net::Shutdown::Write)
+        // The answer's end, then what the asker still sends, read and let go until it closes:
+        // a socket closed with bytes of the request still unread, as after a request too long,
+        // ends the asker's reading as reset, and the asker loses the answer it had.
+        stream.shutdown(std::net::Shutdown::Write)?;
+        drain(&stream);
+        Ok(())
+    }
+
+    /// Reads what `stream` still brings until its end, and lets it go: at most
+    /// [`REQUEST_LIMIT`] bytes more, over at most [`REQUEST_WAIT`].
+    fn drain(stream: &UnixStream) {
+        let until = std::time::Instant::now() + REQUEST_WAIT;
+        let mut left = REQUEST_LIMIT;
+        let mut buffer = [0; 64 << 10];
+        while left > 0 {
+            let wait = until.saturating_duration_since(std::time::Instant::now());
+            if wait.is_zero() || stream.set_read_timeout(Some(wait)).is_err() {
+                return;
+            }
+            let most = buffer
+                .len()
+                .min(usize::try_from(left).unwrap_or(usize::MAX));
+            match (&*stream).read(&mut buffer[..most]) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => left -= n as u64,
+            }
+        }
     }
 
     /// Asks the coordinator at the door at `path`, and returns its answer. Fails at once when no

@@ -24,6 +24,11 @@ use mag_mar::{ChannelEnd, Credentials, Link, LinkError, Receiver, Sender, TlsLin
 /// The members' time to give their devices back, in seconds.
 const GIVE_BACK: f64 = 2.0;
 
+/// A time to give back that no load on the machine reaches, for the tests of a leave the
+/// coordinator records: within [`GIVE_BACK`] a member under load can end at its deadline before
+/// the coordinator's answer comes, which is also right, and the test would see the other ending.
+const PATIENT: f64 = 60.0;
+
 /// A pool's files in a directory of their own: the authority, and each member's certificate and
 /// key, the key readable by its owner alone.
 struct Pool {
@@ -185,6 +190,46 @@ fn description() -> Description {
         jobs: vec![],
         formats: vec![],
     }
+}
+
+/// The pool with members that give back within [`PATIENT`] in their own start files. The
+/// coordinator, on [`description`], holds them to the shorter time, as it takes the shorter
+/// of the two.
+fn patient() -> Description {
+    let mut pool = description();
+    for member in &mut pool.members {
+        if member.name != "workstation" {
+            member.give_back_seconds = PATIENT;
+        }
+    }
+    pool
+}
+
+/// An address on loopback at a port below the system's ephemeral ports, free when chosen. A
+/// coordinator stopped and started again binds it again: no connection's own port and no bind
+/// of port 0 can take it meanwhile, as they can a port from that range under load.
+fn steady_address() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    // Linux's range begins at 32768 by default, macOS's at 49152.
+    let low: u16 = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|r| r.split_whitespace().next()?.parse().ok())
+        .unwrap_or(32768);
+    const SPAN: u16 = 10_000;
+    assert!(low > SPAN + 1024, "ephemeral ports begin at {low}");
+    // A place of this process's own and this call's to begin from, so that copies of these
+    // tests run at once seldom try the same ports.
+    let seed = u64::from(std::process::id()) * 7919
+        + CALLS.fetch_add(1, Ordering::Relaxed) * 104_729
+        + u64::from(Instant::now().elapsed().subsec_nanos());
+    (0..u64::from(SPAN))
+        .map(|i| low - SPAN + ((seed + i) % u64::from(SPAN)) as u16)
+        .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+        .expect("no free port below the ephemeral ones")
+        .local_addr()
+        .unwrap()
+        .to_string()
 }
 
 /// The member program, running, its standard error read a line at a time. Killed if dropped
@@ -382,6 +427,12 @@ fn stand_in(
     (address, seen)
 }
 
+/// Whether a member said it left, either way that is right: the coordinator recorded its leave,
+/// or its deadline came first, which under load it can.
+fn left(member: &Program) -> bool {
+    member.said("left: the coordinator recorded it") || member.said("at its deadline")
+}
+
 fn next(seen: &mpsc::Receiver<Seen>) -> Seen {
     seen.recv_timeout(Duration::from_secs(20))
         .expect("the stand-in coordinator saw nothing more")
@@ -392,11 +443,16 @@ fn limit() -> Duration {
     Duration::from_secs_f64(GIVE_BACK)
 }
 
+/// A patient member's time to give its devices back.
+fn patiently() -> Duration {
+    Duration::from_secs_f64(PATIENT)
+}
+
 #[test]
 fn a_member_binds_joins_with_its_offers_and_leaves_on_sigterm_once_recorded() {
     let pool = Pool::new("joins");
     let (coordinator, seen) = stand_in(&pool, &["server"], AfterLeave::Answer);
-    let start = pool.start("server", Some("127.0.0.1:0"), Some(&coordinator));
+    let start = pool.start_in("server", Some("127.0.0.1:0"), Some(&coordinator), patient());
     let mut program = Program::start(Some(&start));
 
     // It binds its `listen` address, and answers there.
@@ -415,7 +471,7 @@ fn a_member_binds_joins_with_its_offers_and_leaves_on_sigterm_once_recorded() {
     }
     match next(&seen) {
         Seen::Word(Control::Join { member: m, offers }) => {
-            assert_eq!(m, member("server", Trust::Owner, GIVE_BACK));
+            assert_eq!(m, member("server", Trust::Owner, PATIENT));
             assert_eq!(
                 offers,
                 vec![offer("server", 0, 16 << 30), offer("server", 1, 24 << 30)]
@@ -425,11 +481,12 @@ fn a_member_binds_joins_with_its_offers_and_leaves_on_sigterm_once_recorded() {
     }
     program.says("joined the pool");
 
-    // SIGTERM: it says it leaves, the coordinator records it and closes, and it exits 0 at once.
-    let (status, took) = program.terminate(limit() * 3);
+    // SIGTERM: it says it leaves, the coordinator records it and closes, and it exits 0 then,
+    // not at its deadline.
+    let (status, took) = program.terminate(patiently());
     assert!(matches!(next(&seen), Seen::Word(Control::Leave)));
     assert_eq!(status.code(), Some(0), "{:#?}", program.said);
-    assert!(took < limit(), "{took:?}");
+    assert!(took < patiently(), "{took:?}");
     assert!(
         program.said("left: the coordinator recorded it"),
         "{:#?}",
@@ -708,15 +765,15 @@ fn the_coordinator_records_its_members_joins_in_its_ledger_one_entry_per_device(
 fn a_member_leaving_on_sigterm_is_recorded_before_it_is_told_and_the_ledger_replays() {
     let pool = Pool::new("records-leave");
     let (mut coordinating, at) = coordinator(&pool);
-    let mut server = joined(&pool, "server", &at, description());
+    let mut server = joined(&pool, "server", &at, patient());
     let _laptop = joined(&pool, "laptop", &at, description());
     ledger_of(&pool, 3);
 
     // SIGTERM: the leave of each of its devices is in the ledger, and the member is told, within
     // its time to give back.
-    let (status, took) = server.terminate(limit() * 3);
+    let (status, took) = server.terminate(patiently());
     assert_eq!(status.code(), Some(0), "{:#?}", server.said);
-    assert!(took < limit(), "{took:?}");
+    assert!(took < patiently(), "{took:?}");
     assert!(
         server.said("left: the coordinator recorded it"),
         "{:#?}",
@@ -945,13 +1002,13 @@ fn an_unlisted_member_is_recorded_at_outside_and_a_listed_one_at_the_lower_trust
 fn a_member_with_no_offers_is_recorded_nowhere_and_its_leave_is_answered() {
     let pool = Pool::new("no-offers");
     let (mut coordinating, at) = coordinator(&pool);
-    let mut bare = description();
+    let mut bare = patient();
     bare.offers.retain(|o| o.device.member != "server");
     let mut server = joined(&pool, "server", &at, bare);
     coordinating.says("`server` joined with 0 devices");
-    let (status, took) = server.terminate(limit() * 3);
+    let (status, took) = server.terminate(patiently());
     assert_eq!(status.code(), Some(0));
-    assert!(took < limit(), "{took:?}");
+    assert!(took < patiently(), "{took:?}");
     assert!(
         server.said("left: the coordinator recorded it"),
         "{:#?}",
@@ -983,9 +1040,11 @@ fn a_member_gone_without_leaving_is_recorded_as_left_at_the_end_of_its_grace() {
     let (mut coordinating, at) = coordinator(&pool);
     let mut laptop = joined(&pool, "laptop", &at, description());
     ledger_of(&pool, 1);
+    // Timed from before the kill: the coordinator's grace begins once it notices, which is
+    // after, while its line saying so can reach this test late.
+    let gone = Instant::now();
     laptop.child.kill().unwrap();
     coordinating.says("`laptop` went without leaving");
-    let gone = Instant::now();
     // Kept for its grace: its time to give back is 2 s, so the least grace, 5 s.
     assert_eq!(mag_mar::coordinator::LEAST_GRACE, Duration::from_secs(5));
     let ledger = ledger_of(&pool, 2);
@@ -1327,24 +1386,32 @@ fn the_door_refuses_what_the_pool_refuses_writes_nothing_for_it_and_says_when_a_
             refusal: DoorRefusal::Unreadable { .. }
         }
     ));
-    // A line longer than the door reads, refused once it has read that much.
+    // A line longer than the door reads, refused once it has read that much. A mebibyte more
+    // than that is still coming as the door answers: it reads that and lets it go before it
+    // closes, or the answer would end in a reset.
     let mut stream = std::os::unix::net::UnixStream::connect(pool.dir.join("door.sock")).unwrap();
-    let long = vec![b' '; mag_mar::door::REQUEST_LIMIT as usize + 2];
+    let long = vec![b' '; mag_mar::door::REQUEST_LIMIT as usize + (1 << 20)];
     let writing = {
         let mut stream = stream.try_clone().unwrap();
         thread::spawn(move || {
             let _ = stream.write_all(&long);
         })
     };
+    // Read once the writing has ended: by then the door has read the rest, or has closed on it
+    // and the answer would end in a reset.
+    writing.join().unwrap();
     let mut answer = String::new();
     std::io::Read::read_to_string(&mut stream, &mut answer).unwrap();
-    writing.join().unwrap();
     match serde_json::from_str::<DoorAnswer>(&answer).unwrap() {
         DoorAnswer::Refused {
             refusal: DoorRefusal::Unreadable { error },
         } => assert!(error.contains("longer than"), "{error}"),
         other => panic!("{other:?}"),
     }
+    // It reads what still comes after its answer, until the asker closes: a mebibyte more, more
+    // than a socket holds unread, goes through.
+    stream.write_all(&vec![b' '; 1 << 20]).unwrap();
+    drop(stream);
 
     // The command's own refusals, before it asks: a graph file it cannot read, and its usage.
     let asked = door(&start, &["submit", path(&pool.dir.join("none.json"))]);
@@ -1724,7 +1791,7 @@ fn a_device_taken_back_by_need_is_written_its_member_told_and_the_door_answered(
     // The laptop's lease ends with no device to record; the server's with the one it kept.
     let (status, _) = laptop.terminate(limit() * 3);
     assert_eq!(status.code(), Some(0), "{:#?}", laptop.said);
-    assert!(laptop.said("left: the coordinator recorded it"));
+    assert!(left(&laptop), "{:#?}", laptop.said);
     let (status, _) = server.terminate(limit() * 3);
     assert_eq!(status.code(), Some(0), "{:#?}", server.said);
     let (ledger, _) = read_ledger(&pool);
@@ -1953,7 +2020,8 @@ fn a_member_told_to_give_back_a_device_it_does_not_offer_gives_back_nothing_for_
 // A coordinator that stops, and one that takes up its ledger.
 
 /// The coordinator started again at `at`, the address the members dial, on its start file with
-/// that address: it and its start file.
+/// that address: it and its start file. `at` is a [`steady_address`], which nothing else takes
+/// while the coordinator is down.
 fn again(pool: &Pool, at: &str) -> (Program, PathBuf) {
     let start = pool.start("workstation", Some(at), None);
     let (program, answers) = coordinator_from(Program::command(Some(&start)));
@@ -1975,7 +2043,7 @@ fn ledger_path(pool: &Pool) -> PathBuf {
 #[test]
 fn a_coordinator_killed_and_started_again_takes_up_its_ledger_and_its_members_join_again() {
     let pool = Pool::new("restart");
-    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let start = pool.start("workstation", Some(&steady_address()), None);
     let (mut first, at) = coordinator_from(Program::command(Some(&start)));
     let mut server = joined(&pool, "server", &at, description());
     let mut laptop = joined(&pool, "laptop", &at, description());
@@ -2016,7 +2084,7 @@ fn a_coordinator_killed_and_started_again_takes_up_its_ledger_and_its_members_jo
     // Appended to, as before: the server leaves on SIGTERM, then the coordinator on its own.
     let (status, _) = server.terminate(limit() * 3);
     assert_eq!(status.code(), Some(0), "{:#?}", server.said);
-    assert!(server.said("left: the coordinator recorded it"));
+    assert!(left(&server), "{:#?}", server.said);
     let (status, _) = second.terminate(Duration::from_secs(10));
     assert_eq!(status.code(), Some(0), "{:#?}", second.said);
     let (ledger, text) = read_ledger(&pool);
@@ -2028,7 +2096,7 @@ fn a_coordinator_killed_and_started_again_takes_up_its_ledger_and_its_members_jo
 #[test]
 fn a_last_ledger_line_cut_short_is_dropped_said_and_cut_away_before_the_ledger_goes_on() {
     let pool = Pool::new("torn");
-    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let start = pool.start("workstation", Some(&steady_address()), None);
     let (mut first, at) = coordinator_from(Program::command(Some(&start)));
     let mut laptop = joined(&pool, "laptop", &at, description());
     ledger_of(&pool, 1);
@@ -2064,7 +2132,7 @@ fn a_last_ledger_line_cut_short_is_dropped_said_and_cut_away_before_the_ledger_g
 #[test]
 fn a_ledger_another_version_wrote_is_read_for_its_facts_and_a_new_one_follows_it() {
     let pool = Pool::new("other-version");
-    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let start = pool.start("workstation", Some(&steady_address()), None);
     let (mut first, at) = coordinator_from(Program::command(Some(&start)));
     let mut server = joined(&pool, "server", &at, description());
     let mut laptop = joined(&pool, "laptop", &at, description());
@@ -2136,7 +2204,7 @@ fn a_ledger_another_version_wrote_is_read_for_its_facts_and_a_new_one_follows_it
 #[test]
 fn a_ledger_this_version_wrote_that_does_not_replay_is_refused_and_left_as_it_is() {
     let pool = Pool::new("no-replay");
-    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let start = pool.start("workstation", Some(&steady_address()), None);
     let (mut first, at) = coordinator_from(Program::command(Some(&start)));
     let graph = graph_file(&pool, "sums", false);
     assert_eq!(door(&start, &["submit", path(&graph)]).code, Some(0));
@@ -2201,10 +2269,11 @@ fn a_member_that_joins_again_within_its_grace_keeps_its_devices_and_one_gone_pas
         ]
     );
 
-    // Gone past its grace: its device's leave recorded at its end, and not before.
+    // Gone past its grace: its device's leave recorded at its end, and not before (timed from
+    // before the cut, as the coordinator's grace begins after it).
+    let gone = Instant::now();
     drop(laptop);
     coordinating.says_times("`laptop` went without leaving", 3);
-    let gone = Instant::now();
     let ledger = ledger_of(&pool, 4);
     let took = gone.elapsed();
     assert!(took >= Duration::from_millis(4900), "{took:?}");
@@ -2330,7 +2399,7 @@ fn a_second_coordinator_on_a_ledger_another_one_writes_is_refused() {
 fn a_coordinator_started_again_joins_its_own_devices_as_they_are_and_records_one_not_back_as_left()
 {
     let pool = Pool::new("not-back");
-    let start = pool.start("workstation", Some("127.0.0.1:0"), None);
+    let start = pool.start("workstation", Some(&steady_address()), None);
     let (mut first, at) = coordinator_from(Program::command(Some(&start)));
     let mut laptop = joined(&pool, "laptop", &at, description());
     ledger_of(&pool, 1);
@@ -2433,12 +2502,9 @@ fn a_join_is_not_told_joined_until_its_ledger_line_is_written() {
 #[test]
 fn a_member_that_cannot_reach_the_coordinator_dials_again_less_and_less_often() {
     let pool = Pool::new("backoff");
-    // An address no one answers at: a port bound, then let go.
-    let address = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .to_string();
+    // An address no one answers at: a port bound, then let go, where no other socket of this
+    // machine's is given it meanwhile.
+    let address = steady_address();
     let start = pool.start("server", None, Some(&address));
     let mut program = Program::start(Some(&start));
     program.says_times("is not reached", 3);
